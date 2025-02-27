@@ -94,7 +94,7 @@ export function SiteHeader() {
                         Blog
                     </Link>
                     <Link
-                        href="/channel"
+                        href="https://t.me/abdurahmon_mamadiyorov"
                         className={`text-sm font-medium transition-colors flex items-center gap-1 ${scrolled ? "text-foreground" : "text-muted-foreground hover:text-primary"}`}
                     >
                         Channel
