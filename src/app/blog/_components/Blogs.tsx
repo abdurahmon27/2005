@@ -159,21 +159,22 @@ const BlogComponent: React.FC = async () => {
                             {latestPosts.map((post) => (
                                 <Link href={`/blog/${post.route}`} key={post.id} className="block group">
                                     <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/30 h-full">
-                                        <div className="flex flex-col sm:flex-row h-full">
+                                        <div className="flex flex-col md:flex-row h-full">
                                             {post.thumb && (
-                                                <div className="w-1/5 aspect-video sm:aspect-square overflow-hidden relative">
+                                                <div className="w-full md:w-1/4 h-48 md:h-auto relative">
                                                     <Image
                                                         src={post.thumb}
                                                         alt={post.title}
-                                                        width={200}
-                                                        height={200}
-                                                        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                                                        fill
+                                                        sizes="(max-width: 768px) 100vw, 25vw"
+                                                        priority
+                                                        className="object-cover transition-transform duration-500 group-hover:scale-105"
                                                     />
                                                     <div className="absolute inset-0 bg-gradient-to-tr from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
                                                 </div>
                                             )}
 
-                                            <div className={cn("flex flex-col justify-between h-full", post.thumb ? "w-full sm:w-3/4" : "w-full")}>
+                                            <div className={cn("flex flex-col justify-between h-full", "w-full")}>
                                                 <CardHeader className="flex-grow py-4 px-5">
                                                     <div className="flex flex-wrap items-center gap-2 mb-2">
                                                         <Badge variant="outline" className="text-xs font-normal rounded-md bg-primary/5 border-primary/20">
@@ -257,23 +258,21 @@ const BlogComponent: React.FC = async () => {
                                         {groupedPosts[monthYear].map((post) => (
                                             <Link href={`/blog/${post.route}`} key={post.id} className="block group">
                                                 <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/20">
-                                                    <div className="flex flex-col sm:flex-row">
+                                                    <div className="flex flex-col md:flex-row">
                                                         {post.thumb && (
-                                                            <div className="w-1/5 aspect-video sm:aspect-square overflow-hidden relative">
+                                                            <div className="w-full md:w-1/4 h-40 md:h-auto relative">
                                                                 <Image
                                                                     src={post.thumb || "/placeholder.svg"}
                                                                     alt={post.title}
-                                                                    width={200}
-                                                                    height={200}
-                                                                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                                                                    fill
+                                                                    sizes="(max-width: 768px) 100vw, 25vw"
+                                                                    className="object-cover transition-transform duration-500 group-hover:scale-105"
                                                                 />
                                                                 <div className="absolute inset-0 bg-gradient-to-tr from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
                                                             </div>
                                                         )}
 
-                                                        <div
-                                                            className={cn("flex flex-col justify-between", post.thumb ? "w-full sm:w-3/4" : "w-full")}
-                                                        >
+                                                        <div className="w-full">
                                                             <CardHeader className="flex-grow py-4 px-5">
                                                                 <div className="flex flex-wrap items-center gap-2 mb-2">
                                                                     <Badge variant="outline" className="text-xs font-normal rounded-md">
@@ -293,7 +292,7 @@ const BlogComponent: React.FC = async () => {
                                                                     {post.title}
                                                                 </CardTitle>
 
-                                                                <CardDescription className="mt-2 line-clamp-2 hidden sm:block text-sm">
+                                                                <CardDescription className="mt-2 line-clamp-2 text-sm">
                                                                     {post.preview}
                                                                 </CardDescription>
                                                             </CardHeader>
