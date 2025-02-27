@@ -7,6 +7,7 @@ import { Clock, Calendar, ChevronLeft } from "lucide-react"
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import ShikiCodeBlock from './_components/CodeBlock'
+import { Metadata } from 'next'
 
 interface BlockProps {
     block: any
@@ -309,3 +310,56 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
 }
 
 export default PostPage
+
+export async function generateMetadata({ params }: { params: { route: string } }): Promise<Metadata> {
+    try {
+      const { route } = params
+      const page = await getPageByRoute(route)
+      
+      if (!page) {
+        return {
+          title: 'Post Not Found',
+        }
+      }
+      
+      const properties = page.properties as any
+      const title = properties.title?.title[0]?.text.content || "Untitled"
+      const description = properties.description?.rich_text[0]?.text.content || 
+                           "Read this blog post on our website"
+      const tags = properties.tags?.multi_select?.map((tag: any) => tag.name) || []
+      const thumb = properties.thumb?.files?.[0]?.file?.url || null
+      
+      return {
+        title,
+        description,
+        keywords: tags,
+        openGraph: {
+          title,
+          description,
+          type: 'article',
+          publishedTime: properties.publish_date?.date?.start || undefined,
+          authors: ['Your Name'],
+          tags,
+          images: thumb ? [{ url: thumb }] : undefined,
+        },
+        twitter: {
+          card: 'summary_large_image',
+          title,
+          description,
+          images: thumb ? [thumb] : undefined,
+        }
+      }
+    } catch (error) {
+      console.error("Error generating metadata:", error)
+      return {
+        title: 'Blog Post',
+        description: 'Read our latest blog post',
+      }
+    }
+  }
+  
+  export const metadata: Metadata = {
+    // This will be overridden by the dynamic metadata above
+    title: 'Blog',
+    description: 'Read our latest blog posts',
+  }
