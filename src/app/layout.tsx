@@ -32,6 +32,6 @@ const spaceGrotesk = Space_Grotesk({
 });
 
 export const metadata: Metadata = {
-  title: "Bekzotovich.uz",
+  title: "Bekzotovich | Software Engineer | CS Student",
   description: "I am a self-taught, nerd developer who loves to build things.",
 };
