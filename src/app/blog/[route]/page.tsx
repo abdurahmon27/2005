@@ -311,9 +311,9 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
 
 export default PostPage
 
-export async function generateMetadata({ params }: { params: { route: string } }): Promise<Metadata> {
+export async function generateMetadata({ params }: { params: Promise<{ route: string }> }): Promise<Metadata> {
     try {
-      const { route } = params
+      const { route } = await params
       const page = await getPageByRoute(route)
       
       if (!page) {
