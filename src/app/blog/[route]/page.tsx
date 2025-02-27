@@ -357,9 +357,4 @@ export async function generateMetadata({ params }: { params: { route: string } }
       }
     }
   }
-  
-  export const metadata: Metadata = {
-    // This will be overridden by the dynamic metadata above
-    title: 'Blog',
-    description: 'Read our latest blog posts',
-  }
+ 
