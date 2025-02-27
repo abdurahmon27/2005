@@ -6,7 +6,6 @@ import { Badge } from "@/components/ui/badge"
 import { Clock, Calendar, ChevronLeft } from "lucide-react"
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
 import ShikiCodeBlock from './_components/CodeBlock'
 
 interface BlockProps {
@@ -185,8 +184,8 @@ const calculateReadingTime = (blocks: any[]): number => {
     return Math.ceil(totalWords / 200) || 1
 }
 
-const PostPage = async ({ params }: { params: { route: string } }) => {
-    const { route } = params
+const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
+    const { route } = await params
 
     try {
         const page = await getPageByRoute(route)
