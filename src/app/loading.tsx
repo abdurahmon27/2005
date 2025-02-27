@@ -1,4 +1,3 @@
-// app/loading.tsx
 "use client";
 
 import { motion } from "framer-motion";
@@ -15,7 +14,6 @@ export default function Loading() {
 }
 
 const LoadingLogo = () => {
-  // Define the animation for circles
   const circleVariants = {
     initial: { scale: 0, opacity: 0 },
     animate: (i: number) => ({
@@ -31,7 +29,6 @@ const LoadingLogo = () => {
     })
   };
 
-  // Create an array of circles
   const circles = Array.from({ length: 3 }).map((_, i) => (
     <motion.circle
       key={i}

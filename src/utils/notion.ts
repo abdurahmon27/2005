@@ -21,15 +21,11 @@ export type PageData = {
   thumb: string;
 };
 
-// Add revalidation time for dynamic data
 export const getPages = cache(
   async (published?: boolean, revalidate = false): Promise<PageData[]> => {
-    // If revalidate is true, we'll force a fresh fetch
     if (revalidate) {
-      // Assuming you're using Next.js, revalidate the paths that might show this content
-      revalidatePath('/');
-      revalidatePath('/blog');
-      // Add any other paths that display your Notion content
+      revalidatePath("/");
+      revalidatePath("/blog");
     }
 
     const response = await NotionClient.databases.query({
@@ -76,21 +72,21 @@ type ParsedBlock = {
   href?: string | null;
 };
 
-export const getPageContent = cache(async (pageId: string, revalidate = false) => {
-  // Force revalidation if needed
-  if (revalidate) {
-    // Revalidate the specific page path
-    revalidatePath(`/[route]`); // Adjust based on your route structure
+export const getPageContent = cache(
+  async (pageId: string, revalidate = false) => {
+    if (revalidate) {
+      revalidatePath(`/[route]`);
+    }
+
+    const blocks = await NotionClient.blocks.children
+      .list({
+        block_id: pageId,
+      })
+      .then((res) => res.results as BlockObjectResponse[]);
+
+    return blocks.map(parseBlockForRendering);
   }
-
-  const blocks = await NotionClient.blocks.children
-    .list({
-      block_id: pageId,
-    })
-    .then((res) => res.results as BlockObjectResponse[]);
-
-  return blocks.map(parseBlockForRendering);
-});
+);
 
 function parseBlockForRendering(block: BlockObjectResponse): ParsedBlock {
   const { id, type } = block;
@@ -176,7 +172,6 @@ function parseRichText(richText: any): ParsedBlock {
 }
 
 export const getPageByRoute = async (route: string, revalidate = false) => {
-  // Force revalidation if needed
   if (revalidate) {
     revalidatePath(`/${route}`);
   }
@@ -194,17 +189,11 @@ export const getPageByRoute = async (route: string, revalidate = false) => {
     .then((res) => res.results[0] as PageObjectResponse);
 };
 
-// Add a function to handle webhook from Notion (if you want to implement this)
 export async function handleNotionWebhook(req: any, res: any) {
-  // Verify the request is from Notion (you should implement proper verification)
-  
-  // Get the updated page ID from the webhook payload
   const { pageId } = req.body;
-  
-  // Revalidate all content
-  revalidatePath('/');
-  revalidatePath('/blog');
-  // If you know the specific route affected, revalidate that too
-  
-  return res.status(200).json({ message: 'Revalidation triggered' });
+
+  revalidatePath("/");
+  revalidatePath("/blog");
+
+  return res.status(200).json({ message: "Revalidation triggered" });
 }

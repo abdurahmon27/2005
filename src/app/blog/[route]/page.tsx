@@ -95,6 +95,10 @@ const ImageBlock: React.FC<BlockProps> = ({ block }) => (
     </figure>
 )
 
+const DividerBlock: React.FC<BlockProps> = ({ block }) => (
+    <hr className='w-full border-t border-tprimary' />
+)
+
 
 
 const TodoBlock: React.FC<BlockProps> = ({ block }) => (
@@ -122,7 +126,8 @@ const BlockRenderer: React.FC<BlockProps> = ({ block }) => {
         case 'image': return <ImageBlock block={block} />
         case 'code': return <ShikiCodeBlock block={block} />
         case 'to_do': return <TodoBlock block={block} />
-        default: return null
+        case 'divider': return <DividerBlock block={block} />
+        default: return `${block.type}`
     }
 }
 
