@@ -115,12 +115,12 @@ export const PROJECTS: Project[] = [
     {
         id: "p6",
         title: "GSK PRO | Telegram Bot",
-        slug: "cod3-lab",
+        slug: "gsk-pro",
         category: "telegram-bot",
         level: "highlighted",
         status: "completed",
-        description: "A company that provides services in several categories including PWA, SPA, Telegram Bot, Landing Pages, and IT",
-        preview: "Cod3 Lab is a software development company that provides services in several categories including Progressive Web Apps, Single Page Applications, Telegram Bots, Landing Pages, and IT Consultation.",
+        description: "Just a simple telegram bot for GSK PRO",
+        preview: "Just a simple telegram bot for GSK PRO",
         technologies: [
             { name: "TypeScript", color: "#3178C6" },
             { name: "Node.js", color: "#FF6F00" },
@@ -143,8 +143,8 @@ export const PROJECTS: Project[] = [
         category: "landing",
         level: "regular",
         status: "completed",
-        description: "A company that provides services in several categories including PWA, SPA, Telegram Bot, Landing Pages, and IT",
-        preview: "Cod3 Lab is a software development company that provides services in several categories including Progressive Web Apps, Single Page Applications, Telegram Bots, Landing Pages, and IT Consultation.",
+        description: "Simplest landing page for my friend's law firm",
+        preview: "Simplest landing page for my friend's law firm",
         technologies: [
             { name: "TypeScript", color: "#3178C6" },
             { name: "Node.js", color: "#FF6F00" },
@@ -152,7 +152,7 @@ export const PROJECTS: Project[] = [
         ],
         thumb: "/s-yurist.jpg",
         links: [
-            { type: "live", url: "https://t.me/gks_pro_bot" }
+            { type: "live", url: "https://s-yurist.uz" }
         ],
         stats: {
             users: 300
