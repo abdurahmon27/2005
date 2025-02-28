@@ -100,8 +100,6 @@ const DividerBlock: React.FC<BlockProps> = () => (
     <hr className='w-full border-t border-t-primary' />
 )
 
-
-
 const TodoBlock: React.FC<BlockProps> = ({ block }) => (
     <div className="flex items-start gap-2 my-2">
         <input
@@ -130,14 +128,16 @@ const VideoBlock: React.FC<BlockProps> = async ({ block }) => {
     console.log(embedUrl)
     return (
         isYouTube ? (
-            <iframe
-                width="560"
-                height="315"
-                src={embedUrl}
-                frameBorder="0"
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                allowFullScreen
-            />
+            <div className='w-full flex items-center justify-center rounded-md min-h-full'>
+                <iframe
+                    width="650"
+                    height="490"
+                    src={embedUrl}
+                    className='w-full min-h-full rounded-md'
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                />
+            </div>
         ) : (
             <video controls width="100%">
                 <source src={url} type="video/mp4" />
