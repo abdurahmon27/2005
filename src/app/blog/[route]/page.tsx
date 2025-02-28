@@ -8,6 +8,7 @@ import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import ShikiCodeBlock from './_components/CodeBlock'
 import { Metadata } from 'next'
+import { getNotionBlock } from '@/utils/getNotionBlock'
 
 interface BlockProps {
     block: any
@@ -95,8 +96,8 @@ const ImageBlock: React.FC<BlockProps> = ({ block }) => (
     </figure>
 )
 
-const DividerBlock: React.FC<BlockProps> = ({ block }) => (
-    <hr className='w-full border-t border-tprimary' />
+const DividerBlock: React.FC<BlockProps> = () => (
+    <hr className='w-full border-t border-t-primary' />
 )
 
 
@@ -115,6 +116,37 @@ const TodoBlock: React.FC<BlockProps> = ({ block }) => (
     </div>
 )
 
+const VideoBlock: React.FC<BlockProps> = async ({ block }) => {
+    console.log(block)
+    const res = await getNotionBlock(block.id)
+    const url = res.video.external.url || 'sth for now';
+    const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
+
+    const getYouTubeEmbedUrl = (url: string) => {
+        const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/|.+?v=))([^?&]+)/);
+        return match ? `https://www.youtube.com/embed/${match[1]}` : null;
+    };
+    const embedUrl = isYouTube ? getYouTubeEmbedUrl(url) : url;
+    console.log(embedUrl)
+    return (
+        isYouTube ? (
+            <iframe
+                width="560"
+                height="315"
+                src={embedUrl}
+                frameBorder="0"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                allowFullScreen
+            />
+        ) : (
+            <video controls width="100%">
+                <source src={url} type="video/mp4" />
+                Your browser does not support the video tag.
+            </video>
+        )
+    )
+}
+
 const BlockRenderer: React.FC<BlockProps> = ({ block }) => {
     switch (block.type) {
         case 'paragraph': return <ParagraphBlock block={block} />
@@ -127,6 +159,7 @@ const BlockRenderer: React.FC<BlockProps> = ({ block }) => {
         case 'code': return <ShikiCodeBlock block={block} />
         case 'to_do': return <TodoBlock block={block} />
         case 'divider': return <DividerBlock block={block} />
+        case 'video': return <VideoBlock block={block} />
         default: return `${block.type}`
     }
 }
@@ -318,48 +351,47 @@ export default PostPage
 
 export async function generateMetadata({ params }: { params: Promise<{ route: string }> }): Promise<Metadata> {
     try {
-      const { route } = await params
-      const page = await getPageByRoute(route)
-      
-      if (!page) {
+        const { route } = await params
+        const page = await getPageByRoute(route)
+
+        if (!page) {
+            return {
+                title: 'Post Not Found',
+            }
+        }
+
+        const properties = page.properties as any
+        const title = properties.title?.title[0]?.text.content || "Untitled"
+        const description = properties.description?.rich_text[0]?.text.content ||
+            "Read this blog post on our website"
+        const tags = properties.tags?.multi_select?.map((tag: any) => tag.name) || []
+        const thumb = properties.thumb?.files?.[0]?.file?.url || null
+
         return {
-          title: 'Post Not Found',
+            title,
+            description,
+            keywords: tags,
+            openGraph: {
+                title,
+                description,
+                type: 'article',
+                publishedTime: properties.publish_date?.date?.start || undefined,
+                authors: ['Your Name'],
+                tags,
+                images: thumb ? [{ url: thumb }] : undefined,
+            },
+            twitter: {
+                card: 'summary_large_image',
+                title,
+                description,
+                images: thumb ? [thumb] : undefined,
+            }
         }
-      }
-      
-      const properties = page.properties as any
-      const title = properties.title?.title[0]?.text.content || "Untitled"
-      const description = properties.description?.rich_text[0]?.text.content || 
-                           "Read this blog post on our website"
-      const tags = properties.tags?.multi_select?.map((tag: any) => tag.name) || []
-      const thumb = properties.thumb?.files?.[0]?.file?.url || null
-      
-      return {
-        title,
-        description,
-        keywords: tags,
-        openGraph: {
-          title,
-          description,
-          type: 'article',
-          publishedTime: properties.publish_date?.date?.start || undefined,
-          authors: ['Your Name'],
-          tags,
-          images: thumb ? [{ url: thumb }] : undefined,
-        },
-        twitter: {
-          card: 'summary_large_image',
-          title,
-          description,
-          images: thumb ? [thumb] : undefined,
-        }
-      }
     } catch (error) {
-      console.error("Error generating metadata:", error)
-      return {
-        title: 'Blog Post',
-        description: 'Read our latest blog post',
-      }
+        console.error("Error generating metadata:", error)
+        return {
+            title: 'Blog Post',
+            description: 'Read our latest blog post',
+        }
     }
-  }
- 
+}
