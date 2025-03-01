@@ -234,9 +234,6 @@ const BlogComponent: React.FC = async () => {
                                 </Link>
                             ))}
                         </div>
-                        <div className="mt-4 w-full h-full">
-                        <GiscusComponent />
-                        </div>
                     </div>
                 )}
 
@@ -352,6 +349,9 @@ const BlogComponent: React.FC = async () => {
                         </p>
                     </div>
                 )}
+            </div>
+            <div className="mt-4 w-full h-full">
+                <GiscusComponent />
             </div>
         </div>
     )
