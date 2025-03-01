@@ -7,7 +7,7 @@ export const GiscusComponent = ({
   return (
     <Giscus
       id="comments"
-      repo="abdurahmon27/2005.uz-disccussion"
+      repo="abdurahmon27/2005.uz-discussion"
       repoId="R_kgDOOBe1Pg"
       category="Announcements"
       categoryId="DIC_kwDOOBe1Ps4CndR0"
