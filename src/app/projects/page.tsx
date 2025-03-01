@@ -10,6 +10,8 @@ import { FeaturedProjectCard } from "./_components/FeaturedProjectCard";
 import { ProjectSheet } from "./_components/ProjectSheet";
 import { ProjectCard } from "./_components/ProjectCard";
 import { motion } from "framer-motion";
+import { GiscusComponent } from "@/components/Giscus";
+import Giscus from "@giscus/react";
 
 const getCategoryIcon = (category: string) => {
     switch (category) {
@@ -287,6 +289,7 @@ const ProjectsComponent: React.FC = () => {
                         ))}
                     </Tabs>
                 </motion.div>
+                <GiscusComponent />
             </div>
             <ProjectSheet
                 project={selectedProject}

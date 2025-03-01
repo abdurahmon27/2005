@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Calendar, Bookmark, ChevronRight, Clock } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Separator } from "@/components/ui/separator"
+import { GiscusComponent } from "@/components/Giscus"
 
 interface TextBlock {
     type: "text"
@@ -232,6 +233,9 @@ const BlogComponent: React.FC = async () => {
                                     </Card>
                                 </Link>
                             ))}
+                        </div>
+                        <div className="mt-4 w-full h-full">
+                        <GiscusComponent />
                         </div>
                     </div>
                 )}

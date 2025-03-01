@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import ShikiCodeBlock from './_components/CodeBlock'
 import { Metadata } from 'next'
 import { getNotionBlock } from '@/utils/getNotionBlock'
+import { GiscusComponent } from '@/components/Giscus'
 
 interface BlockProps {
     block: any
@@ -338,6 +339,7 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
 
                 <div className="prose prose-sm sm:prose lg:prose-lg max-w-none">
                     <GroupBlocks blocks={blocks} />
+                    <GiscusComponent />
                 </div>
             </article>
         )
