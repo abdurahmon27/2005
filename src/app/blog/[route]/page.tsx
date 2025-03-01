@@ -10,6 +10,7 @@ import ShikiCodeBlock from './_components/CodeBlock'
 import { Metadata } from 'next'
 import { getNotionBlock } from '@/utils/getNotionBlock'
 import { GiscusComponent } from '@/components/Giscus'
+import Head from 'next/head'
 
 interface BlockProps {
     block: any
@@ -251,41 +252,79 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
         const hasImage = !!thumb
 
         return (
-            <article className="container mx-auto px-4 py-12 max-w-4xl">
-                <Link href="/blog" className="inline-flex items-center mb-6">
-                    <Button variant="ghost" size="sm" className="text-primary group">
-                        <ChevronLeft className="h-4 w-4 mr-1 group-hover:-translate-x-1 transition-transform" />
-                        Back to blog
-                    </Button>
-                </Link>
+            <>
+                <Head>
+                    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7108468314133475"
+                        crossOrigin="anonymous"></script>
+                </Head>
+                <article className="container mx-auto px-4 py-12 max-w-4xl">
+                    <Link href="/blog" className="inline-flex items-center mb-6">
+                        <Button variant="ghost" size="sm" className="text-primary group">
+                            <ChevronLeft className="h-4 w-4 mr-1 group-hover:-translate-x-1 transition-transform" />
+                            Back to blog
+                        </Button>
+                    </Link>
 
-                {hasImage ? (
-                    <div className="relative rounded-xl overflow-hidden mb-8">
-                        <div className="w-full aspect-video relative">
-                            <Image
-                                src={thumb}
-                                alt={title}
-                                fill
-                                className="object-cover"
-                                priority
-                            />
+                    {hasImage ? (
+                        <div className="relative rounded-xl overflow-hidden mb-8">
+                            <div className="w-full aspect-video relative">
+                                <Image
+                                    src={thumb}
+                                    alt={title}
+                                    fill
+                                    className="object-cover"
+                                    priority
+                                />
 
-                            <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-black/10" />
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-black/10" />
 
-                            <div className="absolute bottom-0 left-0 right-0 p-6 sm:p-8 text-white z-10">
-                                <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white mb-4">
+                                <div className="absolute bottom-0 left-0 right-0 p-6 sm:p-8 text-white z-10">
+                                    <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white mb-4">
+                                        {title}
+                                    </h1>
+
+                                    <div className="flex flex-wrap gap-4 mt-3">
+                                        {publishDate && (
+                                            <div className="flex items-center gap-1.5 text-white/80">
+                                                <Calendar className="h-4 w-4" />
+                                                <span className="text-sm">{publishDate}</span>
+                                            </div>
+                                        )}
+
+                                        <div className="flex items-center gap-1.5 text-white/80">
+                                            <Clock className="h-4 w-4" />
+                                            <span className="text-sm">{readingTime} min read</span>
+                                        </div>
+                                    </div>
+
+                                    {tags.length > 0 && (
+                                        <div className="flex flex-wrap gap-2 mt-4">
+                                            {tags.map((tag: string) => (
+                                                <Badge key={tag} className="bg-white/20 text-white hover:bg-white/30 border-transparent">
+                                                    {tag}
+                                                </Badge>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="mb-8 relative rounded-xl overflow-hidden">
+                            <div className="bg-gradient-to-br from-primary/10 via-primary/20 to-primary/30 p-6 sm:p-8">
+                                <h1 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
                                     {title}
                                 </h1>
 
                                 <div className="flex flex-wrap gap-4 mt-3">
                                     {publishDate && (
-                                        <div className="flex items-center gap-1.5 text-white/80">
+                                        <div className="flex items-center gap-1.5 text-foreground/80">
                                             <Calendar className="h-4 w-4" />
                                             <span className="text-sm">{publishDate}</span>
                                         </div>
                                     )}
 
-                                    <div className="flex items-center gap-1.5 text-white/80">
+                                    <div className="flex items-center gap-1.5 text-foreground/80">
                                         <Clock className="h-4 w-4" />
                                         <span className="text-sm">{readingTime} min read</span>
                                     </div>
@@ -294,7 +333,7 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
                                 {tags.length > 0 && (
                                     <div className="flex flex-wrap gap-2 mt-4">
                                         {tags.map((tag: string) => (
-                                            <Badge key={tag} className="bg-white/20 text-white hover:bg-white/30 border-transparent">
+                                            <Badge key={tag} variant="secondary">
                                                 {tag}
                                             </Badge>
                                         ))}
@@ -302,46 +341,14 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
                                 )}
                             </div>
                         </div>
+                    )}
+
+                    <div className="prose prose-sm sm:prose lg:prose-lg max-w-none">
+                        <GroupBlocks blocks={blocks} />
+                        <GiscusComponent />
                     </div>
-                ) : (
-                    <div className="mb-8 relative rounded-xl overflow-hidden">
-                        <div className="bg-gradient-to-br from-primary/10 via-primary/20 to-primary/30 p-6 sm:p-8">
-                            <h1 className="text-3xl sm:text-4xl font-bold tracking-tight mb-4">
-                                {title}
-                            </h1>
-
-                            <div className="flex flex-wrap gap-4 mt-3">
-                                {publishDate && (
-                                    <div className="flex items-center gap-1.5 text-foreground/80">
-                                        <Calendar className="h-4 w-4" />
-                                        <span className="text-sm">{publishDate}</span>
-                                    </div>
-                                )}
-
-                                <div className="flex items-center gap-1.5 text-foreground/80">
-                                    <Clock className="h-4 w-4" />
-                                    <span className="text-sm">{readingTime} min read</span>
-                                </div>
-                            </div>
-
-                            {tags.length > 0 && (
-                                <div className="flex flex-wrap gap-2 mt-4">
-                                    {tags.map((tag: string) => (
-                                        <Badge key={tag} variant="secondary">
-                                            {tag}
-                                        </Badge>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                )}
-
-                <div className="prose prose-sm sm:prose lg:prose-lg max-w-none">
-                    <GroupBlocks blocks={blocks} />
-                    <GiscusComponent />
-                </div>
-            </article>
+                </article>
+            </>
         )
     } catch (error) {
         console.error("Error fetching post:", error)
