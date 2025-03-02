@@ -9,6 +9,7 @@ import { Calendar, Bookmark, ChevronRight, Clock } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Separator } from "@/components/ui/separator"
 import { GiscusComponent } from "@/components/Giscus"
+import { ClientSideImage } from "./ClientSideImage"
 
 interface TextBlock {
     type: "text"
@@ -164,17 +165,7 @@ const BlogComponent: React.FC = async () => {
                                     <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/30 h-full">
                                         <div className="flex flex-col md:flex-row h-full">
                                             {post.thumb && (
-                                                <div className="w-full md:w-1/4 h-48 md:h-auto relative">
-                                                    <Image
-                                                        src={post.thumb}
-                                                        alt={post.title}
-                                                        fill
-                                                        sizes="(max-width: 768px) 100vw, 25vw"
-                                                        priority
-                                                        className="object-cover transition-transform duration-500 group-hover:scale-105"
-                                                    />
-                                                    <div className="absolute inset-0 bg-gradient-to-tr from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-                                                </div>
+                                                <ClientSideImage thumb={post.thumb} title={post.title} />
                                             )}
 
                                             <div className={cn("flex flex-col justify-between h-full", "w-full")}>

@@ -9,6 +9,7 @@ const nextConfig: NextConfig = {
       },
     ],
     unoptimized: true,
+    minimumCacheTTL: 60,
   },
 };
 
