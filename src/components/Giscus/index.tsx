@@ -1,9 +1,15 @@
 "use client"
 import Giscus from "@giscus/react";
+import { usePathname } from "next/navigation";
 
-export const GiscusComponent = ({
+export const GiscusComponent = () => {
 
-}) => {
+  const pathname = usePathname();
+
+  if (pathname?.endsWith("support")) {
+    return null;
+  }
+
   return (
     <Giscus
       id="comments"
