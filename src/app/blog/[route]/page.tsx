@@ -117,7 +117,6 @@ const TodoBlock: React.FC<BlockProps> = ({ block }) => (
 )
 
 const VideoBlock: React.FC<BlockProps> = async ({ block }) => {
-    console.log(block)
     const res = await getNotionBlock(block.id)
     const url = res.video.external.url || 'sth for now';
     const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
@@ -127,7 +126,6 @@ const VideoBlock: React.FC<BlockProps> = async ({ block }) => {
         return match ? `https://www.youtube.com/embed/${match[1]}` : null;
     };
     const embedUrl = isYouTube ? getYouTubeEmbedUrl(url) : url;
-    console.log(embedUrl)
     return (
         isYouTube ? (
             <div className='w-full flex items-center justify-center rounded-md min-h-full'>

@@ -125,8 +125,6 @@ const BlogComponent: React.FC = async () => {
 
     const allTags = [...new Set(postsWithExtras.flatMap((post) => post.tags))]
 
-    console.log(posts)
-
     return (
         <div className="container mx-auto px-4 py-12">
             <div className="flex flex-col gap-8">
@@ -255,13 +253,14 @@ const BlogComponent: React.FC = async () => {
                                                     <div className="flex flex-col md:flex-row">
                                                         {post.thumb && (
                                                             <div className="w-full md:w-1/4 h-40 md:h-auto relative">
-                                                                <Image
+                                                                {/* <Image
                                                                     src={post.thumb || "/placeholder.svg"}
                                                                     alt={post.title}
                                                                     fill
                                                                     sizes="(max-width: 768px) 100vw, 25vw"
                                                                     className="object-cover transition-transform duration-500 group-hover:scale-105"
-                                                                />
+                                                                /> */}
+                                                                <ClientSideImage thumb={post.thumb} title={post.title} />
                                                                 <div className="absolute inset-0 bg-gradient-to-tr from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
                                                             </div>
                                                         )}

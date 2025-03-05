@@ -1,7 +1,7 @@
 "use client";
 import type React from "react"
 import { Button } from "@/components/ui/button"
-import { ExternalLink, Bot, Layers, Star, PlayCircle, BookOpen, Code, Projector } from "lucide-react"
+import { ExternalLink, Bot, Layers, Star, PlayCircle, BookOpen, Code, Projector, Terminal } from "lucide-react"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useState } from "react"
@@ -11,7 +11,6 @@ import { ProjectSheet } from "./_components/ProjectSheet";
 import { ProjectCard } from "./_components/ProjectCard";
 import { motion } from "framer-motion";
 import { GiscusComponent } from "@/components/Giscus";
-import Giscus from "@giscus/react";
 
 const getCategoryIcon = (category: string) => {
     switch (category) {
@@ -25,6 +24,8 @@ const getCategoryIcon = (category: string) => {
             return <BookOpen className="h-4 w-4" />;
         case 'game':
             return <PlayCircle className="h-4 w-4" />;
+        case 'cli':
+            return <Terminal className="h-4 w-4" />;
         default:
             return <Layers className="h-4 w-4" />;
     }

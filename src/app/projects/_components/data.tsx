@@ -114,6 +114,32 @@ export const PROJECTS: Project[] = [
     },
     {
         id: "p6",
+        title: "Haywan Frontend CLI",
+        slug: "haywan-next-cli",
+        category: "cli",
+        level: "highlighted",
+        status: "completed",
+        description: "Powerful CLI for creating modern Next.js projects with internationalization, UI components, and best practices",
+        longDescription: "Haywan Frontend CLI is a powerful and specialized CLI tool designed for quickly creating modern Next.js projects with internationalization, UI components, and best practices. Developed by Haywan.uz, this installer simplifies the initial setup of complex web applications.",
+        preview: "Create fully customizable Next.js projects with TypeScript, Tailwind CSS, next-intl internationalization, and ShadCN UI components through an interactive CLI experience.",
+        technologies: [
+            { name: "Node.js", color: "#68A063" },
+            { name: "TypeScript", color: "#3178C6" },
+            { name: "Next.js", color: "#000000" },
+            { name: "CLI", color: "#121212" },
+            { name: "npm", color: "#CB3837" }
+        ],
+        thumb: "/haywan-next-cli.png",
+        links: [
+            { type: "live", url: "https://www.npmjs.com/package/haywan-next-cli" },
+            { type: "github", url: "https://github.com/abdurahmon27/haywan-next-cli" }
+        ],
+        startDate: "2025-03-05",
+        endDate: "2025-03-05",
+        featured: true,
+    },
+    {
+        id: "p7",
         title: "GSK PRO | Telegram Bot",
         slug: "gsk-pro",
         category: "telegram-bot",
@@ -137,7 +163,7 @@ export const PROJECTS: Project[] = [
         endDate: "2023-02-28"
     },
     {
-        id: "p7",
+        id: "p8",
         title: "S-yurist",
         slug: "s-yurist",
         category: "landing",
