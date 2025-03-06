@@ -16,7 +16,7 @@ export function HeroSection() {
             </div>
             <div className="flex flex-col items-center text-center md:items-start md:text-left">
                 <h1 className="text-4xl font-bold tracking-normal md:text-5xl">Abdurahmon</h1>
-                <p className="mt-2 text-xl text-muted-foreground font-thin tracking-tighter">Frontend developer at <a href="https://bisoft.tech/" target="_blank" className="text-primary">bisoft</a></p>
+                <p className="mt-2 text-xl text-muted-foreground font-thin tracking-tighter">Frontend developer at <a href="https://cod3.uz/" target="_blank" className="text-primary">Cod3 Lab</a></p>
                 <div className="mt-4 flex gap-4">
                     <Link href="https://www.youtube.com/channel/UC6j51JFDtA1AsUyPMbG81Xg" target="_blank" rel="noopener noreferrer">
                         <Button variant="ghost" size="icon" className="h-9 w-9">
