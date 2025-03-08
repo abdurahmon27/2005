@@ -10,7 +10,6 @@ import ShikiCodeBlock from './_components/CodeBlock'
 import { Metadata } from 'next'
 import { getNotionBlock } from '@/utils/getNotionBlock'
 import { GiscusComponent } from '@/components/Giscus'
-import Head from 'next/head'
 
 interface BlockProps {
     block: any
@@ -251,10 +250,6 @@ const PostPage = async ({ params }: { params: Promise<{ route: string }> }) => {
 
         return (
             <>
-                <Head>
-                    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7108468314133475"
-                        crossOrigin="anonymous"></script>
-                </Head>
                 <article className="container mx-auto px-4 py-12 max-w-4xl">
                     <Link href="/blog" className="inline-flex items-center mb-6">
                         <Button variant="ghost" size="sm" className="text-primary group">

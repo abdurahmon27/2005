@@ -252,17 +252,7 @@ const BlogComponent: React.FC = async () => {
                                                 <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/20">
                                                     <div className="flex flex-col md:flex-row">
                                                         {post.thumb && (
-                                                            <div className="w-full md:w-1/4 h-40 md:h-auto relative">
-                                                                {/* <Image
-                                                                    src={post.thumb || "/placeholder.svg"}
-                                                                    alt={post.title}
-                                                                    fill
-                                                                    sizes="(max-width: 768px) 100vw, 25vw"
-                                                                    className="object-cover transition-transform duration-500 group-hover:scale-105"
-                                                                /> */}
-                                                                <ClientSideImage thumb={post.thumb} title={post.title} />
-                                                                <div className="absolute inset-0 bg-gradient-to-tr from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-                                                            </div>
+                                                            <ClientSideImage thumb={post.thumb} title={post.title} />
                                                         )}
 
                                                         <div className="w-full">
