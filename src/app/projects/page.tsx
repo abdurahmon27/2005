@@ -161,7 +161,7 @@ const ProjectsComponent: React.FC = () => {
                             className="space-y-6"
                             variants={containerVariants}
                         >
-                            {featuredProjects.slice(0, 2).map((project) => (
+                            {featuredProjects.slice(0, 3).map((project) => (
                                 <motion.div
                                     key={project.id}
                                     variants={itemVariants}

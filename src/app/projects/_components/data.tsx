@@ -34,6 +34,29 @@ export const PROJECTS: Project[] = [
         featured: true
     },
     {
+        id: "latteo",
+        title: "Latteo | Learn how to prepare different coffee types",
+        slug: "latteo",
+        category: "landing",
+        level: "featured",
+        status: "completed",
+        description: "A simple landing page for a coffee preparation guide",
+        longDescription: "Latteo is a simple landing page that provides a guide on how to prepare different types of coffee. It features a clean design and easy navigation.",
+        preview: "Learn how to prepare different coffee types with Latteo. A simple landing page that provides a guide on coffee preparation.",
+        technologies: [
+            { name: "Next.js", color: "#000000" },
+            { name: "TypeScript", color: "#3178C6" },
+            { name: "TailwindCSS", color: "#06B6D4" }
+        ],
+        thumb: "/latteo.jpg",
+        links: [
+            { type: "live", url: "https://latteo.2005.uz" }
+        ],
+        startDate: "2025-04-20",
+        endDate: "2024-04-21",
+        featured: true,
+    },
+    {
         id: "p2",
         title: "Linkify | URL Shortener",
         slug: "linkify-url-shortener",
