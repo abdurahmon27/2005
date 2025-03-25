@@ -119,7 +119,7 @@ const ProjectsComponent: React.FC = () => {
 
                     <div className="flex flex-col gap-3 w-full md:w-auto">
                         <div className="flex flex-wrap gap-2 py-1 max-w-md">
-                            {allTechnologies.slice(0, 10).map((tech, i) => (
+                            {allTechnologies.slice(0, 15).map((tech, i) => (
                                 <motion.div
                                     key={tech}
                                     variants={techBadgeVariants}
@@ -161,7 +161,7 @@ const ProjectsComponent: React.FC = () => {
                             className="space-y-6"
                             variants={containerVariants}
                         >
-                            {featuredProjects.slice(0, 3).map((project) => (
+                            {featuredProjects.slice(0, 4).map((project) => (
                                 <motion.div
                                     key={project.id}
                                     variants={itemVariants}
