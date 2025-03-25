@@ -104,7 +104,7 @@ export const PROJECTS: Project[] = [
       { name: "WebView", color: "#007ACC" },
       { name: "CSS Animations", color: "#264DE4" },
     ],
-    thumb: "/https://haywan.uz/extension.jpg",
+    thumb: "https://haywan.uz/extension.jpg",
     images: [
       "https://haywan.uz/extension.jpg",
       "https://www.haywan.uz/haywanjaan.jpg",
