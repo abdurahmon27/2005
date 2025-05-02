@@ -22,7 +22,7 @@ export const GiscusComponent = () => {
       reactionsEnabled="1"
       emitMetadata="0"
       inputPosition="top"
-      theme="gruvbox_light"
+      theme="transparent_dark"
       lang="en"
       loading="lazy"
     />

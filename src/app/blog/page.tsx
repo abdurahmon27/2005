@@ -1,11 +1,11 @@
+"use client";
+
 import React from 'react'
-import BlogComponent from './_components/Blogs'
+import ClientBlogs from './_components/ClientBlogs'
 
 const BlogPage = () => {
-
-
     return (
-        <BlogComponent />
+        <ClientBlogs />
     )
 }
 

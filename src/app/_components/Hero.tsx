@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 import Image from "next/image";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -39,10 +40,7 @@ export function HeroSection() {
           Abdurahmon
         </h1>
         <p className="mt-2 text-xl text-muted-foreground font-thin tracking-tighter">
-          Frontend developer at{" "}
-          <a href="https://cod3.uz/" target="_blank" className="text-primary">
-            Cod3 Lab
-          </a>
+          a self-taught, nerd developer who loves to build things.
         </p>
         <div className="mt-4 flex flex-wrap gap-3">
           <Link
@@ -86,7 +84,7 @@ export function HeroSection() {
             href="https://www.github.com/abdurahmon27"
             target="_blank"
             rel="noopener noreferrer"
-            className="ml-[3rem]"
+            className="ml-[2.145rem]"
           >
             <Button
               variant="ghost"
@@ -202,7 +200,8 @@ export function HeroSection() {
           </Link>
         </div>
         <p className="mt-4 max-w-[600px] text-foreground">
-          I am a self-taught, nerd developer who loves to build things.
+          Curious by nature, driven by purpose — I do it all because excellence
+          has no single path.
         </p>
         <div className="mt-6 flex gap-4">
           <Button asChild>

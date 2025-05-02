@@ -10,6 +10,8 @@ import { cn } from "@/lib/utils"
 import { Separator } from "@/components/ui/separator"
 import { GiscusComponent } from "@/components/Giscus"
 import { ClientSideImage } from "./ClientSideImage"
+import { useState, useEffect } from "react"
+import useSWR from "swr"
 
 interface TextBlock {
     type: "text"
@@ -32,98 +34,60 @@ interface Post {
     readingTime?: number
 }
 
-const extractPreview = (blocks: Block[], maxLength = 150): string => {
-    let preview = ""
-
-    for (const block of blocks) {
-        if (block.type === "paragraph" && Array.isArray(block.content)) {
-            for (const textBlock of block.content) {
-                if (textBlock.type === "text") {
-                    preview += textBlock.content + " "
-                    if (preview.length >= maxLength) {
-                        return preview.slice(0, maxLength) + "..."
-                    }
-                }
-            }
-        }
-    }
-
-    return preview.length > 0 ? preview + "..." : "No preview available"
-}
-
-const calculateReadingTime = (blocks: Block[]): number => {
-    let totalWords = 0
-
-    const countWordsInContent = (content: any): number => {
-        if (typeof content === "string") {
-            return content.split(/\s+/).length
-        } else if (Array.isArray(content)) {
-            return content.reduce((sum, item) => {
-                if (typeof item === "object" && item.content) {
-                    return sum + countWordsInContent(item.content)
-                }
-                return sum
-            }, 0)
-        }
-        return 0
-    }
-
-    blocks.forEach((block) => {
-        totalWords += countWordsInContent(block.content)
-    })
-
-    const minutes = Math.ceil(totalWords / 200)
-    return minutes > 0 ? minutes : 1
-}
-
 interface GroupedPosts {
     [key: string]: Post[]
 }
 
-const BlogComponent: React.FC = async () => {
-    const posts = await getPages(true)
+const fetcher = (url: string) => fetch(url).then(res => res.json())
 
-    const postsWithExtras: Post[] = await Promise.all(
-        posts.map(async (post: Post) => {
-            const content = await getPageContent(post.id)
-            const preview = extractPreview(content)
-            const readingTime = calculateReadingTime(content)
+const BlogComponent: React.FC = () => {
+    const { data, error } = useSWR('/api/blog', fetcher)
+    const [groupedPosts, setGroupedPosts] = useState<GroupedPosts>({})
+    const [sortedMonths, setSortedMonths] = useState<string[]>([])
+    const [latestPosts, setLatestPosts] = useState<Post[]>([])
+    const [allTags, setAllTags] = useState<string[]>([])
 
-            return {
-                ...post,
-                preview,
-                readingTime,
-            }
-        }),
-    )
+    useEffect(() => {
+        if (data) {
+            const postsWithExtras = data.posts
 
-    const sortedPosts = [...postsWithExtras].sort((a, b) => {
-        return new Date(b.publish_date).getTime() - new Date(a.publish_date).getTime()
-    })
+            const sortedPosts = [...postsWithExtras].sort((a, b) => {
+                return new Date(b.publish_date).getTime() - new Date(a.publish_date).getTime()
+            })
 
-    const latestPosts = sortedPosts.slice(0, 3)
+            setLatestPosts(sortedPosts.slice(0, 3))
 
-    const groupedPosts: GroupedPosts = sortedPosts.slice(3).reduce((acc: GroupedPosts, post: Post) => {
-        if (!post.publish_date) return acc
+            const grouped = sortedPosts.slice(3).reduce((acc: GroupedPosts, post: Post) => {
+                if (!post.publish_date) return acc
 
-        const date = new Date(post.publish_date)
-        const monthYear = `${date.toLocaleString("default", { month: "long" })} ${date.getFullYear()}`
+                const date = new Date(post.publish_date)
+                const monthYear = `${date.toLocaleString("default", { month: "long" })} ${date.getFullYear()}`
 
-        if (!acc[monthYear]) {
-            acc[monthYear] = []
+                if (!acc[monthYear]) {
+                    acc[monthYear] = []
+                }
+
+                acc[monthYear].push(post)
+                return acc
+            }, {})
+
+            setGroupedPosts(grouped)
+
+            const months = Object.keys(grouped).sort((a, b) => {
+                const dateA = new Date(a)
+                const dateB = new Date(b)
+                return dateB.getTime() - dateA.getTime()
+            })
+
+            setSortedMonths(months)
+
+            const tags = [...new Set(postsWithExtras.flatMap((post: Post) => post.tags))] as string[]
+            setAllTags(tags)
         }
+    }, [data])
 
-        acc[monthYear].push(post)
-        return acc
-    }, {})
-
-    const sortedMonths = Object.keys(groupedPosts).sort((a, b) => {
-        const dateA = new Date(a)
-        const dateB = new Date(b)
-        return dateB.getTime() - dateA.getTime()
-    })
-
-    const allTags = [...new Set(postsWithExtras.flatMap((post) => post.tags))]
+    if (error) return <div>Failed to load posts</div>
+    if (!data) return <div>Loading...</div>
 
     return (
         <div className="container mx-auto px-4 py-12">
@@ -318,7 +282,7 @@ const BlogComponent: React.FC = async () => {
                 )}
 
                 {/* Empty State */}
-                {sortedPosts.length === 0 && (
+                {data.posts.length === 0 && (
                     <div className="text-center py-16 bg-muted/20 rounded-lg border border-dashed">
                         <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 mb-4">
                             <Bookmark className="h-8 w-8 text-primary/70" />
