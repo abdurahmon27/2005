@@ -788,7 +788,7 @@ const ClientPostPage = ({ route }: { route: string }) => {
               <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 mb-12 p-6 rounded-lg bg-muted/30 border border-border/50">
                 <div className="relative h-16 w-16 rounded-full overflow-hidden flex-shrink-0">
                   <Image
-                    src="/avatar.jpg"
+                    src="/avatar.png"
                     alt="Author"
                     fill
                     className="object-cover"
