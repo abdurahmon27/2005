@@ -70,6 +70,10 @@ type ParsedBlock = {
     color: string;
   };
   href?: string | null;
+  checked?: boolean;
+  videoUrl?: string;
+  caption?: ParsedBlock[];
+  language?: string;
 };
 
 export const getPageContent = cache(
@@ -151,6 +155,23 @@ function parseBlockForRendering(block: BlockObjectResponse): ParsedBlock {
         type,
         content: block.code.rich_text.map(parseRichText),
         language: block.code.language,
+      } as any;
+    case "video":
+      return {
+        id,
+        type,
+        content: "",
+        videoUrl:
+          block.video.type === "file"
+            ? block.video.file.url
+            : block.video.external.url,
+        caption: block.video.caption?.map(parseRichText) || [],
+      } as any;
+    case "divider":
+      return {
+        id,
+        type,
+        content: "",
       } as any;
     default:
       return {
