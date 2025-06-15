@@ -191,10 +191,24 @@ const VideoBlock: React.FC<BlockProps> = ({ block }) => {
   const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
 
   const getYouTubeEmbedUrl = (url: string) => {
-    const match = url.match(
-      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/|.+?v=))([^?&]+)/
-    );
-    return match ? `https://www.youtube.com/embed/${match[1]}` : "";
+    // Handle different YouTube URL formats
+    let videoId = "";
+    
+    if (url.includes("youtu.be/")) {
+      // Short URL format: https://youtu.be/VIDEO_ID
+      const match = url.match(/youtu\.be\/([^?&]+)/);
+      videoId = match ? match[1] : "";
+    } else if (url.includes("youtube.com/watch")) {
+      // Standard URL format: https://www.youtube.com/watch?v=VIDEO_ID
+      const urlParams = new URLSearchParams(url.split('?')[1]);
+      videoId = urlParams.get('v') || "";
+    } else if (url.includes("youtube.com/embed/")) {
+      // Embed URL format: https://www.youtube.com/embed/VIDEO_ID
+      const match = url.match(/youtube\.com\/embed\/([^?&]+)/);
+      videoId = match ? match[1] : "";
+    }
+    
+    return videoId ? `https://www.youtube.com/embed/${videoId}` : "";
   };
 
   const embedUrl = isYouTube ? getYouTubeEmbedUrl(url) : url;

@@ -12,7 +12,6 @@ export const ClientSideImage = ({
 ) => {
     return (
         <div className="w-full md:w-1/4 h-48 md:h-auto relative">
-            <div className="absolute inset-0 bg-gray-100 animate-pulse z-0"></div>
             <Image
                 src={thumb}
                 alt={title}
