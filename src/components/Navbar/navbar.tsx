@@ -95,7 +95,7 @@ export function SiteHeader() {
                     </Link>
                      <Link
                         href="/log"
-                        className={`text-sm font-medium transition-colors ${path.includes("/blog")
+                        className={`text-sm font-medium transition-colors ${path.includes("/log")
                             ? "text-primary"
                             : scrolled
                                 ? "text-foreground"
