@@ -221,11 +221,11 @@ export default function ProjectsPage() {
         </div>
 
         {/* Floating wavy lines */}
-        <div className="absolute top-1/2 -left-20 -translate-y-1/2 opacity-20 rotate-45 hidden lg:block">
-          <SketchyWavyLine className="text-primary" width="100" height="8" />
+        <div className="absolute top-1/2 left-0 -translate-x-1/2  opacity-20 rotate-90  hidden lg:block">
+          <SketchyWavyLine className="text-primary" width="300" height="8" />
         </div>
-        <div className="absolute top-1/3 -right-20 opacity-20 -rotate-45 hidden lg:block">
-          <SketchyWavyLine className="text-primary" width="100" height="8" />
+        <div className="absolute top-1/2 left-[32rem] opacity-20 -rotate-90 hidden lg:block">
+          <SketchyWavyLine className="text-primary" width="300" height="8" />
         </div>
       </div>
     </div>
