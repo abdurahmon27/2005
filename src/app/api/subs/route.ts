@@ -9,6 +9,7 @@ export async function GET() {
       `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${CHANNEL_ID}&key=${API_KEY}`
     )
     const data = await res.json()
+
     const subscribers = data.items[0].statistics.subscriberCount
 
     return NextResponse.json({ subscribers: parseInt(subscribers, 10) })
@@ -16,3 +17,5 @@ export async function GET() {
     return NextResponse.json({ error: 'Failed to fetch subscriber count' }, { status: 500 })
   }
 }
+
+

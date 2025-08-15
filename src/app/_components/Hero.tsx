@@ -75,7 +75,9 @@ export function HeroSection() {
               <div className="mt-1.5 transform transition-all duration-300 group-hover:scale-105">
                 <div className="bg-gradient-to-r from-red-600/20 to-red-500/10 backdrop-blur-md border border-red-500/30 rounded-lg px-2 py-0.5 text-xs font-medium text-foreground whitespace-nowrap flex items-center gap-1 shadow-md">
                   <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse"></span>
-                  <span>{subscribers.toLocaleString()}</span>
+                  <span>
+                    {subscribers > 0 ? subscribers.toLocaleString() : null}
+                  </span>
                 </div>
               </div>
             )}

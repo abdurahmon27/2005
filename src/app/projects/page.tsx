@@ -1,305 +1,233 @@
 "use client";
-import type React from "react"
-import { Button } from "@/components/ui/button"
-import { ExternalLink, Bot, Layers, Star, PlayCircle, BookOpen, Code, Projector, Terminal } from "lucide-react"
-import { Separator } from "@/components/ui/separator"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useState } from "react"
-import { PROJECTS } from "./_components/data";
-import { FeaturedProjectCard } from "./_components/FeaturedProjectCard";
-import { ProjectSheet } from "./_components/ProjectSheet";
-import { ProjectCard } from "./_components/ProjectCard";
-import { motion } from "framer-motion";
-import { GiscusComponent } from "@/components/Giscus";
 
-const getCategoryIcon = (category: string) => {
-    switch (category) {
-        case 'web':
-            return <ExternalLink className="h-4 w-4" />;
-        case 'landing':
-            return <Projector className="h-4 w-4" />;
-        case 'telegram-bot':
-            return <Bot className="h-4 w-4" />;
-        case 'library':
-            return <BookOpen className="h-4 w-4" />;
-        case 'game':
-            return <PlayCircle className="h-4 w-4" />;
-        case 'cli':
-            return <Terminal className="h-4 w-4" />;
-        default:
-            return <Layers className="h-4 w-4" />;
+import { Button } from "@/components/ui/button";
+import { Check, ArrowRight, Play, Users, Video, Eye } from "lucide-react";
+import Image from "next/image";
+import {
+  SketchyWavyLine,
+  SketchyBorder,
+  SketchyArrow,
+  SketchyCornerBracket,
+} from "@/components/sketch";
+import { useState, useEffect } from "react";
+
+export default function ProjectsPage() {
+  const [isVisible, setIsVisible] = useState(false);
+  const [subscribers, setSubscribers] = useState<number | null>(null);
+  const [watchTimeHours, setWatchTimeHours] = useState<number | null>(null);
+  const [videoCount, setVideoCount] = useState<number | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    async function fetchYouTubeData() {
+      try {
+        // Fetch subscribers
+        const subsResponse = await fetch("/api/subs");
+        const subsData = await subsResponse.json();
+        setSubscribers(subsData.subscribers);
+
+        // Fetch watch time
+        const watchTimeResponse = await fetch("/api/wtime");
+        const watchTimeData = await watchTimeResponse.json();
+        setWatchTimeHours(watchTimeData.watchTimeHours);
+
+        // Fetch video count
+        const videosResponse = await fetch("/api/videos");
+        const videosData = await videosResponse.json();
+        setVideoCount(videosData.videoCount);
+      } catch (error) {
+        console.error("Failed to fetch YouTube data:", error);
+      } finally {
+        setLoading(false);
+      }
     }
-};
 
-// Animation variants
-const containerVariants = {
-    hidden: { opacity: 0 },
-    visible: {
-        opacity: 1,
-        transition: {
-            staggerChildren: 0.1
-        }
-    }
-};
+    fetchYouTubeData();
+  }, []);
 
-const itemVariants = {
-    hidden: { y: 20, opacity: 0 },
-    visible: {
-        y: 0,
-        opacity: 1,
-        transition: {
-            type: "spring",
-            stiffness: 100,
-            damping: 15
-        }
-    }
-};
+  useEffect(() => {
+    setIsVisible(true);
+  }, []);
 
-const headerVariants = {
-    hidden: { y: -20, opacity: 0 },
-    visible: {
-        y: 0,
-        opacity: 1,
-        transition: {
-            type: "spring",
-            stiffness: 100,
-            damping: 15,
-            delay: 0.1
-        }
-    }
-};
+  // Helper function to format numbers
+  const formatNumber = (num: number | null): string => {
+    if (num === null) return loading ? "..." : "0";
+    if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
+    if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
+    return num.toString();
+  };
 
-const techBadgeVariants = {
-    hidden: { scale: 0.8, opacity: 0 },
-    visible: (i: any) => ({
-        scale: 1,
-        opacity: 1,
-        transition: {
-            delay: i * 0.05,
-            type: "spring",
-            stiffness: 100
-        }
-    })
-};
+  const stats = [
+    {
+      label: "Subscribers",
+      value: formatNumber(subscribers),
+      delay: "0.8s",
+    },
+    {
+      label: "Videos",
+      value: formatNumber(videoCount),
+      delay: "1s",
+    },
+    {
+      label: "Watch Time (Hours)",
+      value: formatNumber(watchTimeHours),
+      delay: "1.2s",
+    },
+  ];
 
-const ProjectsComponent: React.FC = () => {
-    const [selectedProject, setSelectedProject] = useState<Project | null>(null);
-    const [isSheetOpen, setIsSheetOpen] = useState(false);
-
-    const handleProjectClick = (project: Project) => {
-        setSelectedProject(project);
-        setIsSheetOpen(true);
-    };
-
-    const featuredProjects = PROJECTS.filter(p => p.level === "featured");
-    const highlightedProjects = PROJECTS.filter(p => p.level === "highlighted");
-
-    const categories = [...new Set(PROJECTS.map(project => project.category))];
-
-    const allTechnologies = [...new Set(PROJECTS.flatMap(project => project.technologies.map(tech => tech.name)))];
-
-    return (
-        <motion.div
-            className="container mx-auto px-4 py-12"
-            initial="hidden"
-            animate="visible"
-            variants={containerVariants}
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="container mx-auto relative max-w-7xl">
+        {/* Sketchy decorative elements */}
+        <div className="absolute -top-10 -left-10 opacity-30 animate-wiggle">
+          <SketchyCornerBracket
+            corner="top-left"
+            size={40}
+            className="text-primary"
+          />
+        </div>
+        <div
+          className="absolute -top-10 -right-10 opacity-30 animate-wiggle"
+          style={{ animationDelay: "1s" }}
         >
-            <div className="flex flex-col gap-8">
-                {/* Header Section */}
-                <motion.div
-                    className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6"
-                    variants={headerVariants}
-                >
-                    <div>
-                        <h1 className="text-4xl font-bold tracking-tight bg-gradient-to-r from-primary to-primary/70 bg-clip-text text-transparent">Projects</h1>
-                        <p className="text-muted-foreground mt-2">Explore my software development and research projects.</p>
-                        <p className="text-muted-foreground mt-2">I&lsquo;m afraid to open source my projects at this point. Juniors will laugh at me.</p>
-                    </div>
+          <SketchyCornerBracket
+            corner="top-right"
+            size={40}
+            className="text-primary"
+          />
+        </div>
+        <div
+          className="absolute -bottom-10 -left-10 opacity-30 animate-wiggle"
+          style={{ animationDelay: "2s" }}
+        >
+          <SketchyCornerBracket
+            corner="bottom-right"
+            size={40}
+            className="text-primary rotate-180"
+          />
+        </div>
+        <div
+          className="absolute -bottom-10 -right-10 opacity-30 animate-wiggle"
+          style={{ animationDelay: "3s" }}
+        >
+          <SketchyCornerBracket
+            corner="bottom-left"
+            size={40}
+            className="text-primary rotate-180"
+          />
+        </div>
 
-                    <div className="flex flex-col gap-3 w-full md:w-auto">
-                        <div className="flex flex-wrap gap-2 py-1 max-w-md">
-                            {allTechnologies.slice(0, 15).map((tech, i) => (
-                                <motion.div
-                                    key={tech}
-                                    variants={techBadgeVariants}
-                                    custom={i}
-                                >
-                                    <Button variant="outline" size="sm" className="rounded-full whitespace-nowrap hover:bg-primary/5 hover:text-primary transition-colors">
-                                        {tech}
-                                    </Button>
-                                </motion.div>
-                            ))}
-                            {allTechnologies.length > 10 && (
-                                <motion.div
-                                    variants={techBadgeVariants}
-                                    custom={10}
-                                >
-                                    <Button variant="outline" size="sm" className="rounded-full whitespace-nowrap hover:bg-primary/5 hover:text-primary transition-colors">
-                                        +{allTechnologies.length - 10} more
-                                    </Button>
-                                </motion.div>
-                            )}
-                        </div>
-                    </div>
-                </motion.div>
+        {/* Main card with sketchy border */}
 
-                <Separator className="bg-primary/10" />
-
-                {/* Featured Projects */}
-                {featuredProjects.length > 0 && (
-                    <motion.div
-                        className="space-y-6"
-                        variants={itemVariants}
-                    >
-                        <div className="flex items-center gap-2">
-                            <Star className="h-5 w-5 text-primary" />
-                            <h2 className="text-2xl font-bold tracking-tight">Featured Projects</h2>
-                        </div>
-
-                        <motion.div
-                            className="space-y-6"
-                            variants={containerVariants}
-                        >
-                            {featuredProjects.slice(0, 4).map((project) => (
-                                <motion.div
-                                    key={project.id}
-                                    variants={itemVariants}
-                                    whileHover={{ scale: 1.01 }}
-                                    transition={{ type: "spring", stiffness: 400, damping: 17 }}
-                                >
-                                    <FeaturedProjectCard
-                                        project={project}
-                                        onProjectClick={handleProjectClick}
-                                    />
-                                </motion.div>
-                            ))}
-                        </motion.div>
-                    </motion.div>
-                )}
-
-                {/* Highlighted Projects */}
-                {highlightedProjects.length > 0 && (
-                    <motion.div
-                        className="space-y-6 mt-10"
-                        variants={itemVariants}
-                    >
-                        <div className="flex items-center gap-2">
-                            <Layers className="h-5 w-5 text-primary" />
-                            <h2 className="text-2xl font-bold tracking-tight">Highlighted Work</h2>
-                        </div>
-
-                        <motion.div
-                            className="grid grid-cols-1 md:grid-cols-2 gap-6"
-                            variants={containerVariants}
-                        >
-                            {highlightedProjects.map((project) => (
-                                <motion.div
-                                    key={project.id}
-                                    variants={itemVariants}
-                                    whileHover={{ scale: 1.02 }}
-                                    transition={{ type: "spring", stiffness: 400, damping: 17 }}
-                                >
-                                    <ProjectCard
-                                        project={project}
-                                        onProjectClick={handleProjectClick}
-                                    />
-                                </motion.div>
-                            ))}
-                        </motion.div>
-                    </motion.div>
-                )}
-
-                {/* Projects by Category */}
-                <motion.div
-                    className="space-y-6 mt-10"
-                    variants={itemVariants}
-                >
-                    <div className="flex items-center gap-2">
-                        <Code className="h-5 w-5 text-primary" />
-                        <h2 className="text-2xl font-bold tracking-tight">All Projects</h2>
-                    </div>
-
-                    <Tabs defaultValue={categories[0]} className="w-full">
-                        <TabsList className="mb-6 flex flex-wrap h-auto">
-                            <TabsTrigger value="all" className="data-[state=active]:bg-primary/10">All</TabsTrigger>
-                            {categories.map((category) => (
-                                <TabsTrigger
-                                    key={category}
-                                    value={category}
-                                    className="data-[state=active]:bg-primary/10"
-                                >
-                                    <div className="flex items-center gap-1.5">
-                                        {getCategoryIcon(category)}
-                                        <span>{category.charAt(0).toUpperCase() + category.slice(1)}</span>
-                                    </div>
-                                </TabsTrigger>
-                            ))}
-                        </TabsList>
-
-                        <TabsContent value="all" className="mt-0">
-                            <motion.div
-                                className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
-                                variants={containerVariants}
-                                initial="hidden"
-                                animate="visible"
-                                key="all"
-                            >
-                                {PROJECTS.map((project) => (
-                                    <motion.div
-                                        key={project.id}
-                                        variants={itemVariants}
-                                        whileHover={{ scale: 1.02 }}
-                                        transition={{ type: "spring", stiffness: 400, damping: 17 }}
-                                    >
-                                        <ProjectCard
-                                            project={project}
-                                            featured={project.featured}
-                                            onProjectClick={handleProjectClick}
-                                        />
-                                    </motion.div>
-                                ))}
-                            </motion.div>
-                        </TabsContent>
-
-                        {categories.map((category) => (
-                            <TabsContent key={category} value={category} className="mt-0">
-                                <motion.div
-                                    className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
-                                    variants={containerVariants}
-                                    initial="hidden"
-                                    animate="visible"
-                                    key={category}
-                                >
-                                    {PROJECTS.filter(project => project.category === category).map((project) => (
-                                        <motion.div
-                                            key={project.id}
-                                            variants={itemVariants}
-                                            whileHover={{ scale: 1.02 }}
-                                            transition={{ type: "spring", stiffness: 400, damping: 17 }}
-                                        >
-                                            <ProjectCard
-                                                project={project}
-                                                featured={project.featured}
-                                                onProjectClick={handleProjectClick}
-                                            />
-                                        </motion.div>
-                                    ))}
-                                </motion.div>
-                            </TabsContent>
-                        ))}
-                    </Tabs>
-                </motion.div>
-                <GiscusComponent />
+        <div className="flex flex-col lg:flex-row overflow-hidden ">
+          {/* Left side - Text content */}
+          <div className="flex-1 p-8 lg:p-12 relative">
+            {/* Animated wavy border */}
+            <div className="absolute top-0 left-0 right-0">
+              <SketchyWavyLine
+                className="text-primary"
+                width="100%"
+                height="8"
+              />
             </div>
-            <ProjectSheet
-                project={selectedProject}
-                isOpen={isSheetOpen}
-                onOpenChange={setIsSheetOpen}
-            />
 
-        </motion.div>
-    );
+            <div
+              className={`transform transition-all duration-1000 delay-300 ${
+                isVisible
+                  ? "translate-x-0 opacity-100"
+                  : "-translate-x-10 opacity-0"
+              }`}
+            >
+              <div className="relative mb-6">
+                <h1 className="text-4xl lg:text-5xl font-bold mb-2 leading-tight ">
+                  Youtube Channel
+                </h1>
+                <div className="absolute -bottom-2 left-0">
+                  <SketchyWavyLine
+                    className="text-primary/40"
+                    width="200"
+                    height="4"
+                  />
+                </div>
+              </div>
+
+              <p className="text-lg text-muted-foreground mb-8 leading-relaxed">
+                {`I removed the projects section, bcoz currently I'm focusing on
+                real world applications and tech stacks.`}
+              </p>
+
+              {/* Stats section */}
+              <div className="grid grid-cols-3 gap-4 mb-8">
+                {stats.map((stat, index) => (
+                  <div
+                    key={index}
+                    className={`text-center p-4 rounded-xl bg-background/50 backdrop-blur-sm border border-border/30 transform transition-all duration-700 hover:scale-105 ${
+                      isVisible
+                        ? "translate-y-0 opacity-100"
+                        : "translate-y-5 opacity-0"
+                    }`}
+                    style={{ transitionDelay: stat.delay }}
+                  >
+                    <div className="flex justify-center mb-2"></div>
+                    <div className="text-2xl font-bold text-primary mb-1">
+                      {stat.value}
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      {stat.label}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-center">
+                <Button
+                  asChild
+                  variant="outline"
+                  className="text-primary border-primary hover:bg-primary/10 transition-colors"
+                >
+                  <a
+                    href="https://www.youtube.com/@bekzotovich"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Sub buddy, please👉🏿
+                  </a>
+                </Button>
+              </div>
+            </div>
+
+            {/* Bottom wavy border */}
+            <div className="absolute bottom-0 left-0 right-0">
+              <SketchyWavyLine
+                className="text-primary"
+                width="100%"
+                height="8"
+              />
+            </div>
+          </div>
+
+          {/* Right side - 3D Image */}
+          <div className="flex-1 p-8 lg:p-12 flex items-center justify-center relative overflow-hidden">
+            <div className="relative group">
+              <Image
+                width={500}
+                height={300}
+                alt="bekzotovich youtube channel"
+                src={"/youtube/image.png"}
+                className="w-[210%] max-w-md h-auto rounded-2xl shadow-2xl three-d-img group-hover:scale-105 transition-transform duration-500"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Floating wavy lines */}
+        <div className="absolute top-1/2 -left-20 -translate-y-1/2 opacity-20 rotate-45">
+          <SketchyWavyLine className="text-primary" width="100" height="8" />
+        </div>
+        <div className="absolute top-1/3 -right-20 opacity-20 -rotate-45">
+          <SketchyWavyLine className="text-primary" width="100" height="8" />
+        </div>
+      </div>
+    </div>
+  );
 }
-
-export default ProjectsComponent
