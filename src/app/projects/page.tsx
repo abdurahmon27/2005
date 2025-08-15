@@ -76,10 +76,10 @@ export default function ProjectsPage() {
   ];
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
+    <div className="min-h-screen flex items-center justify-center px-4 py-8">
       <div className="container mx-auto relative max-w-7xl">
         {/* Sketchy decorative elements */}
-        <div className="absolute -top-10 -left-10 opacity-30 animate-wiggle">
+        <div className="absolute -top-10 -left-10 opacity-30 animate-wiggle hidden md:block">
           <SketchyCornerBracket
             corner="top-left"
             size={40}
@@ -87,7 +87,7 @@ export default function ProjectsPage() {
           />
         </div>
         <div
-          className="absolute -top-10 -right-10 opacity-30 animate-wiggle"
+          className="absolute -top-10 -right-10 opacity-30 animate-wiggle hidden md:block"
           style={{ animationDelay: "1s" }}
         >
           <SketchyCornerBracket
@@ -97,7 +97,7 @@ export default function ProjectsPage() {
           />
         </div>
         <div
-          className="absolute -bottom-10 -left-10 opacity-30 animate-wiggle"
+          className="absolute -bottom-10 -left-10 opacity-30 animate-wiggle hidden md:block"
           style={{ animationDelay: "2s" }}
         >
           <SketchyCornerBracket
@@ -107,7 +107,7 @@ export default function ProjectsPage() {
           />
         </div>
         <div
-          className="absolute -bottom-10 -right-10 opacity-30 animate-wiggle"
+          className="absolute -bottom-10 -right-10 opacity-30 animate-wiggle hidden md:block"
           style={{ animationDelay: "3s" }}
         >
           <SketchyCornerBracket
@@ -119,11 +119,11 @@ export default function ProjectsPage() {
 
         {/* Main card with sketchy border */}
 
-        <div className="flex flex-col lg:flex-row overflow-hidden ">
+        <div className="flex flex-col lg:flex-row overflow-hidden">
           {/* Left side - Text content */}
-          <div className="flex-1 p-8 lg:p-12 relative">
+          <div className="flex-1 p-4 sm:p-6 lg:p-12 relative">
             {/* Animated wavy border */}
-            <div className="absolute top-0 left-0 right-0">
+            <div className="absolute top-0 left-0 right-0 hidden sm:block">
               <SketchyWavyLine
                 className="text-primary"
                 width="100%"
@@ -138,11 +138,11 @@ export default function ProjectsPage() {
                   : "-translate-x-10 opacity-0"
               }`}
             >
-              <div className="relative mb-6">
-                <h1 className="text-4xl lg:text-5xl font-bold mb-2 leading-tight ">
+              <div className="relative mb-4 sm:mb-6">
+                <h1 className="text-2xl sm:text-3xl lg:text-4xl xl:text-5xl font-bold mb-2 leading-tight">
                   Youtube Channel
                 </h1>
-                <div className="absolute -bottom-2 left-0">
+                <div className="absolute -bottom-2 left-0 hidden sm:block">
                   <SketchyWavyLine
                     className="text-primary/40"
                     width="200"
@@ -151,17 +151,17 @@ export default function ProjectsPage() {
                 </div>
               </div>
 
-              <p className="text-lg text-muted-foreground mb-8 leading-relaxed">
+              <p className="text-base sm:text-lg text-muted-foreground mb-6 sm:mb-8 leading-relaxed">
                 {`I removed the projects section, bcoz currently I'm focusing on
                 real world applications and tech stacks.`}
               </p>
 
               {/* Stats section */}
-              <div className="grid grid-cols-3 gap-4 mb-8">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mb-6 sm:mb-8">
                 {stats.map((stat, index) => (
                   <div
                     key={index}
-                    className={`text-center p-4 rounded-xl bg-background/50 backdrop-blur-sm border border-border/30 transform transition-all duration-700 hover:scale-105 ${
+                    className={`text-center p-3 sm:p-4 rounded-xl bg-background/50 backdrop-blur-sm border border-border/30 transform transition-all duration-700 hover:scale-105 ${
                       isVisible
                         ? "translate-y-0 opacity-100"
                         : "translate-y-5 opacity-0"
@@ -169,10 +169,10 @@ export default function ProjectsPage() {
                     style={{ transitionDelay: stat.delay }}
                   >
                     <div className="flex justify-center mb-2"></div>
-                    <div className="text-2xl font-bold text-primary mb-1">
+                    <div className="text-xl sm:text-2xl font-bold text-primary mb-1">
                       {stat.value}
                     </div>
-                    <div className="text-sm text-muted-foreground">
+                    <div className="text-xs sm:text-sm text-muted-foreground">
                       {stat.label}
                     </div>
                   </div>
@@ -197,7 +197,7 @@ export default function ProjectsPage() {
             </div>
 
             {/* Bottom wavy border */}
-            <div className="absolute bottom-0 left-0 right-0">
+            <div className="absolute bottom-0 left-0 right-0 hidden sm:block">
               <SketchyWavyLine
                 className="text-primary"
                 width="100%"
@@ -207,24 +207,24 @@ export default function ProjectsPage() {
           </div>
 
           {/* Right side - 3D Image */}
-          <div className="flex-1 p-8 lg:p-12 flex items-center justify-center relative overflow-hidden">
-            <div className="relative group">
+          <div className="flex-1 p-4 sm:p-6 lg:p-12 flex items-center justify-center relative overflow-hidden">
+            <div className="relative group w-full max-w-md lg:max-w-none">
               <Image
-                width={500}
-                height={300}
+                width={900}
+                height={500}
                 alt="bekzotovich youtube channel"
                 src={"/youtube/image.png"}
-                className="w-[210%] max-w-md h-auto rounded-2xl shadow-2xl three-d-img group-hover:scale-105 transition-transform duration-500"
+                className="w-full h-auto rounded-2xl shadow-2xl three-d-img group-hover:scale-105 transition-transform duration-500"
               />
             </div>
           </div>
         </div>
 
         {/* Floating wavy lines */}
-        <div className="absolute top-1/2 -left-20 -translate-y-1/2 opacity-20 rotate-45">
+        <div className="absolute top-1/2 -left-20 -translate-y-1/2 opacity-20 rotate-45 hidden lg:block">
           <SketchyWavyLine className="text-primary" width="100" height="8" />
         </div>
-        <div className="absolute top-1/3 -right-20 opacity-20 -rotate-45">
+        <div className="absolute top-1/3 -right-20 opacity-20 -rotate-45 hidden lg:block">
           <SketchyWavyLine className="text-primary" width="100" height="8" />
         </div>
       </div>
