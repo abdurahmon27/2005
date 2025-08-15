@@ -161,7 +161,7 @@ export default function ProjectsPage() {
                 {stats.map((stat, index) => (
                   <div
                     key={index}
-                    className={`text-center p-3 sm:p-4 rounded-xl bg-background/50 backdrop-blur-sm border border-border/30 transform transition-all duration-700 hover:scale-105 ${
+                    className={`text-center p-3 sm:p-4  transform transition-all duration-700 hover:scale-105 ${
                       isVisible
                         ? "translate-y-0 opacity-100"
                         : "translate-y-5 opacity-0"
@@ -183,7 +183,7 @@ export default function ProjectsPage() {
                 <Button
                   asChild
                   variant="outline"
-                  className="text-primary border-primary hover:bg-primary/10 transition-colors"
+                  className="text-primary border-primary hover:bg-primary/10 transition-colors hover:text-white"
                 >
                   <a
                     href="https://www.youtube.com/@bekzotovich"
@@ -214,7 +214,7 @@ export default function ProjectsPage() {
                 height={500}
                 alt="bekzotovich youtube channel"
                 src={"/youtube/image.png"}
-                className="w-full h-auto rounded-2xl shadow-2xl three-d-img group-hover:scale-105 transition-transform duration-500"
+                className="w-full h-auto rounded-2xl  three-d-img group-hover:scale-105 transition-transform duration-500"
               />
             </div>
           </div>
