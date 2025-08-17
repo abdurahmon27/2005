@@ -78,59 +78,8 @@ export default function ProjectsPage() {
   return (
     <div className="min-h-screen flex items-center justify-center px-4 py-8">
       <div className="container mx-auto relative max-w-7xl">
-        {/* Sketchy decorative elements */}
-        <div className="absolute -top-10 -left-10 opacity-30 animate-wiggle hidden md:block">
-          <SketchyCornerBracket
-            corner="top-left"
-            size={40}
-            className="text-primary"
-          />
-        </div>
-        <div
-          className="absolute -top-10 -right-10 opacity-30 animate-wiggle hidden md:block"
-          style={{ animationDelay: "1s" }}
-        >
-          <SketchyCornerBracket
-            corner="top-right"
-            size={40}
-            className="text-primary"
-          />
-        </div>
-        <div
-          className="absolute -bottom-10 -left-10 opacity-30 animate-wiggle hidden md:block"
-          style={{ animationDelay: "2s" }}
-        >
-          <SketchyCornerBracket
-            corner="bottom-right"
-            size={40}
-            className="text-primary rotate-180"
-          />
-        </div>
-        <div
-          className="absolute -bottom-10 -right-10 opacity-30 animate-wiggle hidden md:block"
-          style={{ animationDelay: "3s" }}
-        >
-          <SketchyCornerBracket
-            corner="bottom-left"
-            size={40}
-            className="text-primary rotate-180"
-          />
-        </div>
-
-        {/* Main card with sketchy border */}
-
         <div className="flex flex-col lg:flex-row overflow-hidden">
-          {/* Left side - Text content */}
           <div className="flex-1 p-4 sm:p-6 lg:p-12 relative">
-            {/* Animated wavy border */}
-            <div className="absolute top-0 left-0 right-0 hidden sm:block">
-              <SketchyWavyLine
-                className="text-primary"
-                width="100%"
-                height="8"
-              />
-            </div>
-
             <div
               className={`transform transition-all duration-1000 delay-300 ${
                 isVisible
@@ -142,13 +91,6 @@ export default function ProjectsPage() {
                 <h1 className="text-2xl sm:text-3xl lg:text-4xl xl:text-5xl font-bold mb-2 leading-tight">
                   Youtube Channel
                 </h1>
-                <div className="absolute -bottom-2 left-0 hidden sm:block">
-                  <SketchyWavyLine
-                    className="text-primary/40"
-                    width="200"
-                    height="4"
-                  />
-                </div>
               </div>
 
               <p className="text-base sm:text-lg text-muted-foreground mb-6 sm:mb-8 leading-relaxed">
@@ -195,15 +137,6 @@ export default function ProjectsPage() {
                 </Button>
               </div>
             </div>
-
-            {/* Bottom wavy border */}
-            <div className="absolute bottom-0 left-0 right-0 hidden sm:block">
-              <SketchyWavyLine
-                className="text-primary"
-                width="100%"
-                height="8"
-              />
-            </div>
           </div>
 
           {/* Right side - 3D Image */}
@@ -218,14 +151,6 @@ export default function ProjectsPage() {
               />
             </div>
           </div>
-        </div>
-
-        {/* Floating wavy lines */}
-        <div className="absolute top-1/2 left-0 -translate-x-1/2  opacity-20 rotate-90  hidden lg:block">
-          <SketchyWavyLine className="text-primary" width="300" height="8" />
-        </div>
-        <div className="absolute top-1/2 left-[32rem] opacity-20 -rotate-90 hidden lg:block">
-          <SketchyWavyLine className="text-primary" width="300" height="8" />
         </div>
       </div>
     </div>

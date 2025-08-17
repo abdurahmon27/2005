@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Rss, SquareArrowOutUpRight } from "lucide-react";
+import { Flame, Rss, SquareArrowOutUpRight } from "lucide-react";
 
 export function SiteHeader() {
   const [scrolled, setScrolled] = useState(false);
@@ -117,6 +117,19 @@ export function SiteHeader() {
           >
             Log
             <Rss size={16} />
+          </Link>
+          <Link
+            href="/garbage"
+            className={`text-sm font-medium transition-colors flex items-center justify-center gap-1 ${
+              path.includes("/garbage")
+                ? "text-primary"
+                : scrolled
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-primary"
+            }`}
+          >
+            Garbage
+            <Flame size={16} />
           </Link>
           <Link
             href="https://t.me/abdurahmon_mamadiyorov"
