@@ -1,14 +1,19 @@
 "use client";
 
-import React, { useState } from "react";
+import React from "react";
 import Link from "next/link";
-import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Calendar, Bookmark, ChevronRight, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
-import { GiscusComponent } from "@/components/Giscus";
 import { ClientSideImage } from "./ClientSideImage";
 import useSWR from "swr";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -31,19 +36,22 @@ interface GroupedPosts {
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
 
 const ClientBlogs: React.FC = () => {
-  const { data: posts, error, isLoading } = useSWR('/api/blog?published=true', fetcher, {
+  const {
+    data: posts,
+    error,
+    isLoading,
+  } = useSWR("/api/blog?published=true", fetcher, {
     revalidateOnFocus: true,
     revalidateIfStale: true,
-    refreshInterval: 60000, // Refresh every minute
+    refreshInterval: 60000,
   });
 
-  if (error) return <div className="text-center py-12">Failed to load blog posts</div>;
+  if (error)
+    return <div className="text-center py-12">Failed to load blog posts</div>;
 
-  // Prepare data for rendering
   let latestPosts: Post[] = [];
   let groupedPosts: GroupedPosts = {};
   let sortedMonths: string[] = [];
-  let allTags: string[] = [];
 
   if (posts) {
     latestPosts = posts.slice(0, 3);
@@ -52,7 +60,9 @@ const ClientBlogs: React.FC = () => {
       if (!post.publish_date) return acc;
 
       const date = new Date(post.publish_date);
-      const monthYear = `${date.toLocaleString("default", { month: "long" })} ${date.getFullYear()}`;
+      const monthYear = `${date.toLocaleString("default", {
+        month: "long",
+      })} ${date.getFullYear()}`;
 
       if (!acc[monthYear]) {
         acc[monthYear] = [];
@@ -67,8 +77,6 @@ const ClientBlogs: React.FC = () => {
       const dateB = new Date(b);
       return dateB.getTime() - dateA.getTime();
     });
-
-    allTags = [...new Set(posts.flatMap((post: Post) => post.tags))] as string[];
   }
 
   // Skeletons for loading state
@@ -127,21 +135,24 @@ const ClientBlogs: React.FC = () => {
     <div className="container mx-auto px-4 py-12">
       <div className="flex flex-col gap-8">
         {/* Header Section */}
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
-          <div>
-            <h1 className="text-4xl font-bold tracking-tight bg-gradient-to-r from-primary to-primary/70 bg-clip-text text-transparent">Blog</h1>
-            <p className="text-muted-foreground mt-2">Discover thoughts, stories, and insights.</p>
-            <p className="text-muted-foreground mt-2">Telegram kanal: <a href="https://t.me/abdurahmon_mamadiyorov" className="text-primary" target="_blank">Soutpaw&lsquo;s Mindscape🦅</a></p>
-          </div>
-
-          <div className="flex flex-col gap-3 w-full md:w-auto">
-            <div className="flex flex-wrap gap-2 py-1 max-w-md">
-              {allTags.map((tag) => (
-                <Button key={tag} variant="outline" size="sm" className="rounded-full whitespace-nowrap hover:bg-primary/5 hover:text-primary transition-colors">
-                  {tag}
-                </Button>
-              ))}
-            </div>
+        <div className="flex flex-col md:flex-row justify-end items-start md:items-center gap-6">
+          <div className="flex flex-col items-end">
+            <h1 className="text-4xl font-bold tracking-tight bg-gradient-to-r from-primary to-primary/70 bg-clip-text text-transparent">
+              Blog
+            </h1>
+            <p className="text-muted-foreground mt-2">
+              Discover thoughts, stories, and insights.
+            </p>
+            <p className="text-muted-foreground mt-2">
+              Telegram channel:{" "}
+              <a
+                href="https://t.me/abdurahmon_mamadiyorov"
+                className="text-primary"
+                target="_blank"
+              >
+                Soutpaw&lsquo;s Mindscape🦅
+              </a>
+            </p>
           </div>
         </div>
 
@@ -151,28 +162,45 @@ const ClientBlogs: React.FC = () => {
         {latestPosts.length > 0 && (
           <div className="space-y-6">
             <div className="flex items-center gap-2">
-              <Bookmark className="h-5 w-5 text-primary" />
               <h2 className="text-2xl font-bold tracking-tight">Latest</h2>
             </div>
 
             <div className="grid grid-cols-1 gap-6 px-2">
               {latestPosts.map((post) => (
-                <Link href={`/blog/${post.route}`} key={post.id} className="block group">
+                <Link
+                  href={`/blog/${post.route}`}
+                  key={post.id}
+                  className="block group"
+                >
                   <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/30 h-full">
                     <div className="flex flex-col md:flex-row h-full">
                       {post.thumb && (
-                        <ClientSideImage thumb={post.thumb} title={post.title} />
+                        <ClientSideImage
+                          thumb={post.thumb}
+                          title={post.title}
+                        />
                       )}
 
-                      <div className={cn("flex flex-col justify-between h-full", "w-full")}>
+                      <div
+                        className={cn(
+                          "flex flex-col justify-between h-full",
+                          "w-full"
+                        )}
+                      >
                         <CardHeader className="flex-grow py-4 px-5">
                           <div className="flex flex-wrap items-center gap-2 mb-2">
-                            <Badge variant="outline" className="text-xs font-normal rounded-md bg-primary/5 border-primary/20">
-                              {new Date(post.publish_date).toLocaleDateString("en-US", {
-                                month: "short",
-                                day: "numeric",
-                                year: "numeric",
-                              })}
+                            <Badge
+                              variant="outline"
+                              className="text-xs font-normal rounded-md bg-primary/5 border-primary/20"
+                            >
+                              {new Date(post.publish_date).toLocaleDateString(
+                                "en-US",
+                                {
+                                  month: "short",
+                                  day: "numeric",
+                                  year: "numeric",
+                                }
+                              )}
                             </Badge>
 
                             <div className="flex items-center text-xs text-muted-foreground gap-1">
@@ -194,12 +222,19 @@ const ClientBlogs: React.FC = () => {
                           <div className="flex justify-between items-center w-full">
                             <div className="flex flex-wrap gap-1.5">
                               {post.tags.slice(0, 2).map((tag) => (
-                                <Badge key={tag} variant="secondary" className="rounded-md font-normal text-xs bg-secondary/50">
+                                <Badge
+                                  key={tag}
+                                  variant="secondary"
+                                  className="rounded-md font-normal text-xs bg-secondary/50"
+                                >
                                   {tag}
                                 </Badge>
                               ))}
                               {post.tags.length > 2 && (
-                                <Badge variant="outline" className="rounded-md text-xs">
+                                <Badge
+                                  variant="outline"
+                                  className="rounded-md text-xs"
+                                >
                                   +{post.tags.length - 2}
                                 </Badge>
                               )}
@@ -234,10 +269,18 @@ const ClientBlogs: React.FC = () => {
 
             <div className="relative">
               {sortedMonths.map((monthYear, monthIndex) => (
-                <div key={monthYear} className={cn("mb-12", monthIndex === sortedMonths.length - 1 ? "mb-4" : "")}>
+                <div
+                  key={monthYear}
+                  className={cn(
+                    "mb-12",
+                    monthIndex === sortedMonths.length - 1 ? "mb-4" : ""
+                  )}
+                >
                   <div className="sticky top-[5rem] bg-background/95 backdrop-blur-sm z-10 py-2 border-b shadow-sm rounded-md px-4">
                     <div className="flex items-center gap-2">
-                      <h3 className="text-lg font-semibold text-primary/90">{monthYear}</h3>
+                      <h3 className="text-lg font-semibold text-primary/90">
+                        {monthYear}
+                      </h3>
                       <Badge variant="outline" className="ml-2 text-xs">
                         {groupedPosts[monthYear].length} posts
                       </Badge>
@@ -246,18 +289,30 @@ const ClientBlogs: React.FC = () => {
 
                   <div className="space-y-4 mt-4 px-2">
                     {groupedPosts[monthYear].map((post) => (
-                      <Link href={`/blog/${post.route}`} key={post.id} className="block group">
+                      <Link
+                        href={`/blog/${post.route}`}
+                        key={post.id}
+                        className="block group"
+                      >
                         <Card className="overflow-hidden transition-all duration-300 hover:shadow-md group-hover:border-primary/20">
                           <div className="flex flex-col md:flex-row">
                             {post.thumb && (
-                              <ClientSideImage thumb={post.thumb} title={post.title} />
+                              <ClientSideImage
+                                thumb={post.thumb}
+                                title={post.title}
+                              />
                             )}
 
                             <div className="w-full">
                               <CardHeader className="flex-grow py-4 px-5">
                                 <div className="flex flex-wrap items-center gap-2 mb-2">
-                                  <Badge variant="outline" className="text-xs font-normal rounded-md">
-                                    {new Date(post.publish_date).toLocaleDateString("en-US", {
+                                  <Badge
+                                    variant="outline"
+                                    className="text-xs font-normal rounded-md"
+                                  >
+                                    {new Date(
+                                      post.publish_date
+                                    ).toLocaleDateString("en-US", {
                                       month: "short",
                                       day: "numeric",
                                     })}
@@ -282,12 +337,19 @@ const ClientBlogs: React.FC = () => {
                                 <div className="flex justify-between items-center w-full">
                                   <div className="flex flex-wrap gap-1.5">
                                     {post.tags.slice(0, 2).map((tag) => (
-                                      <Badge key={tag} variant="secondary" className="rounded-md font-normal text-xs">
+                                      <Badge
+                                        key={tag}
+                                        variant="secondary"
+                                        className="rounded-md font-normal text-xs"
+                                      >
                                         {tag}
                                       </Badge>
                                     ))}
                                     {post.tags.length > 2 && (
-                                      <Badge variant="outline" className="rounded-md text-xs">
+                                      <Badge
+                                        variant="outline"
+                                        className="rounded-md text-xs"
+                                      >
                                         +{post.tags.length - 2}
                                       </Badge>
                                     )}
@@ -323,13 +385,11 @@ const ClientBlogs: React.FC = () => {
             </div>
             <h3 className="text-xl font-semibold mb-2">No posts yet</h3>
             <p className="text-muted-foreground max-w-md mx-auto">
-              There are no blog posts available at the moment. Check back later for new content.
+              There are no blog posts available at the moment. Check back later
+              for new content.
             </p>
           </div>
         )}
-      </div>
-      <div className="mt-4 w-full h-full">
-        <GiscusComponent />
       </div>
     </div>
   );
