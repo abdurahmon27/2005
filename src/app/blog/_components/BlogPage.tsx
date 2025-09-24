@@ -113,10 +113,8 @@ export function BlogPage({ slug }: { slug: string }) {
     const parts: (string | JSX.Element)[] = [];
     let keyCounter = 0;
 
-    // Split text and process each part
     const processedParts: (string | JSX.Element)[] = [];
 
-    // First, handle links (both markdown and HTML style)
     let workingText = text;
     const linkMatches: Array<{
       start: number;
@@ -124,7 +122,6 @@ export function BlogPage({ slug }: { slug: string }) {
       element: JSX.Element;
     }> = [];
 
-    // Markdown links [text](url)
     const markdownLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
     let match;
     while ((match = markdownLinkRegex.exec(text)) !== null) {
@@ -217,7 +214,7 @@ export function BlogPage({ slug }: { slug: string }) {
             regex: /`(.*?)`/g,
             tag: "code",
             className:
-              "px-1.5 py-0.5 bg-muted text-accent rounded text-sm font-mono",
+              "px-1.5 py-0.5 bg-secondary text-accent rounded text-sm font-mono",
           },
           {
             regex: /<u>(.*?)<\/u>/g,

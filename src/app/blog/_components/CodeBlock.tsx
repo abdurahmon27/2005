@@ -1,89 +1,86 @@
 "use client";
 import React from "react";
-import type { Highlighter, BuiltinLanguage, ThemedToken } from "shiki";
+import { createHighlighter, type Highlighter } from "shiki";
 
 type CodeBlockProps = {
   code: string;
   language?: string;
 };
 
-const theme = "gruvbox-dark-soft";
+const theme = "vesper";
+const DEFAULT_LANGUAGE = "javascript";
 
-export function CodeBlock({ code, language = "txt" }: CodeBlockProps) {
-  const [tokens, setTokens] = React.useState<ThemedToken[][]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState(false);
+function escapeHtml(str: string) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function CodeBlock({
+  code,
+  language = DEFAULT_LANGUAGE,
+}: CodeBlockProps) {
+  const [html, setHtml] = React.useState<string>("");
+  const [loading, setLoading] = React.useState<boolean>(true);
 
   React.useEffect(() => {
     let mounted = true;
-    async function load() {
-      setLoading(true);
-      setError(false);
+
+    (async () => {
       try {
-        const shiki = await import("shiki");
-        const highlighter: Highlighter = await shiki.createHighlighter({
+        setLoading(true);
+        
+        // Create highlighter with the theme and languages we need
+        const highlighter: Highlighter = await createHighlighter({
           themes: [theme],
-          langs: [
-            "txt",
-            "javascript",
-            "typescript",
-            "jsx",
-            "tsx",
-            "html",
-            "css",
-            "json",
-            "markdown",
-            "python",
-            "bash",
-            "sql",
-          ],
+          langs: [language, DEFAULT_LANGUAGE], // Load both requested and fallback language
         });
-        let lang = language;
-        if (
-          !highlighter.getLoadedLanguages().includes(lang as BuiltinLanguage)
-        ) {
-          lang = "txt";
+
+        // Check if the requested language is available, fallback to default if not
+        const availableLanguages = highlighter.getLoadedLanguages();
+        const langToUse = availableLanguages.includes(language) ? language : DEFAULT_LANGUAGE;
+
+        const htmlResult = highlighter.codeToHtml(code, {
+          lang: langToUse,
+          theme: theme,
+        });
+
+        if (mounted) {
+          setHtml(htmlResult);
+          setLoading(false);
         }
-        const result = highlighter.codeToTokens(code, {
-          lang: lang as BuiltinLanguage,
-          theme,
-        });
-        if (mounted) setTokens(result.tokens);
-      } catch (e) {
-        if (mounted) setError(true);
-      } finally {
-        if (mounted) setLoading(false);
+      } catch (err) {
+        console.error("Shiki highlight error:", err);
+        if (mounted) {
+          setHtml(`<pre><code>${escapeHtml(code)}</code></pre>`);
+          setLoading(false);
+        }
       }
-    }
-    load();
+    })();
+
     return () => {
       mounted = false;
     };
   }, [code, language]);
 
+  if (loading) {
+    return (
+      <div className="rounded-lg my-4 overflow-hidden relative">
+        <div className="p-4">
+          <div className="text-gray-300 text-sm">Loading syntax highlighting...</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="bg-transparent rounded-lg my-4 overflow-hidden relative">
+    <div className="rounded square-dotted-border  my-4 overflow-hidden relative">
+      <div className="bg-primary px-4 py-2 text-sm text-secondary border-b border-muted">
+        {language}
+      </div>
       <div className="p-4">
-        {loading || error ? (
-          <pre className="fire-code bg-[#252525] rounded-lg p-4 text-sm overflow-x-auto">
-            <code>{code}</code>
-          </pre>
-        ) : (
-          <pre
-            className="m-0 overflow-x-auto bg-transparent text-sm"
-            style={{ background: "none" }}
-          >
-            {tokens.map((line, i) => (
-              <div key={i} className="leading-relaxed">
-                {line.map((token, j) => (
-                  <span key={j} style={{ color: token.color }}>
-                    {token.content}
-                  </span>
-                ))}
-              </div>
-            ))}
-          </pre>
-        )}
+        <div
+          className="text-sm overflow-x-auto [&_pre]:!bg-transparent [&_pre]:!p-0 [&_code]:!bg-transparent [&_pre]:!m-0"
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
       </div>
     </div>
   );
