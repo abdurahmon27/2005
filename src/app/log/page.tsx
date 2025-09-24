@@ -1,12 +1,12 @@
 "use client";
 
-import React from 'react'
-import ClientTemporary from './_components/ClientTemporary'
+import { BlogPage } from '../blog/_components/BlogPage';
 
-const TemporaryPage = () => {
-    return (
-        <ClientTemporary />
-    )
+// You may want to get the slug from the URL or use a static one for logs
+// For demo, we'll use a static slug 'log' (adjust as needed)
+const LogPage = () => {
+    // If you have dynamic log slugs, use next/navigation or next/router to get params
+    return <BlogPage slug="log" />;
 }
 
-export default TemporaryPage
+export default LogPage;

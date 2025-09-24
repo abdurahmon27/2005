@@ -1,14 +1,12 @@
-import ClientPostPage from "./_components/ClientPostPage";
+import { BlogPage } from "../_components/BlogPage";
 
-interface PostPageProps {
+interface BlogPostPageProps {
   params: Promise<{
     route: string;
   }>;
 }
 
-const PostPage = async ({ params }: PostPageProps) => {
-  const { route } = await params;
-  return <ClientPostPage route={route} />;
-};
-
-export default PostPage;
+export default async function BlogPostPage({ params }: BlogPostPageProps) {
+  const resolvedParams = await params;
+  return <BlogPage slug={resolvedParams.route} />;
+}

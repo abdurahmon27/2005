@@ -1,4 +1,3 @@
-/* eslint-disable no-console */
 import { getPages, getPageContent } from "@/utils/notion";
 import { NextRequest, NextResponse } from "next/server";
 
@@ -7,10 +6,8 @@ export async function GET(request: NextRequest) {
     const url = new URL(request.url);
     const published = url.searchParams.get("published") === "true";
     
-    // Get all pages
     const posts = await getPages(published);
     
-    // For each post, get additional data like preview and reading time
     const postsWithExtras = await Promise.all(
       posts.map(async (post) => {
         const content = await getPageContent(post.id);
@@ -25,7 +22,6 @@ export async function GET(request: NextRequest) {
       }),
     );
 
-    // Sort posts by publish date
     const sortedPosts = [...postsWithExtras].sort((a, b) => {
       return new Date(b.publish_date).getTime() - new Date(a.publish_date).getTime();
     });
@@ -37,7 +33,6 @@ export async function GET(request: NextRequest) {
   }
 }
 
-// Helper functions
 function extractPreview(blocks: any[], maxLength = 150): string {
   let preview = "";
 

@@ -1,5 +1,13 @@
+"use client"
+import { usePathname } from "next/navigation";
 
 export const Footer = () => {
+  const pathname = usePathname();
+
+  if (pathname === "/") {
+    return null;
+  }
+
     return (
         <footer className="container mx-auto flex items-center justify-center pb-5 py-4">
             <p>

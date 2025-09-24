@@ -67,23 +67,8 @@ export function SiteHeader() {
 
         <nav className="hidden md:flex items-center gap-6">
           <Link
-            href="https://cod3.uz/"
-            target="_blank"
-            className={`text-sm font-medium transition-colors flex items-center gap-1 ${
-              scrolled
-                ? "text-foreground"
-                : "text-muted-foreground hover:text-primary"
-            }`}
-          >
-            Cod3 Lab
-            <SquareArrowOutUpRight
-              className="inline-block h-3 w-3"
-              aria-hidden="true"
-            />
-          </Link>
-          <Link
             href="/projects"
-            className={`text-sm font-medium transition-colors ${
+            className={`text-sm font-medium transition-colors underline fira-code ${
               path.includes("/projects")
                 ? "text-primary"
                 : scrolled
@@ -91,11 +76,11 @@ export function SiteHeader() {
                 : "text-muted-foreground hover:text-primary"
             }`}
           >
-            Projects
+            projects
           </Link>
           <Link
             href="/blog"
-            className={`text-sm font-medium transition-colors ${
+            className={`text-sm font-medium transition-colors underline fira-code ${
               path.includes("/blog")
                 ? "text-primary"
                 : scrolled
@@ -103,11 +88,11 @@ export function SiteHeader() {
                 : "text-muted-foreground hover:text-primary"
             }`}
           >
-            Blog
+            blog
           </Link>
           <Link
             href="/log"
-            className={`text-sm font-medium transition-colors flex items-center justify-center gap-1 ${
+            className={`text-sm font-medium transition-colors flex items-center justify-center underline fira-code${
               path.includes("/log")
                 ? "text-primary"
                 : scrolled
@@ -115,35 +100,17 @@ export function SiteHeader() {
                 : "text-muted-foreground hover:text-primary"
             }`}
           >
-            Log
-            <Rss size={16} />
-          </Link>
-          <Link
-            href="/garbage"
-            className={`text-sm font-medium transition-colors flex items-center justify-center gap-1 ${
-              path.includes("/garbage")
-                ? "text-primary"
-                : scrolled
-                ? "text-foreground"
-                : "text-muted-foreground hover:text-primary"
-            }`}
-          >
-            Garbage
-            <Flame size={16} />
+            log
           </Link>
           <Link
             href="https://t.me/abdurahmon_mamadiyorov"
-            className={`text-sm font-medium transition-colors flex items-center gap-1 ${
+            className={`text-sm font-medium transition-colors flex items-center gap-1 underline fira-code ${
               scrolled
                 ? "text-foreground"
                 : "text-muted-foreground hover:text-primary"
             }`}
           >
-            Channel
-            <SquareArrowOutUpRight
-              className="inline-block h-3 w-3"
-              aria-hidden="true"
-            />
+            @channel
           </Link>
         </nav>
 

@@ -1,3 +1,4 @@
+// This file has been removed as it is now unused.
 /* eslint-disable no-console */
 "use client";
 
