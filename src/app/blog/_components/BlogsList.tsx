@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { BlogCard } from "./BlogCard";
 import { useBlogSearch } from "./useBlogSearch";
+import Image from "next/image";
 
 export function BlogsList() {
   const {
@@ -35,27 +36,38 @@ export function BlogsList() {
       : [];
 
   return (
-    <div className="fire-code">
+    <div className="fire-code w-full">
       {/* Tag filter bar */}
-      {allTags.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-4 items-center">
-          <span className="text-xs text-[#7c7c7c] mr-2">tags:</span>
-          {allTags.map((t) => (
-            <button
-              key={t}
-              className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
-                tag === t
-                  ? " text-[#e7c664]"
-                  : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
-              }`}
-              onClick={() => onTagClick(t)}
-              type="button"
-            >
-              #{t}
-            </button>
-          ))}
+      <div className="w-full flex justify-between items-start relative">
+        {allTags.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-4 items-center">
+            <span className="text-xs text-[#7c7c7c] mr-2">tags:</span>
+            {allTags.map((t) => (
+              <button
+                key={t}
+                className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
+                  tag === t
+                    ? " text-[#e7c664]"
+                    : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
+                }`}
+                onClick={() => onTagClick(t)}
+                type="button"
+              >
+                #{t}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="w-auto h-auto translate-y-10 relative max-md:hidden">
+          <Image
+            src={"/blog-boy-2.png"}
+            alt="Blog Boy"
+            width={200}
+            height={200}
+            className=""
+          />
         </div>
-      )}
+      </div>
       <div className="flex flex-wrap gap-2 mb-6 items-center w-full">
         <input
           type="text"
