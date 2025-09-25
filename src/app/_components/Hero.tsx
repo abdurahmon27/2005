@@ -156,7 +156,7 @@ export function HeroSection() {
                             </Link>{" "}
                             <span className="text-muted">&</span>{" "}
                             <Link
-                              href={achievement.href}
+                              href={`https://gopher.uz`}
                               target="_blank"
                               rel="noopener noreferrer"
                             >
