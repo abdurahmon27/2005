@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-
+import React, { useMemo, useCallback } from "react";
 import { BlogCard } from "./BlogCard";
 import { useBlogSearch } from "./useBlogSearch";
 import Image from "next/image";
@@ -18,10 +18,25 @@ export function BlogsList() {
     },
     staleTime: 1000 * 60 * 5,
     gcTime: 1000 * 60 * 20,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: 5,
   });
 
   const { search, tag, filtered, onTagClick, onSearch, clearFilters } =
     useBlogSearch(blogs || []);
+
+  const allTags = useMemo(() => {
+    if (!blogs || !Array.isArray(blogs)) return [];
+    return Array.from(new Set(blogs.flatMap((b: any) => b.tags || [])));
+  }, [blogs]);
+
+  const memoizedOnTagClick = useCallback(
+    (tag: string) => {
+      onTagClick(tag);
+    },
+    [onTagClick]
+  );
 
   if (isLoading) return <div className="p-8 text-center">Loading blogs...</div>;
   if (error)
@@ -31,45 +46,35 @@ export function BlogsList() {
   if (!blogs?.length)
     return <div className="p-8 text-center">No blogs found.</div>;
 
-  // Collect all unique tags from blogs
-  const allTags =
-    blogs && Array.isArray(blogs)
-      ? Array.from(new Set(blogs.flatMap((b: any) => b.tags || [])))
-      : [];
-
   return (
     <div className="fire-code w-full">
-      {/* Tag filter bar */}
       <div className="w-full flex justify-between items-start relative">
         {allTags.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-4 items-center">
             <span className="text-xs text-[#7c7c7c] mr-2">tags:</span>
             {allTags.map((t) => (
-              <button
+              <TagButton
                 key={t}
-                className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
-                  tag === t
-                    ? " text-[#e7c664]"
-                    : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
-                }`}
-                onClick={() => onTagClick(t)}
-                type="button"
-              >
-                #{t}
-              </button>
+                tag={t}
+                isActive={tag === t}
+                onClick={memoizedOnTagClick}
+              />
             ))}
           </div>
         )}
         <div className="w-auto h-auto translate-y-10 relative max-md:hidden">
           <Image
-            src={"/blog-boy-2.png"}
+            src="/blog-boy-2.png"
             alt="Blog Boy"
             width={200}
             height={200}
+            priority={false}
+            loading="lazy"
             className=""
           />
         </div>
       </div>
+
       <div className="flex flex-wrap gap-2 mb-6 items-center w-full">
         <input
           type="text"
@@ -92,11 +97,42 @@ export function BlogsList() {
           </span>
         )}
       </div>
+
       <div className="flex items-center justify-center flex-col gap-4 w-full">
         {filtered.map((blog: any) => (
-          <BlogCard key={blog.id} blog={blog} onTagClick={onTagClick} />
+          <BlogCard key={blog.id} blog={blog} onTagClick={memoizedOnTagClick} />
         ))}
       </div>
     </div>
   );
 }
+
+const TagButton = React.memo(
+  ({
+    tag,
+    isActive,
+    onClick,
+  }: {
+    tag: string;
+    isActive: boolean;
+    onClick: (tag: string) => void;
+  }) => {
+    const handleClick = useCallback(() => {
+      onClick(tag);
+    }, [tag, onClick]);
+
+    return (
+      <button
+        className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
+          isActive
+            ? " text-[#e7c664]"
+            : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
+        }`}
+        onClick={handleClick}
+        type="button"
+      >
+        #{tag}
+      </button>
+    );
+  }
+);
