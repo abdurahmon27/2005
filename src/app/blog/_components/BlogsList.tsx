@@ -16,6 +16,8 @@ export function BlogsList() {
       if (!res.ok) throw new Error("Failed to fetch blogs");
       return res.json();
     },
+    staleTime: 1000 * 60 * 5,
+    gcTime: 1000 * 60 * 20,
   });
 
   const { search, tag, filtered, onTagClick, onSearch, clearFilters } =
