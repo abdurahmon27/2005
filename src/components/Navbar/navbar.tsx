@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Flame, Rss, SquareArrowOutUpRight } from "lucide-react";
+import { SquareArrowOutUpRight } from "lucide-react";
 
 export function SiteHeader() {
   const [scrolled, setScrolled] = useState(false);
@@ -103,6 +103,19 @@ export function SiteHeader() {
             log
           </Link>
           <Link
+            href="/donate"
+            className={`text-sm font-medium transition-colors underline fira-code ${
+              path.includes("/donate")
+                ? "text-primary"
+                : scrolled
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-primary"
+            }`}
+          >
+            donate
+          </Link>
+
+          <Link
             href="https://t.me/abdurahmon_mamadiyorov"
             className={`text-sm font-medium transition-colors flex items-center gap-1 underline fira-code ${
               scrolled
@@ -148,38 +161,32 @@ export function SiteHeader() {
       >
         <nav className="flex flex-col p-6 space-y-6">
           <Link
-            href="https://cod3.uz/"
-            target="_blank"
-            className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
-            onClick={() => setMobileMenuOpen(false)}
-          >
-            Cod3 Lab
-            <SquareArrowOutUpRight
-              className="inline-block h-4 w-4"
-              aria-hidden="true"
-            />
-          </Link>
-          <Link
             href="/projects"
             className="text-base font-medium text-foreground transition-colors flex items-center"
             onClick={() => setMobileMenuOpen(false)}
           >
-            Projects
+            projects
           </Link>
           <Link
             href="/blog"
             className="text-base font-medium text-foreground transition-colors flex items-center"
             onClick={() => setMobileMenuOpen(false)}
           >
-            Blog
+            blog
           </Link>
           <Link
             href="/log"
             className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
             onClick={() => setMobileMenuOpen(false)}
           >
-            Log
-            <Rss size={16} />
+            log
+          </Link>
+          <Link
+            href="/donate"
+            className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
+            onClick={() => setMobileMenuOpen(false)}
+          >
+            donate
           </Link>
           <Link
             href="https://t.me/abdurahmon_mamadiyorov"

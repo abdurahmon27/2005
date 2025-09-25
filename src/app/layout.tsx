@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Space_Grotesk } from "next/font/google";
-import './globals.css';
+import "./globals.css";
 import { Footer } from "@/components/Footer";
 import { SiteHeader } from "@/components/Navbar";
 
@@ -12,15 +12,17 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${spaceGrotesk.variable} ${spaceGrotesk.className} antialiased tv-container bg-secondary`}
+        className={`${spaceGrotesk.variable} ${spaceGrotesk.className} antialiased bg-secondary`}
       >
-        <div className="z-20">
-          <SiteHeader />
-          <div className="mt-20">
+        <div className="tv-effects-overlay"></div>
+        
+        <SiteHeader />
+        <main className="mt-20 tv-container">
+          <div className="content-above-tv">
             {children}
           </div>
-          <Footer />
-        </div>
+        </main>
+        <Footer />
       </body>
     </html>
   );
@@ -33,5 +35,5 @@ const spaceGrotesk = Space_Grotesk({
 
 export const metadata: Metadata = {
   title: "Bekzotovich | Software Engineer | CS Student",
-  description: "I am a self-taught, nerd developer who loves to build things.",
+  description: "a self-taught, nerd developer who loves to build things.",
 };

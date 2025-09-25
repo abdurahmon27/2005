@@ -56,7 +56,7 @@ export function TableOfContents({ items }: TableOfContentsProps) {
   const scrollToHeading = (id: string) => {
     const element = document.getElementById(id);
     if (element) {
-      const offset = 100; // Adjust this value based on your header height
+      const offset = 100;
       const elementPosition = element.offsetTop - offset;
       window.scrollTo({
         top: elementPosition,
@@ -71,11 +71,11 @@ export function TableOfContents({ items }: TableOfContentsProps) {
 
   return (
     <>
-      {/* Mobile Toggle Button */}
-      <div className="lg:hidden fixed top-20 right-4 z-10">
+      {/* Mobile TOC Toggle Button */}
+      <div className="lg:hidden fixed top-24 right-4 z-[150]">
         <button
           onClick={() => setIsOpen(!isOpen)}
-          className="bg-secondary border mt-5 border-muted rounded-lg p-3 shadow-lg hover:bg-muted transition-colors"
+          className="bg-secondary border border-muted rounded-lg p-3 shadow-lg hover:bg-muted transition-colors backdrop-blur-sm"
           aria-label="Toggle table of contents"
         >
           <svg
@@ -97,8 +97,8 @@ export function TableOfContents({ items }: TableOfContentsProps) {
       </div>
 
       {/* Desktop TOC */}
-      <div className="hidden lg:block fixed right-4 top-1/2 transform -translate-y-1/2 w-64 z-40">
-        <div className="bg-secondary border border-muted rounded-lg shadow-lg max-h-[70vh] overflow-y-auto">
+      <div className="hidden lg:block absolute right-[5rem] top-[20rem] -translate-y-1/2 w-64 z-[150]">
+        <div className="bg-secondary/95 backdrop-blur-sm border border-muted rounded-lg shadow-lg max-h-[70vh] overflow-y-auto">
           <div className="p-4 border-b border-muted">
             <h3 className="font-semibold text-primary text-sm font-mono flex items-center gap-2">
               <span>::</span>
@@ -134,8 +134,8 @@ export function TableOfContents({ items }: TableOfContentsProps) {
 
       {/* Mobile TOC Overlay */}
       {isOpen && (
-        <div className="lg:hidden fixed inset-0 z-50 bg-current/50 backdrop-blur-sm">
-          <div className="fixed top-0 right-0 h-full w-80 max-w-[85vw] bg-secondary border-l border-muted shadow-xl overflow-y-auto">
+        <div className="lg:hidden fixed inset-0 z-[200] bg-black/50 backdrop-blur-sm">
+          <div className="fixed top-0 right-0 h-full w-80 max-w-[85vw] bg-secondary/95 backdrop-blur-sm border-l border-muted shadow-xl overflow-y-auto">
             <div className="p-4 border-b border-muted flex items-center justify-between">
               <h3 className="font-semibold text-primary text-sm font-mono flex items-center gap-2">
                 <span>::</span>

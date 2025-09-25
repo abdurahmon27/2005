@@ -752,24 +752,19 @@ export function BlogPage({ slug }: { slug: string }) {
 
   return (
     <div className="min-h-screen bg-current">
-      {/* Table of Contents */}
       <TableOfContents items={tocItems} />
-
       <div className="absolute bottom-10 left-10 w-auto max-md:hidden z-50">
         <Image
           src="/darling.png"
           alt="*)"
-          width={200}
-          height={200}
+          width={300}
+          height={300}
           objectFit="cover"
         />
       </div>
 
       <div className="py-10">
-        {" "}
-        {/* Add left padding on desktop for TOC */}
         <article className="font-mono bg-secondary rounded-lg mx-auto mt-8 mb-8 overflow-hidden container">
-          {/* Header */}
           <div className="px-6 py-4 border-b border-primary flex items-center justify-between">
             <div className="flex items-center gap-3">
               <button
@@ -787,9 +782,7 @@ export function BlogPage({ slug }: { slug: string }) {
             </div>
           </div>
 
-          {/* Content */}
           <div className="px-8 py-8">
-            {/* Title and metadata */}
             <header className="mb-8">
               <h1 className="text-4xl font-bold mb-4 leading-tight text-primary">
                 {blog.title}
