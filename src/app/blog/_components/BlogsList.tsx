@@ -107,32 +107,33 @@ export function BlogsList() {
   );
 }
 
-const TagButton = React.memo(
-  ({
-    tag,
-    isActive,
-    onClick,
-  }: {
-    tag: string;
-    isActive: boolean;
-    onClick: (tag: string) => void;
-  }) => {
-    const handleClick = useCallback(() => {
-      onClick(tag);
-    }, [tag, onClick]);
+function TagButtonComponent({
+  tag,
+  isActive,
+  onClick,
+}: {
+  tag: string;
+  isActive: boolean;
+  onClick: (tag: string) => void;
+}) {
+  const handleClick = useCallback(() => {
+    onClick(tag);
+  }, [tag, onClick]);
 
-    return (
-      <button
-        className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
-          isActive
-            ? " text-[#e7c664]"
-            : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
-        }`}
-        onClick={handleClick}
-        type="button"
-      >
-        #{tag}
-      </button>
-    );
-  }
-);
+  return (
+    <button
+      className={`px-2 py-0.5 rounded text-xs underline transition-colors cursor-pointer ${
+        isActive
+          ? " text-[#e7c664]"
+          : " text-[#7c7c7c] hover:text-[#e7c664] hover:border-[#e7c664]"
+      }`}
+      onClick={handleClick}
+      type="button"
+    >
+      #{tag}
+    </button>
+  );
+}
+
+const TagButton = React.memo(TagButtonComponent);
+TagButton.displayName = "TagButton";
