@@ -66,7 +66,7 @@ export function HeroSection() {
             <div className="relative h-56 w-56 md:h-72 md:w-72 rounded-full border-4 border-secondary bg-secondary overflow-hidden group-hover:border-accent transition-all duration-300">
               <div className="absolute inset-2 rounded-full overflow-hidden">
                 <Image
-                  src="/pur-pur.jpeg"
+                  src="/avatar.png"
                   alt="Gatto - Developer"
                   width={288}
                   height={288}
