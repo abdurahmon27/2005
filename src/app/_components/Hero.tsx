@@ -5,24 +5,9 @@ import { useState, useEffect } from "react";
 
 export function HeroSection() {
   const [isVisible, setIsVisible] = useState(false);
-  const [typedText, setTypedText] = useState("");
-  const fullText = "a self-taught, nerd developer who loves to build things";
 
   useEffect(() => {
     setIsVisible(true);
-
-    // Typewriter effect
-    let currentIndex = 0;
-    const typeInterval = setInterval(() => {
-      if (currentIndex <= fullText.length) {
-        setTypedText(fullText.slice(0, currentIndex));
-        currentIndex++;
-      } else {
-        clearInterval(typeInterval);
-      }
-    }, 50);
-
-    return () => clearInterval(typeInterval);
   }, []);
 
   const achievements = [
@@ -41,17 +26,16 @@ export function HeroSection() {
 
   return (
     <section className="container mx-auto min-h-[100dvh] flex flex-col justify-center items-start py-12 md:py-20 px-4 sm:px-6 lg:px-8 relative overflow-hidden max-md:mt-[200px]">
-      <div className="max-w-2xl">
+      <div className="max-w-2xl mx-auto">
         {/* Main Content */}
         <div
-          className={`mb-8 transform transition-all duration-700 ${
+          className={`mb-8 transform transition-all duration-700 w-full ${
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
           }`}
           style={{ transitionDelay: "100ms" }}
         >
-          <h2 className="text-lg md:text-xl mb-4 fira-code text-foreground leading-relaxed">
-            {typedText}
-            <span className="animate-pulse">|</span>
+          <h2 className="text-lg md:text-xl mb-4 font-mono text-foreground leading-relaxed min-h-[1.5em] break-words">
+            {`a self-taught, nerd developer who loves to build things`}
           </h2>
         </div>
 
