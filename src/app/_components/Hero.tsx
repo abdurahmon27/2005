@@ -92,14 +92,14 @@ export function HeroSection() {
               <div className="flex gap-2 text-sm font-mono">
                 <span className="text-muted-foreground">{`>`}</span>
                 <span className="text-foreground">{achievement.role}</span>
-                <a
+                <Link
                   href={achievement.href}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all text-primary hover:text-accent"
                 >
                   {achievement.org}
-                </a>
+                </Link>
               </div>
             </div>
           ))}
@@ -116,24 +116,24 @@ export function HeroSection() {
           }`}
           style={{ transitionDelay: "700ms" }}
         >
-          <a
+          <Link
             href="/blog"
             className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
           >
             → read blog
-          </a>
-          <a
+          </Link>
+          <Link
             href="/projects"
             className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
           >
             → view projects
-          </a>
-          <a
+          </Link>
+          <Link
             href="/about"
             className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
           >
             → about me
-          </a>
+          </Link>
         </div>
 
         {/* Tech Stack */}

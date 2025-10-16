@@ -108,7 +108,7 @@ export default function ProjectsPage() {
             <Image src={'/projects.jpeg'} alt="Haywan Monkey" width={32} height={32} className="rounded-md -translate-y-1" />
           </h1>
           <p className="text-sm text-muted-foreground font-mono">
-            things i've built and shipped
+            things i&apos;ve built and shipped
           </p>
         </div>
 
