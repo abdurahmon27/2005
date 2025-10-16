@@ -1,15 +1,41 @@
 "use client";
 
-import { Button } from "@/components/ui/button";
-import { Check, ArrowRight, Play, Users, Video, Eye } from "lucide-react";
 import Image from "next/image";
-import {
-  SketchyWavyLine,
-  SketchyBorder,
-  SketchyArrow,
-  SketchyCornerBracket,
-} from "@/components/sketch";
 import { useState, useEffect } from "react";
+
+interface Project {
+  id: string;
+  title: string;
+  description: string;
+  tags: string[];
+  link?: string;
+  github?: string;
+}
+
+interface Video {
+  id: string;
+  title: string;
+  thumbnail: string;
+  url: string;
+}
+
+const projects: Project[] = [
+  {
+    id: "1",
+    title: "Qulay Makon",
+    description:
+      "an e-commerce website for a company that provides equipment for creating accessible physical environments for people with disabilities.",
+    tags: ["Next.js", "TypeScript", "MongoDB"],
+    link: "https://qulaymakon.uz",
+  },
+  {
+    id: "2",
+    title: "IlmTown",
+    description: "Landing page for an educational center",
+    tags: ["React", "TypeScript"],
+    link: "https://ilmtown.uz",
+  },
+];
 
 export default function ProjectsPage() {
   const [isVisible, setIsVisible] = useState(false);
@@ -21,17 +47,14 @@ export default function ProjectsPage() {
   useEffect(() => {
     async function fetchYouTubeData() {
       try {
-        // Fetch subscribers
         const subsResponse = await fetch("/api/subs");
         const subsData = await subsResponse.json();
         setSubscribers(subsData.subscribers);
 
-        // Fetch watch time
         const watchTimeResponse = await fetch("/api/wtime");
         const watchTimeData = await watchTimeResponse.json();
         setWatchTimeHours(watchTimeData.watchTimeHours);
 
-        // Fetch video count
         const videosResponse = await fetch("/api/videos");
         const videosData = await videosResponse.json();
         setVideoCount(videosData.videoCount);
@@ -49,7 +72,6 @@ export default function ProjectsPage() {
     setIsVisible(true);
   }, []);
 
-  // Helper function to format numbers
   const formatNumber = (num: number | null): string => {
     if (num === null) return loading ? "..." : "0";
     if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
@@ -61,96 +83,145 @@ export default function ProjectsPage() {
     {
       label: "Subscribers",
       value: formatNumber(subscribers),
-      delay: "0.8s",
     },
     {
       label: "Videos",
       value: formatNumber(videoCount),
-      delay: "1s",
     },
     {
       label: "Watch Time (Hours)",
       value: formatNumber(watchTimeHours),
-      delay: "1.2s",
     },
   ];
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 py-8">
-      <div className="container mx-auto relative max-w-7xl">
-        <div className="flex flex-col lg:flex-row overflow-hidden">
-          <div className="flex-1 p-4 sm:p-6 lg:p-12 relative">
+    <div className="min-h-screen py-12 md:py-16 px-4 sm:px-6 lg:px-8 bg-secondary">
+      <div className="max-w-2xl mx-auto">
+        {/* Header */}
+        <div
+          className={`mb-10  pb-6 transform transition-all duration-700 ${
+            isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+          }`}
+        >
+          <h1 className="text-3xl md:text-4xl font-bold mb-2 font-mono flex items-center gap-2">
+            projects
+            <Image src={'/projects.jpeg'} alt="Haywan Monkey" width={32} height={32} className="rounded-md -translate-y-1" />
+          </h1>
+          <p className="text-sm text-muted-foreground font-mono">
+            things i've built and shipped
+          </p>
+        </div>
+
+        <div className="my-8 flex items-center">
+          <div className="flex-1 border-t border-muted"></div>
+          <div className="px-4">
+            <span className="text-muted text-sm">• • •</span>
+          </div>
+          <div className="flex-1 border-t border-muted"></div>
+        </div>
+
+        {/* Projects List */}
+        <div className="space-y-4 mb-16">
+          {projects.map((project, index) => (
             <div
-              className={`transform transition-all duration-1000 delay-300 ${
+              key={project.id}
+              className={`transform transition-all duration-700 ${
                 isVisible
-                  ? "translate-x-0 opacity-100"
-                  : "-translate-x-10 opacity-0"
+                  ? "translate-y-0 opacity-100"
+                  : "translate-y-4 opacity-0"
               }`}
+              style={{ transitionDelay: `${index * 50}ms` }}
             >
-              <div className="relative mb-4 sm:mb-6">
-                <h1 className="text-2xl sm:text-3xl lg:text-4xl xl:text-5xl font-bold mb-2 leading-tight">
-                  Youtube Channel
-                </h1>
-              </div>
-
-              <p className="text-base sm:text-lg text-muted-foreground mb-6 sm:mb-8 leading-relaxed">
-                {`I removed the projects section, bcoz currently I'm focusing on
-                real world applications and tech stacks.`}
-              </p>
-
-              {/* Stats section */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mb-6 sm:mb-8">
-                {stats.map((stat, index) => (
-                  <div
-                    key={index}
-                    className={`text-center p-3 sm:p-4  transform transition-all duration-700 hover:scale-105 ${
-                      isVisible
-                        ? "translate-y-0 opacity-100"
-                        : "translate-y-5 opacity-0"
-                    }`}
-                    style={{ transitionDelay: stat.delay }}
-                  >
-                    <div className="flex justify-center mb-2"></div>
-                    <div className="text-xl sm:text-2xl font-bold text-primary mb-1">
-                      {stat.value}
-                    </div>
-                    <div className="text-xs sm:text-sm text-muted-foreground">
-                      {stat.label}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="flex items-center justify-center">
-                <Button
-                  asChild
-                  variant="outline"
-                  className="text-primary border-primary hover:bg-primary/10 transition-colors hover:text-white"
+              <div className="space-y-1">
+                <a
+                  href={project.link || project.github || "#"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all group font-mono font-bold text-base"
                 >
-                  <a
-                    href="https://www.youtube.com/@bekzotovich"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Sub buddy, please👉🏿
-                  </a>
-                </Button>
+                  {project.title}
+                </a>
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  {project.description}
+                </p>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  {project.tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="text-xs font-mono text-muted-foreground hover:text-foreground transition-colors cursor-default"
+                    >
+                      #{tag}
+                    </span>
+                  ))}
+                </div>
               </div>
             </div>
+          ))}
+        </div>
+
+        <div className="my-8 flex items-center">
+          <div className="flex-1 border-t border-muted"></div>
+          <div className="px-4">
+            <span className="text-muted text-sm">• • •</span>
+          </div>
+          <div className="flex-1 border-t border-muted"></div>
+        </div>
+
+        {/* You Section - YouTube */}
+        <div
+          className={`transform transition-all duration-1000 ${
+            isVisible ? "translate-y-0 opacity-100" : "translate-y-8 opacity-0"
+          }`}
+          style={{ transitionDelay: "500ms" }}
+        >
+          <div className="mb-8">
+            <pre className="font-mono text-xs mb-3 text-muted-foreground">
+              {`┌─────────────────────┐
+│  ▶ YOU / YOUTUBE    │
+└─────────────────────┘`}
+            </pre>
+            <p className="text-sm text-muted-foreground font-mono">
+              tech content, tutorials, and coding tips
+            </p>
           </div>
 
-          {/* Right side - 3D Image */}
-          <div className="flex-1 p-4 sm:p-6 lg:p-12 flex items-center justify-center relative overflow-hidden">
-            <div className="relative group w-full max-w-md lg:max-w-none">
-              <Image
-                width={900}
-                height={500}
-                alt="bekzotovich youtube channel"
-                src={"/youtube/image.png"}
-                className="w-full h-auto rounded-2xl  three-d-img group-hover:scale-105 transition-transform duration-500"
-              />
-            </div>
+          {/* Stats */}
+          <div className="grid grid-cols-3 gap-4 mb-8">
+            {stats.map((stat, index) => (
+              <div
+                key={stat.label}
+                className={`transform transition-all duration-700 ${
+                  isVisible
+                    ? "translate-y-0 opacity-100"
+                    : "translate-y-4 opacity-0"
+                }`}
+                style={{ transitionDelay: `${600 + index * 100}ms` }}
+              >
+                <p className="text-xs text-muted-foreground font-mono uppercase tracking-wider mb-2">
+                  {stat.label}
+                </p>
+                <p className="text-2xl font-bold font-mono text-foreground">
+                  {stat.value}
+                </p>
+                <div className="w-full h-px bg-border mt-2" />
+              </div>
+            ))}
           </div>
+
+          {/* Call to Action */}
+          <a
+            href="https://www.youtube.com/@bekzotovich"
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`inline-block underline decoration-2 decoration-foreground font-mono font-bold text-sm hover:text-primary transition-colors ${
+              isVisible
+                ? "translate-y-0 opacity-100"
+                : "translate-y-4 opacity-0"
+            }`}
+            style={{ transitionDelay: "900ms" }}
+          >
+            → youtube.com/@bekzotovich
+          </a>
         </div>
       </div>
     </div>
