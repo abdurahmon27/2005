@@ -125,6 +125,16 @@ export function SiteHeader() {
           >
             @channel
           </Link>
+          <Link
+            href="https://gopher.uz"
+            className={`text-sm font-medium transition-colors flex items-center gap-1 underline fira-code ${
+              scrolled
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-primary"
+            }`}
+          >
+            @gopher
+          </Link>
         </nav>
 
         <button
@@ -193,7 +203,18 @@ export function SiteHeader() {
             className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
             onClick={() => setMobileMenuOpen(false)}
           >
-            Channel
+            @channel
+            <SquareArrowOutUpRight
+              className="inline-block h-4 w-4"
+              aria-hidden="true"
+            />
+          </Link>
+          <Link
+            href="https://gopher.uz"
+            className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
+            onClick={() => setMobileMenuOpen(false)}
+          >
+            @gopher
             <SquareArrowOutUpRight
               className="inline-block h-4 w-4"
               aria-hidden="true"
