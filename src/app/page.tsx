@@ -41,7 +41,7 @@ export default function Home() {
       variants={containerVariants}
     >
       <motion.main
-        className="w-full mx-auto h-[80vh] flex items-center justify-center"
+        className="w-full mx-auto min-h-[80vh] flex items-center justify-center"
         variants={childVariants}
       >
         <HeroSection />

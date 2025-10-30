@@ -11,22 +11,18 @@ export function HeroSection() {
   }, []);
 
   const achievements = [
-    { role: "mentor at", org: "@teamituz", href: "https://teamit.uz" },
+    { role: "Software Engineer at", org: "@numeo", href: "https://numeo.ai" },
+    { role: "ex mentor at", org: "@teamituz", href: "https://teamit.uz" },
     {
       role: "Gopher Uzbekistan Chairman at",
       org: "@flossuz",
       href: "https://floss.uz",
     },
-    {
-      role: "loves cats at",
-      org: "@home",
-      href: "https://t.me/abdurahmon_mamadiyorov",
-    },
   ];
 
   return (
-    <section className="container mx-auto min-h-[100dvh] flex flex-col justify-center items-start py-12 md:py-20 px-4 sm:px-6 lg:px-8 relative overflow-hidden max-md:mt-[200px]">
-      <div className="max-w-2xl mx-auto">
+    <section className="container mx-auto min-h-[100dvh] flex flex-col justify-center items-center py-12 md:py-20 px-4 sm:px-6 lg:px-8 relative overflow-hidden">
+      <div className="max-w-2xl w-full">
         {/* Main Content */}
         <div
           className={`mb-8 transform transition-all duration-700 w-full ${
@@ -52,11 +48,9 @@ export function HeroSection() {
           </p>
         </div>
 
-        {/* using border-image square dotted double border */}
         <div className="square-dotted-border  pt-6"></div>
         <div className="square-dotted-border mt-1"></div>
 
-        {/* Roles/Achievements */}
         <div
           className={`mb-8 space-y-3 transform transition-all duration-700 mt-10 ${
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
@@ -89,16 +83,14 @@ export function HeroSection() {
           ))}
         </div>
 
-        {/* using border-image square dotted double border */}
         <div className="square-dotted-border  pt-6"></div>
         <div className="square-dotted-border mt-1"></div>
 
-        {/* Links/CTA */}
         <div
           className={`flex flex-col gap-3 transform transition-all duration-700 mt-10 ${
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
           }`}
-          style={{ transitionDelay: "700ms" }}
+          style={{ transitionDelay: "500ms" }}
         >
           <Link
             href="/blog"
@@ -125,7 +117,7 @@ export function HeroSection() {
           className={`mt-8 transform transition-all duration-700 ${
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
           }`}
-          style={{ transitionDelay: "800ms" }}
+          style={{ transitionDelay: "600ms" }}
         >
           <p className="text-xs font-mono text-muted-foreground mb-3">
             tech stack:
