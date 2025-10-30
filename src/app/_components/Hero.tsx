@@ -1,7 +1,6 @@
-/* eslint-disable no-console */
-import Image from "next/image";
 import Link from "next/link";
 import { useState, useEffect } from "react";
+import Image from "next/image";
 
 export function HeroSection() {
   const [isVisible, setIsVisible] = useState(false);
@@ -23,7 +22,6 @@ export function HeroSection() {
   return (
     <section className="container mx-auto min-h-[100dvh] flex flex-col justify-center items-center py-12 md:py-20 px-4 sm:px-6 lg:px-8 relative overflow-hidden">
       <div className="max-w-2xl w-full">
-        {/* Main Content */}
         <div
           className={`mb-8 transform transition-all duration-700 w-full ${
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
@@ -31,7 +29,14 @@ export function HeroSection() {
           style={{ transitionDelay: "100ms" }}
         >
           <h2 className="text-lg md:text-xl mb-4 font-mono text-foreground leading-relaxed min-h-[1.5em] break-words">
-            {`a self-taught, nerd developer who loves to build things`}
+            {`a self-taught, nerd developer who loves automation`}
+            <Image
+              src={"/hero.jpeg"}
+              alt="Not me"
+              width={26}
+              height={26}
+              className="inline-block ml-2 -translate-y-1 rounded-md"
+            />
           </h2>
         </div>
 
