@@ -8,8 +8,8 @@ import { Calendar, Clock, FileText } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import useSWR from "swr";
 import { Skeleton } from "@/components/ui/skeleton";
-import ShikiCodeBlock from "../../blog/[route]/_components/CodeBlock";
-import { LogPageData } from "@/utils/getLogPage";
+import { CodeBlock as ShikiCodeBlock } from "@/components/blog";
+import type { LogPageData } from "@/services/notion";
 
 interface TextContent {
   content: string;
@@ -223,7 +223,10 @@ const BlockRenderer: React.FC<BlockProps> = ({ block }) => {
     case "image":
       return <ImageBlock block={block} />;
     case "code":
-      return <ShikiCodeBlock block={block} />;
+      const codeContent = Array.isArray(block.content)
+        ? block.content.map((c: any) => c.content).join("")
+        : String(block.content);
+      return <ShikiCodeBlock code={codeContent} language={block.language} />;
     case "to_do":
       return <TodoBlock block={block} />;
     case "divider":

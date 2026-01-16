@@ -1,6 +1,6 @@
 "use client";
 
-import { BlogPage } from '../blog/_components/BlogPage';
+import { BlogPage } from "@/components/blog";
 
 // You may want to get the slug from the URL or use a static one for logs
 // For demo, we'll use a static slug 'log' (adjust as needed)

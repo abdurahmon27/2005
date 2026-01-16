@@ -1,5 +1,5 @@
 "use client";
-import { HeroSection } from "./_components/Hero";
+import { HeroSection } from "@/components/home";
 import { motion } from "framer-motion";
 
 const containerVariants = {

@@ -2,40 +2,7 @@
 
 import Image from "next/image";
 import { useState, useEffect } from "react";
-
-interface Project {
-  id: string;
-  title: string;
-  description: string;
-  tags: string[];
-  link?: string;
-  github?: string;
-}
-
-interface Video {
-  id: string;
-  title: string;
-  thumbnail: string;
-  url: string;
-}
-
-const projects: Project[] = [
-  {
-    id: "1",
-    title: "Qulay Makon",
-    description:
-      "an e-commerce website for a company that provides equipment for creating accessible physical environments for people with disabilities.",
-    tags: ["Next.js", "TypeScript", "MongoDB"],
-    link: "https://qulaymakon.uz",
-  },
-  {
-    id: "2",
-    title: "IlmTown",
-    description: "Landing page for an educational center",
-    tags: ["React", "TypeScript"],
-    link: "https://ilmtown.uz",
-  },
-];
+import { projects } from "@/data/projects";
 
 export default function ProjectsPage() {
   const [isVisible, setIsVisible] = useState(false);
@@ -47,15 +14,15 @@ export default function ProjectsPage() {
   useEffect(() => {
     async function fetchYouTubeData() {
       try {
-        const subsResponse = await fetch("/api/subs");
+        const subsResponse = await fetch("/api/youtube/subscribers");
         const subsData = await subsResponse.json();
         setSubscribers(subsData.subscribers);
 
-        const watchTimeResponse = await fetch("/api/wtime");
+        const watchTimeResponse = await fetch("/api/youtube/watch-time");
         const watchTimeData = await watchTimeResponse.json();
         setWatchTimeHours(watchTimeData.watchTimeHours);
 
-        const videosResponse = await fetch("/api/videos");
+        const videosResponse = await fetch("/api/youtube/videos");
         const videosData = await videosResponse.json();
         setVideoCount(videosData.videoCount);
       } catch (error) {
@@ -95,7 +62,7 @@ export default function ProjectsPage() {
   ];
 
   return (
-    <div className="min-h-screen py-12 md:py-16 px-4 sm:px-6 lg:px-8 bg-secondary">
+    <div className="min-h-screen py-12 md:py-16 px-4 sm:px-6 lg:px-8">
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div

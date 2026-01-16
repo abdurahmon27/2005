@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import { Space_Grotesk } from "next/font/google";
 import "./globals.css";
-import { Footer } from "@/components/Footer";
-import { SiteHeader } from "@/components/Navbar";
+import { Footer, SiteHeader } from "@/components/layout";
 
 export default function RootLayout({
   children,

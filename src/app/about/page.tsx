@@ -41,7 +41,7 @@ export default function AboutPage() {
     };
 
     return (
-        <div className="min-h-screen bg-current py-10">
+        <div className="min-h-screen py-10">
             <article className="font-mono bg-secondary rounded-lg mx-auto mt-8 mb-8 overflow-hidden container">
                 <div className="px-8 py-8">
                     <BlogPageContent blog={aboutData} />

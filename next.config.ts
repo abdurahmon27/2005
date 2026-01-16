@@ -1,4 +1,11 @@
 import type { NextConfig } from "next";
+import nextra from "nextra";
+
+const withNextra = nextra({
+  // Nextra options
+  defaultShowCopyCode: true,
+  readingTime: true,
+});
 
 const nextConfig: NextConfig = {
   images: {
@@ -11,6 +18,7 @@ const nextConfig: NextConfig = {
     unoptimized: true,
     minimumCacheTTL: 60,
   },
+  pageExtensions: ["js", "jsx", "ts", "tsx", "md", "mdx"],
 };
 
-export default nextConfig;
+export default withNextra(nextConfig);

@@ -1,2 +1,0 @@
-export { SiteHeader } from "./navbar";
-

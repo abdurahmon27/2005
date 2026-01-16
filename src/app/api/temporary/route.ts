@@ -1,5 +1,5 @@
 /* eslint-disable no-console */
-import { getLogPage } from "@/utils/getLogPage";
+import { getLogPage } from "@/services/notion";
 import { NextResponse } from "next/server";
 
 export async function GET() {
