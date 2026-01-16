@@ -90,19 +90,19 @@ export function HeroSection() {
         >
           <Link
             href="/blog"
-            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
+            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base text-foreground hover:text-primary"
           >
             → read blog
           </Link>
           <Link
             href="/projects"
-            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
+            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base text-foreground hover:text-primary"
           >
             → view projects
           </Link>
           <Link
             href="/about"
-            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base hover:text-primary"
+            className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base text-foreground hover:text-primary"
           >
             → about me
           </Link>
