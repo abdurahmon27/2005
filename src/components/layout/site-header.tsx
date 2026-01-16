@@ -92,7 +92,7 @@ export function SiteHeader() {
           </Link>
           <Link
             href="/log"
-            className={`text-sm font-medium transition-colors flex items-center justify-center underline fira-code${
+            className={`text-sm font-medium transition-colors flex items-center justify-center underline fira-code ${
               path.includes("/log")
                 ? "text-primary"
                 : scrolled
