@@ -70,7 +70,7 @@ export default function ProjectsPage() {
             isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
           }`}
         >
-          <h1 className="text-3xl md:text-4xl font-bold mb-2 font-mono flex items-center gap-2">
+          <h1 className="text-3xl md:text-4xl font-bold mb-2 font-mono flex items-center gap-2 text-primary">
             projects
             <Image src={'/projects.jpeg'} alt="Haywan Monkey" width={32} height={32} className="rounded-md -translate-y-1" />
           </h1>
@@ -180,7 +180,7 @@ export default function ProjectsPage() {
             href="https://www.youtube.com/@bekzotovich"
             target="_blank"
             rel="noopener noreferrer"
-            className={`inline-block underline decoration-2 decoration-foreground font-mono font-bold text-sm hover:text-primary transition-colors ${
+            className={`inline-block text-foreground underline decoration-2 decoration-foreground font-mono font-bold text-sm hover:text-primary transition-colors ${
               isVisible
                 ? "translate-y-0 opacity-100"
                 : "translate-y-4 opacity-0"
