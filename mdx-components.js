@@ -1,10 +1,10 @@
-import { useMDXComponents as getDocsMDXComponents } from "nextra-theme-blog";
+import { useMDXComponents as getBlogMDXComponents } from "nextra-theme-blog";
 
-const docsComponents = getDocsMDXComponents();
+const blogComponents = getBlogMDXComponents();
 
 export function useMDXComponents(components) {
   return {
-    ...docsComponents,
+    ...blogComponents,
     ...components,
   };
 }
