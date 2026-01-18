@@ -20,61 +20,57 @@ interface DocConfig {
 }
 
 const docsConfig: Record<string, DocConfig> = {
-  "nodejs-backend": {
-    basePath: "/docs/nodejs-backend",
-    title: "Node.js Backend (O'zbek)",
+  "notes-api": {
+    basePath: "/docs/notes-api",
+    title: "Notes API yaratish",
     overviewLabel: "Umumiy",
     items: [
-      { title: "Kirish", href: "/docs/nodejs-backend" },
+      { title: "Kirish", href: "/docs/notes-api" },
       {
-        title: "Boshlash",
-        href: "/docs/nodejs-backend/boshlash",
+        title: "Kirish",
+        href: "/docs/notes-api/kirish",
         children: [
-          { title: "Backend nima?", href: "/docs/nodejs-backend/boshlash#backend-nima" },
-          { title: "O'rganish yo'li", href: "/docs/nodejs-backend/boshlash#organish-yoli" },
-          { title: "Keyingi qadamlar", href: "/docs/nodejs-backend/boshlash#keyingi-qadamlar" },
+          { title: "Nimalar kerak?", href: "/docs/notes-api/kirish#nimalar-kerak" },
+          { title: "Nima qilamiz?", href: "/docs/notes-api/kirish#nima-qilamiz" },
+          { title: "Loyihani boshlash", href: "/docs/notes-api/kirish#loyihani-boshlash" },
         ],
       },
       {
-        title: "Asoslar",
-        href: "/docs/nodejs-backend/asoslar",
+        title: "Loyiha tuzilishi",
+        href: "/docs/notes-api/loyiha-tuzilishi",
         children: [
-          { title: "HTTP asoslari", href: "/docs/nodejs-backend/asoslar#http-asoslari" },
-          { title: "REST API", href: "/docs/nodejs-backend/asoslar#rest-api" },
-          { title: "Ma'lumotlar bazasi", href: "/docs/nodejs-backend/asoslar#malumotlar-bazasi" },
-          { title: "Autentifikatsiya", href: "/docs/nodejs-backend/asoslar#autentifikatsiya" },
+          { title: "Papkalar", href: "/docs/notes-api/loyiha-tuzilishi#papkalar" },
+          { title: "Har bir papkaning vazifasi", href: "/docs/notes-api/loyiha-tuzilishi#har-bir-papkaning-vazifasi" },
+          { title: "Asosiy fayl", href: "/docs/notes-api/loyiha-tuzilishi#asosiy-fayl" },
         ],
       },
       {
-        title: "Node.js",
-        href: "/docs/nodejs-backend/nodejs",
+        title: "MongoDB",
+        href: "/docs/notes-api/mongodb",
         children: [
-          { title: "Node.js asoslari", href: "/docs/nodejs-backend/nodejs#nodejs-asoslari" },
-          { title: "Express.js", href: "/docs/nodejs-backend/nodejs#expressjs" },
-          { title: "Asinxron dasturlash", href: "/docs/nodejs-backend/nodejs#asinxron-dasturlash" },
-          { title: "Testlash", href: "/docs/nodejs-backend/nodejs#testlash" },
+          { title: "MongoDB ga ulanish", href: "/docs/notes-api/mongodb#mongodb-ga-ulanish" },
+          { title: "Model yaratish", href: "/docs/notes-api/mongodb#model-yaratish" },
+          { title: "Model bilan ishlash", href: "/docs/notes-api/mongodb#model-bilan-ishlash" },
         ],
       },
       {
-        title: "Arxitektura",
-        href: "/docs/nodejs-backend/arxitektura",
+        title: "Controller",
+        href: "/docs/notes-api/controller",
         children: [
-          { title: "Dizayn patternlari", href: "/docs/nodejs-backend/arxitektura#dizayn-patternlari" },
-          { title: "Mikroservislar", href: "/docs/nodejs-backend/arxitektura#mikroservislar" },
-          { title: "Tizim dizayni", href: "/docs/nodejs-backend/arxitektura#tizim-dizayni" },
+          { title: "Controller yaratish", href: "/docs/notes-api/controller#controller-yaratish" },
+          { title: "Har bir funksiya", href: "/docs/notes-api/controller#har-bir-funksiya-nima-qiladi" },
+          { title: "Xatolarni ushlash", href: "/docs/notes-api/controller#xatolarni-ushlash" },
         ],
       },
       {
-        title: "DevOps",
-        href: "/docs/nodejs-backend/devops",
+        title: "API",
+        href: "/docs/notes-api/api",
         children: [
-          { title: "Docker", href: "/docs/nodejs-backend/devops#docker" },
-          { title: "Kubernetes", href: "/docs/nodejs-backend/devops#kubernetes" },
-          { title: "CI/CD", href: "/docs/nodejs-backend/devops#ci-cd" },
-          { title: "Monitoring", href: "/docs/nodejs-backend/devops#monitoring" },
+          { title: "Route yaratish", href: "/docs/notes-api/api#route-yaratish" },
+          { title: "API ni tekshirish", href: "/docs/notes-api/api#api-ni-tekshirish" },
+          { title: "Xulosa", href: "/docs/notes-api/api#xulosa" },
         ],
       },
-      { title: "Resurslar", href: "/docs/nodejs-backend/resurslar" },
     ],
   },
   "example-doc": {

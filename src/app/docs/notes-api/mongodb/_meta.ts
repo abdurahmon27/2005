@@ -1,3 +1,3 @@
 export default {
-  index: "Asoslar",
+  index: "MongoDB",
 };

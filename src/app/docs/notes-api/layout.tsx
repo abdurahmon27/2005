@@ -1,11 +1,11 @@
 import { DocsLayout } from "@/components/docs";
 
 export const metadata = {
-  title: "Node.js Backend (O'zbek) | Haywan",
-  description: "Node.js yordamida backend dasturlash bo'yicha to'liq qo'llanma",
+  title: "Notes API | Haywan",
+  description: "Express.js va MongoDB bilan Notes API yaratish",
 };
 
-export default function NodejsBackendLayout({
+export default function NotesApiLayout({
   children,
 }: {
   children: React.ReactNode;

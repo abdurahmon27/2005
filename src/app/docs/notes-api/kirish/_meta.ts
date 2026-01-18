@@ -1,3 +1,3 @@
 export default {
-  index: "Node.js",
+  index: "Kirish",
 };

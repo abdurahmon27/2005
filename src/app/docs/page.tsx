@@ -4,8 +4,8 @@ import Link from "next/link";
 
 const docCollections = [
   {
-    slug: "nodejs-backend",
-    title: "Node.js Backend (O'zbek)",
+    slug: "notes-api",
+    title: "Notes API yaratish (O'zbek)",
     date: "2025/01/18",
   },
   {
