@@ -5,8 +5,9 @@ import Link from "next/link";
 import "./nextra.css";
 
 export const metadata = {
-  title: "Bekzotovich",
-  description: "MDX-based blog posts",
+  title: "Blog | Haywan",
+  description:
+    "Southpaw's Mindscape🦅",
 };
 
 export default async function BlogLayout({
@@ -20,9 +21,6 @@ export default async function BlogLayout({
     <div className="nextra-blog-container">
       <Layout>
         <Navbar pageMap={pageMap}>
-          <Link href="/" className="font-bold text-lg">
-            Bekzotovich
-          </Link>
           <Search />
         </Navbar>
         {children}

@@ -11,13 +11,9 @@ export async function GET() {
     const data = await res.json();
 
     const viewCount = data.items[0].statistics.viewCount;
-
-    // YouTube API doesn't directly provide watch time, but we can estimate it
-    // Average watch time per view is typically 40-60% of video duration
-    // For estimation, we'll use viewCount as a base metric
     const estimatedWatchTimeMinutes = Math.floor(
       parseInt(viewCount, 10) * 0.5 * 8
-    ); // Assuming 8 min average video length, 50% retention
+    );
 
     return NextResponse.json({
       watchTimeMinutes: estimatedWatchTimeMinutes,

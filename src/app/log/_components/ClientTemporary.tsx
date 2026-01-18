@@ -151,10 +151,7 @@ const TodoBlock: React.FC<BlockProps> = ({ block }) => (
 );
 
 const VideoBlock: React.FC<BlockProps> = ({ block }) => {
-  console.log("Video block:", block);
-  
   if (!block.videoUrl) {
-    console.log("No videoUrl found in block");
     return <div>Loading video...</div>;
   }
 
@@ -162,30 +159,23 @@ const VideoBlock: React.FC<BlockProps> = ({ block }) => {
   const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
 
   const getYouTubeEmbedUrl = (url: string) => {
-    console.log("Processing YouTube URL:", url);
-    // Handle different YouTube URL formats
     let videoId = "";
-    
+
     if (url.includes("youtu.be/")) {
-      // Short URL format: https://youtu.be/VIDEO_ID
       const match = url.match(/youtu\.be\/([^?&]+)/);
       videoId = match ? match[1] : "";
     } else if (url.includes("youtube.com/watch")) {
-      // Standard URL format: https://www.youtube.com/watch?v=VIDEO_ID
-      const urlParams = new URLSearchParams(url.split('?')[1]);
-      videoId = urlParams.get('v') || "";
+      const urlParams = new URLSearchParams(url.split("?")[1]);
+      videoId = urlParams.get("v") || "";
     } else if (url.includes("youtube.com/embed/")) {
-      // Embed URL format: https://www.youtube.com/embed/VIDEO_ID
       const match = url.match(/youtube\.com\/embed\/([^?&]+)/);
       videoId = match ? match[1] : "";
     }
-    
-    console.log("Extracted video ID:", videoId);
+
     return videoId ? `https://www.youtube.com/embed/${videoId}` : "";
   };
 
   const embedUrl = isYouTube ? getYouTubeEmbedUrl(url) : url;
-  console.log("Final embed URL:", embedUrl);
 
   return isYouTube ? (
     <div className="w-full flex items-center justify-center rounded-md min-h-full my-8">

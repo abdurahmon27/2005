@@ -104,7 +104,7 @@ export default function ProjectsPage() {
                   href={project.link || project.github || "#"}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all group font-mono font-bold text-base"
+                  className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all group font-mono font-bold text-base text-foreground"
                 >
                   {project.title}
                 </a>
