@@ -1,5 +1,6 @@
 "use client";
 import { HeroSection } from "@/components/home";
+import { GiscusComments } from "@/components/shared";
 import { motion } from "framer-motion";
 
 const containerVariants = {
@@ -46,6 +47,12 @@ export default function Home() {
       >
         <HeroSection />
       </motion.main>
+      <motion.div
+        className="max-w-2xl mx-auto w-full px-4 pb-12"
+        variants={childVariants}
+      >
+        <GiscusComments />
+      </motion.div>
     </motion.div>
   );
 }
