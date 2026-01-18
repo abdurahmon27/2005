@@ -38,7 +38,7 @@ export default function DonatePage() {
   return (
     <main className="max-w-5xl mx-auto py-10 px-4">
       <div className="mb-8">
-        <h1 className="text-3xl font-bold">Donate</h1>
+        <h1 className="text-3xl font-bold text-foreground">Donate</h1>
         <p className="text-muted mt-2">
           Support my work — every contribution helps.
         </p>

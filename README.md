@@ -1,3 +1,3 @@
-## I did item
+## I did it
 
-tf | 2005.uz
+tf | 2005.uz | haywan.uz | abdurahmon.tech | bekzotovich.uz | etc...
