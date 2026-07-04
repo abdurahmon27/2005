@@ -3,6 +3,7 @@
 import Link from "next/link";
 
 const posts = [
+  { slug: "ios-on-nixos", title: "I Ran My React Native Swift Code on a Real iPhone — From NixOS, Without a Mac", date: "2026/07/04" },
   { slug: "career-ladder", title: "Engineering Career Ladder & Competency Framework", date: "2026/02/04" },
   { slug: "books-and-docs", title: "Books & Docs I'm Reading", date: "2025/01/16" },
   { slug: "about", title: "About Me", date: "2025/01/16" },

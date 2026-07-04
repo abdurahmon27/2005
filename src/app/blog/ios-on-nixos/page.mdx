@@ -1,0 +1,169 @@
+---
+title: "I Ran My React Native Swift Code on a Real iPhone — From NixOS, Without a Mac"
+date: 2026/07/04
+description: How I built, signed, and installed an iOS app with custom Swift native modules on my iPhone using only a NixOS laptop, Docker, xtool, and GitHub's free macOS runners — no Mac, no paid Apple Developer account.
+tag: ios, react-native, nixos, swift, expo
+author: Bekzotovich
+---
+
+import { GiscusComments } from "@/components/shared";
+
+# I Ran My React Native Swift Code on a Real iPhone — From NixOS, Without a Mac
+
+Today my beauty-filter camera app — an Expo app with a **custom native Swift module** (Metal shaders, Vision face tracking, AVFoundation) — launched on my iPhone 14 Pro. Nothing unusual about that sentence, except that there is **no Mac anywhere in the pipeline**. The whole thing runs from my NixOS laptop with a free Apple ID.
+
+I open-sourced the complete setup here: **[github.com/abdurahmon27/ios-on-nixos](https://github.com/abdurahmon27/ios-on-nixos)** — clone it and you can do the same.
+
+This post is the story and the architecture, written for every iOS-curious developer who only has Linux — and especially for the NixOS crowd, because NixOS makes this harder in its own special ways.
+
+---
+
+## The problem
+
+Apple's position is simple: you build iOS apps on macOS, with Xcode, and if you want your app on a real device for more than a science experiment, you pay $99/year.
+
+My position was also simple: I have a NixOS laptop, an iPhone, and no interest in either buying a Mac or paying Apple to run my own code on my own phone.
+
+Between those two positions sit three separate walls:
+
+1. **The toolchain wall.** Building for iOS needs a modern Swift toolchain and the iOS SDK. The official swift.org Linux toolchains don't run on NixOS — they assume an FHS filesystem and dynamic linker paths that NixOS deliberately doesn't have. And the Swift in nixpkgs is far too old for modern iOS tooling.
+2. **The signing wall.** Even a successfully built app won't install on a device unless it's code-signed with a certificate Apple issued to you.
+3. **The React Native wall.** My app isn't a pure Swift package — it's Expo + React Native. Building its iOS project requires `xcodebuild` and CocoaPods, which genuinely only exist on macOS. No Linux toolchain will ever save you here.
+
+Each wall has a different answer. Here's all three.
+
+---
+
+## Wall 1: a Swift toolchain that works on NixOS
+
+The key discovery is [**xtool**](https://github.com/xtool-org/xtool) — an MIT-licensed, cross-platform replacement for the parts of Xcode you actually need: it builds SwiftPM-based iOS apps, manages signing certificates and provisioning profiles with a **free** Apple ID, and installs apps onto a USB-connected device from Linux.
+
+But xtool needs Swift 6.3, and — see wall 1 — that won't run natively on NixOS. Instead of fighting the dynamic linker, I put the whole toolchain in Docker:
+
+```dockerfile
+FROM swift:6.3-jammy
+
+# xtool ships as an AppImage; Docker has no FUSE, so extract it at build time
+ARG XTOOL_VERSION=1.17.0
+RUN curl -fsSL -o xtool.AppImage \
+      "https://github.com/xtool-org/xtool/releases/download/${XTOOL_VERSION}/xtool-x86_64.AppImage" \
+    && ./xtool.AppImage --appimage-extract \
+    && ...
+```
+
+The container is disposable; the state that matters (Apple ID session, the generated Darwin SDK, SwiftPM caches) lives in a named volume, and my projects are a plain bind mount I edit from the host with my normal editor.
+
+**The NixOS-specific trick** is how the container sees the iPhone. iOS devices talk over USB through a daemon called `usbmuxd`, which exposes a Unix socket. So the host runs the daemon, and the container just gets the socket:
+
+```nix
+# configuration.nix
+services.usbmuxd.enable = true;
+environment.systemPackages = with pkgs; [ libimobiledevice ];
+```
+
+```yaml
+# docker-compose.yml
+volumes:
+  - ./projects:/workspace
+  - xtool-home:/root
+  - /var/run/usbmuxd:/var/run/usbmuxd   # <- the iPhone, as far as the container knows
+```
+
+After `sudo nixos-rebuild switch`, `idevice_id -l` prints my iPhone's UDID **both on the host and inside the container**. That one bind mount is doing all the work.
+
+One-time setup inside the container is `xtool setup`: you feed it an Xcode `.xip` downloaded from Apple (free account is enough — it's only needed to extract the iOS SDK, which Apple's license doesn't allow redistributing) and log in with your Apple ID + 2FA. After that, the `.xip` can be deleted.
+
+For **pure Swift apps**, that's already the whole story:
+
+```console
+$ ./xtool-shell        # enter the container
+$ xtool new HelloIOS
+$ cd HelloIOS && xtool dev
+```
+
+…and the app is on the phone. From Linux. It honestly feels illegal the first time.
+
+---
+
+## Wall 2: signing with a free Apple ID
+
+This one xtool solves entirely. With a free Apple ID it requests a development certificate, creates an App ID, generates a provisioning profile, signs the binary, and pushes it over USB — the same dance Xcode does behind its "Personal Team" setting.
+
+The free tier has real limits, and you should know them going in:
+
+- **Apps expire after 7 days.** Re-running the install re-signs and resets the clock. Annoying, survivable.
+- Max **3 sideloaded apps** on the device at once.
+- Max **10 App IDs per 7 days** — don't churn bundle identifiers.
+
+On the phone itself: enable **Developer Mode** (Settings → Privacy & Security), and after the first install, trust your certificate (Settings → General → VPN & Device Management).
+
+---
+
+## Wall 3: React Native needs a Mac — so borrow one for free
+
+Here's where it gets interesting. My FilterCam app is Expo SDK 57 / React Native 0.86 with a custom native module. xtool **cannot** build it — xtool builds SwiftPM packages, and an RN iOS project is an `.xcworkspace` full of CocoaPods that only `xcodebuild` on macOS understands. Expo Go can't run it either (custom native code), and EAS device builds want the paid account.
+
+The escape hatch: **GitHub Actions gives every public repo free macOS runners.** So the Mac in my pipeline exists for about six minutes per build, in a data center, for free:
+
+```
+ ┌─────────────────────────┐        ┌──────────────────────────────┐
+ │  NixOS laptop           │  push  │  GitHub Actions (macos-26)   │
+ │  write TS + Swift code  │ ─────> │  expo prebuild -p ios        │
+ │                         │        │  xcodebuild …                │
+ │                         │        │    CODE_SIGNING_ALLOWED=NO   │
+ │  gh run download  <──────────────│  upload unsigned .ipa        │
+ │  xtool install .ipa     │        └──────────────────────────────┘
+ │   └─ signs w/ Apple ID  │
+ │   └─ installs over USB  │
+ └──────────┬──────────────┘
+            │ usbmuxd
+        ┌───▼────┐
+        │ iPhone │
+        └────────┘
+```
+
+The workflow's core is just "build without signing, zip the .app into an .ipa":
+
+```yaml
+- name: Build (Release, no code signing)
+  run: |
+    cd ios
+    xcodebuild -workspace FilterCam.xcworkspace -scheme FilterCam \
+      -configuration Release -sdk iphoneos \
+      CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+      build
+```
+
+Signing happens **later, on my laptop**, where my Apple ID lives. The unsigned `.ipa` comes down with `gh run download`, and xtool does the rest:
+
+```console
+$ gh run download --name FilterCam-unsigned --dir ~/ios-dev/projects
+$ ./xtool-shell xtool install /workspace/FilterCam-unsigned.ipa
+```
+
+A few hard-won details that will save you an afternoon:
+
+- **Use `macos-26` runners, not `macos-latest`.** Expo 57 needs Swift 6.2+/Xcode 26; `macos-latest` still ships older Xcode and fails with cryptic Swift version errors.
+- **xtool's certificate prompt needs a TTY.** When it asks to revoke an old cert in a non-interactive Docker run, wrap it: `printf 'y\n' | script -qec "docker compose run --rm xtool xtool install …" /dev/null`.
+- **Don't rebuild native for JS changes.** Build an `expo-dev-client` ipa once, then iterate on JavaScript over Wi-Fi with `npx expo start`. CI only needs to run when Swift/native code changes.
+
+---
+
+## The result
+
+- My phone: iPhone 14 Pro, iOS 26.3.1, connected to a NixOS 25.05 laptop over USB.
+- My app: Expo + React Native with real Swift — Metal shaders, Vision framework face tracking, a custom AVFoundation camera controller.
+- Cost: **$0**. Free Apple ID, free macOS CI minutes, open-source everything.
+- Macs owned: **0**.
+
+The full setup — Dockerfile, compose file, the NixOS module, helper scripts, and the ready-to-copy React Native CI workflow — is open source:
+
+👉 **[github.com/abdurahmon27/ios-on-nixos](https://github.com/abdurahmon27/ios-on-nixos)**
+
+If you're a Linux-only developer who assumed iOS was permanently out of reach: it isn't. It's one `usbmuxd` socket, one Docker container, and one borrowed Mac away.
+
+---
+
+## Comments
+
+<GiscusComments />
