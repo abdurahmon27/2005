@@ -21,6 +21,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
+        suppressHydrationWarning
         className={`${spaceGrotesk.variable} ${spaceGrotesk.className} ${firaCode.variable} antialiased bg-secondary`}
       >
         <div className="tv-effects-overlay"></div>
