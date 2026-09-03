@@ -91,6 +91,18 @@ export function SiteHeader() {
             blog
           </Link>
           <Link
+            href="/lab"
+            className={`text-sm font-medium transition-colors underline fira-code ${
+              path.includes("/lab")
+                ? "text-primary"
+                : scrolled
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-primary"
+            }`}
+          >
+            lab
+          </Link>
+          <Link
             href="/docs"
             className={`text-sm font-medium transition-colors underline fira-code ${
               path.includes("/docs")
@@ -195,6 +207,13 @@ export function SiteHeader() {
             onClick={() => setMobileMenuOpen(false)}
           >
             blog
+          </Link>
+          <Link
+            href="/lab"
+            className="text-base font-medium text-foreground transition-colors flex items-center"
+            onClick={() => setMobileMenuOpen(false)}
+          >
+            lab
           </Link>
           <Link
             href="/docs"
