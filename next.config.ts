@@ -19,6 +19,12 @@ const nextConfig: NextConfig = {
     minimumCacheTTL: 60,
   },
   pageExtensions: ["js", "jsx", "ts", "tsx", "md", "mdx"],
+  async redirects() {
+    return [
+      // the reading list moved into the lab, where it can keep changing
+      { source: "/blog/books-and-docs", destination: "/lab/books", permanent: true },
+    ];
+  },
 };
 
 export default withNextra(nextConfig);
