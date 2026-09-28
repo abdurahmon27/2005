@@ -20,28 +20,26 @@ export function HeroSection() {
           }`}
           style={{ transitionDelay: "100ms" }}
         >
-          <h2 className="text-lg md:text-xl mb-4 font-mono text-foreground leading-relaxed min-h-[1.5em] break-words">
-            {`a self-taught, nerd developer who loves automation`}
+          <div className="flex items-center gap-5 sm:gap-6">
             <Image
-              src={"/hero.jpeg"}
-              alt="Not me"
-              width={26}
-              height={26}
-              className="inline-block ml-2 -translate-y-1 rounded-md"
+              src="/me.jpg"
+              alt="Abdurahmon Mamadiyorov"
+              width={660}
+              height={880}
+              priority
+              className="w-44 sm:w-56 md:w-64 h-auto shrink-0 rounded-md border border-muted"
             />
-          </h2>
-        </div>
-
-        <div
-          className={`mb-8 transform transition-all duration-700 ${
-            isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
-          }`}
-          style={{ transitionDelay: "200ms" }}
-        >
-          <p className="text-sm text-muted-foreground leading-relaxed mb-4">
-            Curious by nature, driven by purpose — I do it all because
-            excellence has no single path.
-          </p>
+            <h2 className="text-lg md:text-xl font-mono text-foreground leading-relaxed break-words">
+              {`a self-taught, nerd developer who loves automation`}
+              <Image
+                src={"/hero.jpeg"}
+                alt="Not me"
+                width={26}
+                height={26}
+                className="inline-block ml-2 -translate-y-1 rounded-md"
+              />
+            </h2>
+          </div>
         </div>
 
         <div className="square-dotted-border  pt-6"></div>
@@ -101,7 +99,7 @@ export function HeroSection() {
             → view projects
           </Link>
           <Link
-            href="/about"
+            href="/blog/about"
             className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all font-mono font-bold text-base text-foreground hover:text-primary"
           >
             → about me
