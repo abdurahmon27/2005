@@ -35,19 +35,19 @@ export function HeroSection() {
               </h2>
             </div>
 
-            {/* matted frame, and the photo warms up when you look at it */}
+            {/* thin ring around the portrait; it warms up when you look at it */}
             <figure className="group shrink-0">
-              <div className="rounded-lg border border-muted p-1.5">
+              <div className="rounded-full border border-muted p-1.5">
                 <Image
                   src="/me.jpg"
                   alt="Abdurahmon Mamadiyorov"
-                  width={660}
-                  height={880}
+                  width={600}
+                  height={600}
                   priority
-                  className="w-40 sm:w-48 md:w-56 h-auto rounded-md grayscale-[0.25] contrast-[1.05] transition-[filter] duration-500 ease-out group-hover:grayscale-0"
+                  className="w-36 sm:w-44 md:w-48 aspect-square rounded-full object-cover grayscale-[0.25] contrast-[1.05] transition-[filter] duration-500 ease-out group-hover:grayscale-0"
                 />
               </div>
-              <figcaption className="mt-2 text-center font-mono text-[0.65rem] text-muted-foreground">
+              <figcaption className="mt-2.5 text-center font-mono text-[0.65rem] text-muted-foreground">
                 haywan
               </figcaption>
             </figure>
