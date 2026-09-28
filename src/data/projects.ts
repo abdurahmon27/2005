@@ -1,26 +1,26 @@
+export interface ProjectLink {
+  label: string;
+  href: string;
+}
+
 export interface Project {
   id: string;
   title: string;
   description: string;
   tags: string[];
-  link?: string;
-  github?: string;
+  links: ProjectLink[];
 }
 
 export const projects: Project[] = [
   {
-    id: "1",
-    title: "Qulay Makon",
+    id: "shoshshi",
+    title: "shoshshi",
     description:
-      "an e-commerce website for a company that provides equipment for creating accessible physical environments for people with disabilities.",
-    tags: ["Next.js", "TypeScript", "MongoDB"],
-    link: "https://qulaymakon.uz",
-  },
-  {
-    id: "2",
-    title: "IlmTown",
-    description: "Landing page for an educational center",
-    tags: ["React", "TypeScript"],
-    link: "https://ilmtown.uz",
+      "A Telegram Mini App that pairs two strangers for a live voice conversation — no text chat, and company rather than dating. You filter by age, gender and language, skip whenever you want, and swap Telegram contacts only through a mutual-consent handshake.",
+    tags: ["TypeScript", "Telegram Mini App", "WebRTC", "Fastify", "Postgres"],
+    links: [
+      { label: "@shoshshi_bot", href: "https://t.me/shoshshi_bot" },
+      { label: "shoshshi.haywan.uz", href: "https://shoshshi.haywan.uz" },
+    ],
   },
 ];

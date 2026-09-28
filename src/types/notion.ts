@@ -22,6 +22,7 @@ export interface LogPageData {
   title: string;
   route: string;
   publish_date: string;
+  updated_at?: string | null;
   tags: string[];
   thumb?: string;
   preview?: string;
