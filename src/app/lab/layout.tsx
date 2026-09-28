@@ -1,40 +1,44 @@
-import { Footer, Layout, Navbar } from "nextra-theme-blog";
-import { Search } from "nextra/components";
-import { getPageMap } from "nextra/page-map";
-import Link from "next/link";
+import { LabBacklinks, LabExplorer, LabGraphPanel, LabToc } from "@/components/lab";
+import type { BacklinkEntry } from "@/components/lab/lab-backlinks";
+import { getLabIndex } from "@/lib/lab/notes";
+
 import "./nextra.css";
+import "./lab.css";
 
 export const metadata = {
   title: "Lab | Haywan",
-  description: "Live learning logs — thinking out loud while I learn.",
+  description:
+    "A digital garden — my skills, the projects living in my head, and notes about myself.",
 };
 
-export default async function LabLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  const pageMap = await getPageMap("/lab");
+export default function LabLayout({ children }: { children: React.ReactNode }) {
+  const { tree, graph, backlinks, notes } = getLabIndex();
+  const byHref = new Map(notes.map((note) => [note.href, note]));
+
+  const backlinkEntries: Record<string, BacklinkEntry[]> = Object.fromEntries(
+    Object.entries(backlinks).map(([href, sources]) => [
+      href,
+      sources.map((source) => ({
+        href: source,
+        title: byHref.get(source)?.title ?? source,
+        description: byHref.get(source)?.description ?? "",
+      })),
+    ])
+  );
 
   return (
-    <div className="nextra-blog-container">
-      <Layout>
-        <Navbar pageMap={pageMap}>
-          <Search />
-        </Navbar>
-        {children}
-        <Footer>
-          <Link href="/">Home</Link>
-          <span> | </span>
-          <Link
-            href="https://t.me/abdurahmon_mamadiyorov"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Telegram
-          </Link>
-        </Footer>
-      </Layout>
+    <div className="dark lab-shell">
+      <div className="lab-column lab-column-left">
+        <LabExplorer tree={tree} />
+      </div>
+
+      <div className="lab-main nextra-blog-container">{children}</div>
+
+      <div className="lab-column lab-column-right">
+        <LabGraphPanel graph={graph} />
+        <LabToc />
+        <LabBacklinks entries={backlinkEntries} />
+      </div>
     </div>
   );
 }

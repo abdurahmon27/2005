@@ -19,7 +19,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    // `dark` on <html> is what mermaid (and nextra's dark styles) look for
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body
         suppressHydrationWarning
         className={`${spaceGrotesk.variable} ${spaceGrotesk.className} ${firaCode.variable} antialiased bg-secondary`}
