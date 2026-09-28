@@ -1,5 +1,6 @@
 import Link from "next/link";
 
+import { GiscusComments } from "@/components/shared";
 import { slugify, tagHref } from "@/lib/lab/slug";
 
 export type LabArticleMetadata = {
@@ -58,6 +59,11 @@ export function LabArticle({
       </header>
 
       <div className="lab-prose x:prose x:dark:prose-invert">{children}</div>
+
+      <section className="lab-comments" data-pagefind-ignore="all">
+        <h2 className="lab-section-title">comments</h2>
+        <GiscusComments />
+      </section>
     </article>
   );
 }
