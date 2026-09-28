@@ -1,140 +1,122 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { useState } from "react";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardContent,
-  CardDescription,
-  CardFooter,
-} from "@/components/ui/card";
 
-export default function DonatePage() {
+const TIRIKCHILIK = "https://tirikchilik.uz/haywan";
+const TELEGRAM = "https://t.me/abdurahmon_mamadiyorov";
+
+const CARD = {
+  number: "4278 3200 2518 8383",
+  holder: "Raxmon Mamadiyorov",
+};
+
+const TON_ADDRESS = "UQDPo_oije20mUuEBx4r4rH1KNAzFAROL9c60yQRQ6rGfC8m";
+
+function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false);
-  const [visaCopied, setVisaCopied] = useState(false);
 
-  const tonAddress = "UQDPo_oije20mUuEBx4r4rH1KNAzFAROL9c60yQRQ6rGfC8m";
-  const visaCard = {
-    number: "4278 3200 2518 8383",
-    name: "Raxmon Mamadiyorov",
-  };
-
-  async function copyToClipboard(text: string, type: "ton" | "visa") {
-    if (type === "ton") {
-      await navigator.clipboard.writeText(text);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } else if (type === "visa") {
-      await navigator.clipboard.writeText(text);
-      setVisaCopied(true);
-      setTimeout(() => setVisaCopied(false), 2000);
+    } catch {
+      // clipboard is blocked (insecure context, denied permission) — the value
+      // is selectable next to the button, so there is nothing else to do
     }
-  }
+  };
 
   return (
-    <main className="max-w-5xl mx-auto py-10 px-4">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-foreground">Donate</h1>
-        <p className="text-muted mt-2">
-          Support my work — every contribution helps.
+    <button
+      type="button"
+      onClick={copy}
+      aria-label={`Copy ${label}`}
+      className="shrink-0 font-mono text-[0.7rem] text-[#665c54] transition-colors hover:text-[#fe8019]"
+    >
+      {copied ? "copied" : "copy"}
+    </button>
+  );
+}
+
+function Row({
+  label,
+  children,
+  note,
+}: {
+  label: string;
+  children: React.ReactNode;
+  note?: string;
+}) {
+  return (
+    <div className="border-t border-[#32302f] py-5">
+      <p className="mb-2 font-mono text-[0.7rem] text-[#7c6f64]">{label}</p>
+      {children}
+      {note && <p className="mt-2 text-[0.78rem] text-[#665c54]">{note}</p>}
+    </div>
+  );
+}
+
+export default function DonatePage() {
+  return (
+    <main className="mx-auto w-full max-w-2xl px-5 py-12 sm:px-8">
+      <header className="mb-8">
+        <h1 className="mb-3 text-[clamp(1.6rem,3vw,2.1rem)] leading-tight text-[#fe8019]">
+          Donate
+        </h1>
+        <p className="text-[0.92rem] leading-relaxed text-[#928374]">
+          Everything I build is free and open. If something here saved you time —
+          or you just want to keep the lab running — any of these work.
         </p>
-      </div>
+      </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Tirikchilik.uz</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="mb-4 text-foreground">
-              Use the Tirikchilik payment link to donate with cards or mobile
-              wallets. This opens their secure checkout.
-            </p>
-            <div className="flex items-center gap-4">
-              <Button asChild variant="default">
-                <Link
-                  href="https://tirikchilik.uz/haywan"
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Open Tirikchilik.uz
-                </Link>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+      <Row label="tirikchilik" note="Cards and mobile wallets, through their checkout.">
+        <Link
+          href={TIRIKCHILIK}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-mono text-[0.9rem] text-[#83a598] underline decoration-dotted underline-offset-[3px] transition-colors hover:text-[#8ec07c]"
+        >
+          tirikchilik.uz/haywan →
+        </Link>
+      </Row>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Other options</CardTitle>
-            <CardDescription>
-              Credit cards, mobile wallets and TON
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-4">
-              <div className="p-3 rounded-md border">
-                <div className="flex items-start gap-4">
-                  <div className="flex-1">
-                    <div className="font-medium">VISA</div>
-                    <div className="text-sm text-muted">
-                      Send VISA or MasterCard payments to the card below
-                    </div>
+      <Row label="card" note={CARD.holder}>
+        <div className="flex items-center gap-4">
+          <code className="select-all font-mono text-[0.9rem] text-[#d5c4a1]">
+            {CARD.number}
+          </code>
+          <CopyButton value={CARD.number.replace(/\s/g, "")} label="card number" />
+        </div>
+      </Row>
 
-                    <div className="mt-3 flex items-center gap-3">
-                      <div className="px-3 py-2 bg-secondary rounded-md font-mono text-sm select-all">
-                        {visaCard.number} * {visaCard.name}
-                      </div>
-                      <Button
-                        variant="outline"
-                        onClick={() => copyToClipboard(visaCard.number, "visa")}
-                      >
-                        {visaCopied ? "Copied" : "Copy"}
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div className="p-3 rounded-md border">
-                <div className="flex items-start gap-4">
-                  <div className="flex-1">
-                    <div className="font-medium">TON Wallet</div>
-                    <div className="text-sm text-muted">
-                      Send TON directly to the wallet below
-                    </div>
+      <Row label="ton" note="TON network only.">
+        <div className="flex items-start gap-4">
+          <code className="min-w-0 select-all break-all font-mono text-[0.8rem] leading-relaxed text-[#d5c4a1]">
+            {TON_ADDRESS}
+          </code>
+          <CopyButton value={TON_ADDRESS} label="TON address" />
+        </div>
+      </Row>
 
-                    <div className="mt-3 flex items-center justify-between gap-3">
-                      <div className="px-3 py-2 bg-secondary rounded-md font-mono text-sm select-all">
-                        {tonAddress.slice(0, 10) + "..." + tonAddress.slice(-4)}
-                      </div>
-                      <Button
-                        variant="outline"
-                        onClick={() => copyToClipboard(tonAddress, "ton")}
-                      >
-                        {copied ? "Copied" : "Copy"}
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="mt-8 text-sm text-muted">
-        <p>
-          Questions? Reach out via{" "}
-          <Link href="/about" className="text-accent">
-            about
-          </Link>{" "}
-          page or contact on Telegram.
-        </p>
-      </div>
+      <p className="mt-8 border-t border-[#32302f] pt-6 text-[0.8rem] text-[#665c54]">
+        Questions, or another way to send it?{" "}
+        <Link
+          href={TELEGRAM}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#7c6f64] underline decoration-dotted underline-offset-[3px] hover:text-[#83a598]"
+        >
+          telegram
+        </Link>
+        {" · "}
+        <Link
+          href="/blog/about"
+          className="text-[#7c6f64] underline decoration-dotted underline-offset-[3px] hover:text-[#83a598]"
+        >
+          about
+        </Link>
+      </p>
     </main>
   );
 }

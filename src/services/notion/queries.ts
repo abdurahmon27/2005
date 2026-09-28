@@ -16,6 +16,7 @@ export interface LogPageData {
   title: string;
   route: string;
   publish_date: string;
+  updated_at?: string | null;
   tags: string[];
   thumb?: string;
   preview?: string;
@@ -58,6 +59,7 @@ export async function getLogPage(): Promise<LogPageData | null> {
       title: properties.title?.title[0]?.text.content || "Log",
       route: properties.route?.rich_text[0]?.text.content || "log",
       publish_date: properties.publish_date?.date?.start || null,
+      updated_at: pageData.last_edited_time || null,
       tags: properties.tags?.multi_select?.map((tag: any) => tag.name) || [],
       thumb: properties.thumb?.files?.[0]?.file?.url || null,
     };

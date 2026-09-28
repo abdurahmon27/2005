@@ -1,196 +1,151 @@
 "use client";
 
 import Image from "next/image";
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
+
 import { projects } from "@/data/projects";
 
+const YOUTUBE_CHANNEL = "https://www.youtube.com/@bekzotovich";
+
+type YouTubeStats = {
+  subscribers: number | null;
+  videos: number | null;
+  watchHours: number | null;
+};
+
+function format(value: number | null, loading: boolean): string {
+  if (value === null) return loading ? "…" : "—";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toString();
+}
+
 export default function ProjectsPage() {
-  const [isVisible, setIsVisible] = useState(false);
-  const [subscribers, setSubscribers] = useState<number | null>(null);
-  const [watchTimeHours, setWatchTimeHours] = useState<number | null>(null);
-  const [videoCount, setVideoCount] = useState<number | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [stats, setStats] = useState<YouTubeStats>({
+    subscribers: null,
+    videos: null,
+    watchHours: null,
+  });
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    async function fetchYouTubeData() {
+    let active = true;
+
+    async function load() {
+      const read = async (path: string) => {
+        const response = await fetch(path);
+        if (!response.ok) throw new Error(path);
+        return response.json();
+      };
+
       try {
-        const subsResponse = await fetch("/api/youtube/subscribers");
-        const subsData = await subsResponse.json();
-        setSubscribers(subsData.subscribers);
-
-        const watchTimeResponse = await fetch("/api/youtube/watch-time");
-        const watchTimeData = await watchTimeResponse.json();
-        setWatchTimeHours(watchTimeData.watchTimeHours);
-
-        const videosResponse = await fetch("/api/youtube/videos");
-        const videosData = await videosResponse.json();
-        setVideoCount(videosData.videoCount);
-      } catch (error) {
-        console.error("Failed to fetch YouTube data:", error);
+        const [subs, videos, watchTime] = await Promise.all([
+          read("/api/youtube/subscribers"),
+          read("/api/youtube/videos"),
+          read("/api/youtube/watch-time"),
+        ]);
+        if (!active) return;
+        setStats({
+          subscribers: subs.subscribers ?? null,
+          videos: videos.videoCount ?? null,
+          watchHours: watchTime.watchTimeHours ?? null,
+        });
+      } catch {
+        // the channel stats are a nice-to-have; the page works without them
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     }
 
-    fetchYouTubeData();
+    load();
+    return () => {
+      active = false;
+    };
   }, []);
 
-  useEffect(() => {
-    setIsVisible(true);
-  }, []);
-
-  const formatNumber = (num: number | null): string => {
-    if (num === null) return loading ? "..." : "0";
-    if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
-    if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
-    return num.toString();
-  };
-
-  const stats = [
-    {
-      label: "Subscribers",
-      value: formatNumber(subscribers),
-    },
-    {
-      label: "Videos",
-      value: formatNumber(videoCount),
-    },
-    {
-      label: "Watch Time (Hours)",
-      value: formatNumber(watchTimeHours),
-    },
+  const numbers = [
+    { label: "subscribers", value: format(stats.subscribers, loading) },
+    { label: "videos", value: format(stats.videos, loading) },
+    { label: "hours watched", value: format(stats.watchHours, loading) },
   ];
 
   return (
-    <div className="min-h-screen py-12 md:py-16 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-2xl mx-auto">
-        {/* Header */}
-        <div
-          className={`mb-10  pb-6 transform transition-all duration-700 ${
-            isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
-          }`}
-        >
-          <h1 className="text-3xl md:text-4xl font-bold mb-2 font-mono flex items-center gap-2 text-primary">
-            projects
-            <Image src={'/projects.jpeg'} alt="Haywan Monkey" width={32} height={32} className="rounded-md -translate-y-1" />
-          </h1>
-          <p className="text-sm text-muted-foreground font-mono">
-            things i&apos;ve built and shipped
+    <main className="mx-auto w-full max-w-2xl px-5 py-12 sm:px-8">
+      <header className="mb-8">
+        <h1 className="mb-3 flex items-center gap-2.5 text-[clamp(1.6rem,3vw,2.1rem)] leading-tight text-[#fe8019]">
+          Projects
+          <Image
+            src="/projects.jpeg"
+            alt="Haywan Monkey"
+            width={28}
+            height={28}
+            className="rounded-md"
+          />
+        </h1>
+        <p className="text-[0.92rem] leading-relaxed text-[#928374]">
+          Things I&apos;ve built and shipped.
+        </p>
+      </header>
+
+      {projects.map((project) => (
+        <article key={project.id} className="border-t border-[#32302f] py-5">
+          <h2 className="mb-2 font-mono text-[0.95rem] text-[#d5c4a1]">
+            {project.title}
+          </h2>
+          <p className="mb-3 text-[0.88rem] leading-[1.7] text-[#928374]">
+            {project.description}
           </p>
-        </div>
-
-        <div className="my-8 flex items-center">
-          <div className="flex-1 border-t border-muted"></div>
-          <div className="px-4">
-            <span className="text-muted text-sm">• • •</span>
-          </div>
-          <div className="flex-1 border-t border-muted"></div>
-        </div>
-
-        {/* Projects List */}
-        <div className="space-y-4 mb-16">
-          {projects.map((project, index) => (
-            <div
-              key={project.id}
-              className={`transform transition-all duration-700 ${
-                isVisible
-                  ? "translate-y-0 opacity-100"
-                  : "translate-y-4 opacity-0"
-              }`}
-              style={{ transitionDelay: `${index * 50}ms` }}
-            >
-              <div className="space-y-1">
-                <a
-                  href={project.link || project.github || "#"}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-block underline decoration-2 decoration-foreground/30 hover:decoration-foreground transition-all group font-mono font-bold text-base text-foreground"
-                >
-                  {project.title}
-                </a>
-                <p className="text-sm text-muted-foreground leading-relaxed">
-                  {project.description}
-                </p>
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {project.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      className="text-xs font-mono text-muted-foreground hover:text-foreground transition-colors cursor-default"
-                    >
-                      #{tag}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="my-8 flex items-center">
-          <div className="flex-1 border-t border-muted"></div>
-          <div className="px-4">
-            <span className="text-muted text-sm">• • •</span>
-          </div>
-          <div className="flex-1 border-t border-muted"></div>
-        </div>
-
-        {/* You Section - YouTube */}
-        <div
-          className={`transform transition-all duration-1000 ${
-            isVisible ? "translate-y-0 opacity-100" : "translate-y-8 opacity-0"
-          }`}
-          style={{ transitionDelay: "500ms" }}
-        >
-          <div className="mb-8">
-            <pre className="font-mono text-xs mb-3 text-muted-foreground">
-              {`┌─────────────────────┐
-│  ▶ YOU / YOUTUBE    │
-└─────────────────────┘`}
-            </pre>
-            <p className="text-sm text-muted-foreground font-mono">
-              tech content, tutorials, and coding tips
-            </p>
-          </div>
-
-          {/* Stats */}
-          <div className="grid grid-cols-3 gap-4 mb-8">
-            {stats.map((stat, index) => (
-              <div
-                key={stat.label}
-                className={`transform transition-all duration-700 ${
-                  isVisible
-                    ? "translate-y-0 opacity-100"
-                    : "translate-y-4 opacity-0"
-                }`}
-                style={{ transitionDelay: `${600 + index * 100}ms` }}
+          <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1">
+            {project.links.map((link) => (
+              <a
+                key={link.href}
+                href={link.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-[0.78rem] text-[#83a598] underline decoration-dotted underline-offset-[3px] transition-colors hover:text-[#8ec07c]"
               >
-                <p className="text-xs text-muted-foreground font-mono uppercase tracking-wider mb-2">
-                  {stat.label}
-                </p>
-                <p className="text-2xl font-bold font-mono text-foreground">
-                  {stat.value}
-                </p>
-                <div className="w-full h-px bg-border mt-2" />
-              </div>
+                {link.label} →
+              </a>
             ))}
           </div>
+          <div className="flex flex-wrap gap-x-3 gap-y-1">
+            {project.tags.map((tag) => (
+              <span key={tag} className="font-mono text-[0.7rem] text-[#665c54]">
+                #{tag.toLowerCase().replace(/\s+/g, "-")}
+              </span>
+            ))}
+          </div>
+        </article>
+      ))}
 
-          {/* Call to Action */}
-          <a
-            href="https://www.youtube.com/@bekzotovich"
-            target="_blank"
-            rel="noopener noreferrer"
-            className={`inline-block text-foreground underline decoration-2 decoration-foreground font-mono font-bold text-sm hover:text-primary transition-colors ${
-              isVisible
-                ? "translate-y-0 opacity-100"
-                : "translate-y-4 opacity-0"
-            }`}
-            style={{ transitionDelay: "900ms" }}
-          >
-            → youtube.com/@bekzotovich
-          </a>
-        </div>
-      </div>
-    </div>
+      <section className="border-t border-[#32302f] py-5">
+        <h2 className="mb-2 font-mono text-[0.95rem] text-[#d5c4a1]">youtube</h2>
+        <p className="mb-4 text-[0.88rem] leading-[1.7] text-[#928374]">
+          Tech content, tutorials and coding tips.
+        </p>
+
+        <dl className="mb-3 flex flex-wrap gap-x-8 gap-y-2">
+          {numbers.map((item) => (
+            <div key={item.label}>
+              <dd className="font-mono text-[1.05rem] text-[#d5c4a1]">
+                {item.value}
+              </dd>
+              <dt className="font-mono text-[0.68rem] text-[#665c54]">
+                {item.label}
+              </dt>
+            </div>
+          ))}
+        </dl>
+
+        <a
+          href={YOUTUBE_CHANNEL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-mono text-[0.78rem] text-[#83a598] underline decoration-dotted underline-offset-[3px] transition-colors hover:text-[#8ec07c]"
+        >
+          youtube.com/@bekzotovich →
+        </a>
+      </section>
+    </main>
   );
 }

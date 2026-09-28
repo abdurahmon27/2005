@@ -1,9 +1,12 @@
-"use client";
+import type { Metadata } from "next";
 
-import { BlogPage } from "@/components/blog";
+import { LogView } from "./_components/log-view";
 
-const LogPage = () => {
-  return <BlogPage slug="log" />;
+export const metadata: Metadata = {
+  title: "Log | Haywan",
+  description: "A running log — written in Notion, rendered here.",
 };
 
-export default LogPage;
+export default function LogPage() {
+  return <LogView />;
+}
