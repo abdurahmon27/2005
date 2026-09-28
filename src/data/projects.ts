@@ -13,6 +13,16 @@ export interface Project {
 
 export const projects: Project[] = [
   {
+    id: "yamu",
+    title: "yamu",
+    description:
+      "Yandex Music has no public API and its endpoints refuse cross-origin calls, so nobody could put their playlist on a portfolio the way Spotify users do. yamu collects the data in a scheduled GitHub Action inside your own repository and commits it as static JSON and an SVG card — no hosted service, and nobody's token is stored anywhere but their own repo.",
+    tags: ["TypeScript", "GitHub Action", "SVG", "Open Source"],
+    links: [
+      { label: "github.com/abdurahmon27/yamu", href: "https://github.com/abdurahmon27/yamu" },
+    ],
+  },
+  {
     id: "shoshshi",
     title: "shoshshi",
     description:

@@ -3,6 +3,7 @@ import Link from "next/link";
 import { useState, useEffect } from "react";
 import Image from "next/image";
 import { achievements } from "@/data/achievements";
+import { Listening } from "./listening";
 
 export function HeroSection() {
   const [isVisible, setIsVisible] = useState(false);
@@ -125,6 +126,15 @@ export function HeroSection() {
               </span>
             ))}
           </div>
+        </div>
+
+        <div
+          className={`mt-10 transform transition-all duration-700 ${
+            isVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+          }`}
+          style={{ transitionDelay: "700ms" }}
+        >
+          <Listening limit={5} />
         </div>
       </div>
     </section>
