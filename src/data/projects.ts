@@ -16,7 +16,7 @@ export const projects: Project[] = [
     id: "yamu",
     title: "yamu",
     description:
-      "Yandex Music has no public API and its endpoints refuse cross-origin calls, so nobody could put their playlist on a portfolio the way Spotify users do. yamu collects the data in a scheduled GitHub Action inside your own repository and commits it as static JSON and an SVG card — no hosted service, and nobody's token is stored anywhere but their own repo.",
+      "Yandex Music has no public API and its endpoints refuse cross-origin calls, so nobody could put their playlist on a portfolio the way Spotify users do. yamu collects it in a scheduled GitHub Action inside your own repository and commits static JSON and an SVG card. The whole setup is one playlist link — no login, no token, no hosted service, and nothing of yours stored anywhere but your own repo. The playlist on my home page is the first thing using it.",
     tags: ["TypeScript", "GitHub Action", "SVG", "Open Source"],
     links: [
       { label: "github.com/abdurahmon27/yamu", href: "https://github.com/abdurahmon27/yamu" },
