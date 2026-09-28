@@ -2,7 +2,10 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect } from "react";
-import { SquareArrowOutUpRight } from "lucide-react";
+import { Github, SquareArrowOutUpRight } from "lucide-react";
+
+/** This site's own source, linked from the nav. */
+const SOURCE_REPO = "https://github.com/abdurahmon27/2005";
 
 export function SiteHeader() {
   const [scrolled, setScrolled] = useState(false);
@@ -103,18 +106,6 @@ export function SiteHeader() {
             lab
           </Link>
           <Link
-            href="/docs"
-            className={`text-sm font-medium transition-colors underline fira-code ${
-              path.includes("/docs")
-                ? "text-primary"
-                : scrolled
-                ? "text-foreground"
-                : "text-muted-foreground hover:text-primary"
-            }`}
-          >
-            docs
-          </Link>
-          <Link
             href="/log"
             className={`text-sm font-medium transition-colors flex items-center justify-center underline fira-code ${
               path.includes("/log")
@@ -158,6 +149,20 @@ export function SiteHeader() {
             }`}
           >
             @gopher
+          </Link>
+          <Link
+            href={SOURCE_REPO}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Source code of this site on GitHub"
+            title="source of this site"
+            className={`transition-colors ${
+              scrolled
+                ? "text-foreground hover:text-primary"
+                : "text-muted-foreground hover:text-primary"
+            }`}
+          >
+            <Github className="h-4 w-4" aria-hidden="true" />
           </Link>
         </nav>
 
@@ -216,13 +221,6 @@ export function SiteHeader() {
             lab
           </Link>
           <Link
-            href="/docs"
-            className="text-base font-medium text-foreground transition-colors flex items-center"
-            onClick={() => setMobileMenuOpen(false)}
-          >
-            docs
-          </Link>
-          <Link
             href="/log"
             className="text-base font-medium text-foreground transition-colors flex items-center gap-1"
             onClick={() => setMobileMenuOpen(false)}
@@ -257,6 +255,16 @@ export function SiteHeader() {
               className="inline-block h-4 w-4"
               aria-hidden="true"
             />
+          </Link>
+          <Link
+            href={SOURCE_REPO}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-base font-medium text-foreground transition-colors flex items-center gap-2"
+            onClick={() => setMobileMenuOpen(false)}
+          >
+            <Github className="h-4 w-4" aria-hidden="true" />
+            source
           </Link>
         </nav>
       </div>
