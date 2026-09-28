@@ -21,25 +21,36 @@ export function HeroSection() {
           }`}
           style={{ transitionDelay: "100ms" }}
         >
-          <div className="flex items-center gap-5 sm:gap-6">
-            <Image
-              src="/me.jpg"
-              alt="Abdurahmon Mamadiyorov"
-              width={660}
-              height={880}
-              priority
-              className="w-44 sm:w-56 md:w-64 h-auto shrink-0 rounded-md border border-muted"
-            />
-            <h2 className="text-lg md:text-xl font-mono text-foreground leading-relaxed break-words">
-              {`a self-taught, nerd developer who loves automation`}
-              <Image
-                src={"/hero.jpeg"}
-                alt="Not me"
-                width={26}
-                height={26}
-                className="inline-block ml-2 -translate-y-1 rounded-md"
-              />
-            </h2>
+          <div className="flex flex-col-reverse items-start gap-6 sm:flex-row sm:items-center sm:gap-8">
+            <div className="flex-1 max-w-sm">
+              <h2 className="text-lg md:text-xl font-mono text-foreground leading-relaxed break-words">
+                {`a self-taught, nerd developer who loves automation`}
+                <Image
+                  src={"/hero.jpeg"}
+                  alt="Not me"
+                  width={26}
+                  height={26}
+                  className="inline-block ml-2 -translate-y-1 rounded-md"
+                />
+              </h2>
+            </div>
+
+            {/* matted frame, and the photo warms up when you look at it */}
+            <figure className="group shrink-0">
+              <div className="rounded-lg border border-muted p-1.5">
+                <Image
+                  src="/me.jpg"
+                  alt="Abdurahmon Mamadiyorov"
+                  width={660}
+                  height={880}
+                  priority
+                  className="w-40 sm:w-48 md:w-56 h-auto rounded-md grayscale-[0.25] contrast-[1.05] transition-[filter] duration-500 ease-out group-hover:grayscale-0"
+                />
+              </div>
+              <figcaption className="mt-2 text-center font-mono text-[0.65rem] text-muted-foreground">
+                haywan
+              </figcaption>
+            </figure>
           </div>
         </div>
 
