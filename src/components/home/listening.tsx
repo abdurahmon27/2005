@@ -1,39 +1,72 @@
+"use client";
 import Link from "next/link";
+import useSWR from "swr";
+import { formatDistanceToNowStrict } from "date-fns";
 
-import music from "@/data/music.json";
-
-/** ms -> m:ss, the way a player shows it. */
-function duration(ms: number): string {
-  const total = Math.floor(ms / 1000);
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+interface Track {
+  title: string;
+  artist: string;
+  album: string;
+  url: string;
+  nowPlaying: boolean;
+  playedAt: number | null;
 }
 
+interface Recent {
+  user: string;
+  profileUrl: string;
+  scrobbles: number;
+  tracks: Track[];
+}
+
+const fetcher = async (url: string): Promise<Recent> => {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`last.fm route answered ${res.status}`);
+  return res.json();
+};
+
 /**
- * The playlist is read from a JSON file that a scheduled workflow refreshes
- * with yamu — nothing is fetched while the page is open.
+ * What last.fm has scrobbled most recently, with the track that is playing
+ * right now on top. Renders nothing until there is something to show, so a
+ * missing key or a last.fm outage costs this block and not the page.
  */
 export function Listening({ limit = 5 }: { limit?: number }) {
-  const playlist = music.playlist;
-  if (!playlist || playlist.tracks.length === 0) return null;
+  const { data } = useSWR<Recent>(`/api/lastfm?limit=${limit}`, fetcher, {
+    refreshInterval: 60_000,
+    shouldRetryOnError: false,
+  });
+
+  if (!data || data.tracks.length === 0) return null;
 
   return (
     <div>
       <p className="mb-3 font-mono text-xs text-muted-foreground">listening:</p>
 
       <ul className="space-y-1.5">
-        {playlist.tracks.slice(0, limit).map((track) => (
-          <li key={track.id} className="flex items-baseline gap-3 text-sm">
+        {data.tracks.map((track) => (
+          <li
+            key={`${track.url}-${track.playedAt ?? "now"}`}
+            className="flex items-baseline gap-3 text-sm"
+          >
             <Link
-              href={track.url ?? playlist.url}
+              href={track.url}
               target="_blank"
               rel="noopener noreferrer"
               className="truncate text-foreground transition-colors hover:text-primary"
             >
               {track.title}
-              <span className="text-muted-foreground"> — {track.artists}</span>
+              <span className="text-muted-foreground"> — {track.artist}</span>
             </Link>
-            <span className="ml-auto shrink-0 font-mono text-xs text-muted-foreground">
-              {duration(track.durationMs)}
+            <span
+              className={`ml-auto shrink-0 font-mono text-xs ${
+                track.nowPlaying ? "text-primary" : "text-muted-foreground"
+              }`}
+            >
+              {track.nowPlaying
+                ? "now"
+                : track.playedAt
+                  ? formatDistanceToNowStrict(track.playedAt, { addSuffix: true })
+                  : ""}
             </span>
           </li>
         ))}
@@ -41,21 +74,12 @@ export function Listening({ limit = 5 }: { limit?: number }) {
 
       <p className="mt-3 font-mono text-xs text-muted-foreground">
         <Link
-          href={playlist.url}
+          href={data.profileUrl}
           target="_blank"
           rel="noopener noreferrer"
           className="underline decoration-foreground/30 transition-colors hover:text-primary"
         >
-          {playlist.trackCount} tracks on yandex music
-        </Link>
-        {" · built with "}
-        <Link
-          href="https://github.com/abdurahmon27/yamu"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="underline decoration-foreground/30 transition-colors hover:text-primary"
-        >
-          yamu
+          {data.scrobbles.toLocaleString("en-US")} scrobbles on last.fm
         </Link>
       </p>
     </div>

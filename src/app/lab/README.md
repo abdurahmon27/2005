@@ -46,6 +46,9 @@ import { LabNoteList } from "@/components/lab/lab-note-list";
 
 `folder`, `tag`, `limit` and `showDescription` are all optional.
 
+`<YamuPlaylist limit={6} />` from `@/components/lab/yamu-playlist` renders the
+playlist in `src/data/music.json` — the exhibit on the yamu note.
+
 ## Layout pieces
 
 | File | Role |
