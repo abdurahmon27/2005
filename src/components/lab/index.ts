@@ -5,3 +5,4 @@ export { LabGraph } from "./lab-graph";
 export { LabGraphPanel } from "./lab-graph-panel";
 export { LabNoteList } from "./lab-note-list";
 export { LabToc } from "./lab-toc";
+export { YamuPlaylist } from "./yamu-playlist";
