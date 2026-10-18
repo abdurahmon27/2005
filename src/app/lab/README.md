@@ -23,7 +23,9 @@ Body starts here — no `# Title`, the layout renders the title from frontmatter
 ```
 
 `lab: true` is what switches the MDX wrapper to the garden layout, so don't
-forget it. Folders become folders in the explorer; a folder can have its own
+forget it. An optional `order: 1` makes the explorer list notes (and folders,
+via their index note) in that order instead of newest first — that's how the
+Arabic course keeps its lessons in walking order. Folders become folders in the explorer; a folder can have its own
 index note at `<folder>/page.mdx`.
 
 ## Links, graph and tags
