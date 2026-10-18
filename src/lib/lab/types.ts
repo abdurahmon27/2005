@@ -17,6 +17,8 @@ export type LabNote = {
   /** Sortable value derived from `date`, 0 when undated. */
   timestamp: number;
   description: string;
+  /** Optional `order:` from frontmatter — a course walks in this order instead of by date. */
+  order: number | null;
   tags: string[];
   words: number;
   readingMinutes: number;

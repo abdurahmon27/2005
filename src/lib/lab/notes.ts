@@ -126,6 +126,11 @@ function extractOutgoing(body: string, selfSlug: string): string[] {
   return [...found];
 }
 
+function readOrder(data: Frontmatter): number | null {
+  const value = Number.parseFloat(asString(data.order));
+  return Number.isFinite(value) ? value : null;
+}
+
 function parseTimestamp(date: string): number {
   if (!date) return 0;
   const value = Date.parse(date.replace(/\//g, "-"));
@@ -173,6 +178,7 @@ function readNote(segments: string[]): LabNote | null {
     date: asString(data.date) || null,
     timestamp: parseTimestamp(asString(data.date)),
     description: asString(data.description),
+    order: readOrder(data),
     tags: readTags(data),
     words,
     readingMinutes: Math.max(1, Math.round(words / WORDS_PER_MINUTE)),
@@ -226,11 +232,15 @@ function buildTree(notes: LabNote[]): LabTreeItem[] {
   const sort = (items: LabTreeItem[]): LabTreeItem[] => {
     const sorted = [...items].sort((a, b) => {
       if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+      const noteA = a.note;
+      const noteB = b.note;
+      // notes (and folders whose index note) carry `order:` walk in that order
+      if (noteA?.order != null && noteB?.order != null && noteA.order !== noteB.order) {
+        return noteA.order - noteB.order;
+      }
       if (a.type === "folder" && b.type === "folder") {
         return a.name.localeCompare(b.name);
       }
-      const noteA = a.type === "note" ? a.note : null;
-      const noteB = b.type === "note" ? b.note : null;
       if (!noteA || !noteB) return 0;
       if (noteA.timestamp !== noteB.timestamp) {
         return noteB.timestamp - noteA.timestamp;
