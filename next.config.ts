@@ -26,6 +26,12 @@ const nextConfig: NextConfig = {
       "@theguild/remark-mermaid/mermaid": "./src/components/lab/mermaid.tsx",
     },
   },
+  async rewrites() {
+    return [
+      // Timber is a static build in public/timber/play; Next serves no index.html for a folder by itself
+      { source: "/timber/play", destination: "/timber/play/index.html" },
+    ];
+  },
   async redirects() {
     return [
       // the reading list moved into the lab, where it can keep changing
