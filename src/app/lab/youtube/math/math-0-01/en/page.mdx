@@ -1,0 +1,1118 @@
+---
+title: "How much math does an engineer need? An honest map"
+date: "2026/11/26"
+description: "We compute p99 latency and an A/B test with percents and powers, check them with a Go simulation, then map six modules: who needs which part."
+tag: "youtube, math, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/math/math-0-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/math/math-0-01"
+    ru: "https://www.haywan.uz/lab/youtube/math/math-0-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/math/math-0-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/math/math-0-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/math/math-0-01) · [Русский](/lab/youtube/math/math-0-01/ru) · **English**  
+Lesson MATH-0.01 · [Muhandislar uchun matematika](/lab/youtube/math#math-0-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/math-01-map)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Each of your services answers 99 requests out of 100 in under a second. Even so, 63 % of pages take longer than a
+second to load. How? A second question: you changed a button, and purchases went up 10 %. Is that a win or noise?
+Today we answer both questions with a Go simulation and a calculation by hand.
+
+**One idea:** a little math (percents and powers) changes an engineering decision. Mean latency hides the tail, and a
+small A/B test shows noise as a win. In this track every topic comes with one picture, one hand calculation and one
+piece of code. The calculation and the code must agree, and only a real measurement checks the assumption.
+
+By the end of the lesson you will:
+
+- compute by hand, with `1 − 0.99ᴺ`, the share of slow pages when a page sends N requests in parallel, and know when
+  this formula does not work;
+- compare releases by p50 and p99, not by the mean;
+- judge with the standard error whether a difference in an A/B test is noise, and find the needed group size with
+  `n = 16σ²/Δ²`;
+- know which of the six modules of the Math for Engineers track you need, and what you can skip.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| p99 | the time that 99 % of requests are faster than or equal to. The slowest 1 % beyond it is the **tail** | percentile, tail |
+| independent events | one of them happening does not change the probability of the other; then the probabilities multiply | independent events |
+| standard error | the size of random noise: how much the result usually moves if you repeat the same experiment | standard error |
+
+There are two helper words too. An **A/A test** is a test where both groups see exactly the same thing: any "win" in
+it is noise. A **z-test** is a rule: divide the difference by the standard error and say "there is a difference" if
+the result is above 1.96.
+
+## Before you start
+
+This is the first lesson of the Math for Engineers track: there is no math lesson before it. Today's calculations need
+only percents and powers (`0.99¹⁰⁰` is 0.99 multiplied by itself 100 times). The code is in Go, and it builds on these
+Go lessons:
+
+- [GO-1.06 · Funksiyalar: ikki qiymat qaytarish, closure va variadic](/lab/youtube/go/go-1-06/en): the `mediana` function (the
+  middle of a list of server response times), passing a function as a value, and closures.
+- [GO-1.07 · Taxmin qilmang, oʻlchang: birinchi test va benchmark](/lab/youtube/go/go-1-07/en): `benchstat` and the question "is the
+  difference real or random". Today's A/B test is the same question.
+- [GO-1.05 · Go'da while yoʻq: bitta for va uning hamma shakllari](/lab/youtube/go/go-1-05/en): `for range N` (repeat N times)
+  and `for _, n := range []int{…}`.
+- [GO-1.08 · Slice'lar: append tuzogʻi va eskirgan 1024 qoidasi](/lab/youtube/go/go-1-08/en): `make([]float64, n)`.
+- [GO-1.10 · Struct'lar va xotira: bir xil maydonlar, 24 va 16 bayt](/lab/youtube/go/go-1-10/en): `struct`.
+- [GO-1.22 · WaitGroup.Go, Mutex va -race: birinchi data race](/lab/youtube/go#go-1-22): `wg.Go` and `sync.Mutex`. They appear
+  only inside `abtest`, to make it faster. The math of this lesson is clear without them.
+
+**How to run the code.** The four programs are in the course folder (`lessons/math-01-map`), each in its own folder:
+`fanout/`, `latency/`, `abtest/`, `homework/`. Open a terminal in that folder and run them like `go run ./fanout`.
+All programs use only the standard library. But `fanout` and `abtest` take a command-line argument
+(`go run ./fanout 10`), so it is easiest to run them in the course folder. Our computer has no C compiler (gcc), so
+every command was run with `CGO_ENABLED=0`. It makes no difference for these programs.
+
+**The video's numbers and ours.** Every random number comes from a `math/rand/v2` generator with a fixed *seed*. The
+seed is the generator's starting value: if it is the same, the sequence of "random" numbers is the same every time.
+So every result on this page is **identical, digit for digit,** to the video: we re-ran everything on the evening of
+2026-11-26 and compared. Only the run time changes: `go run ./abtest 30400` took ~0.7 s in the research and 0.65 s
+for us. In this lesson the shares matter, not the times, and the shares do not change.
+
+A question from GO-1.06. The `mediana` function in that lesson found the middle of server response times. The times
+are 10, 50 and 90 ms. Now the 90 ms request becomes 9000 ms. How do the median and the mean change?
+
+**A)** both grow about 100 times · **B)** the median stays at 50 ms, the mean grows from 50 to 3020 ms ·
+**C)** the median grows, the mean barely changes
+
+<details>
+<summary>Answer</summary>
+
+**B.** The sorted list is `[10 50 9000]`, and its middle is still 50. The mean is (10 + 50 + 9000) / 3 = 3020 ms. One
+slow request made the mean 60 times larger and did not move the median. One number does not show the shape of a
+distribution: today we will also see the opposite — the mean looks *good* while the tail is bad. If you chose "A", you
+thought the median, like the mean, looks at every value.
+
+</details>
+
+## A page with 100 requests: how 1 % becomes 63 %
+
+For one user request, a page (or an API gateway) sends 100 requests to internal services in parallel and waits for
+all the answers. In the frontend this is `await Promise.all([...])`, in Python `asyncio.gather(...)`. The time of a
+parallel wait equals the time of the slowest answer. Let us check it in JS (this file is not in the course folder; we
+wrote it for this page):
+
+```js
+const sorov = (ms) => new Promise((ok) => setTimeout(() => ok(ms), ms));
+const boshi = performance.now();
+await Promise.all([sorov(10), sorov(20), sorov(1000)]);
+console.log(`sahifa: ${Math.round(performance.now() - boshi)} ms`);
+```
+
+```console
+$ node fanout.mjs
+sahifa: 1001 ms
+```
+
+Three requests: 10, 20 and 1000 ms. The page ("sahifa") waited 1001 ms (1000 ms on a second run, Node 24.10). The
+two fast requests did not help: the page waits for **the slowest one**.
+
+```text
+       ┌─ request 1:   23 ms ─┐
+       ├─ request 2:   41 ms ─┤
+page ──┼─ request 3: 1730 ms ─┼──▶ page ready: max(...) = 1730 ms
+       ├─    …                │
+       └─ request 100: 17 ms ─┘
+```
+
+Now our model. Each request answers in 10–50 ms in 99 cases out of 100, and in 1–3 seconds in 1 case out of 100. The
+page sends 100 such requests.
+
+Predict: what share of pages takes longer than a second?
+
+**A)** ~1 % · **B)** ~10 % · **C)** ~63 %
+
+<details>
+<summary>Answer</summary>
+
+**C.** The Go simulation counted 100,000 pages:
+
+```console
+$ go run ./fanout
+so'rovlar: 1 s dan sekini  1.00 %
+sahifalar (100 so'rovli): 1 s dan sekini 63.5 %
+qo'lda hisob: 1 - 0.99^100 = 63.4 %
+```
+
+1.00 % of requests ("so'rovlar") are slow, but 63.5 % of pages ("sahifalar") are. The last line is the hand
+calculation ("qo'lda hisob"). If you chose "A", you counted the page as one request. But a page has 100 requests, and
+it is enough for *one* of them to be slow. "B" is too low as well: it is hard for none of 100 draws to hit a 1 %
+chance of bad luck.
+
+</details>
+
+### By hand: why the probabilities multiply
+
+The probability that one request is fast is 0.99. If the requests do not depend on each other, that is, if they are
+**independent**, the probability of "all fast" equals the product of the single probabilities (Stanford CS109,
+*Independence*):
+
+| Step | Calculation | Result |
+|---|---|---|
+| 1 request fast | 0.99 | 99 % |
+| 2 requests fast too | 0.99 · 0.99 = 0.99² | 98.0 % |
+| all 100 requests fast | 0.99¹⁰⁰ | ≈ 0.366, that is ~37 % |
+| at least one slow | 1 − 0.99¹⁰⁰ | ≈ 0.634, that is **63.4 %** |
+
+In Python, in one line:
+
+```console
+$ python3 -c "print(1 - 0.99**100)"
+0.6339676587267709
+```
+
+The simulation gives 63.5 %, the formula 63.4 %: the difference is chance. This example comes from a paper by Google
+engineers Jeff Dean and Luiz Barroso (*The Tail at Scale*, CACM 2013, p. 76): "If a user request must collect
+responses from 100 such servers in parallel, then 63% of user requests will take more than one second".
+
+**An important condition: independence.** In real systems slowness is often correlated. One GC pause
+(the garbage collector briefly stops the program) or one congested switch slows down several requests together. Dean and Barroso
+also list garbage collection and shared resources among the causes of slowness. Our code is also written with the
+independence assumption. So when the code and the formula agree, that only checks the arithmetic: the formula shows
+the direction, and only a real measurement checks the assumption. We measure what happens when slowness is
+correlated in the "Common mistakes" section.
+
+## The code: the `fanout` simulation
+
+The program is very simple: the `sorov` ("request") function returns the time of one request, the inner loop finds
+the slowest of 100 requests, and the outer loop repeats this for 100,000 pages.
+
+```go filename="fanout/main.go" showLineNumbers
+// fanout: bitta sahifa N ta so'rovni parallel yuboradi va eng sekin javobni kutadi.
+// Har bir so'rov yuztadan bitta holatda 1 soniyadan sekin. Sahifalarning qanchasi sekin?
+// So'rovlar bir-biriga bog'liq emas (mustaqil) deb olinadi: hayotda bu har doim ham rost emas.
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"os"
+	"strconv"
+)
+
+const sahifalar = 100_000
+
+// sorov: 99 % hollarda 10..50 ms, 1 % hollarda 1..3 soniya.
+func sorov(r *rand.Rand) float64 {
+	if r.Float64() < 0.01 {
+		return 1000 + 2000*r.Float64()
+	}
+	return 10 + 40*r.Float64()
+}
+
+func main() {
+	N := 100
+	if len(os.Args) > 1 {
+		if os.Args[1] == "jadval" { // 1 - 0.99^N, turli N uchun
+			for _, n := range []int{1, 10, 20, 50, 100, 200, 500} {
+				fmt.Printf("N = %3d: %5.1f %% sahifa sekin\n", n, 100*(1-math.Pow(0.99, float64(n))))
+			}
+			return
+		}
+		n, err := strconv.Atoi(os.Args[1])
+		if err != nil || n < 1 {
+			fmt.Fprintln(os.Stderr, "foydalanish: go run ./fanout [N >= 1 | jadval]")
+			os.Exit(2)
+		}
+		N = n
+	}
+	r := rand.New(rand.NewPCG(1, 2))
+	sekinSorov, sekinSahifa := 0, 0
+	for range sahifalar {
+		eng := 0.0
+		for range N {
+			t := sorov(r)
+			if t >= 1000 {
+				sekinSorov++
+			}
+			eng = max(eng, t) // sahifa eng sekin javobni kutadi
+		}
+		if eng >= 1000 {
+			sekinSahifa++
+		}
+	}
+	fmt.Printf("so'rovlar: 1 s dan sekini %5.2f %%\n", 100*float64(sekinSorov)/float64(sahifalar*N))
+	fmt.Printf("sahifalar (%d so'rovli): 1 s dan sekini %4.1f %%\n", N, 100*float64(sekinSahifa)/sahifalar)
+	fmt.Printf("qo'lda hisob: 1 - 0.99^%d = %.1f %%\n", N, 100*(1-math.Pow(0.99, float64(N))))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–3 | comments | what the program does, and the main assumption: requests are independent |
+| 6–12 | `import (…)` | `math` for `math.Pow` (power); `math/rand/v2` is the random number generator; `os` for arguments and the exit code; `strconv` turns text into a number |
+| 14 | `const sahifalar = 100_000` | how many pages ("sahifalar") to count. `_` is a separator for reading only: `100_000` = 100000 |
+| 17 | `func sorov(r *rand.Rand) float64` | takes the generator and returns the time of one request in milliseconds. `*rand.Rand` is a pointer to the generator: all calls use one generator, not a copy of it (pointers: GO-1.11) |
+| 18 | `if r.Float64() < 0.01` | `r.Float64()` is a random number between 0 and 1, all values equally likely. Below 0.01 is 1 case in 100 |
+| 19 | `return 1000 + 2000*r.Float64()` | the slow case: 1000 to 3000 ms |
+| 21 | `return 10 + 40*r.Float64()` | the fast case: 10 to 50 ms |
+| 25 | `N := 100` | by default the page sends 100 requests |
+| 26 | `if len(os.Args) > 1` | is there a command-line argument (`os.Args[0]` is the program itself) |
+| 27–32 | `if os.Args[1] == "jadval"` | ("table") prints `1 − 0.99ᴺ` for seven values of N and exits with `return`. `%3d` is a 3-wide integer, `%5.1f` a number with one decimal, `%%` the `%` sign itself |
+| 33 | `n, err := strconv.Atoi(os.Args[1])` | turns the argument into an integer. If that fails, `err` is not nil |
+| 34–37 | `if err != nil \|\| n < 1 { … os.Exit(2) }` | not a number, or less than 1: prints a usage message to stderr and exits with code 2 |
+| 38 | `N = n` | the number of requests per page now comes from the argument |
+| 40 | `r := rand.New(rand.NewPCG(1, 2))` | a PCG generator with seed `(1, 2)`. A fixed seed gives the same result every time |
+| 41 | `sekinSorov, sekinSahifa := 0, 0` | two counters: slow requests and slow pages |
+| 42 | `for range sahifalar` | the outer loop: 100,000 times, one page each time |
+| 43 | `eng := 0.0` | ("the most") the slowest answer of this page, 0 for now |
+| 44 | `for range N` | the inner loop: the page's N requests |
+| 45–48 | `t := sorov(r)`, `if t >= 1000` | the time of one request; if it is slower than a second, `sekinSorov` goes up by one |
+| 49 | `eng = max(eng, t)` | `max` is a Go built-in function (since Go 1.21). With parallel requests the page time is the time of the slowest one |
+| 51–53 | `if eng >= 1000` | if the page's slowest answer is slower than a second, the page is slow |
+| 55 | `100*float64(sekinSorov)/float64(sahifalar*N)` | the share of slow requests in percent. `float64(…)` turns an integer into a floating-point number: otherwise the division would give an integer |
+| 56 | `100*float64(sekinSahifa)/sahifalar` | the share of slow pages |
+| 57 | `math.Pow(0.99, float64(N))` | the hand calculation: `1 − 0.99ᴺ` |
+
+The program does not really send requests in parallel: it only picks the times at random. With parallel requests the
+page time equals the slowest answer, so `max` is enough. No goroutines are needed.
+
+## In a Google service: from 10 ms to 140 ms
+
+Dean and Barroso also measured a real Google service (Table 1 in the paper). This is not our model, it is a real
+system:
+
+| Measurement (at the root server) | p99 |
+|---|---|
+| one random request finishing | 10 ms |
+| all requests finishing | 140 ms |
+
+The p99 of one request is 10 ms, but the page waits for all of them, so 140 ms. The fix also comes from the same
+calculation: you cannot remove the tail completely, but you can route around it. If an answer is late, send the same
+request to another copy (replica) as well and use whichever answers first. The paper calls these **hedged requests**.
+
+In their test, 1000 values were read from 100 servers. Waiting 10 ms and then sending a hedge cut the p99.9 (the
+slowest one-thousandth) **from 1800 ms to 74 ms**. The number of requests grew by only **2 %**. This is math turning
+into a decision: once you know where the tail comes from, you can cut it cheaply.
+
+## Mean, median and p99
+
+Now let us define the terms. The `p50`, `p95`, `p99` you see on a Grafana or other monitoring panel are exactly these.
+
+| Measure | Definition | In our code |
+|---|---|---|
+| mean | sum of all times / number of requests | `sum/n` |
+| **median** (p50) | the middle of the sorted list: half are faster | `percentil(xs, 0.50)` |
+| **p99** | 99 % of requests are faster than or equal to it | `percentil(xs, 0.99)` |
+| **tail** | the slowest 1 %, slower than p99 | — |
+
+We wrote the median itself in GO-1.06 (`mediana`). It took `xs[len/2]`. Today's `percentil` uses the *nearest rank*
+method: in a sorted `xs`, take `xs[ceil(p·n) − 1]`. For an even n, GO-1.06 picks the upper middle and ours the lower
+middle; with 100,000 requests the difference does not show (course README).
+
+Google's SRE book warns: "the 99th percentile of one backend can easily become the median response of your frontend".
+We just saw it: 1 % of requests are slow, but most pages with 100 requests are.
+
+A small example with Python's `statistics` module: 96 requests take 8 ms, 4 take 400 ms.
+
+```console
+$ python3 -c 'import statistics as s; xs = [8]*96 + [400]*4; print(s.mean(xs), s.median(xs), s.quantiles(xs, n=100)[98])'
+23.68 8.0 400.0
+```
+
+The mean is 23.68 ms — no request took that long. The median is 8 ms, the p99 is 400 ms. `quantiles(n=100)` returns
+99 cut points, and `[98]` is the 99th, that is p99. The mean "spreads" the tail out: you cannot see that 4 % of users
+waited 400 ms.
+
+## Which release is faster? The mean hides the tail
+
+Now, how does this knowledge change a decision? This is a **synthetic model**: we chose the numbers, but the shape is
+real. There are two releases:
+
+| Release | Each request | Rough time |
+|---|---|---|
+| `eski` ("old") | goes to the database every time | ~35 ms |
+| `kesh` ("cache") | 96 % of requests come from the cache; 4 % are not in the cache and take the slow path (cold disk, heavy query) | ~8 ms or ~400 ms |
+
+Predict: which release is better?
+
+**A)** `kesh`: both its mean and its median are smaller · **B)** `eski`: when you look at p99 · **C)** no difference
+
+<details>
+<summary>Answer</summary>
+
+**It depends on which measure you look at** — and that is exactly the idea of this lesson.
+
+```console
+$ go run ./latency
+eski so'rov:  o'rtacha   37 ms | p50   35 ms | p99   70 ms
+eski sahifa: 100 so'rov   | p50   73 ms | p99  107 ms
+kesh so'rov:  o'rtacha   25 ms | p50    8 ms | p99  492 ms
+kesh sahifa: 100 so'rov   | p50  531 ms | p99  918 ms
+```
+
+Per request ("so'rov"), `kesh` wins on the mean ("o'rtacha", 25 vs 37 ms) and the median (8 vs 35 ms). But its p99
+is 492 ms, against 70 ms for `eski`: **7 times slower**. The 4 % of requests that miss the cache take the slow path,
+and the mean hides that tail. If you chose "A", you looked only at the mean and the median. Not "C": the difference is
+huge, it is just in the tail.
+
+</details>
+
+Now let a page send 100 requests to this service. The probability that at least one request misses the cache:
+
+| Calculation | Result |
+|---|---|
+| one request from the cache | 0.96 |
+| all 100 from the cache | 0.96¹⁰⁰ ≈ 0.017 |
+| at least one on the slow path | 1 − 0.96¹⁰⁰ ≈ **98.3 %** |
+
+98 % of pages wait for at least one slow answer. The program measured this too (the `sahifa` lines of the output,
+10,000 pages): the page median is **531 ms** for the cache release and **73 ms** for the old one. For such a page the
+old release is better — and it was a percentile, not the mean, that showed it.
+
+In this model a miss is expensive (~400 ms). According to the course README, if a miss is cheap (for example
+~40 ms), the cache wins on every measure (we did not run this variant). The conclusion stays the same: the tail
+decides, not the mean. The SRE book also advises tracking latency not by the mean but with a histogram of requests
+counted in latency buckets.
+
+### The `latency` code
+
+```go filename="latency/main.go" showLineNumbers
+// latency: ikki reliz, sintetik model. Qaysi biri tezroq?
+// Javob qaysi o'lchovga qarashingizga bog'liq: o'rtacha, mediana yoki p99.
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"slices"
+)
+
+const (
+	n         = 100_000 // alohida so'rovlar
+	sahifalar = 10_000  // har sahifa 100 so'rov yuborib, eng sekinini kutadi
+)
+
+// lognormal: mediana atrofida, o'ngga cho'zilgan "dum" bilan (ms).
+func lognormal(r *rand.Rand, mediana, sigma float64) float64 {
+	return mediana * math.Exp(sigma*r.NormFloat64())
+}
+
+// eski: har so'rov bazaga boradi, ~35 ms.
+func eski(r *rand.Rand) float64 { return lognormal(r, 35, 0.3) }
+
+// kesh: 96 % so'rov keshdan ~8 ms. 4 % keshda yo'q: sekin yo'l (sovuq disk, og'ir so'rov) ~400 ms.
+func kesh(r *rand.Rand) float64 {
+	if r.Float64() < 0.96 {
+		return lognormal(r, 8, 0.3)
+	}
+	return lognormal(r, 400, 0.3)
+}
+
+// percentil: saralangan xs da "eng yaqin rang" usuli: p ulushdan kam bo'lmagan eng kichik qiymat.
+func percentil(xs []float64, p float64) float64 {
+	k := int(math.Ceil(p*float64(len(xs)))) - 1
+	return xs[max(k, 0)]
+}
+
+func olcha(nom string, f func(*rand.Rand) float64) {
+	r := rand.New(rand.NewPCG(1, 2))
+	xs := make([]float64, n)
+	var sum float64
+	for i := range xs {
+		xs[i] = f(r)
+		sum += xs[i]
+	}
+	slices.Sort(xs)
+	sh := make([]float64, sahifalar)
+	for i := range sh {
+		for range 100 {
+			sh[i] = max(sh[i], f(r))
+		}
+	}
+	slices.Sort(sh)
+	fmt.Printf("%-4s so'rov:  o'rtacha %4.0f ms | p50 %4.0f ms | p99 %4.0f ms\n",
+		nom, sum/n, percentil(xs, 0.50), percentil(xs, 0.99))
+	fmt.Printf("%-4s sahifa: 100 so'rov   | p50 %4.0f ms | p99 %4.0f ms\n",
+		nom, percentil(sh, 0.50), percentil(sh, 0.99))
+}
+
+func main() {
+	olcha("eski", eski)
+	olcha("kesh", kesh)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 12–15 | `const (n = 100_000; sahifalar = 10_000)` | 100,000 single requests and 10,000 pages of 100 requests |
+| 18–20 | `lognormal(r, mediana, sigma)` | `r.NormFloat64()` is a number from the standard normal distribution (usually between −2 and 2). `mediana · e^(sigma·z)` gives a time whose median is `mediana`, with a tail stretched to the right. `sigma = 0.3` is the spread. Why latency is not normal: MATH-3.09 |
+| 23 | `eski` | each request around ~35 ms |
+| 26–31 | `kesh` | ~8 ms in 96 % of cases, ~400 ms in 4 % |
+| 34–37 | `percentil(xs, p)` | nearest rank: `k = ceil(p·n) − 1`. `max(k, 0)` keeps the index from going negative when `p = 0` |
+| 39 | `func olcha(nom string, f func(*rand.Rand) float64)` | ("measure") `f` is a function value: `eski` or `kesh` is passed in (GO-1.06) |
+| 40 | `rand.NewPCG(1, 2)` | the same seed for both releases |
+| 41–46 | `xs := make([]float64, n)` and the loop | 100,000 times and their sum (`sum`) |
+| 47 | `slices.Sort(xs)` | sort in place: a percentile is taken from the sorted list |
+| 48–53 | `sh` | ("pages") for each page, the slowest of 100 requests: `sh[i] = max(sh[i], f(r))` |
+| 55–58 | `fmt.Printf("%-4s …")` | `%-4s` writes the name left-aligned in a 4-character field, `%4.0f` a number with no decimals |
+| 61–64 | `main` | calls `olcha` twice: first `eski`, then `kesh` |
+
+## A/B test: is +10 % a win or noise?
+
+The second example. You changed a button and ran an A/B test: 2000 people saw each button.
+
+| Group | Saw it | Bought | Conversion |
+|---|---|---|---|
+| old button | 2000 | 100 | 5.0 % |
+| new button | 2000 | 110 | 5.5 % |
+
+10 % more people bought with the new button. Note: this is a **relative** 10 % (110 / 100). The absolute difference is
+0.5 **percentage points** (5.5 % − 5.0 %). Before shipping the new button, let us check: if nothing changed, how often
+does a difference like this appear?
+
+The `abtest` program simulates the button test 10,000 times. First both buttons are exactly the same (5 %) — this is
+an **A/A test**. Kohavi and colleagues define an A/A test this way: both groups get "exactly the same experience".
+Theirs uses real traffic, ours is a simulation.
+
+Predict: if the buttons are the same, in what share of the 10,000 experiments does the new button "win by at least
++10 %"?
+
+**A)** almost never (&lt; 1 %) · **B)** ~5 % · **C)** ~25 %
+
+<details>
+<summary>Answer</summary>
+
+**C: almost every fourth experiment.**
+
+```console
+$ go run ./abtest
+har guruhda 2000 kishi, 10000 tajriba
+A/A, tugmalar bir xil:
+  yangi tugma >= +10 %: 24.4 %
+  yangi tugma <= -10 %: 22.4 %
+  z-test "farq bor":     4.8 %
+A/B, yangi tugma rostdan +10 %:
+  z-test "farq bor":    10.9 %
+qo'lda hisob: shovqin ~ sqrt(2*0.05*0.95/2000) = 0.69 foiz punkti
+```
+
+The first line says "2000 people in each group, 10000 experiments". The buttons are the same ("tugmalar bir xil"),
+but in 24.4 % of experiments the new button ("yangi tugma") "won" by at least 10 %, and in 22.4 % it "lost" by at least
+10 %. So in about half of the experiments a 10 % difference appears **by chance**. If you chose "A" or "B", you thought
+2000 people was a lot: at a 5 % conversion it is only ~100 purchases.
+
+</details>
+
+The other lines are the correct decision rule. A **z-test** (NIST e-Handbook 7.3.3): divide the difference of the two
+shares by the standard error, and if the result is above 1.96, say "there is a difference" ("farq bor"). 1.96 is the
+95 % confidence threshold.
+
+| Case | z-test said "there is a difference" | What it means |
+|---|---|---|
+| A/A, the buttons are the same | 4.8 % | false positive: ~5 %, the test is built that way |
+| A/B, the new button really is +10 % (5.5 %) | 10.9 % | it finds a real improvement only ~11 % of the time |
+
+The test is not wrong — it says "I don't know". With 2000 people, a button that really is 10 % better comes out as
+"no difference" 9 times out of 10. Why? Let us compute it by hand.
+
+## By hand: noise and group size
+
+**1. How much noise?** The noise of a difference of two shares, that is the **standard error** (NIST 7.3.3, equal
+groups):
+
+```text
+standard error = √( 2 · p · (1 − p) / n )
+               = √( 2 · 0.05 · 0.95 / 2000 )
+               ≈ 0.0069 = 0.69 percentage points
+```
+
+The last line of the program printed the same: `0.69 foiz punkti` ("percentage points").
+
+**2. How much signal?** "+10 %" is 10 % of 5 %, that is 0.5 percentage points. The signal (0.5) is **smaller** than the
+noise (0.69). That is why even identical buttons often give a ±10 % difference.
+
+**3. How small must the noise be?** To see a difference reliably, the noise must be about 2.8 times smaller than the
+difference. 2.8 = 1.96 + 0.84: 1.96 gives 95 % confidence (a 5 % false positive rate), 0.84 gives finding a real
+difference 80 % of the time (*power*). Kohavi et al. (2009, §3.2) use exactly these 95 % and 80 %.
+
+```text
+needed noise = 0.5 / 2.8 ≈ 0.18 percentage points
+```
+
+**4. How many times more people?** Noise falls with the square root of the number of people: 4 times more people
+means half the noise. To bring the noise down from 0.69 to 0.18:
+
+```text
+(0.69 / 0.18)² ≈ 3.8² ≈ 15 times more people  →  2000 · 15 ≈ 30,000 people
+```
+
+**5. The exact formula.** Formula (2) from the paper by Kohavi, Longbotham, Sommerfield and Henne (2009; they build on
+van Belle 2002):
+
+| Symbol | Meaning | Ours |
+|---|---|---|
+| n | number of people in each group | ? |
+| σ² | variance of the conversion: p · (1 − p) | 0.05 · 0.95 = 0.0475 |
+| Δ | the smallest difference you want to detect | 0.5 percentage points = 0.005 |
+| 16 | the coefficient for 95 % confidence and 80 % power ≈ 2 · 2.8² = 15.7 | 16 |
+
+```text
+n = 16 · σ² / Δ² = 16 · 0.0475 / 0.005² = 30,400 people per group
+```
+
+Predict: with 30,400 people, in what share of cases does the z-test find a button that really is +10 % better?
+
+**A)** ~11 %, as before · **B)** ~80 % · **C)** ~100 %
+
+<details>
+<summary>Answer</summary>
+
+**B.**
+
+```console
+$ go run ./abtest 30400
+har guruhda 30400 kishi, 10000 tajriba
+A/A, tugmalar bir xil:
+  yangi tugma >= +10 %:  0.4 %
+  yangi tugma <= -10 %:  0.2 %
+  z-test "farq bor":     5.0 %
+A/B, yangi tugma rostdan +10 %:
+  z-test "farq bor":    79.2 %
+qo'lda hisob: shovqin ~ sqrt(2*0.05*0.95/30400) = 0.18 foiz punkti
+```
+
+If the buttons are the same, the z-test is again wrong in 5.0 % of cases. If the new button really is better, it finds
+it in 79.2 % of cases. That is exactly what the formula promised: 95 % confidence and 80 % power. The noise
+("shovqin") also dropped to 0.18 percentage points. If you chose "C": reaching 100 % would take infinitely many
+people, and the formula aims at 80 %. "A" is the result with 2000 people.
+
+</details>
+
+So the order is: **first compute the needed size, then start the test.** `benchstat` from GO-1.07 answers the same
+question: is the difference between two benchmarks real or noise? The trap of looking at the results every day
+(*peeking*) is in [MATH-4.07](/lab/youtube/math#math-4-07), and effect size and power in [MATH-4.09](/lab/youtube/math#math-4-09).
+
+### The `abtest` code
+
+```go filename="abtest/main.go" showLineNumbers
+// abtest: tugma testini 10 000 marta simulyatsiya qiladi. Har guruhda n kishi, eski tugmada 5 % sotib oladi.
+//
+//	A/A: yangi tugma AYNAN BIR XIL (5 %). Har qanday "yutuq" shovqin.
+//	A/B: yangi tugma haqiqatan +10 % (5.5 %). Test buni necha marta topadi?
+//
+// "Farq bor" qarori: ikki ulushning z-testi, |z| > 1.96 (95 % ishonch), NIST e-Handbook 7.3.3.
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"os"
+	"strconv"
+	"sync"
+)
+
+const (
+	p          = 0.05 // eski tugma konversiyasi
+	tajribalar = 10_000
+	ishchilar  = 10 // har biri o'z generatori bilan 1000 tajriba: natija har safar bir xil
+)
+
+// sotdi: n kishidan nechtasi q ehtimol bilan sotib oldi.
+func sotdi(r *rand.Rand, n int, q float64) int {
+	k := 0
+	for range n {
+		if r.Float64() < q {
+			k++
+		}
+	}
+	return k
+}
+
+type natija struct{ plus10, minus10, farqBor int }
+
+// sina: yangi tugmaning haqiqiy konversiyasi q bo'lganda 10 000 tajriba.
+func sina(n int, q float64) natija {
+	var mu sync.Mutex
+	var jami natija
+	var wg sync.WaitGroup
+	for w := range ishchilar {
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(1, uint64(w)))
+			var t natija
+			for range tajribalar / ishchilar {
+				a, b := sotdi(r, n, p), sotdi(r, n, q)
+				nisbiy := float64(b-a) / float64(max(a, 1))
+				if nisbiy >= 0.10 {
+					t.plus10++
+				}
+				if nisbiy <= -0.10 {
+					t.minus10++
+				}
+				pa, pb, pp := float64(a)/float64(n), float64(b)/float64(n), float64(a+b)/float64(2*n)
+				if se := math.Sqrt(pp * (1 - pp) * 2 / float64(n)); se > 0 && math.Abs(pb-pa)/se > 1.96 {
+					t.farqBor++
+				}
+			}
+			mu.Lock()
+			jami.plus10, jami.minus10, jami.farqBor = jami.plus10+t.plus10, jami.minus10+t.minus10, jami.farqBor+t.farqBor
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	return jami
+}
+
+func foiz(k int) float64 { return 100 * float64(k) / tajribalar }
+
+func main() {
+	n := 2000 // har bir guruhda
+	if len(os.Args) > 1 {
+		k, err := strconv.Atoi(os.Args[1])
+		if err != nil || k < 100 {
+			fmt.Fprintln(os.Stderr, "foydalanish: go run ./abtest [n >= 100]")
+			os.Exit(2)
+		}
+		n = k
+	}
+	aa, ab := sina(n, p), sina(n, p*1.10)
+	fmt.Printf("har guruhda %d kishi, %d tajriba\n", n, tajribalar)
+	fmt.Println("A/A, tugmalar bir xil:")
+	fmt.Printf("  yangi tugma >= +10 %%: %4.1f %%\n", foiz(aa.plus10))
+	fmt.Printf("  yangi tugma <= -10 %%: %4.1f %%\n", foiz(aa.minus10))
+	fmt.Printf("  z-test \"farq bor\":    %4.1f %%\n", foiz(aa.farqBor))
+	fmt.Println("A/B, yangi tugma rostdan +10 %:")
+	fmt.Printf("  z-test \"farq bor\":    %4.1f %%\n", foiz(ab.farqBor))
+	fmt.Printf("qo'lda hisob: shovqin ~ sqrt(2*0.05*0.95/%d) = %.2f foiz punkti\n", n, 100*math.Sqrt(2*p*(1-p)/float64(n)))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 18–22 | `const (p = 0.05; tajribalar = 10_000; ishchilar = 10)` | the old button's conversion is 5 %, 10,000 experiments ("tajriba" = experiment), 10 workers ("ishchi" = worker) |
+| 25–33 | `sotdi(r, n, q)` | ("bought") each of n people buys with probability q; returns how many bought |
+| 35 | `type natija struct{ plus10, minus10, farqBor int }` | ("result") three counters: "≥ +10 %", "≤ −10 %", "there is a difference" (`farqBor`) |
+| 38 | `func sina(n int, q float64) natija` | ("try") 10,000 experiments where the new button's true conversion is q |
+| 39–41 | `mu`, `jami`, `wg` | `jami` ("total") is the overall result; `mu` protects it; `wg` waits for the workers |
+| 42–43 | `for w := range ishchilar { wg.Go(func() { … }) }` | 10 goroutines. `wg.Go` runs the function in a new goroutine and adds it to the wait list (Go 1.25; GO-1.22). Each loop iteration has its own `w` (since Go 1.22) |
+| 44 | `rand.NewPCG(1, uint64(w))` | each worker has its own generator with seed `(1, w)`: the result is the same no matter in which order the goroutines run |
+| 46–47 | `for range tajribalar / ishchilar`, `a, b := …` | each worker runs 1000 experiments; `a` is purchases with the old button, `b` with the new one |
+| 48–54 | `nisbiy := float64(b-a) / float64(max(a, 1))` | ("relative") the relative difference; `max(a, 1)` avoids dividing by zero. Counted if ≥ +10 % or ≤ −10 % |
+| 55 | `pa, pb, pp := …` | the shares of the two groups and the pooled share of both together (`pp`) |
+| 56–58 | `if se := math.Sqrt(…); se > 0 && math.Abs(pb-pa)/se > 1.96` | the z-test: standard error `√(pp·(1−pp)·2/n)`, the difference is divided by it; above 1.96 means "there is a difference". `if x := …; condition` declares a variable inside the `if` |
+| 60–62 | `mu.Lock()` … `mu.Unlock()` | adds the worker's result to the shared `jami`; the mutex makes sure only one goroutine writes at a time (GO-1.22) |
+| 65 | `wg.Wait()` | waits for all 10 workers to finish |
+| 69 | `foiz(k)` | ("percent") turns k into a percent of the 10,000 experiments |
+| 72–80 | `n := 2000` and the argument | 2000 people per group by default; if the argument is below 100 or not a number, a usage message and code 2 |
+| 81 | `aa, ab := sina(n, p), sina(n, p*1.10)` | A/A: the new button is also 5 %; A/B: the new button is 5.5 % |
+| 82–89 | `fmt.Printf(…)` | the results; `\"` is a quote inside a string; the last line is the hand calculation of the standard error in percentage points |
+
+## The map: six modules
+
+These two examples are a small map of the whole track. It has six modules:
+
+| Module | What | For which job |
+|---|---|---|
+| MATH-0 Introduction | float64, rounding | numerical errors |
+| MATH-1 Linear algebra | vector, matrix, projection, eigenvector, SVD | search (embeddings + cosine), PageRank, PCA |
+| MATH-2 Derivative and gradient | sensitivity, chain rule, gradient descent, autodiff | training models |
+| MATH-3 Probability | Bayes, expectation, distributions, CLT, entropy | hash collisions, Bloom filter, simulation |
+| MATH-4 Statistics | percentiles, confidence intervals, bootstrap, A/B test | latency, A/B test, SLO |
+| MATH-5 Bridge to ML | linear and logistic regression | entry to the ML track |
+
+A few examples:
+
+- **The next lesson of the introduction module** is about float64: how a computer stores a number
+  ([MATH-0.02](/lab/youtube/math#math-0-02)).
+- **Linear algebra is needed for search.** Text becomes a vector, and the cosine measures similarity. For example, in
+  Postgres's pgvector extension `<=>` is the cosine distance, and "1 − cosine distance" is the cosine similarity
+  ([MATH-1.02](/lab/youtube/math#math-1-02)). PageRank is an eigenvector: Brin and Page (1998) wrote that it is "the principal
+  eigenvector of the normalized link matrix of the Web" ([MATH-1.12](/lab/youtube/math#math-1-12)).
+- **Derivatives and gradients** are the engine of model training.
+- **Probability** computes hash collisions and the Bloom filter's error rate ([MATH-3.06](/lab/youtube/math#math-3-06)).
+- **Statistics** is today's latency and A/B test ([MATH-4.01](/lab/youtube/math#math-4-01)).
+- **The last module** brings everything together in regression.
+
+Reference courses: MIT 18.06 (linear algebra, Strang), Stanford CS109 (probability for computer scientists), MIT 6.042
+(mathematics for computer science).
+
+## Who needs how much
+
+Now the answer to the question in the title. This is our choice in building the track:
+
+| Who | Which modules | Why |
+|---|---|---|
+| backend engineer | MATH-0, MATH-3, MATH-4 | numbers, probability, statistics: latency, cache, A/B test, SLO |
+| if you want to move to ML | also MATH-1, MATH-2, MATH-5 | linear algebra, derivatives and regression |
+
+20 of the 56 lessons are marked optional (`core: false` in the track plan). You can leave them for later. Today's
+calculations needed only percents and powers.
+
+## What we skip
+
+An honest map also says what it does *not* cover:
+
+| We skip | Where / why |
+|---|---|
+| Big-O, graphs | in the DSA track |
+| number theory | not in this track |
+| writing formal proofs | in MIT 6.042, foundations like "definitions, proofs, sets, functions, relations" take about a third of the course |
+| computing integrals and determinants by hand | we understand the meaning, the computer does the arithmetic |
+| memorizing a table of statistical tests | Allen Downey: there is really only one test — "all hypothesis tests are based on the same framework". You simulate the null hypothesis and compare the result. Today's A/A test does exactly that |
+
+## The method: picture, hand calculation, code, measurement
+
+The learning method will be what you saw today. In every topic, one picture, one hand calculation and one piece of
+code:
+
+```text
+picture                  →  hand calculation  →  code                  →  measurement
+a page with 100 requests    1 − 0.99¹⁰⁰          Go simulation            checks the assumption
+(waits for the slowest)     ≈ 63.4 %             63.5 %                   (independent?)
+```
+
+If the calculation and the code disagree, there is a mistake in either the formula or the code. Even if they agree,
+only a real measurement checks the assumption (for example, independence). We draw plots in Python and NumPy, and
+write simulations and algorithms in Go.
+
+## Question: a page with 10 requests
+
+A page sends 10 requests, and in each one 1 case out of 100 is slower than a second. What share of pages takes longer
+than a second? Compute it by hand.
+
+**A)** ~1 % · **B)** ~10 % · **C)** ~63 %
+
+<details>
+<summary>Answer</summary>
+
+**B: about 9.6 %.** 1 − 0.99¹⁰ ≈ 1 − 0.904 = 0.096.
+
+```console
+$ go run ./fanout 10
+so'rovlar: 1 s dan sekini  0.99 %
+sahifalar (10 so'rovli): 1 s dan sekini  9.4 %
+qo'lda hisob: 1 - 0.99^10 = 9.6 %
+```
+
+The simulation gave 9.4 %, the formula 9.6 %: the difference is chance. A table for different N ("sahifa sekin" =
+"page slow"):
+
+```console
+$ go run ./fanout jadval
+N =   1:   1.0 % sahifa sekin
+N =  10:   9.6 % sahifa sekin
+N =  20:  18.2 % sahifa sekin
+N =  50:  39.5 % sahifa sekin
+N = 100:  63.4 % sahifa sekin
+N = 200:  86.6 % sahifa sekin
+N = 500:  99.3 % sahifa sekin
+```
+
+With few requests, the percent of slow pages is about the number of requests (10 requests → ~10 %). Then the curve
+bends: with 500 requests almost every page is slow. "C" was the answer for a page with 100 requests.
+
+</details>
+
+Today we saw that mean latency hides the tail, and that with 100 requests a 1 % slowness becomes 63 %. An A/B test with
+2000 people shows noise as a win. In the next lesson, [MATH-0.02 · 0.1 + 0.2 yana: float64 ichida nima
+bor](/lab/youtube/math#math-0-02), we look inside float64: why 0.1 + 0.2 does not come out as exactly 0.3.
+
+## Common mistakes
+
+**1. Judging a release by mean latency (silent bug).** No error is printed: the panel says "mean 37 → 25 ms" and the
+release looks good. In fact p99 went from 70 to 492 ms (the "Which release is faster?" section). **Fix:** compare p50
+and p99 (also at the page level), and track latency with a histogram.
+
+**2. Thinking `1 − 0.99ᴺ` works everywhere.** The formula is right if the requests are independent. What if slowness is
+correlated? For example, 1 % of pages hit a GC pause, and *all* requests of that page slow down together. This program
+is not in the course folder; we wrote it for this page (`bogliq` = "correlated"; its folder has its own `go.mod`:
+`module bogliq`, `go 1.26`):
+
+```go
+// bogliq: fanout kabi, lekin sekinlik bog'liq: 1 % sahifada (masalan, GC pauzasi) hamma so'rov birga sekin.
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+)
+
+const sahifalar = 100_000
+
+func main() {
+	r := rand.New(rand.NewPCG(1, 2))
+	sekinSorov, sekinSahifa := 0, 0
+	for range sahifalar {
+		pauza := r.Float64() < 0.01 // shu sahifa paytida pauza bo'ldimi
+		eng := 0.0
+		for range 100 {
+			t := 10 + 40*r.Float64()
+			if pauza {
+				t += 1000
+				sekinSorov++
+			}
+			eng = max(eng, t)
+		}
+		if eng >= 1000 {
+			sekinSahifa++
+		}
+	}
+	fmt.Printf("so'rovlar: 1 s dan sekini %5.2f %%\n", 100*float64(sekinSorov)/float64(sahifalar*100))
+	fmt.Printf("sahifalar (100 so'rovli): 1 s dan sekini %4.1f %%\n", 100*float64(sekinSahifa)/sahifalar)
+	fmt.Printf("formula (mustaqil deb): 1 - 0.99^100 = %.1f %%\n", 100*(1-math.Pow(0.99, 100)))
+}
+```
+
+```console
+$ go run ./bogliq
+so'rovlar: 1 s dan sekini  0.99 %
+sahifalar (100 so'rovli): 1 s dan sekini  1.0 %
+formula (mustaqil deb): 1 - 0.99^100 = 63.4 %
+```
+
+Slow requests are ~1 % again, but slow pages are 1.0 %, not 63 %: all the slow requests landed in the same pages. One
+line makes the difference: `pauza` is chosen once per page, not once per request. A real system sits between these
+two extremes. **Fix:** use the formula for the direction, and take the number from a real measurement (the p99 at the
+page level).
+
+**3. Saying "every service's p99 is 1 second".** Dean and Barroso's paper says exactly that ("99th-percentile latency
+of one second"). But by our definition it means "1 % of requests are slower than 1 s". In this model the p99 of one
+request is ~50 ms (course README): the request at the 99th cut point is still the slowest of the fast group. **Fix:**
+say it precisely: "1 % of requests are slower than 1 s".
+
+**4. Calling "+10 %" a win in a 2000-person test (silent bug).** In the A/A simulation, identical buttons gave
+"+10 %" 24.4 % of the time (the "A/B test" section). **Fix:** compute the size with `n = 16σ²/Δ²` before the test,
+decide with a z-test, and don't stop the test "when you like it" by looking at the results every day
+([MATH-4.07](/lab/youtube/math#math-4-07)).
+
+**5. Passing something that is not a number as the argument.**
+
+```console
+$ go run ./abtest 2000kishi
+foydalanish: go run ./abtest [n >= 100]
+exit status 2
+```
+
+`strconv.Atoi("2000kishi")` returned an error, so the program printed its usage message ("foydalanish" = usage) and
+exited with code 2. The `exit status 2` line is added by `go run`. `go run ./fanout 0` stops the same way: you cannot
+compute a share for a page with 0 requests. **Fix:** pass only a number: `go run ./abtest 30400` (100 or more),
+`go run ./fanout 20` (1 or more), or `go run ./fanout jadval`.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** A page sends 50 requests, each slower than 1 s in 1 case out of 100. What share of pages is slow?
+
+**A)** ~5 % · **B)** ~40 % · **C)** ~50 %
+
+<details>
+<summary>Answer</summary>
+
+**B.** 1 − 0.99⁵⁰ ≈ 1 − 0.605 = 39.5 % (the `N =  50` line of `go run ./fanout jadval`). If you chose "C", you
+stretched the "N requests → N %" rule to 50: it is only roughly right for small N.
+
+</details>
+
+**2.** A new release cut mean latency from 37 to 25 ms. Is that enough to ship it?
+
+<details>
+<summary>Answer</summary>
+
+No. The mean hides the tail. In the `latency` model the cache release has a better mean, but its p99 is 7 times worse
+(492 vs 70 ms). If a page sends 100 requests, 98 % of pages wait for at least one slow answer, and the page median goes
+up to 531 ms (73 ms for the old one). Compare p50 and p99, at the page level if you can.
+
+</details>
+
+**3.** What is an A/A test, and why did about half of the experiments in the 2000-person A/A simulation show a ±10 %
+difference?
+
+<details>
+<summary>Answer</summary>
+
+In an A/A test both groups see exactly the same thing, so any difference is noise. With 2000 people the standard error
+of the difference is ~0.69 percentage points, while "+10 %" is 0.5 percentage points: the signal is smaller than the
+noise. That is why 24.4 % of experiments showed "≥ +10 %" and 22.4 % showed "≤ −10 %".
+
+</details>
+
+**4.** 30,400 people find a +10 % difference 80 % of the time. Now you want to detect a +5 % difference (5 % → 5.25 %)
+just as well. About how many people do you need per group?
+
+**A)** ~61,000 (2 times) · **B)** ~122,000 (4 times) · **C)** ~30,400, the same
+
+<details>
+<summary>Answer</summary>
+
+**B.** `n = 16σ²/Δ²`: if Δ is half as large, Δ² is four times smaller and n is four times larger:
+16 · 0.0475 / 0.0025² = 121,600. Kohavi's paper says the same for this example: "less than 122,000 users". If you
+chose "A", you thought noise falls in proportion to the number of people: in fact it falls with its **square root**.
+
+</details>
+
+**5.** From GO-1.07: one benchmark came out 5 % faster in the new version. Why not trust it, and use `-count 10` and
+`benchstat` instead?
+
+<details>
+<summary>Answer</summary>
+
+Because even a single measurement has noise (machine load, caches, CPU frequency). As in today's A/A test, even when
+there is "no" difference, one result can show ±5 %. `benchstat` gives the median and a confidence interval over many
+measurements and says whether the difference is statistically real (`~` means "no difference"). It is the same
+question as today's z-test.
+
+</details>
+
+## Homework
+
+The tasks and answers are in the lesson folder on GitHub:
+[lessons/math-01-map](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/math-01-map). The answer program
+is [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/math-01-map/homework)
+(`go run ./homework`). Try it yourself first.
+
+- 🟢 **Easy:** a page with 20 requests, each slower than 1 s in 1 case out of 100. What share of pages is slow? Find
+  it by hand, then check with `go run ./fanout 20`.
+- 🟡 **Medium:** each request is slower than 1 s in 1 case out of 1000. What happens to a page with 100 requests?
+- 🟠 **Hard:** at a 5 % conversion, how many people per group does the paper's formula need to detect a +5 % relative
+  increase (5 % → 5.25 %)?
+- 🔴 **Guru:** what share of requests must the cache catch for the `kesh` release to have p99 &lt; 100 ms?
+
+<details>
+<summary>Answer</summary>
+
+The answer program:
+
+```go filename="homework/main.go" showLineNumbers
+// Uy vazifasi javoblari: go run ./homework
+package main
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"slices"
+)
+
+func main() {
+	// Oson: 20 so'rovli sahifa, har so'rov 100 tadan 1 holatda 1 s dan sekin.
+	fmt.Printf("oson:  1 - 0.99^20 = %.1f %% (tekshiring: go run ./fanout 20)\n", 100*(1-math.Pow(0.99, 20)))
+
+	// O'rta: har so'rov 1000 tadan 1 holatda 1 s dan sekin bo'lsa, 100 so'rovli sahifa.
+	fmt.Printf("o'rta: 1 - 0.999^100 = %.1f %% (100 tadan 1 bo'lganda 63.4 %% edi)\n", 100*(1-math.Pow(0.999, 100)))
+
+	// Qiyin: Kohavi formulasi n = 16*sigma^2/delta^2, 5 % konversiya, +5 % nisbiy (5 % -> 5.25 %).
+	sigma2, delta := 0.05*0.95, 0.05*0.05
+	fmt.Printf("qiyin: n = 16*0.0475/0.0025^2 = %.0f kishi har guruhda\n", 16*sigma2/(delta*delta))
+
+	// Guru: kesh relizida p99 < 100 ms bo'lishi uchun kesh qancha so'rovni ushlashi kerak?
+	for _, hit := range []float64{0.96, 0.98, 0.99, 0.995} {
+		fmt.Printf("guru:  kesh %.1f %% -> p99 %4.0f ms\n", 100*hit, p99(hit))
+	}
+}
+
+func p99(hit float64) float64 {
+	r := rand.New(rand.NewPCG(1, 2))
+	xs := make([]float64, 100_000)
+	for i := range xs {
+		m := 400.0
+		if r.Float64() < hit {
+			m = 8
+		}
+		xs[i] = m * math.Exp(0.3*r.NormFloat64())
+	}
+	slices.Sort(xs)
+	return xs[int(math.Ceil(0.99*float64(len(xs))))-1]
+}
+```
+
+| Line | What it does |
+|---|---|
+| 13 | Easy ("oson"): `1 − 0.99²⁰` |
+| 16 | Medium ("o'rta"): `1 − 0.999¹⁰⁰` |
+| 19–20 | Hard ("qiyin"): σ² = 0.05 · 0.95, Δ = 5 % of 5 % = 0.0025; `16σ²/Δ²` |
+| 23–25 | Guru: p99 for four cache shares (`hit` is the share found in the cache) |
+| 28–40 | `p99(hit)`: the `kesh` model from `latency`, but with the cache share as a parameter; 100,000 requests, p99 by nearest rank |
+
+```console
+$ go run ./homework
+oson:  1 - 0.99^20 = 18.2 % (tekshiring: go run ./fanout 20)
+o'rta: 1 - 0.999^100 = 9.5 % (100 tadan 1 bo'lganda 63.4 % edi)
+qiyin: n = 16*0.0475/0.0025^2 = 121600 kishi har guruhda
+guru:  kesh 96.0 % -> p99  492 ms
+guru:  kesh 98.0 % -> p99  399 ms
+guru:  kesh 99.0 % -> p99  185 ms
+guru:  kesh 99.5 % -> p99   17 ms
+```
+
+🟢 18.2 %. The simulation:
+
+```console
+$ go run ./fanout 20
+so'rovlar: 1 s dan sekini  0.99 %
+sahifalar (20 so'rovli): 1 s dan sekini 18.0 %
+qo'lda hisob: 1 - 0.99^20 = 18.2 %
+```
+
+18.0 % and 18.2 %: the difference is chance.
+
+🟡 63.4 % → 9.5 %. Each request's slow case became 10 times rarer, and slow pages 6.7 times rarer. For a page with 100
+requests, what matters is not each request's p99 but its p99.9.
+
+🟠 121,600 people per group: four times 30,400, because Δ is half as large. Kohavi's paper says the same for this
+example: "less than 122,000 users".
+
+🔴 The miss share must be below 1 %, that is, the cache must catch more than 99 %. At 99 % it is still on the edge
+(185 ms); at 99.5 % it is 17 ms. The reason: p99 is the edge of the slowest 1 %. If more than 1 % are misses, the p99
+always lands inside the misses.
+
+</details>
+
+## Sources
+
+- Dean, Barroso. *The Tail at Scale*. CACM 56(2), 2013, pp. 74–80 — the 63 % example (p. 76), Table 1, hedged
+  requests: [research.google](https://research.google/pubs/the-tail-at-scale/) ·
+  [full text (Wayback)](https://web.archive.org/web/2019id_/https://www.barroso.org/publications/TheTailAtScale.pdf)
+- Google SRE book, chapter 6 "Monitoring Distributed Systems", *Worrying About Your Tail*:
+  [sre.google](https://sre.google/sre-book/monitoring-distributed-systems/)
+- Kohavi, Longbotham, Sommerfield, Henne. *Controlled experiments on the web: survey and practical guide*, 2009 —
+  formula (2) `n = 16σ²/Δ²`, A/A test, §3.2:
+  [PDF](https://ai.stanford.edu/~ronnyk/2009controlledExperimentsOnTheWebSurvey.pdf)
+- NIST/SEMATECH e-Handbook 7.3.3 — comparing two proportions (z-test):
+  [itl.nist.gov](https://www.itl.nist.gov/div898/handbook/prc/section3/prc33.htm)
+- Allen Downey, [There is still only one test](https://allendowney.blogspot.com/2016/06/there-is-still-only-one-test.html) (2016)
+- [Stanford CS109](https://web.stanford.edu/class/cs109/) *Probability for Computer Scientists* (Independence) ·
+  [MIT 18.06SC](https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/) *Linear Algebra* ·
+  [MIT 6.042J](https://ocw.mit.edu/courses/6-042j-mathematics-for-computer-science-spring-2015/) *Mathematics for
+  Computer Science* (course description: "divides roughly into thirds")
+- Brin, Page, [The Anatomy of a Large-Scale Hypertextual Web Search Engine](https://snap.stanford.edu/class/cs224w-readings/Brin98Anatomy.pdf),
+  1998, §2.1.1 (PageRank as an eigenvector)
+- [pgvector README](https://github.com/pgvector/pgvector) (`<=>` is the cosine distance)
+- Go: [`math/rand/v2`, `NewPCG`](https://pkg.go.dev/math/rand/v2#NewPCG) ·
+  [`sync.WaitGroup.Go`](https://pkg.go.dev/sync#WaitGroup.Go) · Python:
+  [`statistics.quantiles`](https://docs.python.org/3/library/statistics.html#statistics.quantiles) · JS:
+  [`Promise.all`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all)
+- Course folder and README: [lessons/math-01-map](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/math-01-map)
+- Results from `go1.26.8 linux/amd64`, `CGO_ENABLED=0`, 2026-11-26 (re-run in the evening, identical to the video: the
+  seed is fixed). Python 3.13.15, Node 24.10.0. `bogliq` and `fanout.mjs` are not in the course folder; they were
+  written for this page. The ~40 ms miss variant and the ~50 ms p99 of a single request are taken from the course
+  README, not re-run.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/math-01-map)
+
+---
+
+Next lesson: [MATH-0.02](/lab/youtube/math#math-0-02) → · [All lessons](/lab/youtube/math)
+
+</div>
