@@ -1,0 +1,1068 @@
+---
+title: "From nanoseconds to milliseconds: we measure the latency table ourselves"
+date: "2026/11/26"
+description: "Measure the waiting time of cache, RAM, SSD, fsync, Wi-Fi and the internet in Go, and compare it with the famous latency numbers table."
+tag: "youtube, sys, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/sys/sys-1-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/sys/sys-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/sys/sys-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/sys/sys-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/sys/sys-1-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/sys/sys-1-01) · [Русский](/lab/youtube/sys/sys-1-01/ru) · **English**  
+Lesson SYS-1.01 · [Kompyuter, OS va tarmoq](/lab/youtube/sys#sys-1-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-11-latency)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+A computer takes one number from its fastest memory. Then it waits for an answer from a website on the internet.
+How big is the difference between these two jobs? If the first one takes one second, the second one takes almost
+twelve years. We will do this calculation together at the end of the page.
+
+**The one idea:** every job inside a computer has its own waiting time, and these times differ by a factor of a
+million. One number from the processor's fastest memory takes ~1.5 ns, an answer from a website ~0.55 s. Today we
+measure these times ourselves with a Go program and compare them with the famous table that programmers know by
+heart.
+
+By the end of the lesson you will:
+
+- convert between ns, µs and ms, and guess on which "floor" a job lives;
+- measure a slow job many times with `time.Now` / `time.Since` and read the median and the range;
+- understand the mistake "I wrote to the file, so it is on disk" and know the price of `f.Sync()` (fsync);
+- explain, stage by stage, why one HTTPS request takes hundreds of milliseconds.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| latency | the time from the moment a program asks for something until the answer arrives | latency |
+| cache | a small, very fast memory inside the processor | cache |
+| round trip | the time for a small message to reach another computer and for the reply to come back | round trip |
+
+Two helper words also appear. An **SSD** is a disk that keeps data when the power is off: it has no moving parts,
+only chips. **fsync** is the command that tells Linux "wait until the data reaches the disk"; in Go it is `f.Sync()`.
+
+## Before you start
+
+- [GO-1.07 · Taxmin qilmang, oʻlchang: birinchi test va benchmark](/lab/youtube/go/go-1-07/en): what a benchmark is, `b.Loop()`
+  and the rule "don't trust a single measurement".
+- [DSA-A.01 · RAM modeli va haqiqiy protsessor: cache qanchalik muhim](/lab/youtube/dsa#dsa-a-01): the cache levels (L1, L2,
+  L3) and RAM; memory pictured as a pocket and a warehouse; 1.52 ns and 105.8 ns measured with the chain method.
+- [GO-1.05 · Go'da while yoʻq: bitta for va uning hamma shakllari](/lab/youtube/go/go-1-05/en): `for i := range n` (from 0 to
+  n−1).
+- [GO-1.06 · Funksiyalar: ikki qiymat qaytarish, closure va variadic](/lab/youtube/go/go-1-06/en): a function as a value, and
+  closures (today's `ish func(i int)` parameter).
+- [GO-1.08 · Slice'lar: append tuzogʻi va eskirgan 1024 qoidasi](/lab/youtube/go/go-1-08/en): `append`.
+- [SYS-0.01 · Terminal: pipe, grep va bitta qatorda yechiladigan ishlar](/lab/youtube/sys/sys-0-01/en): `grep`, `head` and the
+  vertical bar `|`.
+
+**How to run the code.** This lesson's programs run in the course folder (`lessons/sys-11-latency`): they consist of
+several files and go to the disk and the network, so go.dev/play cannot run them. Open the terminal in that folder.
+The disk measurement only works correctly on Linux (`O_DIRECT`, see below). The first `go run ./olcha disk` creates a
+1 GiB file `sinov.dat` ("sinov" = test) in the folder: delete it afterwards. The internet measurement sends dozens of
+requests to go.dev.
+
+Our computer has no C compiler (gcc), so cgo was switched off before all commands:
+
+```console
+$ export CGO_ENABLED=0
+```
+
+This command prints nothing. It tells Go not to use C code: then Go's own resolver does the DNS lookup (course
+README: with cgo the DNS time may be a little different).
+
+**The video's numbers and ours.** The video shows the result measured on the morning of 2026-11-26 (10:55–10:58):
+round 5 of the file `natija.txt` in the course folder. The terminal output on this page was run again on the evening
+of the same day (20:43–20:47), on the same laptop. In the evening the laptop was on a different Wi-Fi network. The
+numbers differ, and they should: the computer's load, the disk's state and the network change every minute. What
+matters is **the ratios and the order** (how many times, on which "floor"). They came out the same in both runs. The
+cache and RAM numbers were not measured again: they come from DSA-A.01 (see below).
+
+One question from DSA-A.01. In that lesson we added the same numbers, but in one order the work was more than 100
+times slower. Why?
+
+**A)** the slow order had more additions · **B)** the numbers came from a far part of memory, and each read waited
+for the previous one · **C)** Go's garbage collector got in the way
+
+<details>
+<summary>Answer</summary>
+
+**B.** The number of additions was the same. In the slow version the numbers were read along a chain: each number
+gave the address of the next one. So the processor could not load them in advance, and each read waited for the
+previous one. When the slice was bigger than the cache, the numbers came from RAM. In that lesson's measurement the
+chain was 179 times slower than a sequential read. If you chose "A", you thought the slowness was in the number of
+operations: today we will see that time is usually spent not on the operation but on **waiting**.
+
+</details>
+
+## Units of time: ms, µs, ns
+
+Today's numbers come in three units. A blink of an eye lasts from 100 to 400 milliseconds (BioNumbers BNID 100706).
+
+| Unit | Symbol | Fraction of a second | Example (from today's measurements) |
+|---|---|---|---|
+| millisecond | ms | 1/1,000 | a round trip over Wi-Fi ~5 ms |
+| microsecond | µs | 1/1,000,000 | reading 4 KiB from the SSD ~120–150 µs |
+| nanosecond | ns | 1/1,000,000,000 | one number from the cache ~1.5 ns |
+
+Each step is a factor of a thousand: 1 ms = 1000 µs, 1 µs = 1000 ns. In Go these units are in the `time` package:
+`time.Millisecond`, `time.Microsecond`, `time.Nanosecond`. A span of time is stored in the type `time.Duration`. It
+is really a number of nanoseconds (`int64`), but it prints as `1.29ms`, `146µs`.
+
+## Latency: from request to answer
+
+When you write `await fetch(url)` in the frontend, the page waits until the answer arrives. In Python
+`requests.get(url)` does the same. This waiting is not only in the network: the processor waits when it asks memory
+for a number, and a program waits when it reads a file from the disk.
+
+In DSA-A.01 we pictured memory as a pocket and a warehouse. You take something from your pocket at once. For
+something in the warehouse you have to walk there and back. Today we add one more floor: a distant archive, that is,
+the disk. Even further away is another computer, over the network.
+
+| Floor | Picture | Today's order of magnitude |
+|---|---|---|
+| cache (inside the processor) | pocket | nanoseconds |
+| RAM | warehouse | ~100 ns |
+| disk (SSD) | distant archive | hundreds of microseconds |
+| network, internet | sending a neighbour a question and waiting for the reply | milliseconds, hundreds of ms |
+
+We call this waiting time **latency** (the Uzbek page uses *kechikish*, "delay"). Latency tells how long one job
+*waits*. It does not tell how many jobs are done per second (that is *throughput*). These are two different things:
+in the "Guru" level of the homework we will see it in numbers.
+
+## Where the famous table comes from
+
+Programmers know a table called "Latency Numbers Every Programmer Should Know". Its history is short:
+
+| Year | Who | What |
+|---|---|---|
+| 2001 | Peter Norvig | added a 5-row table to his article "Teach Yourself Programming in Ten Years" ("Timing for various operations on a typical 1GHz PC in summer 2001"). In the Wayback Machine it is missing from the 2001-06-03 copy and present in the 2001-10-17 copy |
+| 2009 | Jeff Dean (Google) | the slide "Numbers Everyone Should Know" in his talks: L1 cache 0.5 ns, RAM 100 ns, round trip within a datacenter 500 µs, California → Netherlands → California 150 ms. The numbers that circulate today come from here |
+| 2012 | Jonas Bonér | collected the numbers in a GitHub gist ("Latency Comparison Numbers (~2012)") and added the SSD rows: a random 4K read from an SSD 150 µs |
+
+Many people think the table describes today's computers. In fact the numbers are from 2009–2012. Today we measure
+them again on a 2022 laptop (Intel Core i5-12450H, HP SSD EX900 NVMe).
+
+## How we measure: the `olcha` function
+
+In JS you measure time like this:
+
+```js
+const boshi = performance.now();
+await ish();
+console.log(performance.now() - boshi); // milliseconds, with a fraction
+```
+
+In Python it is `boshi = time.perf_counter()` and `time.perf_counter() - boshi`. Go does the same with two functions:
+`time.Now()` looks at the clock, `time.Since(boshi)` tells how much time has passed since then. The video shows the
+heart of the program in a shortened form:
+
+```go
+for i := range n {
+	boshi := time.Now()
+	ish(i)
+	vaqt := time.Since(boshi)
+	natija = append(natija, vaqt)
+}
+```
+
+Line 1 repeats the job `n` times. Line 2 sticks the current time to the label `boshi` ("start") (`:=` is a new
+variable). Line 3 runs the measured job (`ish`, "job") once. Line 4 takes the time passed since the start. Line 5
+adds it to the list `natija` ("result").
+
+The real function in the course folder (from `olcha/main.go`, unchanged) is a little shorter: there is no `vaqt`
+("time") label. `olcha` means "measure":
+
+```go
+// olcha: ishni n marta bajarib, har birining vaqtini yozib boradi.
+func olcha(nom string, n int, ish func(i int)) natija {
+	r := natija{nom: nom}
+	for i := range n {
+		boshi := time.Now()
+		ish(i)
+		r.t = append(r.t, time.Since(boshi))
+	}
+	return r
+}
+```
+
+| Code | What it does |
+|---|---|
+| `func olcha(nom string, n int, ish func(i int)) natija` | three parameters: the measurement's name (`nom`), how many times (`n`) and the job to measure. `ish` is a function value, like a `(i) => {…}` callback in JS (GO-1.06). The result is a `natija` struct |
+| `r := natija{nom: nom}` | an empty result: it has a name, the list of times is still empty |
+| `for i := range n` | `i` = 0, 1, …, n−1 (GO-1.05) |
+| `boshi := time.Now()` | looks at the clock. Go's `time.Now()` also carries a monotonic clock reading: even if the system clock is adjusted, `time.Since` stays correct (like `performance.now()` in JS) |
+| `ish(i)` | calls the measured job: for example, reading 4 KiB from the SSD |
+| `r.t = append(r.t, time.Since(boshi))` | adds the elapsed time (`time.Duration`) to the end of the list (GO-1.08) |
+| `return r` | returns all the times |
+
+Why many times? Each time the result is a little different: the disk is busy, a packet in the network is delayed.
+You cannot trust a single measurement (the GO-1.07 rule). So the job is repeated from 30 to 5000 times, and then the
+times are sorted:
+
+```go
+// natija: bitta o'lchovning hamma vaqtlari.
+type natija struct {
+	nom string
+	t   []time.Duration
+	yoq int // tarmoq: javobsiz qolgan urinishlar
+}
+
+// p: tartiblangan vaqtlarning q-qismi, eng yaqin o'rin bo'yicha (0.5 = mediana; juft n da yuqori o'rtadagi).
+func (n natija) p(q float64) time.Duration {
+	s := slices.Clone(n.t)
+	slices.Sort(s)
+	return s[int(q*float64(len(s)-1)+0.5)]
+}
+```
+
+The `natija` struct holds the measurement's name and all the times (`t`). `yoq` ("none") is the number of network
+attempts that got no reply within 3 seconds: they are not added to the times, they are counted separately. The `p`
+method takes a copy of the times (`slices.Clone`: so the original order is not spoiled), sorts it and returns the
+element at fraction `q`. The three columns of the output come from it:
+
+| Column | Meaning | How it is computed |
+|---|---|---|
+| `marta` ("times") | how many times it was measured | `len(n.t)` |
+| `odatda` ("usually") | the **median**: the middle of the sorted list, half of the results are faster, half slower | `p(0.5)` |
+| `oraliq` ("range") | what is left after dropping the fastest 10 % and the slowest 10 % | `p(0.1) … p(0.9)` |
+
+Why the median and not the average? One 500 ms network attempt doubles the average of 99 attempts of 5 ms (from
+5 ms to ~10 ms). The median stays at 5 ms. The p50 / p90 / p99 you see in Grafana and APM tools are the same thing.
+
+One important limit: this method only works for jobs that take **a microsecond or longer**. `time.Now()` itself costs
+~25 ns on this laptop (we measure it in "Going deeper"). You cannot time a 1.5 ns job one by one with a 25 ns clock:
+such jobs need the benchmark loop from GO-1.07.
+
+## Cache and RAM: pocket and warehouse
+
+The **cache** is a small, very fast memory inside the processor: our pocket. The bigger RAM is the warehouse. In
+DSA-A.01 we measured them with the chain method. In this lesson they were **not measured again**: the numbers come
+from DSA-A.01's `natija.txt` file (median of 10 runs):
+
+| From where | Size | One read | Famous table |
+|---|---|---|---|
+| L1 cache | 8 KiB | 1.52 ns | 0.5 ns |
+| L2 cache | 256 KiB | 4.23 ns | 7 ns |
+| RAM | 128 MiB | 105.8 ns | 100 ns |
+
+```text
+processor ──asks──▶ cache (pocket)          ~1.5 ns
+                       │ if not there
+                       ▼
+                RAM (warehouse)             ~106 ns   ≈ 70 times longer
+```
+
+1.52 ns is the time when each read waits for the previous one: the real *latency*. Sequential reads that don't
+depend on each other are faster: in DSA-A.01, 0.31 ns per element from L1. But that is not waiting, it is throughput.
+Today we care about waiting, so we count from 1.52 ns.
+
+## Disk: the SSD and Linux's copy
+
+The disk is the place where data survives a power cut: our distant archive. On this laptop the disk is an SSD: no
+moving parts, only chips. And Linux keeps a copy of a file it has read from the disk in RAM. This copy is called the
+**page cache**. When the same place is asked for again, Linux does not go to the disk, it serves the copy.
+
+The program reads 4 KiB in two ways. Once directly from the SSD: for that the file is opened with the `O_DIRECT`
+flag, which bypasses Linux's copy (open(2)). Once with a normal `os.Open`, from the copy. The code (`olcha/main.go`,
+unchanged):
+
+```go
+func disk() {
+	tayyorla()
+	r := rand.New(rand.NewPCG(3, 4))
+
+	// 1) SSD'dan 4 KiB, tasodifiy joydan. O_DIRECT xotiradagi nusxani (page cache) chetlab o'tadi:
+	// har bir o'qish haqiqatan SSD'ga boradi.
+	f, buf, err := ochDirect(*faylYoli, kb4)
+	tekshir(err)
+	chiqar(olcha("SSD'dan 4 KiB", 5000, func(int) {
+		_, err := f.ReadAt(buf, int64(r.IntN(hajm/kb4))*kb4)
+		tekshir(err)
+	}))
+	f.Close()
+
+	// 2) Xuddi shu 4 KiB, oddiy open bilan: avval 16 MiB ni bir marta o'qiymiz,
+	// Linux uni operativ xotirada nusxa qilib saqlaydi, keyingi o'qishlar nusxadan.
+	g, err := os.Open(*faylYoli)
+	tekshir(err)
+	defer g.Close()
+	_, err = g.ReadAt(make([]byte, 16*mib), 0)
+	tekshir(err)
+	b := make([]byte, kb4)
+	chiqar(olcha("nusxadan 4 KiB", 5000, func(int) {
+		_, err := g.ReadAt(b, int64(r.IntN(16*mib/kb4))*kb4)
+		tekshir(err)
+	}))
+}
+```
+
+| Code | What it does |
+|---|---|
+| `kb4`, `mib`, `hajm` | constants: 4 KiB, 1 MiB and the test file's size ("hajm" = size), 1 GiB |
+| `tayyorla()` | ("prepare") creates the 1 GiB `sinov.dat` from random bytes, if it does not exist yet |
+| `rand.New(rand.NewPCG(3, 4))` | a random number generator that gives the same sequence every time (`math/rand/v2`) |
+| `ochDirect(*faylYoli, kb4)` | `*faylYoli` is the value of the `-fayl` flag (default `sinov.dat`; `*` reads the value through a pointer). The function opens the file with `O_DIRECT` and gives a 4 KiB buffer. It lives in `olcha/direct_linux.go`: `O_DIRECT` needs the buffer address to be a multiple of 4096, so the buffer comes from `syscall.Mmap` |
+| `f.ReadAt(buf, int64(r.IntN(hajm/kb4))*kb4)` | reads 4 KiB from a random place inside the 1 GiB. A random place, so that one read does not help the next |
+| `g.ReadAt(make([]byte, 16*mib), 0)` | reads the first 16 MiB of the file once: Linux keeps a copy of it in RAM |
+| `g.ReadAt(b, …16*mib/kb4…)` | now reads only inside those 16 MiB: every read comes from the copy |
+| `tekshir(err)` | ("check") on an error, prints a message and stops the program |
+
+Does `O_DIRECT` really go to the disk? The course README checked it with `/proc/diskstats`: during `olcha disk` the
+device did +5066 reads (5000 measurements and the 16 MiB). So yes.
+
+Now make a guess. The copy is in RAM, and RAM was ~100 ns. The SSD is the distant archive. How many times faster is
+reading from the copy than reading from the SSD?
+
+**A)** 2 times · **B)** 20 times · **C)** 200 times
+
+<details>
+<summary>Answer</summary>
+
+**C: even more than 200 times.**
+
+```console
+$ go run ./olcha disk
+o'lchov                 marta   odatda   oraliq
+SSD'dan 4 KiB            5000    119µs   74.0µs … 125µs
+nusxadan 4 KiB           5000    517ns   365ns … 603ns
+```
+
+From the SSD 119 µs, from the copy 517 ns: 230 times. In the video (natija.txt, round 5) it was 146 µs and 492 ns:
+297 times. Both runs are above 200. That is why Linux keeps a copy, and why a second `cat katta.log` ("big log")
+finishes much faster than the first.
+
+517 ns is not 106 ns either: it includes the `pread` system call (the program asking the Linux kernel) and copying
+4 KiB. If you chose "A", you thought the SSD was close to RAM. "B" is also too low: the SSD works in microseconds,
+the copy in nanoseconds.
+
+</details>
+
+| Measurement | Video (morning, round 5) | Our re-run (evening) | Famous table |
+|---|---|---|---|
+| 4 KiB from the SSD | 146 µs | 119 µs | 150 µs (Bonér, 2012) |
+| 4 KiB from the copy | 492 ns | 517 ns | — |
+| ratio | 297× | 230× | — |
+
+One interesting observation. On the first run, right after `sinov.dat` was created, the SSD row showed 73.3 µs
+(range 68.9–83.6 µs). One minute later: 119 µs. The research saw the same thing: a freshly written file gave
+68–81 µs, later 116–145 µs. The cause was not investigated. The conclusion is simple: the same disk gives different
+times, so measure several times.
+
+## A common mistake: "I wrote to the file, so it is on disk"
+
+Many programmers think this way: `write` returned, so the data is on the disk. In fact Linux first puts the data in
+the warehouse, that is, in the copy in RAM. It writes to the disk later, when it suits it. If the power goes off in
+between, the data can be lost. The write(2) documentation says it plainly: "A successful return from write() does not
+make any guarantee that data has been committed to disk".
+
+```text
+program: f.WriteAt(b, joy)
+   │
+   ▼
+RAM (warehouse)   ◀── WriteAt returns here. Power cut — the data can be lost
+   │  later (Linux decides when)
+   ▼
+SSD (archive)     ◀── f.Sync() waits until here
+```
+
+There is a separate command to wait until the data reaches the disk: **fsync**. In Go it is `f.Sync()`: it "commits
+the current contents of the file to stable storage" (`os.File.Sync` documentation). Other languages have it too:
+Node `fs.fsync(fd)`, Python `os.fsync(f.fileno())` (the Python docs: call `f.flush()` first, because a Python file
+object has its own buffer), PHP 8.1+ `fsync($f)`. The video's picture: a normal write is dropping a letter into a
+mailbox, fsync is delivering the letter and coming back with a signature.
+
+In the video the code is shortened to two lines:
+
+```go
+f.WriteAt(b, joy)
+f.Sync()
+```
+
+`WriteAt` writes the bytes `b` into the file `f` at position `joy` ("place"). `f.Sync()` waits until the disk
+answers "done". The full function in the course folder:
+
+```go
+func fsync() {
+	f, err := os.Create("fsync.dat")
+	tekshir(err)
+	defer os.Remove("fsync.dat")
+	defer f.Close()
+	b := make([]byte, kb4)
+	for i := range 256 { // 1 MiB joy: keyin shu joyga qayta-qayta yozamiz
+		_, err := f.WriteAt(b, int64(i)*kb4)
+		tekshir(err)
+	}
+	tekshir(f.Sync())
+
+	chiqar(olcha("4 KiB yozish", 2000, func(i int) {
+		_, err := f.WriteAt(b, int64(i%256)*kb4)
+		tekshir(err)
+	}))
+	chiqar(olcha("4 KiB yozish + fsync", 300, func(i int) {
+		_, err := f.WriteAt(b, int64(i%256)*kb4)
+		tekshir(err)
+		tekshir(f.Sync()) // Linux'da fsync(2): ma'lumot diskka yetib borguncha kutadi
+	}))
+}
+```
+
+| Code | What it does |
+|---|---|
+| `os.Create("fsync.dat")` | a new file. `defer os.Remove` and `defer f.Close` close and delete it when the function ends |
+| `for i := range 256 { f.WriteAt(b, …) }` | prepares 256 × 4 KiB = 1 MiB of space; then we write into the same space again and again |
+| `tekshir(f.Sync())` | pushes the preparation to the disk: everything is on the disk before the measurement starts |
+| `"4 KiB yozish", 2000` | a normal write ("yozish" = write), 2000 times |
+| `"4 KiB yozish + fsync", 300` | a write plus `f.Sync()` every time, 300 times (slower, so fewer) |
+| `int64(i%256)*kb4` | `%` is the remainder: the position cycles 0, 1, …, 255, 0, 1, … |
+
+Make a guess. A normal write goes to the warehouse (nanoseconds); fsync goes all the way to the archive and waits for
+the answer (hundreds of microseconds). How many times slower is a write with fsync?
+
+**A)** 10 times · **B)** 100 times · **C)** 1000 times
+
+<details>
+<summary>Answer</summary>
+
+**C: even more than a thousand times.**
+
+```console
+$ go run ./olcha fsync
+o'lchov                 marta   odatda   oraliq
+4 KiB yozish             2000    660ns   579ns … 941ns
+4 KiB yozish + fsync      300   1.62ms   1.52ms … 2.12ms
+```
+
+A normal write takes 660 ns, less than a microsecond. With fsync it takes 1.62 ms: 2455 times more. In the video it
+was 732 ns and 1.29 ms: 1762 times. Over the 5 morning rounds the ratio went from 219 to 2104 times: the normal write
+is very noisy (0.67–6.2 µs). But every time it is hundreds or thousands of times. This is this laptop's disk.
+Server disks with power-loss protection do fsync much faster (course README). If you chose "A" or "B", you thought
+a normal write also goes to the disk: no, it only touches RAM.
+
+</details>
+
+That is why some databases collect several writes and do one fsync for all of them. PostgreSQL calls this *group
+commit* (the `commit_delay` setting: "allowing a larger number of transactions to commit via a single WAL flush").
+In the "Medium" homework you measure it yourself.
+
+## Network: the round trip
+
+A network is the path that connects computers by wire or by radio waves. One computer sends a small message, the
+other sends a reply back. The time from sending the message until the reply arrives is the **round trip** (RTT for
+short). The `time=…ms` that `ping` prints is exactly this.
+
+The program measures a round trip with a TCP connection. A connection starts like this: the laptop sends a SYN
+packet, the other side answers with SYN-ACK (RFC 9293 §3.5). That is one full round trip. In the morning the laptop
+was connected to a phone over Wi-Fi, and the internet came from the phone. The program connects to the Wi-Fi
+network's gateway (the default gateway; in the morning, the phone) on port 53:
+
+```go
+func tarmoq() {
+	// Wi-Fi orqali routergacha (bizda: telefon hotspot'i). TCP ulanish = SYN ketadi, SYN-ACK qaytadi:
+	// bitta borib-kelish.
+	addr := *lanAddr
+	if addr == "" {
+		gw, err := gateway()
+		tekshir(err)
+		addr = net.JoinHostPort(gw, "53")
+	}
+	ulan(addr) // isitish: hisobga kirmaydi
+	chiqar(olchaTarmoq("Wi-Fi: borib-kelish", 100, func() bool { return ulan(addr) }))
+}
+
+// ulan: TCP ulanish o'rnatib, darhol yopadi (vaqtni olchaTarmoq o'lchaydi).
+// Port yopiq bo'lsa, qurilma SYN'ga RST bilan javob beradi ("connection refused"):
+// bu ham bitta to'liq borib-kelish. 3 soniyada javob kelmasa (paket yo'qoldi), false.
+func ulan(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	tekshir(err)
+	c.Close()
+	return true
+}
+```
+
+| Code | What it does |
+|---|---|
+| `gateway()` | finds the gateway address in `/proc/net/route` (Linux) |
+| `ulan(addr) // isitish` | the first attempt ("isitish" = warm-up) is not counted: the Wi-Fi radio "waking up" should not spoil the measurement |
+| `olchaTarmoq(…, 100, …)` | like `olcha`, 100 times, with a 100 ms pause between attempts; an attempt without a reply is not added to the times but counted |
+| `net.DialTimeout("tcp", addr, 3*time.Second)` | a TCP connection: SYN goes out, SYN-ACK comes back. No reply in 3 seconds means the packet was lost |
+| `errors.Is(err, syscall.ECONNREFUSED)` | if the port is closed, the device answers with RST ("connection refused"). That is also one full round trip, so `true` |
+| `c.Close()` | closes the connection at once: we only need the connect time |
+
+Now make a guess. Which is faster: reading 4 KiB from the SSD (~120–150 µs), or sending a message to the gateway over
+Wi-Fi and getting a reply?
+
+**A)** Wi-Fi is faster: radio waves travel at the speed of light · **B)** the SSD is faster · **C)** about the same
+
+<details>
+<summary>Answer</summary>
+
+**B: the SSD is much faster.** The results file has the Wi-Fi rows of the 5 morning rounds (`grep`, SYS-0.01):
+
+```console
+$ grep Wi-Fi natija.txt
+Wi-Fi: borib-kelish       100   4.86ms   2.95ms … 13.3ms
+Wi-Fi: borib-kelish       100   4.18ms   2.93ms … 13.7ms
+Wi-Fi: borib-kelish       100   5.00ms   3.10ms … 44.6ms
+Wi-Fi: borib-kelish       100   4.99ms   3.05ms … 14.5ms
+Wi-Fi: borib-kelish       100   4.89ms   3.04ms … 14.4ms
+```
+
+This command reads a file, so you get exactly the same output. Usually 4–5 ms, that is, more than 30 times longer
+than the SSD. In the evening we measured again on a different Wi-Fi network:
+
+```console
+$ go run ./olcha tarmoq
+o'lchov                 marta   odatda   oraliq
+Wi-Fi: borib-kelish       100   5.69ms   1.87ms … 102ms
+```
+
+The median of 5.69 ms is 48 times longer than the SSD (119 µs). But look at the top of the range: 102 ms. The
+slowest 10 % of attempts took more than 100 ms. On the morning of the same day (10:06–10:13) the same measurement
+gave 141–246 ms, and 5–7 % of the packets were lost (research log, not in `natija.txt`).
+
+The signal's path itself is short, so the time is spent somewhere else: inside the Wi-Fi devices and the gateway.
+Exactly where, this measurement does not tell. If you chose "A", you only counted the distance. The network is the
+least stable floor.
+
+</details>
+
+## Internet: how many round trips are inside one request
+
+Now the real internet. `head -3` shows only the first three lines of the output (SYS-0.01):
+
+```console
+$ go run ./olcha internet | head -3
+o'lchov                 marta   odatda   oraliq
+internet: borib-kelish     30    144ms   92.5ms … 164ms
+sahifa so'rovi             10    529ms   450ms … 643ms
+```
+
+The second line: one round trip (a TCP connection) to the Google server that answers for go.dev, 144 ms. In the
+video it was 128 ms. The gateway was ~5 ms away: the rest is the path after it, through the provider's network (in
+the morning, the mobile operator's) and the internet to the server. We did not measure where the server is: the
+response header only says `server: Google Frontend`.
+
+The third line: we ask for the small file `https://go.dev/robots.txt`, each time with a new connection. 529 ms (in
+the video, 555 ms). That is 3.7 times longer than one round trip. Why? One request really consists of four stages:
+
+| Stage | What happens | Round trips |
+|---|---|---|
+| finding the address (DNS) | the name `go.dev` turns into a numeric IP address | one, but to a nearby server (in the morning the answer came from the phone) |
+| connecting (TCP) | SYN → SYN-ACK | one, to the server |
+| encryption (TLS) | both sides agree to encrypt the data so that strangers cannot read it | one in TLS 1.3 (RFC 8446 §2) + computation |
+| waiting for the answer | the request goes out, the first byte of the answer comes back | one + the server's work |
+
+You have seen this in the browser: DevTools → Network → one request → the **Timing** tab: "DNS Lookup", "Initial
+connection", "SSL", "Waiting for server response". In Go the `net/http/httptrace` package gives the same stages. The
+code (part of the `internet` function in `olcha/main.go`):
+
+```go
+		iz := &httptrace.ClientTrace{
+			// DNS: go.dev nomidan IP manzilni topish
+			DNSStart: func(httptrace.DNSStartInfo) { dns0 = time.Now() },
+			DNSDone:  func(httptrace.DNSDoneInfo) { dD = time.Since(dns0) },
+			// TCP: ulanish (bitta borib-kelish)
+			ConnectStart: func(string, string) { tcp0 = time.Now() },
+			ConnectDone:  func(string, string, error) { tD = time.Since(tcp0) },
+			// TLS: shifrlangan kanal haqida kelishish
+			TLSHandshakeStart: func() { tls0 = time.Now() },
+			TLSHandshakeDone:  func(tls.ConnectionState, error) { sD = time.Since(tls0) },
+			// so'rov yuborilgandan javobning birinchi baytigacha
+			WroteRequest:         func(httptrace.WroteRequestInfo) { yubordi = time.Now() },
+			GotFirstResponseByte: func() { jD = time.Since(yubordi) },
+		}
+```
+
+`httptrace.ClientTrace` is a set of functions (hooks) that `http.Client` calls at the start and the end of each
+stage. Each pair measures one stage with `time.Now()` and `time.Since()`: `dD` is DNS, `tD` is TCP, `sD` is TLS,
+`jD` is from sending the request to the first byte (`iz` = "trace", `yubordi` = "sent"). Other parts of the function:
+`DisableKeepAlives: true` makes every request use a new connection, `"tcp4"` uses IPv4 only, and the first request
+is thrown away as a warm-up (the certificates are loaded).
+
+The full output:
+
+```console
+$ go run ./olcha internet
+o'lchov                 marta   odatda   oraliq
+internet: borib-kelish     30    150ms   90.4ms … 164ms
+sahifa so'rovi             10    547ms   447ms … 683ms
+  manzil topish            10   14.2ms   7.98ms … 22.8ms
+  ulanish                  10    153ms   89.2ms … 157ms
+  shifrlash                10    152ms   114ms … 216ms
+  javob kutish             10    285ms   223ms … 308ms
+```
+
+Compare the numbers with each other. A round trip is 150 ms. Connecting (`ulanish`, 153 ms) is one round trip.
+Encryption (`shifrlash`, 152 ms) is one more. Waiting for the answer (`javob kutish`, 285 ms) is one round trip plus
+the server's work. Finding the address (`manzil topish`) takes only 14 ms: the answer came from nearby. Each line is
+a separate median, so they do not add up to exactly 547. In the video the stages were 13 / 121 / 154 / 261 ms: the
+same picture.
+
+Conclusion: a request over the internet is slow because it contains several round trips. Reusing an open
+connection (keep-alive) removes the DNS, TCP and TLS stages ("Going deeper").
+
+## Comparing with the famous table
+
+The `jadval` ("table") program puts the median of the 5 rounds in `natija.txt` next to the famous table. It reads the
+video's (morning) result, so you get exactly the same output:
+
+```console
+$ go run ./jadval < natija.txt
+amal                  mashhur jadval bu noutbuk      nisbat
+L1 keshdan o'qish             0.5 ns    1.52 ns  3.0× sekin
+L2 keshdan o'qish               7 ns    4.23 ns    1.7× tez
+mutex lock/unlock              25 ns    20.7 ns    1.2× tez
+RAM'dan o'qish                100 ns     106 ns           ≈
+RAM'dan 1 MiB                 250 µs     149 µs    1.7× tez
+nusxadan 4 KiB                     —     605 ns            
+SSD'dan 4 KiB                 150 µs     141 µs           ≈
+4 KiB yozish                       —    1.35 µs            
+4 KiB yozish + fsync               —     1.4 ms            
+tarmoq borib-kelish        500 µs DC    4.89 ms  9.8× sekin
+internet borib-kelish   150 ms CA-NL     124 ms    1.2× tez
+sahifa so'rovi                     —     555 ms            
+```
+
+`< natija.txt` feeds the file to the program's standard input. The `mutex` and `RAM'dan 1 MiB` ("1 MiB from RAM")
+rows come from the benchmarks in "Going deeper". The chart in the video shows the same numbers on a logarithmic
+scale: each line on the vertical axis is ten times bigger than the one before, so 1 ns and 100 ms fit in one
+picture. Here we draw it with text (every 4 characters = 10 times):
+
+```text
+             1 ns        1 µs        1 ms        1 s
+             |           |           |           |
+cache     ░░░
+          █████
+RAM       ░░░░░░░░░░░░
+          ████████████
+SSD       ░░░░░░░░░░░░░░░░░░░░░░░░░
+          █████████████████████████
+          ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+fsync     (not in the famous table)
+          ████████████████████████████
+          ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+network   ░░░░░░░░░░░░░░░░░░░░░░░░░░░
+          ███████████████████████████████
+          ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+internet  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+          ████████████████████████████████████
+          ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+```
+
+`░` is the famous table, `█` the video (natija.txt, round 5), `▓` our evening re-run (cache and RAM were not
+measured again).
+
+What we see:
+
+- **Cache, RAM, SSD and internet** stayed in the same order. 17 years have passed, and the "floors" are still in
+  place.
+- In the **network** row we are ~10 times slower. But it is not the same thing: the table's 500 µs is the network
+  inside a **datacenter** (a building with thousands of servers, "Round trip within same datacenter"). Ours goes over
+  Wi-Fi to the gateway.
+- In the **internet** row the distances differ too: the table has California → Netherlands → California, we have
+  this laptop to a Google server (we did not measure where the server is).
+- **fsync** is not in the famous table at all, even though it is today's most expensive disk operation.
+
+## Stretched to human time
+
+Now the promised calculation. We stretch every time by the same factor: let one number from the cache (1.52 ns)
+become one second. We divide every time by 1.52 ns:
+
+| Job | Video | Stretched | Our re-run | Stretched |
+|---|---|---|---|---|
+| one number from the cache | 1.52 ns | 1 second | (not re-measured) | 1 second |
+| one number from RAM | 106 ns | ~70 seconds (1 minute) | (not re-measured) | ~70 seconds |
+| 4 KiB from the SSD | 146 µs | ~27 hours (1 day) | 119 µs | ~22 hours |
+| Wi-Fi round trip | 4.89 ms | ~37 days (1 month) | 5.69 ms | ~43 days |
+| internet round trip | 128 ms | ~2.7 years | 144 ms | ~3.0 years |
+| answer from a website (new connection) | 555 ms | ~11.6 years | 529 ms | ~11.0 years |
+
+If a number from the cache is one second, an answer from a website is eleven to twelve years. At two different times
+of day, on two different Wi-Fi networks, the numbers are different, but the staircase is the same. That is today's
+one idea.
+
+Practical advice: when a program is slow, first count how many times it went to the disk and to the network. One
+`fsync` or one new HTTPS connection costs more than millions of processor operations.
+
+In the next lesson ([SYS-1.02](/lab/youtube/sys#sys-1-02)) we go inside the processor and see how a Go function turns into
+processor instructions.
+
+## Going deeper (optional): nanosecond jobs, keep-alive and disk spread
+
+**How to measure nanosecond jobs.** How much does `time.Now()` itself cost? You cannot time it one call at a time,
+so you need the benchmark loop from GO-1.07 (`b.Loop()`). The `xotira/` ("memory") package in the course folder
+measures three things:
+
+```go filename="xotira/xotira_test.go" showLineNumbers
+// Nanosekund darajasidagi amallar: ularni bittalab soat bilan o'lchab bo'lmaydi,
+// shuning uchun GO-1.07 dagi kabi benchmark sikli ishlatiladi (b.Loop).
+//
+//	taskset -c 2 go test -run '^$' -bench . -count 10 ./xotira
+//
+// Kesh va operativ xotiradan bitta o'qish (L1, L2, RAM) bu yerda qayta o'lchanmaydi:
+// ular DSA-A.01 darsida o'lchangan (../dsa-a01-cache, Zanjir benchmark'i).
+package xotira
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+// time.Now() ning o'zi qancha turadi? Shu sababli 1 ns lik amalni bittalab o'lchamaymiz.
+func BenchmarkVaqt(b *testing.B) {
+	var t time.Time
+	for b.Loop() {
+		t = time.Now()
+	}
+	_ = t
+}
+
+// Hech kim raqobat qilmayotgan mutex: Lock + Unlock juftligi.
+func BenchmarkMutex(b *testing.B) {
+	var mu sync.Mutex
+	for b.Loop() {
+		mu.Lock()
+		mu.Unlock()
+	}
+}
+
+const (
+	mb    = 1 << 20    // 1 MiB
+	katta = 512 << 20  // 512 MiB: L3 (12 MiB) dan ancha katta
+	el    = mb / 8     // 1 MiB dagi int64 soni
+	nKat  = katta / mb // nechta 1 MiB lik bo'lak
+)
+
+var yigindi int64
+
+// 1 MiB ni ketma-ket o'qish (qo'shish), har safar keyingi bo'lakdan:
+// 512 MiB aylanib chiqquncha bitta bo'lak keshda qolmaydi, demak o'qish operativ xotiradan.
+func BenchmarkMegabayt(b *testing.B) {
+	s := make([]int64, katta/8)
+	for i := range s {
+		s[i] = int64(i)
+	}
+	var y int64
+	k := 0
+	for b.Loop() {
+		bolak := s[k*el : (k+1)*el]
+		for _, v := range bolak {
+			y += v
+		}
+		k = (k + 1) % nKat
+	}
+	yigindi = y
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 17–23 | `BenchmarkVaqt` | ("time") only `time.Now()` inside the loop: the price of one look at the clock |
+| 26–32 | `BenchmarkMutex` | a `Lock` + `Unlock` pair on a `sync.Mutex` that nobody else wants (mutexes come in GO-1.22) |
+| 34–39 | `const (…)` | 1 MiB, 512 MiB and numbers derived from them. `<<` is a left shift: `1 << 20` = 2²⁰ = 1,048,576 |
+| 45–59 | `BenchmarkMegabayt` | each time adds up the next 1 MiB piece of a 512 MiB slice, in order. 512 MiB does not fit in the cache (L3 is 12 MiB), so the reads come from RAM |
+| 58 | `yigindi = y` | stores the result in a package variable, so the compiler does not throw the loop away as unused |
+
+`taskset -c 2` pins the benchmark to core 2 (this processor has big P-cores and small E-cores, DSA-A.01):
+
+```console
+$ taskset -c 2 go test -run ^$ -bench . -count 3 ./xotira
+goos: linux
+goarch: amd64
+pkg: github.com/abdurahmon27/go-backend-uz/lessons/sys-11-latency/xotira
+cpu: 12th Gen Intel(R) Core(TM) i5-12450H
+BenchmarkVaqt     	47190955	        25.52 ns/op
+BenchmarkVaqt     	47469183	        25.49 ns/op
+BenchmarkVaqt     	47282148	        25.60 ns/op
+BenchmarkMutex    	100000000	        11.40 ns/op
+BenchmarkMutex    	100000000	        11.35 ns/op
+BenchmarkMutex    	100000000	        11.71 ns/op
+BenchmarkMegabayt 	   17427	     68371 ns/op
+BenchmarkMegabayt 	   18135	     66305 ns/op
+BenchmarkMegabayt 	   17962	     66073 ns/op
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/sys-11-latency/xotira	10.958s
+```
+
+`-run ^$` runs no tests (only benchmarks), `-count 3` runs each one three times. `time.Now()` ~25.5 ns, the mutex
+~11.4 ns, reading 1 MiB from RAM ~66 µs (250 µs in the famous table). Rounds 4–5 of the morning `natija.txt` showed
+the same (25.5 ns, 11.5 ns, ~70 µs). In rounds 1–3 the computer was busy with other work and the numbers were two to
+three times higher (`time.Now` 38–76 ns, mutex 18–35 ns): that is why `jadval` shows 20.7 ns for the mutex. When you
+measure latency, the load is part of the latency.
+
+Conclusion: you cannot time a 1.5 ns job one call at a time with a 25 ns clock. A 120 µs SSD read is easy to time:
+the clock's error is 0.02 %.
+
+**Keep-alive.** Our `internet` measurement opens a new connection every time (`DisableKeepAlives: true`). A real
+`http.Client` keeps the connection open and reuses it: the next request has no DNS, TCP or TLS, only "waiting for
+the answer". It was measured with an earlier version of the program (research log, we did not re-run it): ~0.28–0.34 s
+with an open connection, ~0.7–0.8 s with a new one. So in Go, don't create an `http.Client` for every request: reuse
+one client.
+
+**Disk spread.** We saw it above: on a freshly created file the SSD gave 73 µs, one minute later 119 µs. The morning
+measurements showed the same (68–81 µs → 116–145 µs). The cause was not studied (it may be a cache inside the SSD,
+but that was not checked). In such a case, show the range and several runs, not one number.
+
+## Common mistakes
+
+**1. "I wrote to the file, so it is on disk" (silent bug).** No error is printed. If the power goes off or the
+server crashes, the last writes can be lost ("A common mistake" section). **Fix:** after important data, call
+`f.Sync()` and check its error. It costs ~1–2 ms, so collect many writes and do one fsync (homework, "Medium").
+
+**2. `go run main.go` runs a single file.** If you give a file inside the folder by name:
+
+```console
+$ go run olcha/main.go disk
+# command-line-arguments
+olcha/main.go:188:17: undefined: ochDirect
+```
+
+*undefined: ochDirect* means "`ochDirect` is not defined". `olcha/main.go:188:17` is the file, line and column. The
+`ochDirect` function is in another file of the same folder, `direct_linux.go`. When you give a file name, Go builds
+only that file. **Fix:** pass the package as a folder: `go run ./olcha disk`.
+
+**3. Forgetting to choose a measurement.** If you give no argument:
+
+```console
+$ go run ./olcha
+ishlatish: go run ./olcha disk|fsync|tarmoq|internet|hammasi
+exit status 2
+```
+
+"ishlatish" means "usage": the program says which words it expects and exits with code 2 (`os.Exit(2)`). The line
+`exit status 2` is added by `go run`. **Fix:** `go run ./olcha disk` (or `fsync`, `tarmoq`, `internet`, `hammasi`).
+
+**4. Timing a nanosecond job one call at a time with `time.Now()` (silent bug).** You get a number, but it is the
+price of the clock (~25 ns), not of the job. **Fix:** the benchmark loop (`b.Loop()`, GO-1.07), see "Going deeper".
+
+**5. Trusting one measurement or the average (silent bug).** The network changes 10 times within minutes (4–5 ms
+versus more than 100 ms). One slow attempt spoils the average. **Fix:** measure many times, show the median and
+p10 … p90, repeat in several rounds (`olchov.sh` does 5 rounds).
+
+**6. Trusting the "SSD" row on macOS or Windows (silent bug).** `O_DIRECT` exists only on Linux. On another system
+`olcha/direct_other.go` opens the file normally, and the "SSD'dan" row may in fact measure the copy: you get
+nanoseconds, not microseconds. **Fix:** do the disk measurement on Linux.
+
+**7. Comparing Wi-Fi with a datacenter.** "We are 10 times slower than the famous table" is a wrong conclusion: the
+table's 500 µs is for a network inside one building. **Fix:** before comparing, check *what* each of the two numbers
+measured.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** Of today's measurements, which place is the fastest and how long does it take?
+
+<details>
+<summary>Answer</summary>
+
+The processor's cache: one number ~1.5 ns (DSA-A.01, L1, chain method). RAM is ~70 times longer (~106 ns).
+
+</details>
+
+**2.** "I wrote to the file, so it is on disk." True?
+
+<details>
+<summary>Answer</summary>
+
+No. `write` (in Go `f.Write` / `f.WriteAt`) puts the data into the copy in RAM and returns. A special command such as
+fsync (in Go `f.Sync()`) tells you that the data reached the disk. For us it was 1762–2455 times slower than a normal
+write.
+
+</details>
+
+**3.** Why is one HTTPS request over the internet 3–4 times longer than one round trip?
+
+<details>
+<summary>Answer</summary>
+
+Because it contains several round trips: the TCP connection (one), the TLS handshake (one in TLS 1.3), the request
+and the answer (one + the server's work), and before them, finding the address (DNS). Reusing an open connection
+(keep-alive) removes the first three.
+
+</details>
+
+**4.** A program writes 1000 records and calls `f.Sync()` after each one. Roughly how long does it take on this
+laptop?
+
+**A)** ~1 ms · **B)** ~1–2 seconds · **C)** ~1 minute
+
+<details>
+<summary>Answer</summary>
+
+**B.** One write + fsync was 1.29–1.62 ms for us: 1000 × ~1.5 ms ≈ 1.5 seconds. Without fsync: 1000 × ~0.7 µs ≈
+0.7 ms ("A" is the program that forgot fsync). With one fsync per 10 records, the homework measurement gives
+~0.2 seconds.
+
+</details>
+
+**5.** From GO-1.07: why don't we time a `sync.Mutex` Lock + Unlock pair (~11 ns) one call at a time with
+`time.Now()` / `time.Since()`?
+
+<details>
+<summary>Answer</summary>
+
+Because `time.Now()` itself costs ~25 ns: the clock is more expensive than the job. A benchmark loop runs the job
+millions of times and divides the total time by the count (`ns/op`), so the clock's price disappears. We measured it
+in the `xotira/` package with `b.Loop()`: 11.4 ns.
+
+</details>
+
+## Homework
+
+The tasks and answers are in the lesson folder on GitHub:
+[lessons/sys-11-latency](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-11-latency). The answer
+program is [uyvazifa/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-11-latency/uyvazifa)
+("homework", Linux only), the three raw runs are in
+[uyvazifa.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/sys-11-latency/uyvazifa.txt). Try it
+yourself first.
+
+- 🟢 **Easy:** run `go run ./olcha disk` on your computer. How does the SSD row compare with ours (146 µs / 119 µs)?
+  Extra: `go run ./olcha -host <another site> internet`: does the round trip change?
+- 🟡 **Medium:** do one `fsync` per 10 records. How much time does one record take?
+- 🟠 **Hard:** how long is a round trip when the computer talks to itself over the network (localhost, TCP)? And
+  over a Unix socket?
+- 🔴 **Guru:** ask the SSD for 32 reads at the same time. How do the latency of one read and the number of reads per
+  second change?
+
+<details>
+<summary>Answer</summary>
+
+Everything is in the course folder, in `uyvazifa/main.go`. Our evening run:
+
+```console
+$ go run ./uyvazifa guruh
+ 1 ta yozuvga 1 fsync: bitta yozuvga 1.769ms
+10 ta yozuvga 1 fsync: bitta yozuvga 226µs
+$ go run ./uyvazifa unix
+tcp  round trip: mediana 6.591µs, p90 10.718µs
+unix round trip: mediana 2.84µs, p90 2.907µs
+$ go run ./uyvazifa parallel
+ 1 goroutine: mediana  116µs, p90 1.01ms,   3472 o'qish/s
+ 4 goroutine: mediana  148µs, p90 1.065ms,  11812 o'qish/s
+32 goroutine: mediana  223µs, p90  525µs,  84072 o'qish/s
+```
+
+🟢 The answer depends on your disk. We got 135–146 µs in the morning (5 rounds) and 73–119 µs in the evening. For a
+spinning disk (HDD) the famous table gives ~10 ms for one random read (Dean: "Disk seek 10,000,000 ns"). For the
+extra question we measured `kun.uz` in the evening:
+
+```console
+$ go run ./olcha -host kun.uz internet
+o'lchov                 marta   odatda   oraliq
+internet: borib-kelish     30    159ms   92.4ms … 182ms
+sahifa so'rovi             10    714ms   452ms … 885ms
+  manzil topish            10   8.34ms   4.99ms … 14.6ms
+  ulanish                  10    161ms   93.6ms … 166ms
+  shifrlash                10    354ms   220ms … 392ms
+  javob kutish             10    171ms   115ms … 200ms
+```
+
+The round trip is close to go.dev's (144–150 ms). A large part of the latency may be at the start of the path, in
+our provider's network (README: check it with `traceroute`, in the SYS-3 lessons). For `kun.uz` the encryption stage
+is longer: the TLS handshake took more than one round trip (cause not studied).
+
+🟡 The code (from `uyvazifa/main.go`):
+
+```go
+// guruh: ma'lumotlar bazalaridagi "group commit" g'oyasi: bir nechta yozuv, bitta fsync.
+func guruh() {
+	f, err := os.Create("guruh.dat")
+	tekshir(err)
+	defer os.Remove("guruh.dat")
+	defer f.Close()
+	b := make([]byte, 4096)
+	const n = 300
+	for _, k := range []int{1, 10} { // k ta yozuvdan keyin bitta fsync
+		t0 := time.Now()
+		for i := range n {
+			_, err := f.WriteAt(b, int64(i%256)*4096)
+			tekshir(err)
+			if (i+1)%k == 0 {
+				tekshir(f.Sync())
+			}
+		}
+		d := time.Since(t0)
+		fmt.Printf("%2d ta yozuvga 1 fsync: bitta yozuvga %v\n", k, (d / n).Round(time.Microsecond))
+	}
+}
+```
+
+`k` is the number of writes per fsync: first 1, then 10. `(i+1)%k == 0` means every `k`-th write. The total time of
+300 writes is divided by 300. The result: an fsync after every write gives 1.77 ms per write, one per 10 writes gives
+226 µs per write, ~8 times faster (README: 5–19 times over three runs). This is the *group commit* idea in databases:
+the price is mostly in the fsync, not in the number of writes. The cost: before one fsync, 10 writes are at risk, and
+if the power goes off they are lost together.
+
+🟠 TCP localhost: 6.6 µs, Unix domain socket: 2.8 µs, 2.3 times faster (README: 1.4–2.7 times over three runs). The
+network card is not used, but the TCP layer (packets, acknowledgements) still runs; a Unix socket bypasses it.
+Either way it is a thousand times faster than ~5 ms over Wi-Fi.
+
+🔴 1 goroutine: one read 116 µs, 3472 reads per second. 32 goroutines: one read 223 µs (2 times slower), but 84,072
+per second (24 times more). An NVMe SSD runs many requests in parallel. Latency and throughput (jobs per second) are
+different things: one can get worse while the other gets better.
+
+</details>
+
+## Sources
+
+- Peter Norvig, ["Teach Yourself Programming in Ten Years", the table](https://norvig.com/21-days.html#answers) ·
+  [the 2001 version (Wayback)](https://web.archive.org/web/20011017203742/http://norvig.com/21-days.html)
+- Jeff Dean, LADIS 2009 keynote, page 24 "Numbers Everyone Should Know":
+  [dean-keynote-ladis2009.pdf](https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf) ·
+  Stanford CS295, page 13: [stanford-295-talk.pdf](https://static.googleusercontent.com/media/research.google.com/en//people/jeff/stanford-295-talk.pdf)
+- Jonas Bonér, [Latency Numbers Every Programmer Should Know](https://gist.github.com/jboner/2841832) (gist, 2012-05-31)
+- Colin Scott, [Numbers Every Programmer Should Know By Year](https://colin-scott.github.io/personal_website/research/interactive_latency.html)
+  (an estimate by year, not a measurement)
+- Linux: [open(2) `O_DIRECT`](https://man7.org/linux/man-pages/man2/open.2.html) ·
+  [write(2)](https://man7.org/linux/man-pages/man2/write.2.html) ·
+  [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- Go: [`os.File.Sync`](https://pkg.go.dev/os#File.Sync) · [`time.Since`](https://pkg.go.dev/time#Since) ·
+  [time: Monotonic Clocks](https://pkg.go.dev/time#hdr-Monotonic_Clocks) ·
+  [`net/http/httptrace`](https://pkg.go.dev/net/http/httptrace) · [`testing.B.Loop`](https://pkg.go.dev/testing#B.Loop)
+- fsync in other languages: [Node `fs.fsync`](https://nodejs.org/api/fs.html#fsfsyncfd-callback) ·
+  [Python `os.fsync`](https://docs.python.org/3/library/os.html#os.fsync) ·
+  [PHP `fsync`](https://www.php.net/manual/en/function.fsync.php)
+- [PostgreSQL: WAL settings (`commit_delay`, group commit)](https://www.postgresql.org/docs/current/runtime-config-wal.html)
+- [RFC 9293 (TCP) §3.5](https://www.rfc-editor.org/rfc/rfc9293#section-3.5) ·
+  [RFC 8446 (TLS 1.3) §2](https://www.rfc-editor.org/rfc/rfc8446#section-2)
+- [Chrome DevTools: Network, Timing](https://developer.chrome.com/docs/devtools/network/reference#timing-explanation)
+- [BioNumbers BNID 100706](https://bionumbers.hms.harvard.edu/bionumber.aspx?id=100706) (an eye blink, 0.1–0.4 s)
+- The course folder and README: [lessons/sys-11-latency](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-11-latency) ·
+  [natija.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/sys-11-latency/natija.txt) ·
+  DSA-A.01 cache measurement: [lessons/dsa-a01-cache](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache)
+- Results from `go1.26.8 linux/amd64`, Intel Core i5-12450H, HP SSD EX900 1TB (NVMe, ext4), `CGO_ENABLED=0`,
+  2026-11-26. Video: `natija.txt` (10:55–10:58, Wi-Fi to a phone hotspot). The terminal output on this page: the
+  same day, 20:43–20:47, a different Wi-Fi network, load 0.9–1.4. The cache and RAM numbers come from DSA-A.01 and
+  were not measured again. The keep-alive numbers come from the research log and were not re-run.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-11-latency)
+
+---
+
+← Previous lesson: [SYS-0.06](/lab/youtube/sys/sys-0-06/en) · Next lesson: [SYS-1.02](/lab/youtube/sys#sys-1-02) → · [All lessons](/lab/youtube/sys)
+
+</div>
