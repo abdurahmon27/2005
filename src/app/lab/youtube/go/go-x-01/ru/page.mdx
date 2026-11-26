@@ -1,0 +1,1056 @@
+---
+title: "HTTP API в 20 строк: первый сервис на Go и один бинарник"
+date: "2026/11/26"
+description: "Переписываем API с двумя эндпоинтами с Express на Go в 20 строк: go mod, go run/go build, один бинарник, GOOS/GOARCH и ловушка cgo во FROM scratch."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-01"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-01) · **Русский** · [English](/lab/youtube/go/go-x-01/en)  
+Урок GO-X.01 · [Go: 0 → Guru](/lab/youtube/go#go-x-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Мы собрали Docker-образ для API на Express с двумя эндпоинтами: на `node:24-slim` он вышел на 235 MB. Тот же API на
+Go весит 8.66 MB, и в образе нет ни Node, ни Go, ни даже shell. Как так? Сегодня напишем этот API с нуля и выкатим
+его на сервер одним файлом.
+
+**Одна идея:** сервис на Go уезжает на сервер одним файлом. `go build` собирает наш код, стандартную библиотеку и
+runtime в один бинарник, поэтому на сервере не нужны ни Node, ни `node_modules`, ни Go. Но бинарник собирается под
+одну ОС и один процессор, а чтобы он работал в образе `FROM scratch`, cgo должен быть выключен.
+
+К концу урока вы сможете:
+
+- создать проект через `go mod init`, написать на `net/http` API, который отдаёт JSON, и объяснить каждую строку
+  через её аналог в Express;
+- объяснить разницу между `go run` и `go build` и сказать, что лежит в файле, который делает `go build`;
+- выкатить один файл на сервер или в образ `FROM scratch` командой `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build`;
+- найти и исправить причину ошибок `exec format error` и `exec /api: no such file or directory`.
+
+Три главных новых понятия урока:
+
+| Понятие | Простой смысл | Аналог в JS/TS |
+|---|---|---|
+| `go.mod` (модуль) | файл проекта: имя модуля и минимальная версия Go | `package.json` |
+| `go run` / `go build` | скомпилировать и сразу запустить / скомпилировать и записать в файл | `tsx index.ts` / `tsc` |
+| статический бинарник, `GOOS`/`GOARCH` | один исполняемый файл, который ни от чего не зависит; собирается под одну ОС и один процессор | `node` + `node_modules` на сервере |
+
+Есть и два вспомогательных понятия: **cgo** (вызов C-кода из Go; его выключает `CGO_ENABLED=0`) и **кэш модулей**
+вместе с `go.sum` (код внешних модулей и их хеши; вместо pnpm store и `package-lock.json`).
+
+## Что нужно знать заранее
+
+- Это первый урок курса GO-X, предыдущего урока нет. Курс для разработчиков, которые пишут на JS/TS, Python или PHP:
+  мы считаем, что вы знаете HTTP, JSON, `curl`, терминал, Docker-образы и Express.
+- Подробно про Docker (multi-stage сборка, `scratch`):
+  [SYS-0.05 · Docker: «mening kompyuterimda ishlaydi» muammosiga yechim](/lab/youtube/sys#sys-0-05) («Docker: решение проблемы
+  „у меня на компьютере работает“»). Здесь только то, что нужно для Go.
+- Этот код нельзя запустить на go.dev/play: там сервер не может открыть порт, и Docker тоже нет. Скачайте код курса и
+  откройте терминал в папке `lessons/0x-01-http-api`. Все команды работают из этой папки. Понадобятся Go 1.22 или
+  новее (результаты получены на go1.26.8), `curl` и Docker. Для сравнения с Express ещё и Node.
+- На ноутбуке, где получены результаты, нет компилятора C (gcc). Поэтому его команды `go build` и `go run` запускались
+  после `export CGO_ENABLED=0` в терминале (сборки внутри Docker не в счёт). Если у вас есть gcc или ваш Go сам
+  выключает cgo, это не нужно. Что этот ноутбук выводит без этой настройки, смотрите в «Частых ошибках» (ошибка 6).
+
+Один вопрос перед началом. Что должно быть на сервере, чтобы запустить API на Express на обычном VPS?
+
+<details>
+<summary>Ответ</summary>
+
+Три вещи: бинарник `node` (129 491 456 байт у Node v24.10.0 на этом ноутбуке), `node_modules` (для Express
+`npm install` ставит 65 пакетов) и ваш код. В Python то же самое с интерпретатором и `venv`, в PHP с php-fpm и
+`vendor/`. Сегодня увидим, как в Go этот список сжимается до одного файла.
+
+</details>
+
+## `go.mod`: вместо `package.json`
+
+Любой проект на Go начинается с одной команды: `go mod init` вместо `npm init`. В новой пустой папке:
+
+```console
+$ go mod init api
+go: creating new go.mod: module api
+$ cat go.mod
+module api
+
+go 1.26.8
+```
+
+Обратите внимание на названия, они не такие, как в npm:
+
+| npm | Go | Что это |
+|---|---|---|
+| package (проект с `package.json`) | **модуль** (module, проект с `go.mod`) | единица, которая версионируется и распространяется |
+| модуль (один `.js`-файл) | **пакет** (package, одна папка) | `.go`-файлы в одной папке; `import` подключает пакет |
+
+В `go.mod` две строки:
+
+- `module api` — имя модуля. Пакеты внутри проекта импортируются под этим именем (`api/...`). У библиотеки обычно
+  пишут путь к репозиторию, например `github.com/you/api`.
+- `go 1.26.8` — минимальная версия Go, которую требует этот модуль. Похоже на `"engines"` в `package.json`, но есть
+  два отличия. Первое: `engines` — только рекомендация, а Go эту строку соблюдает строго. Более старый Go откажется
+  собирать или с `GOTOOLCHAIN=auto` скачает нужную версию. Второе: эта строка ещё и выбирает, какое поведение языка
+  и стандартной библиотеки действует. Подробно об этом в уроке
+  [GO-1.16 · `go.mod`dagi bitta qator dasturingiz xulqini oʻzgartiradi](/lab/youtube/go/go-1-16/ru) («одна строка в `go.mod`
+  меняет поведение программы»).
+
+`go mod init` записывает версию Go, установленную на компьютере. Как сказано в README курса, её можно поменять на
+`go 1.26.0`, чтобы работать с более старым 1.26.x.
+
+Теперь зависимости. Первое, что делают в проекте на Express, — `npm install`:
+
+```console
+$ npm install express
+
+added 65 packages, and audited 66 packages in 5s
+
+31 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+```
+
+Ради одного Express в `node_modules` легли 65 пакетов. В Go и HTTP-сервер, и JSON — в **стандартной библиотеке**,
+то есть приходят вместе с Go, как `node:http` в Node. Поэтому в `go.mod` вообще нет строки `require` (строки
+зависимости). Это видно в выводе `cat go.mod` выше.
+
+Если нужен внешний модуль (например, драйвер Postgres), его добавляет `go get`:
+
+| Что | npm | Go |
+|---|---|---|
+| список зависимостей и версии | `package.json` (`^5.3.0` — диапазон) | `require` в `go.mod` (точная версия) |
+| хеш каждого файла | `integrity` в `package-lock.json` | `go.sum` (только хеши) |
+| где лежит код | внутри проекта, `node_modules/` | вне проекта, в общем **кэше модулей** (как pnpm store; где он: `go env GOMODCACHE`) |
+
+## API в 20 строк
+
+Вот весь API. Два эндпоинта: `GET /health` и `GET /users/{id}`.
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("id")})
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+Тот же API на Express 5 (`node/index.js` в папке курса; комментарий: «тот же API на Express 5, для сравнения»):
+
+```js filename="node/index.js" showLineNumbers
+// Xuddi shu API Express 5 bilan (taqqoslash uchun): node index.js
+const express = require("express");
+const app = express();
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+app.get("/users/:id", (req, res) => {
+  res.json({ id: req.params.id });
+});
+
+app.listen(3000, () => console.log("listening on :3000"));
+```
+
+Разберём код на Go построчно:
+
+| Строка | Код | Что делает | В Express |
+|---|---|---|---|
+| 1 | `package main` | файл относится к пакету `main`: это запускаемая программа, а не библиотека | файл, который передают в `node index.js` |
+| 3–7 | `import ( … )` | три пакета из стандартной библиотеки: JSON, лог и HTTP-сервер | `require("express")`, но без `npm install` |
+| 9 | `func main() {` | точка входа: Go начинает программу с этой функции | код верхнего уровня файла |
+| 10 | `http.HandleFunc("GET /health", …)` | регистрирует обработчик (handler) для пути. Метод пишется прямо в шаблоне: `GET`, пробел, путь (с Go 1.22) | `app.get("/health", …)` |
+| 10 | `func(w http.ResponseWriter, r *http.Request) { … }` | **анонимная функция**, написанная на месте (функциональный литерал). Сначала `w`, куда пишется ответ, потом запрос `r` | `(req, res) => { … }`, порядок обратный |
+| 10 | `w http.ResponseWriter` | тип пишется после имени | `w: ResponseWriter` в TS |
+| 10 | `*http.Request` | `*` — указатель (pointer). Разберём в [GO-X.04](/lab/youtube/go#go-x-04); пока читайте как «запрос» | — |
+| 11 | `w.Header().Set("Content-Type", "application/json")` | заголовок ответа ставим сами | `res.json` делает это за вас |
+| 12 | `json.NewEncoder(w).Encode(…)` | пишет значение в виде JSON прямо в `w` и добавляет в конце `\n` | `res.json(…)` |
+| 12 | `map[string]string{"status": "ok"}` | map, где и ключи, и значения — `string`, заполненный на месте | `Record<string, string>`, `{ status: "ok" }` |
+| 13 | `})` | закрывает функцию и вызов `HandleFunc` | `});` |
+| 14 | `"GET /users/{id}"` | `{id}` в фигурных скобках — изменяемая часть пути | `"/users/:id"` |
+| 16 | `r.PathValue("id")` | возвращает значение `{id}` из пути | `req.params.id` |
+| 18 | `log.Println("listening on :3000")` | пишет строку лога с датой и временем | `console.log(…)` |
+| 19 | `http.ListenAndServe(":3000", nil)` | запускает сервер на порту 3000. Возвращается только при ошибке, например если порт занят | `app.listen(3000)` |
+| 19 | `nil` | значит «обработчик не передали», как `null` в JS. Тогда сервер берёт стандартный роутер (`http.DefaultServeMux`): вызовы `HandleFunc` выше зарегистрировали пути именно в нём | сам объект `app` |
+| 19 | `log.Fatal(…)` | пишет в лог ошибку, которую вернул `ListenAndServe`, и завершает программу с `exit status 1` | `process.exit(1)` |
+
+В этом коде видны ещё два правила Go:
+
+- `HandleFunc`, `PathValue`, `NewEncoder`, `ListenAndServe` начинаются с заглавной буквы. В Go заглавная буква
+  означает **экспорт**: имя видно снаружи пакета. Имя со строчной буквы остаётся внутри пакета. Сама буква делает то,
+  что в ES-модулях делает слово `export`.
+- `Encode` ещё и возвращает значение ошибки, которое мы пока игнорируем. Как в Go проверяют ошибки — в уроке
+  [GO-X.03](/lab/youtube/go#go-x-03).
+
+Путь одного запроса глазами машины:
+
+| Шаг | Что происходит |
+|---|---|
+| 1 | `main` регистрирует в `DefaultServeMux` два шаблона: `GET /health`, `GET /users/{id}` |
+| 2 | `ListenAndServe(":3000", nil)` открывает порт и ждёт запросов (программа «стоит» на этой строке) |
+| 3 | приходит `GET /users/42` → роутер сверяет метод и путь с шаблонами → подходит второй, `id` = `"42"` |
+| 4 | обработчик ставит заголовок и пишет `{"id":"42"}` + `\n` |
+
+## `go run`: как `tsx`
+
+Запускаем. `go run .` компилирует пакет в текущей папке и сразу его запускает, как `tsx index.ts`. Нового файла в
+папке проекта не остаётся.
+
+```console
+$ go run .
+2026/11/26 18:09:03 listening on :3000
+```
+
+Сервер работает и занимает терминал. Во втором терминале спрашиваем:
+
+```console
+$ curl localhost:3000/users/42
+{"id":"42"}
+```
+
+Теперь прогноз. `/health` зарегистрирован только для `GET`. Если отправить на него `POST`, что вернёт Go?
+
+**A)** `404 Not Found` · **B)** `405 Method Not Allowed` · **C)** `200 OK`, ведь обработчик всё равно сработает
+
+<details>
+<summary>Ответ</summary>
+
+**B: `405 Method Not Allowed`.** Метод входит в шаблон, поэтому роутер знает, что путь существует, но метод не
+подходит. В заголовке `Allow` он ещё и перечисляет разрешённые методы: `GET, HEAD`. Шаблон с `GET` принимает и
+запросы `HEAD` (Express тоже). Если вы выбрали A, вы ждали поведения Express: он на неверный метод отвечает 404. Если
+выбрали C, вы думали, что метод не часть шаблона.
+
+</details>
+
+```console
+$ curl -i -X POST localhost:3000/health
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Thu, 26 Nov 2026 13:09:07 GMT
+Content-Length: 19
+
+Method Not Allowed
+```
+
+Для сравнения Express (`cd node && node index.js`, после остановки сервера на Go):
+
+```console
+$ curl -i -X POST localhost:3000/health
+HTTP/1.1 404 Not Found
+X-Powered-By: Express
+Content-Security-Policy: default-src 'none'
+X-Content-Type-Options: nosniff
+Content-Type: text/html; charset=utf-8
+Content-Length: 146
+Date: Thu, 26 Nov 2026 13:09:20 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Error</title>
+</head>
+<body>
+<pre>Cannot POST /health</pre>
+</body>
+</html>
+$ curl -I localhost:3000/health
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: application/json; charset=utf-8
+Content-Length: 15
+ETag: W/"f-VaSQ4oDUiZblZNAEkkN+sX+q3Sg"
+Date: Thu, 26 Nov 2026 13:09:20 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+```
+
+| Запрос | Go (`net/http`, шаблоны Go 1.22+) | Express 5.3.0 |
+|---|---|---|
+| `GET /health` | 200 | 200 |
+| `HEAD /health` | 200 | 200 |
+| `POST /health` | **405** + `Allow: GET, HEAD` | **404** `Cannot POST /health` |
+
+## Неиспользуемый импорт: ошибка, а не предупреждение
+
+В папке `xato/` («xato» — «ошибка») обработчик `/health` пишет JSON вручную. Импорт `encoding/json` остался и больше
+не используется:
+
+```go filename="xato/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+Отличие от `main.go` из урока: остался только маршрут `/health`, а в строке 12 стоит `w.Write(…)`. Он пишет байты
+прямо в ответ. `` `\{"status":"ok"\}` `` — строка в обратных кавычках (кавычки внутри не нужно экранировать), а
+`[]byte(…)` превращает её в байты.
+
+Что сделает `go build`?
+
+**A)** соберёт и выведет предупреждение, как ESLint · **B)** сборка упадёт с ошибкой, бинарника не будет ·
+**C)** `go build` сам удалит импорт
+
+<details>
+<summary>Ответ</summary>
+
+**B.** У компилятора Go вообще нет предупреждений, только ошибки, которые останавливают компиляцию. Если вы выбрали A,
+вы ждали привычки TS/ESLint: там неиспользуемый импорт обычно лишь предупреждение. Если выбрали C, вы думали о
+редакторе: это делает gopls в редакторе, а не `go build` (ниже).
+
+</details>
+
+`cd xato` — перейти в папку `xato`:
+
+```console
+$ cd xato && go build
+# api/xato
+./main.go:4:2: "encoding/json" imported and not used
+```
+
+Читаем сообщение. `# api/xato` — ошибка в пакете `api/xato`. `./main.go:4:2` — файл, строка 4, столбец 2, как в
+`tsc`. *"encoding/json" imported and not used* — «импортирован, но не используется». В папке остался только `main.go`:
+бинарник не создан.
+
+Команда Go сделала это намеренно. Go FAQ: компилятор не выдаёт предупреждений, только ошибки, которые останавливают
+компиляцию, потому что с ростом кодовой базы неиспользуемые импорты замедляют сборку («unused imports just slow down
+compilation»). В повседневной работе вы этого почти не заметите: **gopls** в редакторе, то есть tsserver для Go,
+обычно сам удаляет такой импорт при сохранении файла.
+
+## `go build`: один бинарник
+
+Теперь соберём в файл. `-o api` — имя выходного файла, `.` — пакет в текущей папке:
+
+```console
+$ go build -o api .
+$ ls -l api
+-rwxr-xr-x 1 haywan users 8659683 Nov 26 18:09 api
+```
+
+Успешный `go build` ничего не выводит. Результат — файл `api` на 8 659 683 байта, то есть 8.66 MB.
+
+Разница с `tsc` в том, что `tsc` выдаёт JavaScript, которому для запуска всё равно нужен `node`. А `go build` выдаёт
+машинный код для этого компьютера. `./api` запускается без всего остального. Что лежит в файле:
+
+| Внутри `api` | Что | Аналог в Node |
+|---|---|---|
+| пакет `main` | наши 20 строк | `index.js` |
+| `net/http`, `encoding/json` и пакеты, которые они тянут | стандартная библиотека | `node_modules/` + встроенные модули Node |
+| **runtime** Go | сборщик мусора чистит память, планировщик (scheduler) распределяет работу, идущую одновременно | V8 и event loop внутри `node` |
+
+Это **статический бинарник** (static binary): один файл, не связанный с другими библиотеками системы. Сколько
+мегабайт на что уходит, мы измеряем в уроке [GO-1.01 · Go nega bor? go build ichida nima bor](/lab/youtube/go/go-1-01/ru)
+(«зачем нужен Go? что внутри go build»).
+
+Но машинный код собирается под одну операционную систему и один процессор. Go берёт их из двух переменных окружения:
+**`GOOS`** (ОС: `linux`, `darwin`, `windows`) и **`GOARCH`** (процессор: `amd64`, `arm64`). Если они не заданы, берутся
+значения компьютера, на котором вы работаете:
+
+```console
+$ go env GOOS GOARCH
+linux
+amd64
+$ node -p process.arch
+x64
+```
+
+У нас `linux` и `amd64`. Ту же архитектуру Node называет `x64`.
+
+Сравним, что уезжает на сервер:
+
+| Язык | Что уезжает на сервер |
+|---|---|
+| Node | бинарник `node` (129 491 456 байт) + `node_modules` (Express: 65 пакетов) + код |
+| Python | интерпретатор `python3` + `venv` + код |
+| PHP | php-fpm + `vendor/` + код |
+| Go | `api` (8 659 683 байта). Работает, даже если на сервере не установлен Go |
+
+В Node тоже можно сделать один файл, например с помощью Node SEA (single executable application). Но он кладёт ваш
+скрипт в копию всего бинарника `node`.
+
+Одно исключение: обычные файлы вроде HTML-шаблонов или SQL-миграций сами в бинарник не попадают. Для них есть
+`//go:embed` (он упомянут в README курса, подробнее в следующих уроках).
+
+### Прогноз: с MacBook на VPS
+
+На MacBook с чипом Apple вы собрали так и скопировали файл через `scp` на обычный amd64 VPS:
+
+```bash
+GOOS=linux go build -o api .
+```
+
+Что сделает `./api` на VPS?
+
+**A)** заработает · **B)** `exec format error` · **C)** `no such file or directory`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `exec format error`.** `GOOS` задали, а `GOARCH` — нет. Он остался от MacBook, то есть `arm64`. Процессор amd64 не
+умеет выполнять машинный код arm64. Если вы выбрали A, вы думали «собрал под Linux — значит, на Linux заработает»: ОС
+верная, а процессор — нет. C — это другая ошибка, мы встретим её в разделе про Docker. В Docker то же самое: образ,
+собранный на Mac с чипом Apple, даёт эту ошибку на amd64-сервере.
+
+</details>
+
+У нас компьютер amd64, поэтому покажем наоборот: запустим здесь файл, собранный под arm64 (в bash):
+
+```console
+$ GOOS=linux GOARCH=arm64 go build -o api-arm .
+$ ./api-arm
+bash: ./api-arm: cannot execute binary file: Exec format error
+```
+
+*cannot execute binary file: Exec format error* — «не удаётся выполнить бинарный файл: неверный формат». В zsh та же
+ошибка выглядит как `zsh:1: exec format error: ./api-arm`. Исправление: задайте обе переменные,
+`GOOS=linux GOARCH=amd64`. Сборку под другую систему (**кросс-компиляцию**) Go делает одними этими двумя переменными:
+отдельный toolchain не нужен.
+
+## Docker: `FROM scratch` и 8.66 MB
+
+В Docker та же идея. `FROM scratch` — совершенно пустой образ: ни shell, ни системных библиотек. Внутрь кладётся
+только один бинарник:
+
+```dockerfile filename="Dockerfile" showLineNumbers
+FROM scratch
+COPY api /api
+EXPOSE 3000
+ENTRYPOINT ["/api"]
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | начинает с пустого образа |
+| 2 | копирует готовый файл `api` в корень образа |
+| 3 | документирует, что используется порт 3000 |
+| 4 | запускает `/api` при старте контейнера |
+
+Для образа Express мы взяли `node:24-slim`, то есть Debian 12 и Node v24.22.3 (комментарий: «для сравнения: тот же
+API на Express, в официальном образе Node»):
+
+```dockerfile filename="node/Dockerfile" showLineNumbers
+# Taqqoslash uchun: xuddi shu API Express bilan, rasmiy Node image'da
+FROM node:24-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY index.js ./
+CMD ["node", "index.js"]
+```
+
+Пишем строку сборки для образа полностью. `GOOS` и `GOARCH` уже знакомы. Зачем `CGO_ENABLED=0`, увидим в ловушке в
+следующем разделе.
+
+```console
+$ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api .
+$ docker build -q -t api-go .
+sha256:4d0f8b3433f082098e38c41d729f6ab92ab66cb833f0f4cddb3047d05966e23c
+$ docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' --filter reference=api-go --filter reference=api-node
+REPOSITORY:TAG    SIZE
+api-go:latest     8.66MB
+api-node:latest   235MB
+```
+
+Образ `api-node` собран в папке `node` командой `docker build -q -t api-node .`. Образ на Go — 8.66 MB, ровно размер
+бинарника (`docker image inspect api-go --format '{{.Size}}'` → `8659683`). Образ Express — 235 MB.
+
+Запускаем контейнер и проверяем:
+
+```console
+$ docker run -d --rm --name api-go -p 3000:3000 api-go
+baa7a86ae0ff11db19811a4723bc2e2626d7925fb2934de6da15b05b7978613b
+$ curl localhost:3000/health
+{"status":"ok"}
+$ docker exec api-go sh
+OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH
+$ docker stop api-go
+api-go
+```
+
+`docker run -d` выводит ID контейнера. API работает, а `sh` нет: *executable file not found* — «исполняемый файл не
+найден». В образе действительно только один файл.
+
+## Ловушка: «no such file or directory», хотя файл на месте
+
+Теперь ситуация, которая часто встречается в продакшене. Соберём бинарник в образе `golang` и положим его в образ
+`scratch` (multi-stage сборка). `tuzoq/Dockerfile` из папки курса («tuzoq» — «ловушка»; комментарий: «в образе
+golang есть gcc, поэтому cgo включается и пакет net связывается с libc»):
+
+```dockerfile filename="tuzoq/Dockerfile" showLineNumbers
+# TUZOQ: golang image'da gcc bor, shuning uchun cgo yoqiladi va net paketi libc'ga bogʻlanadi
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN go build -o /api .
+
+FROM scratch
+COPY --from=build /api /api
+ENTRYPOINT ["/api"]
+```
+
+Строки 2–5 — первый этап: скопировать код в образ `golang` и собрать. Строки 7–9: взять в пустой образ только готовый
+`/api`. В строке 5 нет `CGO_ENABLED`.
+
+```console
+$ docker build -q -t tuzoq -f tuzoq/Dockerfile .
+sha256:cf5f14afa9770685cc7ffceec8c18986d6c8fba70dcd0d495d7be672b1aba41b
+$ docker run --rm tuzoq
+exec /api: no such file or directory
+```
+
+*no such file or directory* — «нет такого файла или каталога». Но `/api` в образе есть: его положил `COPY`. Какого же
+файла нет?
+
+Причина — **cgo**, возможность Go вызывать C-код. В образе `golang` есть компилятор C (gcc), поэтому Go включает cgo.
+Тогда пакет `net` для разрешения DNS-имён связывается с системной библиотекой C, **libc**. Бинарник больше не
+статический. Проверим через `ldd` в образе первого этапа (`--target build`). `ldd` показывает, какие библиотеки
+запрашивает бинарник:
+
+```console
+$ docker build -q --target build -t tuzoq-build -f tuzoq/Dockerfile .
+sha256:61c83141fef877a127f29749e7628accc2d8abbceacac99ad0676395387336b9
+$ docker run --rm tuzoq-build ldd /api
+	linux-vdso.so.1 (0x000072a3a014f000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x000072a39ff50000)
+	/lib64/ld-linux-x86-64.so.2 (0x000072a3a0151000)
+$ docker run --rm tuzoq-build readelf -l /api | grep interpreter
+      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+```
+
+Бинарник просит две вещи: `libc.so.6` и `/lib64/ld-linux-x86-64.so.2`. Вторая — **динамический загрузчик** (dynamic
+loader). Он работает как shebang в скрипте (`#!/usr/bin/env node`): ядро сначала запускает загрузчик, а загрузчик
+подключает libc и запускает бинарник. Это видно в `readelf -l`: *Requesting program interpreter* — «запрашивает
+интерпретатор программы». В `scratch` загрузчика нет, поэтому ядро говорит «файл не найден». Сообщение не про `/api`,
+а про загрузчик.
+
+```text
+docker run tuzoq
+  └─ ядро: запусти /api
+       └─ /api: «пусть меня запустит /lib64/ld-linux-x86-64.so.2»
+            └─ scratch: такого файла нет → ENOENT → "exec /api: no such file or directory"
+
+docker run tuzoq-ok   (CGO_ENABLED=0)
+  └─ ядро: запусти /api
+       └─ /api: статический, ничего не просит → работает
+```
+
+Исправление: добавьте `CGO_ENABLED=0` в строку сборки. `tuzoq/Dockerfile.ok` отличается только строкой 5 (комментарий:
+«исправление: CGO_ENABLED=0 → пакет net с чистым Go-резолвером, бинарник статический»):
+
+```dockerfile filename="tuzoq/Dockerfile.ok" showLineNumbers
+# TUZATISH: CGO_ENABLED=0 → net paketi sof Go resolver bilan, binary static
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -o /api .
+
+FROM scratch
+COPY --from=build /api /api
+ENTRYPOINT ["/api"]
+```
+
+Теперь пакет `net` разрешает DNS на чистом Go, libc не нужна:
+
+```console
+$ docker build -q --target build -t tuzoq-ok-build -f tuzoq/Dockerfile.ok .
+sha256:70ab7438464228cb30ed8983c07789f0acbff57226430b46712cdb2cf1831689
+$ docker run --rm tuzoq-ok-build ldd /api
+	not a dynamic executable
+$ docker build -q -t tuzoq-ok -f tuzoq/Dockerfile.ok .
+sha256:35ca30f9d92756d4142d1ad567fd593613160ab7547f136f1dc1de3e1f938062
+$ docker run -d --rm --name tuzoq-ok -p 3001:3000 tuzoq-ok
+e0cb1ed36cb5b451d5e4fa95786a0fc9b586e7307268e6ccd56626fcdc83cb06
+$ curl localhost:3001/health
+{"status":"ok"}
+$ docker stop tuzoq-ok
+tuzoq-ok
+```
+
+*not a dynamic executable* — «не динамический исполняемый файл», то есть статический. Контейнер работает.
+
+Аналог в JS: нативный аддон Node (модуль на C++), собранный на машине с glibc, не работает в образе Alpine. Причина
+та же: аддон — динамически связанная библиотека, а в Alpine вместо glibc стоит musl.
+
+Когда cgo включается сам? По документации `cmd/cgo`: при обычной (нативной) сборке, если найден компилятор C, cgo
+включён. При сборке под другую систему (кросс-компиляции) или если компилятор C не найден — выключен. Поэтому если
+собирать на Mac с `GOOS=linux`, cgo выключится сам. Но на Linux с установленным gcc, в образе `golang` и в CI он может
+остаться включённым. Значит, пишите его явно.
+
+Рабочий рецепт в одну строку:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api .
+scp api server:/srv/api/    # yoki: COPY api /api  →  FROM scratch
+```
+
+(Комментарий: «или: `COPY api /api` → `FROM scratch`».)
+
+| Шаг | Что |
+|---|---|
+| 1 | `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api .` — все три переменные |
+| 2 | `api`: один файл, внутри код, `net/http` и runtime |
+| 3 | `scp` на VPS или `COPY` в образ `FROM scratch` |
+| 4 | в CI та же самая строка |
+
+Одно условие: в проекте не должно быть пакета, зависящего от библиотеки на C. Например, `github.com/mattn/go-sqlite3` —
+пакет с cgo: ему нужны `CGO_ENABLED=1` и gcc. README курса называет альтернативой `modernc.org/sqlite` на чистом Go.
+
+## Глубже (необязательно): `go version -m` и HTTPS-сертификаты
+
+**Информация о сборке внутри бинарника.** `go version -m` читает информацию о сборке, записанную в бинарник:
+
+```console
+$ go version -m api | grep -E 'go1|GOOS|GOARCH|CGO|vcs.revision|modified'
+api: go1.26.8
+	build	CGO_ENABLED=0
+	build	GOARCH=amd64
+	build	GOOS=linux
+	build	vcs.revision=95652b3dc33eb53aa4bd94febbc5a2f5c8899ecc
+	build	vcs.modified=true
+```
+
+Версия Go, `GOOS`, `GOARCH`, состояние cgo, git-коммит (`vcs.revision`) и были ли изменены файлы после коммита
+(`vcs.modified`). В продакшене можно спросить у самого бинарника, какой коммит сейчас работает. У вас хеш коммита
+будет другим: он зависит от того, на каком коммите собрана папка. Информацию о коммите записывает только `go build`;
+при `go run` и при сборке без `.git` (например, внутри Docker) её нет. Это вы измерите в 🟡 домашнем задании.
+
+**Вторая ловушка scratch: HTTPS.** Если ваш сервис отправляет HTTPS-запрос во внешний API (платёжная система,
+Telegram Bot API), он должен проверить сертификат сервера. Для этого нужен список доверенных центров сертификации
+(CA), а он лежит в системе. `chuqur/https/main.go` («chuqur» — «глубоко») отправляет один HTTPS-запрос (комментарий:
+«в образе scratch нет сертификатов, внешний HTTPS-запрос падает»):
+
+```go filename="chuqur/https/main.go" showLineNumbers
+// Chuqurroq: scratch image'da sertifikatlar yoʻq, tashqi HTTPS soʻrov yiqiladi.
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	resp, err := http.Get("https://go.dev")
+	if err != nil {
+		fmt.Println("xato:", err)
+		os.Exit(1)
+	}
+	resp.Body.Close()
+	fmt.Println("status:", resp.Status)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `resp, err := http.Get(…)` | GET-запрос; возвращает два значения: ответ и ошибку. `:=` — объявление с присваиванием ([GO-X.02](/lab/youtube/go/go-x-02/ru)) |
+| 12–15 | `if err != nil { … os.Exit(1) }` | при ошибке выводит её (`xato:` — «ошибка:») и завершается с `exit status 1` ([GO-X.03](/lab/youtube/go#go-x-03)) |
+| 16 | `resp.Body.Close()` | закрывает тело ответа (освобождает соединение) |
+| 17 | `fmt.Println("status:", resp.Status)` | выводит статус, например `200 OK` |
+
+`Dockerfile` — обычный `FROM scratch` + бинарник. А `Dockerfile.ok` копирует файл сертификатов из образа `golang`:
+
+```dockerfile filename="chuqur/https/Dockerfile.ok" showLineNumbers
+FROM scratch
+COPY --from=golang:1.26.8 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY https /https
+ENTRYPOINT ["/https"]
+```
+
+```console
+$ cd chuqur/https && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o https .
+$ docker build -q -t chuqur-https .
+sha256:f3235ab993be4a1e866e745d3f635192b66e90eb3a71793dabbf59e1ee7b99d7
+$ docker run --rm chuqur-https
+xato: Get "https://go.dev": tls: failed to verify certificate: x509: certificate signed by unknown authority
+$ docker build -q -t chuqur-https-ok -f Dockerfile.ok .
+sha256:2e25c61d41e2c66ec63af46518c3d94a9d5dc1d50cae296878f2040d4f6fb6e4
+$ docker run --rm chuqur-https-ok
+status: 200 OK
+```
+
+*certificate signed by unknown authority* — «сертификат подписан неизвестным центром»: в `scratch` нет ни одного
+центра, которому доверяет Go. С файлом сертификатов образ вырос с 8.5 MB до 8.73 MB. Второй путь — взять вместо
+`scratch` образ `gcr.io/distroless/static`: он тоже почти пустой, но в нём есть сертификаты и база часовых поясов.
+Похожая ловушка с часовыми поясами — в уроке [GO-1.01](/lab/youtube/go/go-1-01/ru).
+
+## Частые ошибки
+
+**1. Думать, что «бинарник Go работает везде».** Это классическое заблуждение в этой теме. Бинарник собирается под
+одну ОС и один процессор. Соберите на Mac с чипом Apple через `GOOS=linux go build`, положите на amd64-сервер — и
+получите `cannot execute binary file: Exec format error`. Полный пример в разделе «`go build`: один бинарник».
+**Исправление:** вместе с `GOOS` задавайте и `GOARCH`. Под какую архитектуру собран файл, скажет
+`go version -m api | grep GOARCH`.
+
+**2. `exec /api: no such file or directory` в `scratch`.** Бинарник собран с включённым cgo там, где есть gcc (образ
+`golang`, CI), и просит libc и динамический загрузчик. Полный пример в разделе «Ловушка». **Исправление:**
+`CGO_ENABLED=0`; проверка: `ldd api` → `not a dynamic executable`.
+
+**3. Неиспользуемый импорт.** `./main.go:4:2: "encoding/json" imported and not used`, бинарника нет. Пример в разделе
+про неиспользуемый импорт. **Исправление:** удалите импорт (gopls делает это при сохранении) или используйте его.
+
+**4. `go build ./xato` из папки урока.** Если написать так вместо `cd xato && go build`:
+
+```console
+$ go build ./xato
+go: build output "xato" already exists and is a directory
+```
+
+Вместо ожидаемой ошибки компиляции — другое сообщение: *build output "xato" already exists and is a directory* —
+«результат сборки "xato" уже существует и это каталог». Когда `go build` собирает один пакет `main`, он хочет
+записать бинарник в текущую папку под именем папки пакета. Но имя `xato` занято самой папкой. **Исправление:**
+`cd xato && go build` или отправьте результат в другое место (`-o /dev/null` — выбросить результат):
+
+```console
+$ go build -o /dev/null ./xato
+# api/xato
+xato/main.go:4:2: "encoding/json" imported and not used
+```
+
+**5. Порт занят.** Если запустить второй сервер, пока первый работает в другом терминале:
+
+```console
+$ go run .
+2026/11/26 18:11:27 listening on :3000
+2026/11/26 18:11:27 listen tcp :3000: bind: address already in use
+exit status 1
+```
+
+Не верьте первой строке. `log.Println("listening …")` стоит **до** `ListenAndServe`, поэтому выводится, даже если порт
+занят. Следующая строка — ошибка, которую вернул `ListenAndServe`; `log.Fatal` записал её и остановил программу.
+*address already in use* — «адрес уже используется». `exit status 1` добавляет `go run`. **Исправление:** остановите
+первый сервер (<kbd>Ctrl</kbd>+<kbd>C</kbd>) или задайте другой порт (🟢 домашнее задание).
+
+**6. gcc нет, а cgo включён.** На ноутбуке, где писался урок (NixOS), `go env CGO_ENABLED` выводит `1`, но gcc нет.
+Обычная сборка без `CGO_ENABLED=0` заканчивается так:
+
+```console
+$ go build -o api .
+# runtime/cgo
+cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
+```
+
+`# runtime/cgo` — ошибка в пакете `runtime/cgo`. *C compiler "gcc" not found* — «компилятор C gcc не найден». Обычно
+Go сам выключает cgo, если gcc не найден (`cmd/cgo`), но если явно задано `CGO_ENABLED=1`, он требует gcc.
+**Исправление:** `CGO_ENABLED=0 go build …` или один раз `export CGO_ENABLED=0` в терминале.
+
+**7. Внешний HTTPS из `scratch`.** `x509: certificate signed by unknown authority`. Пример в разделе «Глубже».
+**Исправление:** скопируйте `ca-certificates.crt` в образ или возьмите `distroless/static`.
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** В проекте на Express библиотеки лежат в `node_modules`. А где они у API на Go?
+
+<details>
+<summary>Ответ</summary>
+
+`net/http` и `encoding/json` — в стандартной библиотеке, они приходят вместе с Go. Внешние модули (`go get`) лежат не
+в проекте, а в общем кэше модулей; `go.mod` хранит их точные версии, `go.sum` — хеши. А `go build` собирает весь нужный
+код вместе с runtime в один бинарник: на сервер не уезжает ни одной папки.
+
+</details>
+
+**2.** Вы хотите собрать образ `FROM scratch` для amd64-сервера на MacBook с чипом Apple. Какая строка сборки?
+
+<details>
+<summary>Ответ</summary>
+
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api .` — все три переменные. Без `GOARCH` бинарник будет arm64
+(`exec format error`). При кросс-компиляции с Mac cgo выключается сам, но в CI или в образе `golang` может остаться
+включённым, поэтому его пишут явно.
+
+</details>
+
+**3.** Файл в образе на месте, но `docker run` пишет `exec /api: no such file or directory`. В чём причина?
+
+<details>
+<summary>Ответ</summary>
+
+Остался включённым cgo: бинарник связан с libc и просит динамический загрузчик `/lib64/ld-linux-x86-64.so.2`. В
+`scratch` его нет, и ядро сообщает об этом как «файл не найден». Это видно в `ldd`. Исправление: `CGO_ENABLED=0`.
+
+</details>
+
+**4.** Работает `go run .`. Какой будет вывод?
+
+```bash
+curl -i -X DELETE localhost:3000/users/42
+```
+
+**A)** `404 Not Found` · **B)** `405 Method Not Allowed` и `Allow: GET, HEAD` · **C)** `200 OK` и `{"id":"42"}`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Путь `/users/{id}` есть, но только для `GET` (и `HEAD`). То же правило, что и с `POST /health`.
+
+```console
+$ curl -i -X DELETE localhost:3000/users/42
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Thu, 26 Nov 2026 13:09:07 GMT
+Content-Length: 19
+
+Method Not Allowed
+```
+
+Если нет самого пути (например, `GET /users`), Go отвечает `404 page not found`.
+
+</details>
+
+**5.** Из начала урока: чем строка `go 1.26.8` в `go.mod` отличается от `"engines"` в `package.json`?
+
+<details>
+<summary>Ответ</summary>
+
+Двумя вещами. Go её строго соблюдает: более старый Go откажется собирать или скачает новый с `GOTOOLCHAIN=auto`
+(а `engines` — лишь рекомендация). И она ещё выбирает, какое поведение языка и стандартной библиотеки действует
+([GO-1.16](/lab/youtube/go/go-1-16/ru)).
+
+</details>
+
+## Домашнее задание
+
+Стартовые файлы и ответы — в папке урока на GitHub:
+[lessons/0x-01-http-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+(папка `uyga/`, ответы в
+[uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api/uyga/javob)). Команды
+работают из папки урока (`lessons/0x-01-http-api`).
+
+🟢 **Легко** (`uyga/oson/main.go`): читайте порт из переменной окружения `PORT` (`os.Getenv("PORT")`, в Node —
+`process.env.PORT`), а если она пустая — `3000`. `:=` и `if` будут в следующем уроке, поэтому две нужные строки уже
+лежат в комментарии стартового файла:
+
+```go
+port := os.Getenv("PORT")
+if port == "" { port = "3000" }
+```
+
+Потом соберите под arm64 и проверьте через `go version -m`:
+`GOOS=linux GOARCH=arm64 go build -o api-arm ./uyga/oson && go version -m api-arm | grep GOARCH`.
+
+🟡 **Средне** (`uyga/orta/main.go`): добавьте эндпоинт `GET /version`, который возвращает
+`{"go":"go1.26.8","revision":"<commit>"}`. Функция `version` готова: она читает информацию о сборке внутри бинарника
+(ту же, что показывает `go version -m`). Ваша задача — подключить её к маршруту и сравнить результат при `go run .` и
+`go build`. В каком случае `revision` будет `unknown`?
+
+В стартовом файле маршрут `/health`, `log.Println` и `ListenAndServe` такие же, как в уроке. Между ними — строка
+комментария, которую нужно заполнить, и готовая функция:
+
+```go
+func version(w http.ResponseWriter, r *http.Request) {
+	out := map[string]string{"go": "", "revision": "unknown"}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		out["go"] = bi.GoVersion
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" {
+				out["revision"] = s.Value
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+```
+
+В импорты добавлен ещё и `"runtime/debug"`. Понимать всё внутри `version` не обязательно (`:=`, `range` —
+[GO-X.02](/lab/youtube/go/go-x-02/ru)). Коротко: `debug.ReadBuildInfo()` возвращает информацию о сборке из бинарника, а цикл ищет
+среди её настроек `vcs.revision`. Обратите внимание: `version` — обычная именованная функция, но её тип совпадает с
+типом обработчика: `func(w http.ResponseWriter, r *http.Request)`.
+
+🔍 **Для любопытных:** на основе `tuzoq/Dockerfile.ok` напишите multi-stage Dockerfile и добавьте в последний этап ещё
+и сертификаты (как в `chuqur/https/Dockerfile.ok`). Сравните размер образа с `api-go` через `docker images`.
+
+<details>
+<summary>Ответ</summary>
+
+🟢 `uyga/javob/oson/main.go`: порт из окружения, если пусто — 3000 (комментарий: «12-factor: настройки в окружении»).
+Строка лога и `ListenAndServe` тоже используют `port`:
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// 🟢 Javob: port muhitdan, boʻsh boʻlsa 3000 (12-factor: sozlama muhitda).
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+)
+
+func main() {
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": r.PathValue("id")})
+	})
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	log.Println("listening on :" + port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+```
+
+Добавлен импорт `"os"` (иначе: `undefined: os`). `":"+port` — сложение строк, как в JS. Под arm64:
+
+```console
+$ GOOS=linux GOARCH=arm64 go build -o api-arm ./uyga/javob/oson
+$ go version -m api-arm | grep GOARCH
+	build	GOARCH=arm64
+```
+
+`go version -m` читает и файл, собранный под другую архитектуру: он его не запускает, а только читает то, что записано
+внутри.
+
+🟡 В файле ответа одна новая строка, на месте строки комментария:
+
+```go
+http.HandleFunc("GET /version", version)
+```
+
+Функцию передаём по имени, писать её на месте не обязательно. Сначала `go run`, во втором терминале `curl`:
+
+```console
+$ go run ./uyga/javob/orta
+2026/11/26 18:10:04 listening on :3000
+```
+
+```console
+$ curl localhost:3000/version
+{"go":"go1.26.8","revision":"unknown"}
+```
+
+Остановите сервер (<kbd>Ctrl</kbd>+<kbd>C</kbd>), теперь через `go build`:
+
+```console
+$ go build -o api-v ./uyga/javob/orta && ./api-v
+2026/11/26 18:14:49 listening on :3000
+```
+
+```console
+$ curl localhost:3000/version
+{"go":"go1.26.8","revision":"95652b3dc33eb53aa4bd94febbc5a2f5c8899ecc"}
+```
+
+При `go run` коммита нет, при `go build` он есть. Версия Go есть в обоих случаях. У вас хеш будет другим.
+
+🔍 Этого файла нет в папке курса: мы написали его отдельно и проверили через `docker build -f` из папки урока.
+Сертификаты берём из образа `golang` первого этапа:
+
+```dockerfile
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -o /api .
+
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /api /api
+ENTRYPOINT ["/api"]
+```
+
+```console
+$ docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' --filter reference=api-go --filter reference=api-certs --filter reference=tuzoq-ok
+REPOSITORY:TAG     SIZE
+api-certs:latest   8.85MB
+api-go:latest      8.66MB
+tuzoq-ok:latest    8.62MB
+```
+
+Файл сертификатов весит 224 449 байт, поэтому `api-certs` примерно на 0.22 MB больше `tuzoq-ok`. Бинарник в `tuzoq-ok`
+и `api-certs` собран в другом окружении: Go из образа `golang`, без `.git`. Его `/api` весит 8 624 683 байта (наш —
+8 659 683), и в нём нет информации о коммите (раздел «Глубже»).
+
+</details>
+
+## Источники
+
+- go.mod: [Go Modules Reference](https://go.dev/ref/mod) (модули и пакеты, директивы `module` и `go`, `go.sum`,
+  [кэш модулей](https://go.dev/ref/mod#module-cache)) · [GODEBUG](https://go.dev/doc/godebug)
+- npm: [`engines`](https://docs.npmjs.com/cli/v11/configuring-npm/package-json#engines)
+- `go run` / `go build` / `go version`: [cmd/go](https://pkg.go.dev/cmd/go)
+- `net/http`: [шаблоны ServeMux](https://pkg.go.dev/net/http#ServeMux) (Go 1.22+) ·
+  [ListenAndServe](https://pkg.go.dev/net/http#ListenAndServe) («The handler is typically nil, in which case
+  DefaultServeMux is used») · [405 и Allow, server.go](https://github.com/golang/go/blob/go1.26.8/src/net/http/server.go#L2699-L2708) ·
+  [Routing Enhancements for Go 1.22](https://go.dev/blog/routing-enhancements)
+- Спецификация Go: [Program execution](https://go.dev/ref/spec#Program_execution) ·
+  [Function literals](https://go.dev/ref/spec#Function_literals) · [Exported identifiers](https://go.dev/ref/spec#Exported_identifiers)
+- Go FAQ: [неиспользуемые импорты, нет предупреждений](https://go.dev/doc/faq#unused_variables_and_imports) ·
+  [runtime в каждом бинарнике](https://go.dev/doc/faq#Why_is_my_trivial_program_such_a_large_binary)
+- `GOOS`/`GOARCH` (по умолчанию — значения хоста): [Installing Go from source, Environment](https://go.dev/doc/install/source#environment)
+- cgo: [cmd/cgo](https://pkg.go.dev/cmd/cgo) (когда включён) · `net`: [Name Resolution](https://pkg.go.dev/net#hdr-Name_Resolution)
+  (cgo и чистый Go-резолвер) · [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) (ENOENT, ELF interpreter)
+- Docker: [образ `scratch`](https://docs.docker.com/build/building/base-images/#create-a-minimal-base-image-using-scratch) ·
+  [distroless](https://github.com/GoogleContainerTools/distroless/blob/main/base/README.md)
+- `runtime/debug`: [BuildInfo](https://pkg.go.dev/runtime/debug#BuildInfo) (`vcs.revision`, `vcs.modified`)
+- Node: [Single executable applications](https://nodejs.org/api/single-executable-applications.html) ·
+  [C++ addons](https://nodejs.org/api/addons.html) · [Alpine Linux](https://alpinelinux.org/about/) (musl)
+- `github.com/mattn/go-sqlite3`: [README](https://github.com/mattn/go-sqlite3) (пакет с cgo)
+- Папка курса: [lessons/0x-01-http-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+  (README, `olchov.sh` — скрипт всех измерений)
+- Все результаты получены на `go1.26.8 linux/amd64`, Node v24.10.0, npm 11.6.1, Express 5.3.0 и Docker 29.8.1
+  2026-11-26. Время, заголовок `Date`, ID образов и хеш коммита меняются при каждом запуске.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+
+---
+
+← Предыдущий урок: [GO-0.05](/lab/youtube/go/go-0-05/ru) · Следующий урок: [GO-X.02](/lab/youtube/go/go-x-02/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
