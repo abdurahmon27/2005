@@ -1,0 +1,1362 @@
+---
+title: "Copy or reference? Value semantics and pointers"
+date: "2026/11/26"
+description: "In Go, = and passing to a function copy a struct: the range trap, &user and *User, the struct-in-map error, slices vs arrays."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-04/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-04"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-04"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-04) · [Русский](/lab/youtube/go/go-x-04/ru) · **English**  
+Lesson GO-X.04 · [Go: 0 → Guru](/lab/youtube/go#go-x-04) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+You wrote an endpoint that adds 50 to a balance. The `POST` response says the balance is 150, all good. But the next
+`GET` says 100 again: no error, nothing in the log. The same `for…of` loop in Node keeps 150. The short answer:
+Go's `range` gives you a copy of the element. Why is that, and how do you fix it?
+
+**One idea:** in Go, `=` and passing to a function copy the value (a struct too, an array too); they do not give you
+a reference to the same object as JS/Python do. To change the original value, you write to it through a pointer
+(`&user`, `*User`) or through an index.
+
+By the end of the lesson you will:
+
+- explain why a change inside `for _, user := range users` is lost, and fix it with `users[i]` or `&users[i]`;
+- write a `*User` parameter and `&user` when a function must change the caller's struct, and pass by value
+  otherwise;
+- read the error `cannot assign to struct field … in map` and fix it in two ways;
+- know how copying an array (`[3]int`) differs from copying a slice (`[]int`).
+
+The three core new words of this lesson:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| value copy | `=` and passing to a function move the whole value (all fields of a struct) to a new place | value semantics |
+| pointer | the address of a value in memory: `&user` takes the address, `*User` is the type "pointer to User" | pointer |
+| array and slice | `[3]int` is an array and is copied whole; `[]int` is a slice, and its copy sees the same elements | array, slice |
+
+There are also two helper words: **addressable** (Go writes only to fields of something that has an address; a map
+element does not) and **slice header** (a pointer to the elements, the length and the capacity).
+
+## Before you start
+
+- [GO-X.01 · A 20-line HTTP API: your first Go service and one binary](/lab/youtube/go/go-x-01/en): the service on `:3000`,
+  `GET /users/{id}`, `r.PathValue("id")`, the handler's `r *http.Request` parameter and one binary.
+- [GO-X.02 · Types exist at runtime too](/lab/youtube/go/go-x-02/en): structs and JSON tags, `:=`, `for _, p := range`, the
+  underscore `_`, the name of a slice (`[]int`), the `&` in `json.Unmarshal(…, &item)` and zero values.
+- [GO-X.03 · No try/catch: errors as values and defer](/lab/youtube/go/go-x-03/en): a `resp` that is `nil` and panic, `go vet`
+  and golangci-lint.
+- You can copy the small programs (`nusxa/`, `param/`, `pointer/`, `range/`, `manzil/`, `mapxato/`, `maptuzat/`,
+  `slice/`) into [go.dev/play](https://go.dev/play) and run them there. `hook/` and `tuzat/` are HTTP servers: run
+  them in the course folder (`lessons/0x-04-values-pointers`). Every command runs from there.
+- On a computer without a C compiler (gcc), programs that use `net/http` may fail with
+  `cgo: C compiler "gcc" not found`. Then put `CGO_ENABLED=0` in front of the command: `CGO_ENABLED=0 go run ./hook`.
+- `mapxato/` and `uyga/orta/` do not build on purpose, so `go vet ./...` reports an error in this folder.
+- Comparison files: `js/server.js` (Node 24), `anchor/topup.py` (Python 3) and `anchor/topup.php` (PHP 8). You do
+  not have to run them: their output is on this page.
+
+First, one question from GO-X.03. `defer resp.Body.Close()` is written **before** the error check, and `http.Get`
+returned an error:
+
+```go
+resp, err := http.Get("http://localhost:9/users/42") // 9-port: hech kim tinglamaydi
+defer resp.Body.Close()
+if err != nil {
+```
+
+What happens? **A)** the `defer` is skipped · **B)** panic: nil pointer · **C)** a build error
+
+<details>
+<summary>Answer</summary>
+
+**B: panic.** When `http.Get` returns an error, `resp` is `nil`. The `defer` line evaluates `resp.Body` right away,
+that is, it reads a field through `nil`. The program crashes with a runtime error: *nil pointer dereference* —
+"reading through a nil pointer". It is similar to `Cannot read properties of null` in JavaScript.
+
+```console
+$ go run ../0x-03-errors/defer-oldin
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x62bbd7]
+
+goroutine 1 [running]:
+main.main()
+	…/0x-03-errors/defer-oldin/main.go:12 +0x37
+exit status 2
+```
+
+(The start of the path is shortened to `…`: it depends on the folder on your computer.) If you chose "skipped", you
+thought the arguments of `defer` are evaluated later: they are evaluated on the `defer` line itself. If you chose "a
+build error", you thought the compiler knows about the `nil` in advance: that is only known at runtime.
+
+</details>
+
+`resp` was a pointer. Today we look at what a pointer is and why Go needs it.
+
+## Where did the balance go: the handler in Go and in Node
+
+Here is the service from the hook. It is the GO-X.01 service, but the users live in an in-memory `users` slice
+instead of a database. `hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+// Hook (GO-X.04): GO-X.01 xizmati + xotiradagi users ro'yxati. POST /users/{id}/topup balansni 50 ga oshirishi
+// kerak. Javob 150 deydi, keyingi GET esa 100: range bergan user — elementning NUSXASI.
+// Ishga tushirish: go run ./hook   (boshqa terminalda: curl -X POST localhost:3000/users/42/topup; curl localhost:3000/users/42)
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+type User struct {
+	ID      string `json:"id"`
+	Balance int    `json:"balance"`
+}
+
+var users = []User{{ID: "42", Balance: 100}}
+
+func main() {
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	http.HandleFunc("POST /users/{id}/topup", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				user.Balance += 50
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–3 | `// …` | comments: the task and how to run it |
+| 4–10 | `package main`, `import ( … )` | an executable program; packages: `encoding/json` (JSON), `log` (logging), `net/http` (HTTP server) |
+| 12–15 | `type User struct { … }` | the `User` type: fields `ID` and `Balance` with JSON tags (GO-X.02) |
+| 17 | `var users = []User{{ID: "42", Balance: 100}}` | `users` is a slice of `User` values, standing in for a database. `{ID: "42", Balance: 100}` in curly braces is a **struct literal**, like an object literal in JavaScript |
+| 20–28 | `GET /users/{id}` | the handler gets `w` (the response) and `r` (the request) (GO-X.01; the `*` in `*http.Request` is explained below in "Pointer"). It returns the `user` with the matching id as JSON, otherwise `http.NotFound` — `404` |
+| 29 | `POST /users/{id}/topup` | the endpoint that adds to the balance |
+| 30 | `for _, user := range users {` | looks like `for (const user of users)` in JavaScript |
+| 31 | `if user.ID == r.PathValue("id") {` | compares with the id from the URL |
+| 32 | `user.Balance += 50` | adds 50 to the `user` it found |
+| 33 | `json.NewEncoder(w).Encode(user)` | writes `user` to the response as JSON |
+| 34 | `return` | leaves the handler |
+| 39–40 | `log.Println(…)`, `http.ListenAndServe(":3000", nil)` | starts the service on `:3000` (GO-X.01) |
+
+Let's run it:
+
+```console
+$ go run ./hook
+2026/11/26 18:39:17 listening on :3000
+```
+
+The server keeps the terminal busy. In a second terminal, first `POST`, then `GET`:
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":100}
+```
+
+The `POST` response says 150, the next `GET` says 100. No error, the log is silent.
+
+Now the same service in Node. `js/server.js` uses no libraries:
+
+```js filename="js/server.js"
+// Hook'ning Node tomoni (GO-X.04): xuddi shu xizmat, kutubxonasiz. for…of bergan user — massivdagi O'SHA obyekt.
+// Ishga tushirish: node js/server.js
+const http = require("node:http");
+
+const users = [{ id: "42", balance: 100 }];
+
+http
+  .createServer((req, res) => {
+    const m = req.url.match(/^\/users\/(\w+)(\/topup)?$/);
+    if (!m) return res.writeHead(404).end();
+    for (const user of users) {
+      if (user.id === m[1]) {
+        if (req.method === "POST" && m[2]) user.balance += 50;
+        return res.end(JSON.stringify(user) + "\n");
+      }
+    }
+    res.writeHead(404).end();
+  })
+  .listen(3000, () => console.log("listening on :3000"));
+```
+
+Stop the Go server with <kbd>Ctrl</kbd>+<kbd>C</kbd> (it is the same port), then:
+
+```console
+$ node js/server.js
+listening on :3000
+```
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":150}
+```
+
+In Node both responses are 150. The loops look the same, but the results differ. The reason is in the next
+sections.
+
+## The same loop in Python and PHP
+
+Python behaves like JavaScript. `anchor/topup.py`:
+
+```python filename="anchor/topup.py"
+# Python tomoni (GO-X.04): for bergan user — ro'yxatdagi O'SHA dict (nom obyektga bog'lanadi).
+users = [{"id": "42", "name": "Dilnoza", "balance": 100}]
+for user in users:
+    if user["id"] == "42":
+        user["balance"] += 50
+print(users[0]["balance"])  # 150
+```
+
+```console
+$ python3 anchor/topup.py
+150
+```
+
+The `user` from `for` is the same dict that is in the list. In Python a name is bound to an object; no copy is
+made.
+
+PHP is different. `anchor/topup.php` loops over arrays first, then over objects:
+
+```php filename="anchor/topup.php"
+<?php
+// PHP tomoni (GO-X.04): massiv qiymat bilan nusxalanadi (Go struct kabi), obyekt esa handle bilan (Go pointer kabi).
+$users = [["id" => "42", "name" => "Dilnoza", "balance" => 100]];
+foreach ($users as $u) {
+    if ($u["id"] === "42") {
+        $u["balance"] += 50; // $u — nusxa
+    }
+}
+echo $users[0]["balance"], "\n"; // 100
+
+$objs = [(object) ["id" => "42", "name" => "Dilnoza", "balance" => 100]];
+foreach ($objs as $o) {
+    if ($o->id === "42") {
+        $o->balance += 50; // $o — o'sha obyektning handle'i
+    }
+}
+echo $objs[0]->balance, "\n"; // 150
+```
+
+```console
+$ php anchor/topup.php
+100
+150
+```
+
+The PHP manual says that array assignment always involves value copying. So the change in `foreach` is lost and 100
+stays. An object, however, PHP changes through a **handle**, that is, an identifier of the object: 150. In PHP you
+can write the reference explicitly: `foreach ($users as &$u)` (`anchor/topup-ref.php`):
+
+```console
+$ php anchor/topup-ref.php
+150
+```
+
+| Language | Loop | Element | Result |
+|---|---|---|---|
+| JavaScript | `for (const user of users)` | the same object | 150 |
+| Python | `for user in users` | the same dict | 150 |
+| PHP, array | `foreach ($users as $u)` | a copy | 100 |
+| PHP, object | `foreach ($objs as $o)` | a handle to the same object | 150 |
+| Go | `for _, user := range users` | ? | `POST` 150, `GET` 100 |
+
+The PHP array is the closest thing to a Go struct. The next section shows why.
+
+## Value copy: `c := user`
+
+In Go a struct is a value, not a reference like an object in JavaScript. `nusxa/main.go` ("copy"):
+
+```go filename="nusxa/main.go" showLineNumbers
+// Qiymat nusxasi (GO-X.04): c := user butun struct'ni (hamma maydonlarini) yangi joyga nusxalaydi.
+// JS'da const c = user — o'sha obyektga ikkinchi havola bo'lardi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	c := user
+	c.Balance += 50
+	fmt.Println(user.Balance, c.Balance) // 100 150
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7–10 | `type User struct { … }` | the `User` from the hook, without tags |
+| 13 | `user := User{ID: "42", Balance: 100}` | a new `user` from a struct literal |
+| 14 | `c := user` | not a reference: all fields of `user` are copied to a new place |
+| 15 | `c.Balance += 50` | only the field of `c` changes |
+| 16 | `fmt.Println(user.Balance, c.Balance)` | prints both balances |
+
+In memory, line by line:
+
+| After line | `user.ID` | `user.Balance` | `c.ID` | `c.Balance` | On screen |
+|---|---|---|---|---|---|
+| 13 | `"42"` | 100 | | | |
+| 14 | `"42"` | 100 | `"42"` (copy) | 100 (copy) | |
+| 15 | `"42"` | 100 | `"42"` | **150** | |
+| 16 | `"42"` | 100 | `"42"` | 150 | `100 150` |
+
+```console
+$ go run ./nusxa
+100 150
+```
+
+This is **value semantics**: `=` copies the value itself. In JavaScript `const c = user` would be a second reference
+to the same object, and `user.balance` would be 150 too. The assignment rule in the Go spec says the same: the value
+is assigned to the variable.
+
+## A function parameter is a copy too
+
+At work a separate function usually adds to the balance. In JavaScript, if you pass an object to a function, the
+function changes that very object. In Go we also pass the `User` to `topUp`. `param/main.go`:
+
+```go filename="param/main.go" showLineNumbers
+// Bashorat 1 (GO-X.04): funksiya parametri ham qiymat berish — topUp user'ning nusxasini oladi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func topUp(user User, amount int) {
+	user.Balance += amount
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	topUp(user, 50)           // JS: topUp(user) → 150
+	fmt.Println(user.Balance) // 100
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11 | `func topUp(user User, amount int) {` | the parameter `user` is of type `User`, `amount` is an `int` number |
+| 12 | `user.Balance += amount` | adds to the parameter's balance |
+| 17 | `topUp(user, 50)` | passes the `user` from `main` |
+
+What does `Println` print after `topUp`? (Try not to look at the `// 100` comment in the file.)
+
+**A)** `150` · **B)** `100` · **C)** a build error
+
+<details>
+<summary>Answer</summary>
+
+**B: `100`.** Passing to a function is also an assignment: the parameter is a copy of the caller's `user`. When the
+function returns, the copy is gone. The Go FAQ puts the rule like this: as in all languages in the C family,
+everything in Go is passed by value. A function always gets a copy of the thing passed, as if the value were
+assigned to the parameter. If you chose "`150`", you carried over a JavaScript habit: there an object is passed as
+a reference. If you chose "a build error", you thought Go treats this as an error: it is not an error, it is the
+rule.
+
+</details>
+
+```console
+$ go run ./param
+100
+```
+
+| Step | `user.Balance` in `main` | `user.Balance` in `topUp` (copy) |
+|---|---|---|
+| after line 16 | 100 | — |
+| entering `topUp` | 100 | 100 |
+| after line 12 | 100 | 150 |
+| `topUp` returned | 100 | — (the copy is gone) |
+
+The build and `go vet` are both silent:
+
+```console
+$ go vet ./param
+```
+
+`go vet` printed nothing. It is not a bug; it is a language rule.
+
+**Why did Go choose this?** In JavaScript any function can silently change your object, and you cannot tell from
+its signature. In Go a function that wants to change your struct says so in its signature: with a pointer, which we
+see next. Slices and maps are a separate case: they come at the end.
+
+| | Who can change it? |
+|---|---|
+| JavaScript: `f(user)` | any function; not visible in the signature |
+| Go: `topUp(user User, …)` | nobody: the function gets a copy and does not touch your `user` |
+| Go: a function that changes it | has a pointer in its signature (next section) |
+
+## Pointer: `&user` and `*User`
+
+Now let `topUp` change the original `user`. `pointer/main.go` differs from `param/main.go` in two lines:
+
+```go filename="pointer/main.go" showLineNumbers
+// Pointer (GO-X.04): &user — user'ning manzili, *User — "User'ga pointer". topUp nusxa emas, manzil oladi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func topUp(user *User, amount int) {
+	user.Balance += amount // Go o'zi (*user).Balance deb o'qiydi
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	topUp(&user, 50)          // JS'da havola yashirin, Go'da &
+	fmt.Println(user.Balance) // 150
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 17 | `topUp(&user, 50)` | `&user` is the **address** of `user` in memory. In JavaScript the reference is hidden; in Go you write it explicitly with `&` |
+| 11 | `func topUp(user *User, amount int) {` | `*User` is a type name: "**pointer** to `User`", that is, the address of a value of type `User` |
+| 12 | `user.Balance += amount` | we write to the field with a plain dot: Go follows the address itself and reads it as `(*user).Balance`. No separate operator like C's `->` is needed |
+
+```console
+$ go run ./pointer
+150
+```
+
+What happens in memory? A short fragment (there is no such file in the course folder; it is the same idea as in
+`pointer/`):
+
+```go
+user := User{Balance: 100}
+p := &user
+p.Balance += 50
+fmt.Println(user.Balance)
+```
+
+`p := &user` does not create a new `User`. `p` only stores where `user` is. If we write through `p`, the value of
+`user` itself changes:
+
+| After line | `user.Balance` | `p` (`*User`) | On screen |
+|---|---|---|---|
+| 1 | 100 | — | |
+| 2 | 100 | the address of `user` (no new `User`) | |
+| 3 | **150** (through `p`, `user` itself) | the address of `user` | |
+| 4 | 150 | | `150` |
+
+```text
+p := &user
+
+  user (User)                       p (*User)
+  ┌──────────┬──────────────┐       ┌────────────────────┐
+  │ ID "42"  │ Balance 150  │ ◄──── │ address of user    │
+  └──────────┴──────────────┘       └────────────────────┘
+
+topUp(&user, 50): the address is copied
+
+  &user in main ─────────┐
+                         ├──► the same single user
+  user in topUp ─────────┘   (both copies point to one place)
+```
+
+Note: when you pass `&user` to `topUp`, a copy is still made, only this time it is a copy of the **address**. Both
+copies point to one place. So the rule does not change: everything in Go is passed by value. Go FAQ: passing a
+pointer value makes a copy of the pointer, but not of the data it points to.
+
+The zero value of a pointer is `nil`: it points to nothing. The panic in the GO-X.03 question at the start was
+exactly this: `resp` was `nil`, and `resp.Body` is a read through `nil`.
+
+### When do you need a pointer?
+
+| Situation | Parameter type |
+|---|---|
+| the caller's value must change | `*User` |
+| the struct is large | `*User` |
+| a small struct that is only read | `User` (the usual case) |
+
+The Go team's advice (Code Review Comments): don't pass pointers as function arguments just to save a few bytes. The
+advice does not apply to large structs, or even to small structs that might grow.
+
+Two promises from earlier lessons are about this too:
+
+- `json.Unmarshal([]byte(body), &item)` from GO-X.02: `Unmarshal` must fill `item`, so it takes `&item`. The
+  documentation says: if the argument is not a pointer, `Unmarshal` returns an `InvalidUnmarshalError`.
+- The handler from GO-X.01 receives the request as `r *http.Request`, that is, through a pointer.
+
+## The `range` copy: the answer to the hook
+
+Back to the handler from the start. Its loop is variant A. Look at two more variants. Before each one, `fresh()`
+resets `users` to 100. Variant B has an index, variant C has a pointer. `range/main.go`:
+
+```go filename="range/main.go" showLineNumbers
+// Bashorat 2 (GO-X.04): uchta sikl — qaysi biri users'ni o'zgartiradi?
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func fresh() []User { return []User{{ID: "42", Balance: 100}} }
+
+func main() {
+	users := fresh()
+	for _, user := range users { // A: user — elementning nusxasi
+		user.Balance += 50
+	}
+	fmt.Println("A:", users[0].Balance)
+
+	users = fresh()
+	for i := range users { // B: users[i] — elementning o'zi
+		users[i].Balance += 50
+	}
+	fmt.Println("B:", users[0].Balance)
+
+	users = fresh()
+	for _, user := range users { // C: &user — NUSXAning manzili
+		p := &user
+		p.Balance += 50
+	}
+	fmt.Println("C:", users[0].Balance)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11 | `func fresh() []User { … }` | returns a new slice with one user on every call |
+| 15–17 | A: `for _, user := range users { user.Balance += 50 }` | the loop from the hook |
+| 21–23 | B: `for i := range users { users[i].Balance += 50 }` | `i` is the index (GO-X.02); `users[i]` is the element taken by index |
+| 27–30 | C: `p := &user; p.Balance += 50` | writes through the address of the `user` that `range` gave |
+| 18, 24, 31 | `fmt.Println("A:", users[0].Balance)` | the balance of the first element in the slice |
+
+Cover the answers in the comments. Which variant makes the balance in `users` 150?
+
+**A)** only B · **B)** B and C · **C)** all three
+
+<details>
+<summary>Answer</summary>
+
+**A: only B.** The `user` from `range` is a copy of the element, just like `c := user`. The pointer in C is the
+address of that **copy**. In B, `users[i]`, taken by index, is the element inside the slice itself. If you chose "B
+and C", you thought a pointer always points to the original: it points to whatever you took the address of, here
+the copy. If you chose "all three", you read `range` as JavaScript's `for…of`.
+
+</details>
+
+```console
+$ go run ./range
+A: 100
+B: 150
+C: 100
+```
+
+| Variant | What was written to | `users[0].Balance` |
+|---|---|---|
+| A | `user`, a copy of the element | 100 |
+| B | `users[i]`, the element itself | **150** |
+| C | `p` → the address of the `user` copy | 100 |
+
+The `for range` rule in the spec: on each step the iteration values are **assigned** to the loop variables, then the
+block runs. Mistake #30 in the book "100 Go Mistakes" is exactly this: the value element in a `range` loop is a
+copy.
+
+### Mid-lesson question: `&users[i]`
+
+This time we loop by index, but we take the address of the element taken by index, with `&`. Then we write through
+`p`. `manzil/main.go` ("address"):
+
+```go filename="manzil/main.go" showLineNumbers
+// O'rtadagi sinov (GO-X.04): &users[i] — slice elementining o'z manzili (C variantdagi &user esa nusxaning manzili).
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := []User{{ID: "42", Balance: 100}}
+	for i := range users {
+		p := &users[i]
+		p.Balance += 50
+	}
+	fmt.Println(users[0].Balance) // 150
+}
+```
+
+Line 14 has `&users[i]`; variant C had `&user`. What is printed?
+
+**A)** `100` — `p` is a copy again · **B)** `150` · **C)** a build error
+
+<details>
+<summary>Answer</summary>
+
+**B: `150`.** `users[i]`, taken by index, is the original element of the slice, and `&` gives its own address. In C
+it was the address of a copy. If you chose "`100`", you thought any `p := &…` makes a copy: `&` copies nothing, it
+only takes an address. If you chose "a build error", you thought you cannot take the address of a slice element: by
+the Go spec a slice element is addressable, that is, it has an address.
+
+</details>
+
+```console
+$ go run ./manzil
+150
+```
+
+This form is handy when the struct is large or when you need to pass the element to another function.
+
+### Fixing the handler
+
+We loop by index and write to the element by index, and we also put that element in the response. `tuzat/main.go`
+("fix"; apart from the comments in lines 1–3, it differs from `hook/main.go` only in lines 30–33):
+
+```go filename="tuzat/main.go" showLineNumbers
+// Tuzatilgan hook (GO-X.04): range indeks bilan, element users[i] orqali o'zgartiriladi.
+// ⚠️ Demo: users global, so'rovlar esa parallel goroutine'larda — haqiqiy xizmatda sync.Mutex kerak (GO-1.09).
+// Ishga tushirish: go run ./tuzat   (boshqa terminalda: curl -X POST localhost:3000/users/42/topup; curl localhost:3000/users/42)
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+type User struct {
+	ID      string `json:"id"`
+	Balance int    `json:"balance"`
+}
+
+var users = []User{{ID: "42", Balance: 100}}
+
+func main() {
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	http.HandleFunc("POST /users/{id}/topup", func(w http.ResponseWriter, r *http.Request) {
+		for i := range users {
+			if users[i].ID == r.PathValue("id") {
+				users[i].Balance += 50
+				json.NewEncoder(w).Encode(users[i])
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+| Line | Code | What changed |
+|---|---|---|
+| 30 | `for i := range users {` | the index, not the element |
+| 31 | `if users[i].ID == r.PathValue("id") {` | we read the element itself |
+| 32 | `users[i].Balance += 50` | we write to the slice element itself |
+| 33 | `json.NewEncoder(w).Encode(users[i])` | the response gets this element too |
+
+The `range` copy in the `GET` handler is harmless: it only reads.
+
+```console
+$ go run ./tuzat
+2026/11/26 18:39:32 listening on :3000
+```
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":150}
+```
+
+Now both `POST` and `GET` say 150. Standard linters do not see the bug in the hook: the copy was written to the
+response, that is, it was used (the golangci-lint output is in "Common mistakes").
+
+This is a demo. `net/http` runs every request in its own goroutine, that is, a separate task that runs in parallel.
+A real service needs a mutex, that is, a lock, to write to the shared `users`. It is in
+[GO-1.09](/lab/youtube/go/go-1-09/en).
+
+## A struct in a map: an element with no address
+
+Many services keep users not in a slice but in a map by id. A map is a key → value table, like `Map` in
+JavaScript. First, one rule.
+
+Go writes only to fields of something that has an address. Such a value is called **addressable**. The list from
+the Go spec:
+
+| What | Addressable? | Example |
+|---|---|---|
+| a variable | yes | `user.Balance = 0` ✓ |
+| a slice element | yes | `users[i].Balance = 0` ✓ |
+| through a pointer | yes | `p.Balance = 0` ✓ |
+| a map element | **no** | `users["42"].Balance = 0` ✗ |
+| replacing a whole map element | (a separate rule) | `users["42"] = user` ✓ |
+
+Why not a map element? When a map grows, it moves its elements to new memory (in the go1.26.8 source, the `grow`
+function in the `runtime/maps` package does this). An element's address would go stale. Robert Griesemer, one of
+Go's designers, wrote in 2012: we don't want a surviving pointer to a map element.
+
+In JavaScript, taking an element from a `Map` and adding to its balance works. Let's write the same thing in Go.
+`mapxato/main.go` ("map error"):
+
+```go filename="mapxato/main.go" showLineNumbers
+// O'rtadagi sinov (GO-X.04): map'dagi struct maydoniga to'g'ridan-to'g'ri yozib bo'lmaydi. Ataylab build bo'lmaydi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := map[string]User{"42": {ID: "42", Balance: 100}}
+	// JS: users.get("42").balance += 50 — ishlaydi
+	users["42"].Balance += 50
+	fmt.Println(users["42"].Balance)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 12 | `users := map[string]User{"42": {…}}` | `map[string]User` is a map with `string` keys and `User` values; key `"42"` holds one `User` |
+| 14 | `users["42"].Balance += 50` | tries to write to a field of the `User` under key `"42"` |
+| 15 | `fmt.Println(users["42"].Balance)` | prints the balance |
+
+What does this program do?
+
+**A)** prints `150` · **B)** prints `100` (a copy) · **C)** a build error
+
+<details>
+<summary>Answer</summary>
+
+**C: a build error.** A map element is not addressable, so you cannot write to its field. Instead of silently
+changing a copy, Go stops this at build time. If you chose "`100` (a copy)", you applied the "everything is copied"
+rule: here Go does not stay silent. If you chose "`150`", you carried over JavaScript's `Map`.
+
+</details>
+
+```console
+$ go run ./mapxato
+# github.com/abdurahmon27/go-backend-uz/lessons/0x-04-values-pointers/mapxato
+mapxato/main.go:14:2: cannot assign to struct field users["42"].Balance in map
+```
+
+The first line says which package has the error. The command was given a folder (`./mapxato`), so Go writes the
+package's full name: the module path + the folder. (In GO-X.02 the command was given a `.go` file, so it said
+`# command-line-arguments`.) `mapxato/main.go:14:2` means line 14, column 2. *cannot assign to struct field
+users["42"].Balance in map* means "you cannot assign to the struct field `users["42"].Balance` inside a map".
+
+### Two fixes
+
+`maptuzat/main.go` ("map fix"):
+
+```go filename="maptuzat/main.go" showLineNumbers
+// Tuzatish (GO-X.04): map'dagi struct — o'qing, o'zgartiring, qaytarib yozing; yoki map'da pointer saqlang.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := map[string]User{"42": {ID: "42", Balance: 100}}
+	user := users["42"] // nusxa
+	user.Balance += 50
+	users["42"] = user               // qaytarib yozamiz
+	fmt.Println(users["42"].Balance) // 150
+
+	ptrs := map[string]*User{"42": &User{ID: "42", Balance: 100}}
+	ptrs["42"].Balance += 50        // pointer orqali: build bo'ladi
+	fmt.Println(ptrs["42"].Balance) // 150
+	// Diqqat: kalit yo'q bo'lsa ptrs["x"] nil, ptrs["x"].Balance esa panic beradi.
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13 | `user := users["42"]` | **fix 1:** read a copy of the value from the map |
+| 14 | `user.Balance += 50` | change the copy (`user` is a variable, so it is addressable) |
+| 15 | `users["42"] = user` | write the whole element back to the map |
+| 18 | `ptrs := map[string]*User{"42": &User{…}}` | **fix 2:** store pointers in the map. `&User{…}` is the address of a new `User` |
+| 19 | `ptrs["42"].Balance += 50` | the map returns a pointer, and writing through a pointer builds |
+
+```console
+$ go run ./maptuzat
+150
+150
+```
+
+Be careful: if the key is missing, a map returns the zero value of its element type. For `*User` that is `nil`, and
+writing through `nil` panics (the example is in "Common mistakes").
+
+## Slices and arrays
+
+The last concept. If there is a length inside the square brackets (`[3]int`), it is an **array**, and the length is
+part of the type: `[3]int` and `[4]int` are two different types. Empty brackets (`[]int`) mean a **slice**, the list
+from earlier lessons. In practice arrays are rare; slices are almost everywhere. But the difference shows the copy
+rule well. `slice/main.go`:
+
+```go filename="slice/main.go" showLineNumbers
+// Bashorat 3 (GO-X.04): massiv qiymat — butunlay nusxalanadi; slice esa elementlarni bo'lishadi.
+package main
+
+import "fmt"
+
+func main() {
+	a := [3]int{1, 2, 3} // massiv: uzunligi turning bir qismi
+	b := a
+	b[0] = 9
+
+	s := []int{1, 2, 3} // slice
+	t := s
+	t[0] = 9
+
+	fmt.Println(a[0], s[0]) // 1 9
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7 | `a := [3]int{1, 2, 3}` | an array of three `int` numbers |
+| 8–9 | `b := a`, `b[0] = 9` | assign `a` to `b`, change the first element of `b` |
+| 11 | `s := []int{1, 2, 3}` | the same as a slice |
+| 12–13 | `t := s`, `t[0] = 9` | assign `s` to `t`, change `t[0]` |
+| 15 | `fmt.Println(a[0], s[0])` | the first elements of the original `a` and `s` |
+
+Cover the comments at the top of the file. What does `Println` print?
+
+**A)** `1 1` · **B)** `9 9` · **C)** `1 9`
+
+<details>
+<summary>Answer</summary>
+
+**C: `1 9`.** An array is a value: `b := a` copies all elements, just like a struct. A slice, like a JavaScript
+array, shares its elements, because it holds a pointer to them. If you chose "`9 9`", you carried over a JavaScript
+habit: there `b = a` is the same array. If you chose "`1 1`", you applied the copy rule you just learned to the slice
+too: for a slice only a small header is copied (below).
+
+</details>
+
+```console
+$ go run ./slice
+1 9
+```
+
+In JavaScript you would write a three-dot spread to copy an array (`[...a]`). A plain `t = s` is the same array:
+
+```console
+$ node -e 'const s=[1,2,3]; const t=s; t[0]=9; console.log(s[0])'
+9
+```
+
+In PHP, on the other hand, the array is copied, just like `[3]int` in Go:
+
+```console
+$ php -r '$a=[1,2,3]; $b=$a; $b[0]=9; echo $a[0];'
+1
+```
+
+(These two commands are not files in the course folder: the code is inside the command.)
+
+### The slice header
+
+A slice is a small **header** (slice header). It holds three things: a pointer to the elements, the length and the
+capacity. `t := s` copies only the header; the elements stay the same:
+
+```text
+a := [3]int{1, 2, 3};  b := a            s := []int{1, 2, 3};  t := s
+
+  a  [1 2 3]                               s  ┌─────────┬───────┬───────┐
+  b  [9 2 3]   ← a separate copy              │ pointer │ len 3 │ cap 3 │
+                                              └────┬────┴───────┴───────┘
+                                                   ▼
+                                                [9 2 3]   ← one set of elements, shared
+                                                   ▲
+                                              t  ┌─┴───────┬───────┬───────┐
+                                                 │ pointer │ len 3 │ cap 3 │  ← a copy of the header
+                                                 └─────────┴───────┴───────┘
+```
+
+The Go FAQ says: map and slice values behave like pointers, and copying a map or slice value doesn't copy the data
+it points to. So if you pass a slice to a function, the function can change its elements, even without a pointer in
+its signature.
+
+Note: if a struct has a slice field, a copy of the struct also gets only the header. This is a shallow copy: the
+elements stay shared (the example is in "Common mistakes"). The traps with `append`, `len` and `cap` are in
+[GO-1.08](/lab/youtube/go/go-1-08/en).
+
+| | What goes into the copy | Elements |
+|---|---|---|
+| struct `c := user` | all fields | — |
+| array `b := a` | all elements | separate |
+| slice `t := s` | only the header (pointer, length, capacity) | shared |
+| pointer `q := p` | only the address | one value |
+
+## Going deeper (optional): a JS array and a Go `[]User` in memory
+
+An array of objects in JavaScript is really a list of references: each element points to an object (MDN: objects
+are a reference type). A Go `[]User` stores the `User` values themselves, one after another. `range` takes its copy
+from exactly there.
+
+```text
+JS:  users = [ ref ─┐ ]                 Go:  users []User
+                    ▼                        ┌───────────────────────┬─────┐
+              { id: "42", balance: 100 }     │ User{ID "42", 100}    │ ... │
+                                             └───────────────────────┴─────┘
+  for (const user of users)                   for _, user := range users
+  → user = the same reference                 → user = a copy of the element
+```
+
+If a pointer leaves the function, the value may move to the **heap**, that is, the memory managed
+by the garbage collector (GC). Go FAQ: if the compiler cannot prove that the variable is not referenced after the function returns,
+it allocates the variable on the heap. This is **escape analysis**, covered in [GO-1.11](/lab/youtube/go/go-1-11/en).
+
+Go has no pointer arithmetic (without the `unsafe` package). The reason in the Go FAQ is one word: "Safety". Without
+pointer arithmetic, a language can never derive an illegal address.
+
+## Common mistakes
+
+**1. Changing the element that `range` gives you.** The most classic mistake of this topic:
+`for _, user := range users { user.Balance += 50 }` does not touch the slice. In the hook, `POST` gave 150 and `GET`
+gave 100 (the "`range` copy" section). Worst of all, the standard linter does not see it, because the copy is read
+in `Encode(user)`:
+
+```console
+$ golangci-lint run ./hook
+hook/main.go:23:30: Error return value of `(*encoding/json.Encoder).Encode` is not checked (errcheck)
+				json.NewEncoder(w).Encode(user)
+				                         ^
+hook/main.go:33:30: Error return value of `(*encoding/json.Encoder).Encode` is not checked (errcheck)
+				json.NewEncoder(w).Encode(user)
+				                         ^
+2 issues:
+* errcheck: 2
+```
+
+Both warnings are only about the unchecked error returned by `Encode`: *Error return value … is not checked*. Nothing
+about the copy (golangci-lint 2.12.2, default linters). **Fix:** `for i := range users { users[i].Balance += 50 }` or
+`p := &users[i]`.
+
+**2. Taking the address of the copy.** `for _, user := range users { p := &user; … }` does not touch the slice
+either: `p` is the address of the copy (variant C, `C: 100`). **Fix:** `p := &users[i]`.
+
+**3. Passing a struct by value to a function that should change it.** `func topUp(user User, …)` does not touch the
+caller's `user`, and both the build and `go vet` are silent (the "A function parameter is a copy too" section).
+**Fix:** `func topUp(user *User, …)` and `topUp(&user, 50)`.
+
+**4. Writing to a struct field inside a map.** `users["42"].Balance += 50` → *cannot assign to struct field
+users["42"].Balance in map* (a build error, the "A struct in a map" section). **Fix:** read → change →
+`users["42"] = user`, or `map[string]*User`.
+
+**5. A missing key in `map[string]*User`.** A missing key gives the zero value of `*User`, that is, `nil`. This
+example is not in the course folder; it was run separately for the lesson (to try it, create `nilptr/main.go` in the
+lesson folder):
+
+```go
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	ptrs := map[string]*User{"42": &User{ID: "42", Balance: 100}}
+	fmt.Println(ptrs["x"] == nil)
+	ptrs["x"].Balance += 50
+}
+```
+
+```console
+$ go run ./nilptr
+true
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x10 pc=0x49e2bd]
+
+goroutine 1 [running]:
+main.main()
+	…/nilptr/main.go:13 +0x17d
+exit status 2
+```
+
+Line 12 printed `true`: `ptrs["x"]` is `nil`. On line 13, writing through `nil` gave the same panic as in the GO-X.03
+question at the start: *invalid memory address or nil pointer dereference* — "an invalid memory address, or access
+through a nil pointer". `main.go:13` is the line where the program crashed. **Fix:** check first that the key exists:
+`p, ok := ptrs[id]`, and return `404` when `!ok` (the `GET` handler in the 🟡 homework does this; details in
+[GO-1.09](/lab/youtube/go/go-1-09/en)).
+
+**6. Thinking a struct copy is "deep".** If a struct has a slice field, `c := user` copies only the slice header.
+This example is not in the course folder either; it was run separately for the lesson (`sayoz/main.go`, "sayoz"
+means "shallow"):
+
+```go
+package main
+
+import "fmt"
+
+type User struct {
+	ID   string
+	Tags []string
+}
+
+func main() {
+	user := User{ID: "42", Tags: []string{"new"}}
+	c := user
+	c.ID = "7"
+	c.Tags[0] = "vip"
+	fmt.Println(user.ID, user.Tags[0])
+}
+```
+
+```console
+$ go run ./sayoz
+42 vip
+```
+
+Changing `c.ID` did not touch `user` (`42`), but `c.Tags[0]` changed `user.Tags[0]` too (`vip`): both headers point
+to the same elements. **Fix:** if you need separate elements, copy the slice explicitly:
+`c.Tags = slices.Clone(user.Tags)` (a [GO-1.08](/lab/youtube/go/go-1-08/en) topic).
+
+## Check yourself
+
+Answer first, then open the answer.
+
+**1.** Why does a loop that changes the `user` from `range` not touch `users`, and what are the two fixes?
+
+<details>
+<summary>Answer</summary>
+
+`user` is a copy of the element. The fixes: write by index (`users[i].Balance += 50`) or take the address of the
+element by index (`p := &users[i]`).
+
+</details>
+
+**2.** When `&user` is passed to `topUp`, what is copied, and why does `user` change?
+
+<details>
+<summary>Answer</summary>
+
+The address is copied. The copy also points to the same `user`, so `user.Balance += amount` inside `topUp` writes
+to the original `user`. The rule does not change: everything is passed by value; here the value is an address.
+
+</details>
+
+**3.** What does this program print? (It is not in the course folder; it was run separately for the lesson.)
+
+```go
+package main
+
+import "fmt"
+
+func reset(a [3]int, s []int) {
+	a[0] = 0
+	s[0] = 0
+}
+
+func main() {
+	a := [3]int{1, 2, 3}
+	s := []int{1, 2, 3}
+	reset(a, s)
+	fmt.Println(a[0], s[0])
+}
+```
+
+**A)** `0 0` · **B)** `1 0` · **C)** `1 1`
+
+<details>
+<summary>Answer</summary>
+
+**B: `1 0`.** `reset` gets a full copy of the array, so `a[0]` stays 1. For the slice only the header is copied and
+the elements are shared: `s[0]` becomes 0. There is no pointer in the signature, yet the function changed the slice
+elements. If you chose "`0 0`", you thought of the array as a reference, like a JavaScript array. If you chose
+"`1 1`", you thought the slice is copied whole too.
+
+```console
+$ go run ./reset
+1 0
+```
+
+</details>
+
+**4.** With `m := map[string]User{…}`, why does `m["42"].Balance = 0` not build, while `m["42"] = user` does?
+
+<details>
+<summary>Answer</summary>
+
+A map element is not addressable: when a map grows, it moves its elements to new memory, so Go does not let you
+write to an element's field. Replacing the whole element is allowed by a separate rule: a map index expression may
+be on the left side of an assignment.
+
+</details>
+
+**5.** From GO-X.01: if you copy a binary built with `go build` to a server, do you need Go there?
+
+<details>
+<summary>Answer</summary>
+
+No. The runtime is inside the binary too. It is only built for one OS and one processor (`GOOS`/`GOARCH`).
+
+</details>
+
+This ends the GO-X course: one binary, types at runtime, errors as values, and now copies and pointers. The next
+step is the Go basics course: [GO-1.01 · Why does Go exist? What is inside go build](/lab/youtube/go/go-1-01/en).
+
+## Homework
+
+The starter files are in the lesson folder on GitHub:
+[lessons/0x-04-values-pointers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+(the `uyga/` folder). Commands run from the lesson folder.
+
+🟢 **Easy** (`uyga/oson/main.go`): `deactivate` and `rename` should change a user, but nothing changes. Fix one with
+an index and the other with a pointer (the call in `main` changes too). Predict the result first.
+
+```go filename="uyga/oson/main.go" showLineNumbers
+// Uy vazifasi 🟢 (GO-X.04): ikkala funksiya users'ni o'zgartirishi kerak, lekin hech narsa o'zgarmaydi.
+//
+//  1. Avval taxmin qiling, keyin dars papkasidan ishga tushiring: go run ./uyga/oson
+//  2. deactivate'ni indeks bilan, rename'ni pointer bilan tuzating (main'dagi chaqiruv ham o'zgaradi).
+//  3. Kutilgan natija:
+//     true
+//     [{42 Dilnoza false} {7 Bekzod true}]
+//
+// Ishora: golangci-lint'da govet'ning unusedwrite tekshiruvini yoqsangiz, ikkala joyni ham ko'rsatadi
+// (README'dagi .golangci.yml namunasi).
+// Javob: uyga/javob/oson/main.go
+package main
+
+import "fmt"
+
+type User struct {
+	ID     string
+	Name   string
+	Active bool
+}
+
+var users = []User{
+	{ID: "42", Name: "Dilnoza", Active: true},
+	{ID: "7", Name: "Jasur", Active: true},
+}
+
+// deactivate id'si mos foydalanuvchini o'chiradi (Active = false).
+func deactivate(id string) bool {
+	for _, u := range users {
+		if u.ID == id {
+			u.Active = false
+			return true
+		}
+	}
+	return false
+}
+
+// rename foydalanuvchining nomini o'zgartiradi.
+func rename(u User, name string) {
+	u.Name = name
+}
+
+func main() {
+	fmt.Println(deactivate("42"))
+	rename(users[1], "Bekzod")
+	fmt.Println(users)
+}
+```
+
+```console
+$ go run ./uyga/oson
+true
+[{42 Dilnoza true} {7 Jasur true}]
+```
+
+`Println` prints the slice as `[{…} {…}]` and each struct as its field values. The expected result: `true` and
+`[{42 Dilnoza false} {7 Bekzod true}]`. The hint in the file refers to the golangci-lint setting in the README:
+govet's `unusedwrite` check finds a write that is never read.
+
+🟡 **Medium** (`uyga/orta/main.go`): `PATCH /users/{id}` should change a user's name in the map, but the file does
+not build:
+
+```console
+$ go run ./uyga/orta
+# github.com/abdurahmon27/go-backend-uz/lessons/0x-04-values-pointers/uyga/orta
+uyga/orta/main.go:53:3: cannot assign to struct field users[id].Name in map
+```
+
+Fix it in two ways: a) read → change → write back to the map; b) `map[string]*User`. The `u, ok := users[…]` in the
+file is the second form of reading from a map: `ok` tells you whether the key exists (details in
+[GO-1.09](/lab/youtube/go/go-1-09/en)). `var body struct { … }` is an unnamed struct used only by this handler. Run it (without
+gcc, with `CGO_ENABLED=0`) and check from another terminal:
+
+```bash
+go run ./uyga/orta
+curl -X PATCH -d '{"name":"Dilnoza A."}' localhost:3000/users/42   # {"id":"42","name":"Dilnoza A.","balance":100}
+curl localhost:3000/users/42                                        # oʻsha
+curl -X PATCH -d '{"name":"X"}' localhost:3000/users/1              # 404 page not found
+```
+
+⚠️ `net/http` runs every request in its own goroutine, so a real service protects writes to the map with
+`sync.Mutex` ([GO-1.09](/lab/youtube/go/go-1-09/en)). In this task we check with a single `curl`.
+
+Answers: the [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers/uyga/javob)
+folder. Try it yourself first.
+
+<details>
+<summary>Answer</summary>
+
+🟢 In `deactivate`, `u` is a copy of the element (`range`); in `rename`, `u` is a copy of the caller's value (a
+value parameter). We fix `deactivate` with an index and `rename` with a pointer:
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// Javob 🟢 (GO-X.04): deactivate — indeks orqali elementning o'zi; rename — pointer (&users[1]).
+package main
+
+import "fmt"
+
+type User struct {
+	ID     string
+	Name   string
+	Active bool
+}
+
+var users = []User{
+	{ID: "42", Name: "Dilnoza", Active: true},
+	{ID: "7", Name: "Jasur", Active: true},
+}
+
+func deactivate(id string) bool {
+	for i := range users {
+		if users[i].ID == id {
+			users[i].Active = false // nusxa emas, slice'dagi element
+			return true
+		}
+	}
+	return false
+}
+
+func rename(u *User, name string) {
+	u.Name = name // u — pointer: chaqiruvchining qiymatiga yozadi
+}
+
+func main() {
+	fmt.Println(deactivate("42"))
+	rename(&users[1], "Bekzod") // slice elementining manzili
+	fmt.Println(users)
+}
+```
+
+```console
+$ go run ./uyga/javob/oson
+true
+[{42 Dilnoza false} {7 Bekzod true}]
+```
+
+`rename(&users[1], …)` is the same idea as `&users[i]` in `manzil/`: the slice element's own address.
+
+🟡 With fix a), the end of the `PATCH` handler looks like this (`uyga/javob/orta/main.go`):
+
+```go
+u, ok := users[id] // u — map'dagi qiymatning nusxasi
+if !ok {
+	http.NotFound(w, r)
+	return
+}
+u.Name = body.Name
+users[id] = u // nusxani qaytarib yozamiz
+json.NewEncoder(w).Encode(u)
+```
+
+With fix b), `var users = map[string]*User{…}`: `u` is a pointer, so after `u.Name = body.Name` there is no need to
+write it back. `sync.Mutex` is needed with both fixes. While preparing the lesson, the answer was run with
+`CGO_ENABLED=0`: `PATCH` and the following `GET` → `{"id":"42","name":"Dilnoza A.","balance":100}`, `/users/1` →
+`404 page not found`.
+
+</details>
+
+## Sources
+
+- Go FAQ: [When are function parameters passed by value?](https://go.dev/doc/faq#pass_by_value) ·
+  [Why is there no pointer arithmetic?](https://go.dev/doc/faq#no_pointer_arithmetic) ·
+  [Stack or heap](https://go.dev/doc/faq#stack_or_heap)
+- Go spec: [Address operators](https://go.dev/ref/spec#Address_operators) ·
+  [Selectors](https://go.dev/ref/spec#Selectors) · [Assignment statements](https://go.dev/ref/spec#Assignment_statements) ·
+  [Calls](https://go.dev/ref/spec#Calls) · [For range](https://go.dev/ref/spec#For_range) ·
+  [Index expressions](https://go.dev/ref/spec#Index_expressions) · [Array types](https://go.dev/ref/spec#Array_types) ·
+  [Slice types](https://go.dev/ref/spec#Slice_types)
+- A. Gerrand, Go blog: [Go Slices: usage and internals](https://go.dev/blog/slices-intro)
+- [Go Code Review Comments: Pass Values](https://go.dev/wiki/CodeReviewComments#pass-values) ·
+  [encoding/json.Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal)
+- Map element: [go1.26.8 runtime/maps table.go](https://github.com/golang/go/blob/go1.26.8/src/internal/runtime/maps/table.go) ·
+  [golang/go#3117](https://github.com/golang/go/issues/3117)
+- [100 Go Mistakes #30: elements are copied in range loops](https://100go.co/#ignoring-that-elements-are-copied-in-range-loops-30)
+- MDN: [Working with objects](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Working_with_objects#comparing_objects) ·
+  Python FAQ: [call by reference](https://docs.python.org/3/faq/programming.html#how-do-i-write-a-function-with-output-parameters-call-by-reference)
+- PHP: [Arrays](https://www.php.net/manual/en/language.types.array.php) ·
+  [Objects and references](https://www.php.net/manual/en/language.oop5.references.php) ·
+  [foreach](https://www.php.net/manual/en/control-structures.foreach.php)
+- Course folder and README: [lessons/0x-04-values-pointers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+- All results from `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15, PHP 8.4.26 and golangci-lint 2.12.2, on
+  2026-11-26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+
+---
+
+← Previous lesson: [GO-X.03](/lab/youtube/go/go-x-03/en) · Next lesson: [GO-1.01](/lab/youtube/go/go-1-01/en) → · [All lessons](/lab/youtube/go)
+
+</div>

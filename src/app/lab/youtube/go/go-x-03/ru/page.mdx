@@ -1,0 +1,1330 @@
+---
+title: "Без try/catch: значение ошибки и defer"
+date: "2026/11/26"
+description: "В Go ошибку не бросают, а возвращают как значение: if err != nil, ошибка, молча потерянная в вызове без результата, errcheck и defer вместо finally."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-03/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-03"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-03"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-03) · **Русский** · [English](/lab/youtube/go/go-x-03/en)  
+Урок GO-X.03 · [Go: 0 → Guru](/lab/youtube/go#go-x-03) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+В `config.json` осталась одна лишняя запятая. Сервис на Node не запускается и падает с `SyntaxError`. Тот же сервис
+на Go пишет `listening on :0` и продолжает работать, но на порту 8080 его никто не слушает. Куда делась ошибка?
+
+**Одна идея:** в Go ошибка — обычное возвращаемое значение. Вы сами проверяете её после каждого вызова (и очистку
+тоже пишете сами, через `defer`, который ставите вы), иначе программа молча продолжает работу с неправильным
+значением.
+
+К концу урока вы:
+
+- прочитаете сигнатуру вроде `func ReadFile(name string) ([]byte, error)` и увидите, откуда возвращается ошибка;
+- проверите ошибку через `if err != nil` и либо вернёте её наверх, либо остановитесь через `log.Fatal`;
+- найдёте ошибку, молча потерянную в вызове без результата, — глазами и с помощью errcheck из golangci-lint;
+- поставите `defer` вместо `finally` в правильное место: `resp.Body.Close()` после проверки ошибки.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| значение ошибки | значение типа `error`, которое функция возвращает последним результатом; `nil` — ошибки нет | error value |
+| `if err != nil` | проверка ошибки: если она есть, вы её обрабатываете или возвращаете наверх; вместо `try…catch` | `if err != nil` |
+| `defer` | откладывает вызов до конца функции, через какой бы `return` она ни вышла; вместо `finally` | defer statement |
+
+Есть и два вспомогательных слова: **`errors.New`** (создаёт новую ошибку из текста) и **errcheck** (проверка из
+набора линтеров golangci-lint: находит непроверенные ошибки).
+
+## Что нужно знать заранее
+
+- [GO-X.01 · HTTP API в 20 строк: первый сервис на Go и один бинарник](/lab/youtube/go/go-x-01/ru): HTTP-сервис,
+  `log.Fatal(http.ListenAndServe(…))`, `go run` / `go build`, чтение ошибки в формате `файл:строка:столбец`.
+- [GO-X.02 · Типы есть и в рантайме](/lab/youtube/go/go-x-02/ru): zero value, `nil`, разница `:=` и `=`, подчёркивание `_`
+  (blank identifier), затенение (shadowing), `json.Unmarshal(…, &cfg)`, `go vet`. Здесь мы это заново не объясняем.
+- Примеры урока используют файл `config.json` и связанные друг с другом папки, поэтому нужна папка курса, а не
+  go.dev/play. Откройте терминал в папке урока (`lessons/0x-03-errors`): все команды запускаются оттуда. Лишняя
+  запятая в `config.json` оставлена **намеренно**.
+- Папки, которые используют `net/http` (`hook/`, `tuzat/`, `http/`), на компьютере без компилятора C (gcc)
+  запускаются с `CGO_ENABLED=0`, как в GO-X.01.
+- `ikki/` и `qamrov/` намеренно не собираются. Поэтому `go vet ./...` выдаст на них ошибки: запускайте каждую
+  папку отдельно.
+- Для сравнения в папке `js/` лежат файлы для Node 24. Команды для Python 3 и PHP 8 — одна строка в терминале.
+
+Сначала вопрос по GO-X.02. В первой строке `a` и `err` объявлены через `:=`. Во второй строке `b` и `err` — снова
+через `:=`:
+
+```go
+a, err := strconv.Atoi("42")
+b, err := strconv.Atoi("x")
+```
+
+`strconv.Atoi` — из домашнего задания GO-X.02: превращает строку в число и возвращает число и ошибку. Соберётся ли
+этот код?
+
+**A)** ошибка сборки: `err` объявлена дважды · **B)** соберётся: `b` новая, а `err` просто получает новое значение ·
+**C)** второй `err` — новая переменная
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Достаточно, чтобы слева от `:=` было хотя бы одно новое имя. `b` новая, а `err` — не новая переменная, она
+только получает новое значение. Если вы выбрали «ошибка сборки», вы перенесли правило о двойном `let err` из
+JavaScript. Если вы выбрали «новая переменная», вы вспомнили затенение: оно бывает только во внутреннем блоке, а
+здесь блок один.
+
+</details>
+
+```go filename="eslash/main.go" showLineNumbers
+// Takrorlash (GO-X.02): := chap tomonida kamida bitta yangi nom bo'lsa yetarli, qolganlari qiymat oladi.
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	a, err := strconv.Atoi("42")
+	b, err := strconv.Atoi("x") // b yangi, err esa qayta yoziladi
+	fmt.Println(a, b, err)
+}
+```
+
+```console
+$ go run ./eslash
+42 0 strconv.Atoi: parsing "x": invalid syntax
+```
+
+`a` — 42. `"x"` — не число, поэтому `b` осталась в zero value (`0`), а `err` принесла текст ошибки: *parsing "x":
+invalid syntax* — «не удалось разобрать `"x"`: неверная запись». В коде на Go `err` переиспользуют именно так,
+снова и снова. Сегодняшний урок — про этот `err`.
+
+## Одна запятая: Node падает, Go молча работает
+
+Файл конфигурации из начала урока. После строки `"users_api"` стоит лишняя запятая, а JSON её не принимает:
+
+```console
+$ cat config.json
+{
+  "port": 8080,
+  "users_api": "http://localhost:9090",
+}
+```
+
+Сервис на Node читает этот файл через `JSON.parse` и берёт из него порт:
+
+```js filename="js/server.js"
+// GO-X.03 hook: Node'dagi xuddi shu xizmat. config.json'da ortiqcha vergul bor.
+const fs = require("node:fs");
+const http = require("node:http");
+
+const cfg = JSON.parse(fs.readFileSync("config.json", "utf8"));
+
+http
+  .createServer((req, res) => res.end("ok"))
+  .listen(cfg.port, () => console.log("listening on :" + cfg.port));
+```
+
+```console
+$ node js/server.js
+<anonymous_script>:4
+}
+^
+
+SyntaxError: Expected double-quoted property name in JSON at position 58 (line 4 column 1)
+    at JSON.parse (<anonymous>)
+    at Object.<anonymous> (…/js/server.js:5:18)
+    at Module._compile (node:internal/modules/cjs/loader:1760:14)
+    at Object..js (node:internal/modules/cjs/loader:1893:10)
+    at Module.load (node:internal/modules/cjs/loader:1480:32)
+    at Module._load (node:internal/modules/cjs/loader:1299:12)
+    at TracingChannel.traceSync (node:diagnostics_channel:328:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:244:24)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.10.0
+```
+
+(Полный путь к файлу сокращён до `…`: он зависит от папки на вашем компьютере.) `JSON.parse` бросил `SyntaxError`,
+никто его не поймал, и процесс завершился с кодом 1. Сервис не запустился, но причина, файл и строка
+(`server.js:5:18`) видны.
+
+Тот же сервис на Go (папка `hook/`, её код посмотрим позже):
+
+```console
+$ go run ./hook
+2026/11/26 18:38:28 listening on :0
+```
+
+Сервис запустился и работает (останавливается <kbd>Ctrl</kbd>+<kbd>C</kbd>). Но порт не `8080`, а `:0`. Ошибка
+нигде не записана. На этот вопрос мы ответим к концу урока.
+
+## Python и PHP: громко и молча
+
+`json.load` в Python тоже бросает ошибку (raise):
+
+```console
+$ python3 -c 'import json; json.load(open("config.json"))'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json; json.load(open("config.json"))
+                 ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "…/json/__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "…/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "…/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "…/json/decoder.py", line 361, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ~~~~~~~~~~~~~~^^^^^^^^
+json.decoder.JSONDecodeError: Illegal trailing comma before end of object: line 3 column 39 (char 56)
+```
+
+(Папка библиотеки Python тоже сокращена до `…`.) *Illegal trailing comma before end of object* — «лишняя запятая
+перед концом объекта». А `json_decode` в PHP по умолчанию ошибку не бросает, он молча возвращает `null`:
+
+```console
+$ php -r 'var_dump(json_decode(file_get_contents("config.json")));'
+NULL
+```
+
+Так написано в документации PHP: если JSON не удаётся декодировать, возвращается `null`. Причину нужно спросить
+самому через `json_last_error_msg()` (он скажет `Syntax error`) или включить исключения флагом
+`JSON_THROW_ON_ERROR`. (Запущено на PHP 8.4.26 через `nix shell nixpkgs#php`.)
+
+| | JavaScript | Python | PHP |
+|---|---|---|---|
+| сломанный JSON | `JSON.parse` → `throw SyntaxError` | `json.load` → `raise JSONDecodeError` | `json_decode` → молчаливый `null` |
+| если не проверить | процесс падает, с причиной | процесс падает, с причиной | программа продолжает работу с `null` |
+
+Поведение Go — где-то посередине. Сейчас увидим.
+
+## Значение ошибки: `error` — обычное возвращаемое значение
+
+В Go ошибку не бросают. Функция, которая может завершиться неудачей, возвращает ошибку как обычное значение,
+обычно последним результатом. Это **значение ошибки** (error value). `os.ReadFile` читает файл и возвращает два
+результата: слайс байтов (`[]byte`) и ошибку. `oqish/main.go` (`oqish` — «чтение») читает несуществующий файл:
+
+```go filename="oqish/main.go" showLineNumbers
+// error qiymat: fayl yo'q bo'lsa, data bo'sh, err esa xato matnini olib keladi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	data, err := os.ReadFile("yoq.json")
+	fmt.Println(len(data), err)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 4–7 | `import ( … )` | пакеты `fmt` и `os` (работа с файлами и операционной системой) |
+| 10 | `data, err := os.ReadFile("yoq.json")` | `data` — байты файла (`[]byte`), `err` — ошибка; обе переменные новые |
+| 11 | `fmt.Println(len(data), err)` | `len(data)` — число байтов; затем ошибка |
+
+`error` — встроенный тип Go. У него один метод: `Error()`, он возвращает текст ошибки. `Println` выводит ошибку
+этим текстом. При успехе `err` — `nil`, то есть «ошибки нет» (GO-X.02). В памяти это выглядит так:
+
+| После строки | `data` (`[]byte`) | `err` (`error`) | На экране |
+|---|---|---|---|
+| 10, файла нет | `nil` (0 байтов) | `open yoq.json: no such file or directory` | |
+| 10, файл есть | байты файла | `nil` | |
+| 11 (файла нет) | `nil` | ошибка | `0 open yoq.json: no such file or directory` |
+
+```console
+$ go run ./oqish
+0 open yoq.json: no such file or directory
+```
+
+*open yoq.json: no such file or directory* — «не удалось открыть `yoq.json`: нет такого файла или каталога»
+(`yoq` — «нет»). Главное: строка 11 всё равно выполнилась. В JavaScript `fs.readFileSync("yoq.json")` бросил бы
+исключение, и управление прыгнуло бы в ближайший `catch`. В Go ничего не прыгает: ошибка лежит в `err`, следующая
+строка выполняется. Если есть ошибка, не доверяйте остальным результатам: `data` пустой.
+
+### Можно ли взять только один результат?
+
+Теперь возьмём один результат: `data := os.ReadFile("config.json")`, без `err`. В JavaScript можно взять первый
+элемент массива, а Python возвращает кортеж. Что сделает Go?
+
+**A)** `data` — первый результат, `err` отбрасывается · **B)** ошибка сборки · **C)** `data` — пара `(байты, err)`
+
+<details>
+<summary>Ответ</summary>
+
+**B: ошибка сборки.** Если вы присваиваете результаты переменным, Go требует взять их все. Если вы выбрали «первый
+результат», вы перенесли деструктуризацию `const [data] = …`. Если вы выбрали «пара», вы вспомнили кортеж Python:
+в Go несколько результатов не собираются в одно значение.
+
+</details>
+
+```go filename="ikki/main.go" showLineNumbers
+// Bashorat: os.ReadFile ikki qiymat qaytaradi, biz bittasini oldik. Ataylab build bo'lmaydi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	data := os.ReadFile("config.json")
+	fmt.Println(len(data))
+}
+```
+
+```console
+$ go run ikki/main.go
+# command-line-arguments
+ikki/main.go:10:10: assignment mismatch: 1 variable but os.ReadFile returns 2 values
+```
+
+`ikki/main.go:10:10` — строка 10, столбец 10: `os.ReadFile`. *assignment mismatch: 1 variable but os.ReadFile
+returns 2 values* — «присваивание не сходится: переменная одна, а `os.ReadFile` возвращает 2 значения». Чтобы
+отбросить ошибку намеренно, есть подчёркивание: `data, _ := os.ReadFile(…)`. Но руководство команды Go по
+код-ревью говорит этого не делать: *Do not discard errors using `_` variables* — «не отбрасывайте ошибки через
+`_`».
+
+### Ошибка видна в сигнатуре
+
+`go doc` показывает документацию пакета в терминале. `grep func` берёт из неё только строку сигнатуры:
+
+```console
+$ go doc os.ReadFile | grep func
+func ReadFile(name string) ([]byte, error)
+```
+
+В сигнатуре два результата, и `error` всегда последний. В JavaScript по сигнатуре не узнать, бросает ли функция
+исключение, и в TypeScript тоже нет `throws` (такое предложение для TypeScript закрыто как «не планируется»). В Go
+сама сигнатура показывает, возвращается ли ошибка.
+
+Почему Go не выбрал исключения? Go FAQ объясняет: привязка исключений к управляющей конструкции вроде
+`try-catch-finally` приводит к запутанному коду. Она также подталкивает программистов объявлять исключительными
+обычные ошибки, например неудачное открытие файла. А несколько возвращаемых значений в Go позволяют легко вернуть
+ошибку рядом с основным значением.
+
+## `if err != nil`: проверить и вернуть наверх
+
+Теперь функция, которая загружает конфигурацию. `config/main.go`:
+
+```go filename="config/main.go" showLineNumbers
+// if err != nil: xatoni yuqoriga qaytarish (loadConfig) va ishga tushishda to'xtatish (main).
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = json.Unmarshal(data, &cfg)
+	return cfg, err
+}
+
+func main() {
+	cfg, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11–13 | `type Config struct { … }` | структура конфигурации: поле `Port` берётся из ключа `port` в JSON (GO-X.02) |
+| 15 | `func loadConfig(path string) (Config, error) {` | в параметрах тоже сначала имя, потом тип; `(Config, error)` в скобках — два результата |
+| 16 | `var cfg Config` | возвращаемая конфигурация, пока в zero value |
+| 17 | `data, err := os.ReadFile(path)` | чтение файла: байты и ошибка |
+| 18 | `if err != nil {` | есть ли ошибка? Скобок вокруг условия нет, а `{ }` обязательны |
+| 19 | `return cfg, err` | возвращает ошибку вызывающему: как `throw` без написанного `catch`, только это видно |
+| 21 | `err = json.Unmarshal(data, &cfg)` | `Unmarshal` возвращает только `error`; `err` уже есть, поэтому обычное `=` |
+| 22 | `return cfg, err` | есть ошибка или нет, вызывающий сам проверит `err` |
+| 26 | `cfg, err := loadConfig("config.json")` | `main` получает результаты |
+| 27–29 | `if err != nil { log.Fatal(err) }` | ошибка при запуске: печатает текст и останавливает программу с кодом 1 (GO-X.01) |
+| 30 | `fmt.Println("port:", cfg.Port)` | ошибки нет: порт |
+
+Это шаблон **`if err != nil`**: в Go он стоит на месте `try…catch`. В видео рядом со строкой 18 есть комментарий
+`// JS: catch'siz throw` («JS: throw без catch»), в файле курса его нет. В JavaScript, если не написать `catch`,
+ошибка сама поднимается наверх. В Go возврат наверх вы пишете вручную, через `return cfg, err`, и он виден в коде.
+
+Со сломанным `config.json`:
+
+```console
+$ go run ./config
+2026/11/26 18:38:10 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+*invalid character '\}' looking for beginning of object key string* — «недопустимый символ `}`: ожидалось начало
+ключа объекта». Запятая означает «будет ещё ключ», а пришла `}`. `exit status 1` — `go run` сообщает, что программа
+завершилась с кодом выхода 1: это сделал `log.Fatal`.
+
+### Где обрабатывать ошибку
+
+Правило из руководства по код-ревью: обработайте ошибку или верните её наверх.
+
+```text
+loadConfig            return cfg, err       → возвращает наверх
+   │
+   ▼
+main (запуск)         log.Fatal(err)        → печатает причину, останавливается
+HTTP handler          http.Error(w, …, 400/500); return
+                                            → отвечает клиенту, выходит из handler
+
+основной путь — у левого края, путь ошибки — внутри if
+```
+
+| Где | Что делаете | Пример |
+|---|---|---|
+| вспомогательная функция | возвращаете наверх | `return cfg, err` |
+| запуск (`main`) | печатаете причину и останавливаетесь | `log.Fatal(err)` |
+| обработчик (handler) HTTP | возвращаете клиенту 400 или 500 | `http.Error(w, …, http.StatusBadRequest)` и `return` |
+
+Ещё одно правило руководства (*Indent Error Flow*): основной путь остаётся у левого края, путь ошибки — внутри
+`if`. `else` не пишут: внутри `if` есть `return`, а основной код продолжается после него.
+
+## Потерянная ошибка: вызов без результата
+
+Вернёмся к сервису из начала урока. `hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+// GO-X.03 hook: GO-X.01 xizmati config.json'ni o'qiydi. Unmarshal'ning xatosi tekshirilmagan.
+// Ishga tushirish (dars papkasidan): go run ./hook   (config.json'da ortiqcha vergul bor)
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func main() {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg Config
+	json.Unmarshal(data, &cfg)
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 18–21 | `data, err := os.ReadFile(…)` + `if err != nil` | `ReadFile` проверен |
+| 22 | `var cfg Config` | `cfg.Port` пока `0` (zero value) |
+| 23 | `json.Unmarshal(data, &cfg)` | вызов без результата: результат никто не взял |
+| 25 | `addr := fmt.Sprintf(":%d", cfg.Port)` | `Sprintf` форматирует текст и возвращает его; `%d` — целое число: порт `8080` → `":8080"` |
+| 26–28 | `http.HandleFunc("GET /health", …)` | обработчик для health check: возвращает `200 OK` (GO-X.01) |
+| 29–30 | `log.Println(…)`, `log.Fatal(http.ListenAndServe(addr, nil))` | запускает сервис на `addr` (GO-X.01) |
+
+Подсказка: `fmt.Println` тоже возвращает два результата, `n` и `err`
+(`func Println(a ...any) (n int, err error)`). Но мы всегда вызываем его без результата, и ни сборка, ни `go vet`
+ни разу не возразили. Что скажут `go build` и `go vet` про `json.Unmarshal` в строке 23?
+
+**A)** ошибка сборки: результат не использован · **B)** соберётся, `go vet` предупредит · **C)** оба молчат
+
+<details>
+<summary>Ответ</summary>
+
+**C: оба молчат.** У правила две стороны. Если вы присваиваете результаты переменным, вы берёте их все
+(*assignment mismatch* в `ikki/`). Если вы пишете вызов отдельной строкой, все его результаты молча отбрасываются:
+по спецификации Go вызов функции может стоять отдельной инструкцией. Если вы выбрали «ошибка сборки», вы вспомнили
+*declared and not used* из GO-X.02: это про переменные, а не про результаты. Если вы выбрали «`go vet`», вы думали,
+что он проверяет всё: его проверка `unusedresult` смотрит только на функции из фиксированного списка, вроде
+`fmt.Sprintf`.
+
+</details>
+
+```console
+$ go build -o /dev/null ./hook && go vet ./hook; echo "exit $?"
+exit 0
+```
+
+`-o /dev/null` никуда не записывает бинарник: обычный `go build ./hook` здесь не может записать бинарник, потому что
+папка `hook` уже существует. `echo "exit $?"` выводит код выхода последней команды: `0`, то есть оба молчат.
+
+| Как написано | Что делает Go |
+|---|---|
+| `data := os.ReadFile(…)` | ошибка сборки: *assignment mismatch* |
+| `data, _ := os.ReadFile(…)` | соберётся: ошибка отброшена намеренно |
+| `json.Unmarshal(data, &cfg)` | соберётся, `go vet` молчит: результат молча отброшен |
+
+Теперь у загадки из начала урока есть ответ. `Unmarshal` споткнулся о запятую и вернул ошибку, её никто не прочитал.
+А `cfg.Port` остался в zero value, в `0`:
+
+| После строки | `err` | `cfg.Port` | `addr` |
+|---|---|---|---|
+| 18 | `nil` (файл есть) | | |
+| 22 | `nil` | `0` | |
+| 23 | `nil` (ошибка `Unmarshal` никуда не записана) | `0` | |
+| 25 | `nil` | `0` | `":0"` |
+
+### Порт `0`: случайный порт
+
+По документации `net.Listen`, если порт — `"0"`, номер порта выбирается автоматически. То есть операционная система
+даёт любой свободный порт. Команда `ss` показывает порты, которые слушаются. Пока `go run ./hook` работает в другом
+терминале:
+
+```console
+$ ss -ltnp | grep hook
+LISTEN 0      4096               *:44139            *:*    users:(("hook",pid=1063504,fd=3))
+```
+
+Сервис на порту `44139` (при каждом запуске номер другой). А health check идёт на `8080` и не получает ответа. Это
+версия молчаливого `null` из PHP в Go: если ошибку не проверить, программа продолжает работу с неправильным
+значением.
+
+## Исправление: короткое объявление внутри `if`
+
+`tuzat/main.go` (`tuzat` — «исправить») такой же, как hook, изменилась только строка с `Unmarshal`:
+
+```go filename="tuzat/main.go" showLineNumbers
+// Tuzatilgan hook: Unmarshal xatosi tekshiriladi, buzuq config bilan xizmat ishga tushmaydi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func main() {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal(err)
+	}
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 22 | `if err := json.Unmarshal(data, &cfg); err != nil {` | короткое объявление после `if`, до точки с запятой: сначала выполняется `Unmarshal`, потом проверяется условие |
+| 23 | `log.Fatal(err)` | сломанная конфигурация: печатает причину и останавливается |
+
+По спецификации Go перед условием `if` может стоять одна простая инструкция. Этот `err` живёт только внутри этого
+`if`: у `if` свой блок. Он скрывает внешний `err` (строка 17), то есть это затенение (GO-X.02), но здесь оно
+безвредно: внешний `err` дальше не используется.
+
+```console
+$ go run ./tuzat
+2026/11/26 18:38:10 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+Теперь сервис со сломанной конфигурацией не запускается и пишет причину.
+
+### errcheck: линтер вместо глаз
+
+**golangci-lint** — набор линтеров, что-то вроде ESLint для Go. Его **errcheck** находит непроверенные ошибки и
+включён по умолчанию. На старой версии hook:
+
+```console
+$ golangci-lint run ./hook
+hook/main.go:23:16: Error return value of `json.Unmarshal` is not checked (errcheck)
+	json.Unmarshal(data, &cfg)
+	              ^
+1 issues:
+* errcheck: 1
+```
+
+*Error return value of `json.Unmarshal` is not checked* — «ошибка, которую вернул `json.Unmarshal`, не проверена».
+Строка 23, столбец 16: скобка, на которую указывает `^`. Добавьте его в CI. Знайте две вещи: ошибки, отброшенные
+через `_`, errcheck по умолчанию не видит (`check-blank: false`). А `defer resp.Body.Close()` он показывает:
+игнорировать ошибку `Close` у тела, открытого для чтения, — распространённая практика. (golangci-lint 2.12.2, без
+файла конфигурации.)
+
+### Вопрос посреди урока: результат, объявленный внутри `if`
+
+Кто-то написал короткую форму с `loadConfig`, и результат тоже объявлен внутри `if`:
+
+```go
+if cfg, err := loadConfig("config.json"); err != nil {
+	log.Fatal(err)
+}
+fmt.Println(cfg.Port)
+```
+
+Если конфигурация правильная, что выведет последняя строка?
+
+**A)** `8080` · **B)** `0` (zero value) · **C)** ошибка сборки
+
+<details>
+<summary>Ответ</summary>
+
+**C: ошибка сборки, даже две.** `cfg`, объявленная в заголовке `if`, живёт только внутри `if`: снаружи её нет, а
+внутри она не используется. Если вы выбрали «`8080`», вы думали, что `cfg` видна во всей функции. Если вы выбрали
+«`0`», вы вспомнили zero value из GO-X.02: дело не в значении, имени просто нет. В JavaScript, если использовать
+`const` из блока снаружи, ошибка появится только при выполнении, а в Go — при сборке.
+
+</details>
+
+```go filename="qamrov/main.go" showLineNumbers
+// O'rtadagi sinov: if ichida := bilan e'lon qilingan nom if'dan keyin yo'q. Ataylab build bo'lmaydi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = json.Unmarshal(data, &cfg)
+	return cfg, err
+}
+
+func main() {
+	if cfg, err := loadConfig("config.json"); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(cfg.Port)
+}
+```
+
+```console
+$ go run qamrov/main.go
+# command-line-arguments
+qamrov/main.go:26:5: declared and not used: cfg
+qamrov/main.go:29:14: undefined: cfg
+```
+
+`qamrov/main.go` (`qamrov` — «область видимости», scope). `26:5` — *declared and not used: cfg* — «`cfg` объявлена,
+но не используется»: внутри `if` её никто не прочитал. `29:14` — *undefined: cfg* — «`cfg` не определена»: после
+`if` этого имени нет.
+
+| Строка | Видна ли `cfg` | Видна ли `err` |
+|---|---|---|
+| 26 (заголовок `if`) | да, объявлена здесь | да |
+| 27 (внутри `if`) | да (но не используется) | да |
+| 29 (после `if`) | нет → *undefined* | нет |
+
+**Исправление:** если результат нужен дальше, получите его отдельной строкой до `if`, как в `config/main.go`:
+`cfg, err := loadConfig(…)`, потом `if err != nil`.
+
+## `defer`: вместо `finally`
+
+Теперь очистка. В JavaScript файл закрывают через `try…finally`, в Python — через `with`. `js/finally.mjs`:
+
+```js filename="js/finally.mjs"
+// defer'ning JS'dagi tanish tomoni: try…finally. Ishga tushirish: node js/finally.mjs
+import { open } from "node:fs/promises";
+
+async function loadUsers(path) {
+  const fh = await open(path);
+  try {
+    return JSON.parse(await fh.readFile("utf8"));
+  } finally {
+    await fh.close();
+  }
+}
+
+console.log(await loadUsers("js/users.json"));
+```
+
+```console
+$ node js/finally.mjs
+[ { id: 42, name: 'Dilnoza' } ]
+```
+
+По MDN, блок `finally` выполняется всегда, прежде чем управление покинет `try…catch…finally`. В Go `finally` нет.
+Вместо него — **`defer`**: одна строка, которая откладывает вызов до конца функции, в которой она стоит.
+
+### Предскажите: `defer` после раннего `return`
+
+Вместо файла будем писать на экран. Функция `load` из `defer/main.go`:
+
+```go
+func load(fail bool) error {
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	defer fmt.Println("yopildi")
+	fmt.Println("o'qildi")
+	return nil
+}
+```
+
+`ochildi` — «открыто», `yopildi` — «закрыто», `o'qildi` — «прочитано». **`errors.New`** создаёт новую ошибку из
+текста. Функция возвращает только `error`: `nil` — успех. Внимание: строка с `defer` стоит **после** раннего
+`return`. `main` сначала вызывает `load(false)`, потом `load(true)` и при ошибке печатает `xato: …` («ошибка: …»).
+
+`finally` выполнился бы всегда. Что появится на экране при вызове `load(true)`?
+
+**A)** `ochildi` · `yopildi` · `xato: buzuq JSON` · **B)** `ochildi` · `xato: buzuq JSON` · **C)** `yopildi` ·
+`ochildi` · `xato: buzuq JSON`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `ochildi` и ошибка, `yopildi` нет.** `defer` регистрируется только тогда, когда выполняется его строка. При
+`fail`, равном true, `return` случился в строке 13, а до `defer` в строке 15 выполнение не дошло. Если вы выбрали
+«A», вы перенесли модель `finally`: `finally` привязан к блоку, а `defer` — к выполненной строке. Если вы выбрали
+«C», вы думали, что `defer` выполняется в начале функции: он выполняется в конце.
+
+</details>
+
+```go filename="defer/main.go" showLineNumbers
+// defer: chaqiruv funksiya tugaguncha kechiktiriladi. Lekin u faqat defer qatori bajarilganda ro'yxatga yoziladi:
+// undan oldingi return'da hech narsa yopilmaydi (finally'dan farqi).
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func load(fail bool) error {
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	defer fmt.Println("yopildi")
+	fmt.Println("o'qildi")
+	return nil
+}
+
+func main() {
+	if err := load(false); err != nil {
+		fmt.Println("xato:", err)
+	}
+	if err := load(true); err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+```
+
+Строки 21 и 24 в `main` используют сегодняшнюю короткую форму: `if err := …; err != nil`.
+
+```console
+$ go run ./defer
+ochildi
+o'qildi
+yopildi
+ochildi
+xato: buzuq JSON
+```
+
+| Вызов | Строка | Что произошло | На экране |
+|---|---|---|---|
+| `load(false)` | 11 | | `ochildi` |
+| | 15 | `defer` записан в список: `fmt.Println("yopildi")` | |
+| | 16 | | `o'qildi` |
+| | 17 | `return nil` → сначала выполняется список | `yopildi` |
+| `load(true)` | 11 | | `ochildi` |
+| | 13 | `return errors.New(…)`: список пуст | |
+| `main` | 25 | | `xato: buzuq JSON` |
+
+При `fail`, равном false, `yopildi` появилось в конце функции, после `o'qildi`. В этом отличие от `finally`: `defer`
+охватывает не блок, а путь после себя. Коротко: `defer` выполняется в конце функции, но только если сам был
+выполнен.
+
+## `defer` на практике: `resp.Body.Close()`
+
+Наш сервис получает пользователя из другого сервиса (users API) по HTTP. `http/main.go`:
+
+```go filename="http/main.go" showLineNumbers
+// defer amalda: xizmat boshqa xizmatdan (users API) foydalanuvchini HTTP orqali oladi.
+// resp.Body — tarmoq ulanishidan oqim; uni yopish shart. Demo uchun users API'ni httptest bilan shu dasturda ko'taramiz.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type User struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+func fetchUser(baseURL, id string) (User, error) {
+	var u User
+	resp, err := http.Get(baseURL + "/users/" + id)
+	if err != nil {
+		return u, err
+	}
+	defer resp.Body.Close()
+	err = json.NewDecoder(resp.Body).Decode(&u)
+	return u, err
+}
+
+func main() {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id": 42, "name": "Dilnoza"}`)
+	}))
+	defer api.Close()
+
+	u, err := fetchUser(api.URL, "42")
+	fmt.Println(u, err)
+
+	_, err = fetchUser("http://localhost:9", "42") // 9-port: hech kim tinglamaydi
+	fmt.Println(err)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 17 | `func fetchUser(baseURL, id string) (User, error) {` | оба параметра — `string` (тип пишется один раз); результаты — пользователь и ошибка |
+| 19 | `resp, err := http.Get(…)` | GET-запрос; `resp` — ответ (`*http.Response`; `*` — указатель, см. [GO-X.04](/lab/youtube/go/go-x-04/ru)) |
+| 20–22 | `if err != nil { return u, err }` | сетевая ошибка: возвращает наверх |
+| 23 | `defer resp.Body.Close()` | `resp.Body` — поток из сетевого соединения; закрывается, когда функция завершится |
+| 24 | `err = json.NewDecoder(resp.Body).Decode(&u)` | читает JSON прямо из потока в `u` (как `await res.json()` в JS) |
+| 29–32 | `httptest.NewServer(…)` | users API для демонстрации: настоящий HTTP-сервер внутри этой же программы, на случайном порту; `api.URL` — его адрес |
+| 33 | `defer api.Close()` | останавливает сервер, когда `main` завершится |
+| 38 | `fetchUser("http://localhost:9", "42")` | порт 9 никто не слушает: сетевая ошибка; `_` — пользователь не нужен |
+
+```console
+$ go run ./http
+{42 Dilnoza} <nil>
+Get "http://localhost:9/users/42": dial tcp [::1]:9: connect: connection refused
+```
+
+Первая строка: пользователь и `<nil>` (ошибки нет). Вторая: *connect: connection refused* — «в соединении
+отказано». В документации `net/http` написано: закрывать `Body` — обязанность вызывающего. Если тело не дочитать
+до конца и не закрыть, keep-alive-соединение HTTP/1.x может не использоваться повторно.
+
+`defer` стоит **после** проверки ошибки. Если есть ошибка, `resp` — `nil`. А строка с `defer` сразу читает
+`resp.Body`, и программа падает. Этот порядок проверяет `go vet` (пример — в разделе «Частые ошибки»).
+
+### Как работает `defer`
+
+Когда выполняется строка с `defer`, вызов записывается в список функции. Через какой бы `return` функция ни
+выходила, сначала выполняется список:
+
+```text
+fetchUser(…)
+  19  resp, err := http.Get(…)
+  20  if err != nil → return u, err      список пуст: закрывать нечего
+  23  defer resp.Body.Close()           список: [ resp.Body.Close() ]
+  24  err = json.NewDecoder(…).Decode(&u)
+  25  return u, err                     → сначала resp.Body.Close(), потом выход
+```
+
+Причина из Effective Go: даже если позже добавить в функцию новый `return`, закрытие не забудется. Закрытие стоит
+рядом с открытием. В базах данных тот же шаблон: после `tx, err := db.BeginTx(…)` идёт `defer tx.Rollback()`, то
+есть отмена транзакции. После `Commit` он безвреден: возвращает `sql.ErrTxDone` и ничего не делает.
+
+| | JavaScript | Python | Go |
+|---|---|---|---|
+| очистка | `try { … } finally { fh.close() }` | `with open(…) as f:` | `defer f.Close()` |
+| к чему привязано | к блоку | к блоку | к функции; только если строка с `defer` выполнилась |
+
+## Глубже (необязательно): почему `if err != nil` остаётся и почему нет stack trace
+
+`if err != nil` повторяется очень часто. По статье в блоге Go от 3 июня 2025 года (R. Griesemer), жалобы на
+обработку ошибок годами занимают первое место в ежегодных опросах пользователей Go. Команда Go рассмотрела несколько
+предложений:
+
+| Год | Предложение |
+|---|---|
+| 2018 | `check` / `handle` |
+| 2019 | `try` |
+| 2024 | оператор `?` (Ian Lance Taylor) |
+| 2025 | решение: в обозримом будущем синтаксис ошибок не изменится |
+
+Через семь лет, в 2025 году, команда Go перестала искать новый синтаксис для ошибок. Значит, `if err != nil`
+остаётся.
+
+Ещё одно отличие: у стандартного `error` нет stack trace, это только значение и текст. В исходниках go1.26.8 тип,
+который создаёт `errors.New`, выглядит так: `type errorString struct { s string }` — одно строковое поле. В `tuzat/`
+`log.Fatal` сказал *invalid character*, но не сказал, какой это файл. А Node показал файл и строку
+(`server.js:5:18`).
+
+| | JavaScript `Error` | Go `error` |
+|---|---|---|
+| что внутри | текст + stack (файл:строка) | только значение и текст |
+| контекст | из stack | добавляете сами |
+
+Добавление контекста к ошибке (`%w`, `errors.Is`) — в [GO-1.14](/lab/youtube/go/go-1-14/ru), `panic` и порядок `defer` — в
+[GO-1.15](/lab/youtube/go/go-1-15/ru).
+
+## Частые ошибки
+
+**1. Вызов без результата: ошибка молча пропадает.** Самая классическая ошибка этой темы:
+`json.Unmarshal(data, &cfg)` собирается, `go vet` тоже молчит, а `cfg` остаётся в zero value (`listening on :0`).
+Полный пример — в разделе «Потерянная ошибка». **Исправление:** `if err := json.Unmarshal(data, &cfg); err != nil
+\{ … \}` и golangci-lint (errcheck) в CI.
+
+**2. Взять один результат из нескольких.** `data := os.ReadFile(…)` → *assignment mismatch: 1 variable but
+os.ReadFile returns 2 values* (`ikki/main.go`, в разделе «Значение ошибки»). **Исправление:** `data, err := …` и
+`if err != nil`. `data, _ :=` соберётся, но отбросит ошибку: не делайте так.
+
+**3. `defer` до проверки ошибки.** В видео только упоминается, в папке курса есть пример:
+
+```go filename="defer-oldin/main.go" showLineNumbers
+// Xato: defer xato tekshiruvidan OLDIN. http.Get xato qaytarsa resp nil bo'ladi, defer qatori esa resp.Body'ni
+// darhol o'qiydi — dastur nil pointer bilan yiqiladi (panic va defer tafsilotlari: GO-1.15).
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	resp, err := http.Get("http://localhost:9/users/42") // 9-port: hech kim tinglamaydi
+	defer resp.Body.Close()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+}
+```
+
+```console
+$ go run ./defer-oldin
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x62bbd7]
+
+goroutine 1 [running]:
+main.main()
+	…/defer-oldin/main.go:12 +0x37
+exit status 2
+```
+
+*invalid memory address or nil pointer dereference* — «недопустимый адрес памяти: обращение через `nil`-указатель».
+`main.go:12` — строка с `defer`. `http.Get` вернул ошибку, `resp` — `nil`, а `defer` прочитал `resp.Body` прямо в
+этой строке. Это **panic** во время выполнения: программа упала с кодом 2 (подробнее в [GO-1.15](/lab/youtube/go/go-1-15/ru)).
+`go vet` ловит это заранее:
+
+```console
+$ go vet ./defer-oldin
+defer-oldin/main.go:12:8: using resp before checking for errors
+```
+
+*using resp before checking for errors* — «`resp` используется до проверки ошибок». **Исправление:** сначала
+`if err != nil { return … }`, потом `defer resp.Body.Close()`, как в `http/main.go`.
+
+**4. Считать `defer` тем же `finally`.** `defer`, поставленный после раннего `return`, на этом пути не выполняется:
+`load(true)` не напечатал `yopildi` (раздел «Предскажите: `defer` после раннего `return`»). **Исправление:**
+пишите `defer` сразу, как только получили ресурс, сразу после проверки его ошибки.
+
+**5. Объявить нужный результат в заголовке `if`.** После `if cfg, err := loadConfig(…); err != nil` переменной `cfg`
+нет: *undefined: cfg* (раздел «Вопрос посреди урока»). **Исправление:** получите результат отдельной строкой до
+`if`. Короткая форма — только для результата, который дальше не понадобится.
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** `json.Unmarshal(data, &cfg)` написан без результата. Соберётся ли код и куда денется ошибка?
+
+<details>
+<summary>Ответ</summary>
+
+И сборка, и `go vet` молчат. Ошибка отбрасывается, её никто не видит, а `cfg` остаётся в zero value. Это находит
+errcheck из golangci-lint.
+
+</details>
+
+**2.** Когда выполняется `defer resp.Body.Close()` и почему он стоит после проверки ошибки?
+
+<details>
+<summary>Ответ</summary>
+
+Когда `fetchUser` завершается, через какой бы `return` она ни вышла. Если есть ошибка, `resp` — `nil`, строка с
+`defer` сразу читает `resp.Body`, и программа падает с panic. `go vet` ловит это как *using resp before checking
+for errors*.
+
+</details>
+
+**3.** Из GO-X.01: почему `http.ListenAndServe(…)` пишут внутри `log.Fatal(…)`?
+
+<details>
+<summary>Ответ</summary>
+
+По документации `ListenAndServe` всегда возвращает ошибку, не равную `nil`: он возвращается только с ошибкой,
+например если порт занят. `log.Fatal` печатает эту ошибку и останавливает программу с кодом 1. Говоря языком этого
+урока: это обработка ошибки при запуске.
+
+</details>
+
+**4.** Что выведет эта программа? (Её нет в папке курса, она запущена отдельно для урока: на этот раз `defer`
+стоит **до** `return`.)
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func load(fail bool) error {
+	defer fmt.Println("yopildi")
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	return nil
+}
+
+func main() {
+	err := load(true)
+	fmt.Println("xato:", err)
+}
+```
+
+**A)** `ochildi` · `xato: buzuq JSON` · **B)** `ochildi` · `yopildi` · `xato: buzuq JSON` · **C)** `yopildi` ·
+`ochildi` · `xato: buzuq JSON`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Строка с `defer` выполнилась первой, поэтому он сработал и при `return errors.New(…)`: `yopildi` перед
+выходом из функции. Потом `main` напечатал ошибку. Если вы выбрали «A», вы перенесли результат `defer/main.go`:
+там `defer` стоял после `return`. Если вы выбрали «C», вы думали, что `defer` выполняется сразу: он только
+записывается в список.
+
+```console
+$ go run oldin/main.go
+ochildi
+yopildi
+xato: buzuq JSON
+```
+
+</details>
+
+## Домашнее задание
+
+Стартовые файлы — в папке урока на GitHub:
+[lessons/0x-03-errors](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors) (папка `uyga/`).
+Команды запускаются из папки урока.
+
+🟢 **Легко** (`uyga/oson/main.go`): загрузчик конфигурации отбрасывает ошибку в трёх местах. Сначала предскажите
+результат, потом исправьте всё через `if err != nil`: `loadConfig` должна возвращать ошибку, а `main` —
+останавливаться через `log.Fatal`. `os.Getenv("CONFIG")` читает переменную окружения `CONFIG` (задаётся как
+`CONFIG=… go run …`).
+
+```go filename="uyga/oson/main.go" showLineNumbers
+// Uy vazifasi 🟢 (GO-X.03): bu config yuklovchi xatolarni uch joyda tashlab yuboradi.
+//
+//  1. Avval taxmin qiling, keyin dars papkasidan ishga tushiring:
+//     go run ./uyga/oson                                  # buzuq config.json (ortiqcha vergul)
+//     CONFIG=uyga/oson/config.json go run ./uyga/oson     # to'g'ri config
+//  2. Uchala joyni ham if err != nil bilan tuzating:
+//     loadConfig xatoni chaqiruvchiga qaytarsin, main esa log.Fatal bilan sababini yozib to'xtasin.
+//  3. Tekshiring: buzuq config → "invalid character '}' …", CONFIG=yoq.json → "open yoq.json: no such file
+//     or directory", to'g'ri config → "port: 8080".
+//     Qiziq: golangci-lint run ./uyga/oson hozir faqat Unmarshal'ni ko'rsatadi — _ bilan tashlangan xatolarni
+//     errcheck sukut bo'yicha sanamaydi (check-blank: false). Ko'z bilan topasiz.
+//
+// Javob: uyga/javob/oson/main.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, _ := os.ReadFile(path)
+	json.Unmarshal(data, &cfg)
+	return cfg, nil
+}
+
+func main() {
+	path := os.Getenv("CONFIG")
+	if path == "" {
+		path = "config.json"
+	}
+	cfg, _ := loadConfig(path)
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+```console
+$ go run ./uyga/oson
+port: 0
+```
+
+`port: 0` и со сломанной конфигурацией, и с отсутствующим файлом. В правильном решении: сломанная конфигурация →
+`invalid character '}' …`, `CONFIG=yoq.json` → `open yoq.json: no such file or directory`,
+`CONFIG=uyga/oson/config.json` → `port: 8080`.
+
+🟡 **Средне** (`uyga/orta/main.go`): users API возвращает `404` для неизвестного id, а `fetchUser` без ошибки
+отдаёт пустого пользователя. В Go, как и в `fetch`, `404` — не ошибка: в документации `net/http` написано *A
+non-2xx response doesn't cause an error* — «ответ не из 2xx ошибкой не считается». После `defer` проверьте
+`resp.StatusCode` и, если он не `200`, верните `fmt.Errorf("users API: %s", resp.Status)`. `fmt.Errorf` форматирует,
+как `Sprintf`, и создаёт ошибку.
+
+В стартовом файле `fetchUser` такой же, как в `http/main.go`, только после `defer resp.Body.Close()` стоит
+комментарий с заданием. `usersAPI()` — поддельный users API для демонстрации (`httptest`): есть только пользователь
+42, на остальные id он отвечает `404` и `{"error": "not found"}`. `main` вызывает `fetchUser` с `"42"` и `"7"`.
+Полный текст файла и комментарий с заданием — в папке `uyga/orta/` на GitHub.
+
+```console
+$ go run ./uyga/orta
+{42 Dilnoza} <nil>
+{0 } <nil>
+```
+
+`{0 }` — пустой `User`: `ID` равен `0`, `Name` — пустая строка. В правильном решении вторая строка будет
+`{0 } users API: 404 Not Found`.
+
+⭐ **Дополнительно:** напишите обработчик `GET /users/{id}` из GO-X.01 с `fetchUser`. При ошибке —
+`http.Error(w, err.Error(), http.StatusBadGateway)` и `return`.
+
+Ответы: папка [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors/uyga/javob).
+Сначала попробуйте сами.
+
+<details>
+<summary>Ответ</summary>
+
+🟢 Мест было три: `data, _ :=` (ошибка `ReadFile` отброшена через `_`), `json.Unmarshal` без результата и
+`cfg, _ :=` в `main`. `return cfg, nil` тоже врал: он говорил «ошибки нет», даже когда она была. errcheck
+показывает только `Unmarshal`, остальные два места вы находите глазами.
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// Javob 🟢 (GO-X.03): uchala xato tekshiriladi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func main() {
+	path := os.Getenv("CONFIG")
+	if path == "" {
+		path = "config.json"
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+```console
+$ go run ./uyga/javob/oson
+2026/11/26 18:38:21 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+```console
+$ CONFIG=yoq.json go run ./uyga/javob/oson
+2026/11/26 18:38:22 open yoq.json: no such file or directory
+exit status 1
+```
+
+```console
+$ CONFIG=uyga/oson/config.json go run ./uyga/javob/oson
+port: 8080
+```
+
+🟡 Статус проверяется после `defer`. Если он не `200`, тело не читается как JSON, возвращается ошибка.
+`resp.Status` — текст вроде `"404 Not Found"`.
+
+```go filename="uyga/javob/orta/main.go" showLineNumbers
+// Javob 🟡 (GO-X.03): 200 bo'lmagan javob xato sifatida qaytariladi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type User struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+func fetchUser(baseURL, id string) (User, error) {
+	var u User
+	resp, err := http.Get(baseURL + "/users/" + id)
+	if err != nil {
+		return u, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return u, fmt.Errorf("users API: %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&u)
+	return u, err
+}
+
+// usersAPI — demo uchun soxta users API: faqat 42-foydalanuvchi bor.
+func usersAPI() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/users/42" {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error": "not found"}`)
+			return
+		}
+		fmt.Fprint(w, `{"id": 42, "name": "Dilnoza"}`)
+	}))
+}
+
+func main() {
+	api := usersAPI()
+	defer api.Close()
+
+	fmt.Println(fetchUser(api.URL, "42"))
+	fmt.Println(fetchUser(api.URL, "7"))
+}
+```
+
+```console
+$ go run ./uyga/javob/orta
+{42 Dilnoza} <nil>
+{0 } users API: 404 Not Found
+```
+
+Для ⭐ файла с ответом нет: в обработчике `u, err := fetchUser(…)`; при ошибке
+`http.Error(w, err.Error(), http.StatusBadGateway)` и `return`, иначе записываете `u` как JSON (GO-X.01).
+
+</details>
+
+## Источники
+
+- Go FAQ: [Why does Go not have exceptions?](https://go.dev/doc/faq#exceptions)
+- Официальные правила Go (Go spec): [If statements](https://go.dev/ref/spec#If_statements),
+  [Blocks](https://go.dev/ref/spec#Blocks), [Expression statements](https://go.dev/ref/spec#Expression_statements),
+  [Assignment statements](https://go.dev/ref/spec#Assignment_statements),
+  [Short variable declarations](https://go.dev/ref/spec#Short_variable_declarations),
+  [Defer statements](https://go.dev/ref/spec#Defer_statements)
+- Go Code Review Comments: [Handle Errors](https://go.dev/wiki/CodeReviewComments#handle-errors),
+  [Indent Error Flow](https://go.dev/wiki/CodeReviewComments#indent-error-flow)
+- Effective Go: [Errors](https://go.dev/doc/effective_go#errors), [Defer](https://go.dev/doc/effective_go#defer) ·
+  [A Tour of Go: Errors](https://go.dev/tour/methods/19)
+- Блог Go: [Defer, Panic, and Recover](https://go.dev/blog/defer-panic-and-recover) (A. Gerrand, 2010) ·
+  [On | No syntactic support for error handling](https://go.dev/blog/error-syntax) (R. Griesemer, 2025)
+- Пакеты: [os.ReadFile](https://pkg.go.dev/os#ReadFile) · [errors.New](https://pkg.go.dev/errors#New) ·
+  [fmt.Println](https://pkg.go.dev/fmt#Println) · [net.Listen](https://pkg.go.dev/net#Listen) ·
+  [net/http.Response](https://pkg.go.dev/net/http#Response) · [net/http.Get](https://pkg.go.dev/net/http#Get) ·
+  [net/http.ListenAndServe](https://pkg.go.dev/net/http#ListenAndServe) ·
+  [go vet: httpresponse](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/httpresponse) ·
+  [go vet: unusedresult](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unusedresult) ·
+  [errors.go (go1.26.8)](https://github.com/golang/go/blob/go1.26.8/src/errors/errors.go)
+- [Executing transactions](https://go.dev/doc/database/execute-transactions) (`defer tx.Rollback()`)
+- [golangci-lint: linters (errcheck)](https://golangci-lint.run/docs/linters/)
+- PHP: [json_decode](https://www.php.net/manual/en/function.json-decode.php) ·
+  [JSON_THROW_ON_ERROR](https://www.php.net/manual/en/json.constants.php)
+- MDN: [try...catch](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/try...catch) ·
+  [fetch()](https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch) · Python:
+  [the with statement](https://docs.python.org/3/reference/compound_stmts.html#the-with-statement)
+- TypeScript: [предложение throws clause, #13219](https://github.com/microsoft/TypeScript/issues/13219)
+- Папка курса и README: [lessons/0x-03-errors](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+- Все результаты получены на `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15, PHP 8.4.26 и
+  golangci-lint 2.12.2 26.11.2026. Время, порт и pid при каждом запуске свои.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+
+---
+
+← Предыдущий урок: [GO-X.02](/lab/youtube/go/go-x-02/ru) · Следующий урок: [GO-X.04](/lab/youtube/go/go-x-04/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
