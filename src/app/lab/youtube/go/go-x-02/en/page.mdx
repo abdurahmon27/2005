@@ -1,0 +1,1130 @@
+---
+title: "Types exist at runtime too: \"2\" + 2 is 22 in JS, a compile error in Go"
+date: "2026/11/26"
+description: "TS types are erased, Go keeps them until runtime: \"2\" + 2 won't build, \"2\" in JSON, zero values, := vs =, shadowing, the range index and string(65)."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-02/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-02"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-02"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-02) · [Русский](/lab/youtube/go/go-x-02/ru) · **English**  
+Lesson GO-X.02 · [Go: 0 → Guru](/lab/youtube/go#go-x-02) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-02-types)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+In TypeScript you declared the `price` field as `number`. The backend sent the price in JSON as a string:
+`{"price": "2"}`. `tsc --strict` says nothing, and JavaScript turns `"2" + 2` into `22`. In Go the same addition
+does not build. Why, and what does this change for a backend?
+
+**One idea:** Go checks types strictly at build time and carries type information into the runtime, while
+TypeScript erases it. So `"2" + 2` does not build, a `"2"` in JSON does not go into an `int` field, and a variable
+without a value is not `undefined` but the zero value of its type.
+
+By the end of the lesson you will:
+
+- read a `mismatched types` error and fix mixed types with an explicit conversion (`float64(a)`);
+- know that `json.Unmarshal` returns an error for a field of the wrong type, but silently makes a missing field `0`;
+- tell `:=` from `=` and spot shadowing inside an `if` in code review;
+- write `for _, p := range` correctly and use `strconv.Itoa(id)` instead of `string(id)`.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| static type | the type of every variable is fixed at build time and never changes; mixed types only through an explicit `T(x)` | static type, conversion |
+| zero value | the starting value of a variable that was given no value: `0`, `""`, `false`, `nil` | zero value |
+| `:=` and `=` | `:=` declares a new variable, `=` assigns a value to an existing one; `:=` in an inner block shadows the outer variable | short variable declaration, assignment, shadowing |
+
+There are also two helper words: **`strconv.Itoa`** (turns a number into a string of decimal digits) and
+**`go vet`** (a static checker that ships with Go). At the end you will also see how `for`/`range` is written.
+
+## Before you start
+
+- [GO-X.01 · A 20-line HTTP API: your first Go service and one binary](/lab/youtube/go/go-x-01/en): `go run`, `go build` → one
+  binary, reading a compiler error as `file:line:column`, the `GET /users/{id}` handler (needed in the 🟡
+  homework). We do not explain these again here.
+- You can copy most Go programs into [go.dev/play](https://go.dev/play) and run them there. If you downloaded the
+  course code, open a terminal in the lesson folder (`lessons/0x-02-types`): every command runs from there.
+- The comparison files are in the `js/` folder. They need Node 24, Python 3 and TypeScript 5.9.3:
+  `npx -p typescript@5.9.3 tsc` runs it without installing it.
+- `hook/`, `aralash/`, `deklar/` and `uyga/oson/` do not build on purpose. So `go vet ./...` reports errors for
+  them: run each folder on its own.
+- The 🟡 homework uses `net/http`. If your computer has no C compiler (gcc), run it with `CGO_ENABLED=0`, as in
+  GO-X.01.
+
+First, one question from GO-X.01. `go build` failed, but yesterday's binary is still in the folder. What happens if
+the deploy script copies it to the server?
+
+**A)** the binary was deleted, the script finds no file · **B)** the old binary is unchanged: yesterday's version
+gets deployed · **C)** the binary was half written
+
+<details>
+<summary>Answer</summary>
+
+**B.** When `go build` fails, it writes no new file and does not touch the old one. This was measured while
+preparing the lesson: after the failed build, the old binary's md5 sum and timestamp did not change. If the script
+does not stop on a build error, it silently deploys yesterday's version. So check the exit code of `go build` in
+the script (`set -e`). If you chose "deleted", you thought the build cleans up the old file first. If you chose
+"half written", you thought Go writes the file up to the error: it did not touch the file at all.
+
+</details>
+
+Today we look at exactly this kind of error: when types do not match, no binary is produced at all.
+
+## `"2" + 2`: TypeScript types are erased after the build
+
+First, the evidence. The TypeScript file from the hook:
+
+```ts filename="js/narx.ts"
+type Item = { price: number };
+
+const item: Item = JSON.parse('{"price": "2"}');
+console.log(item.price + 2);
+```
+
+`JSON.parse` returns `any` (TypeScript's own `lib.es5.d.ts` file says so), and `any` can be assigned to any type.
+So `tsc` is silent even in `--strict` mode:
+
+```console
+$ npx -p typescript@5.9.3 tsc --strict js/narx.ts && node js/narx.js
+22
+```
+
+`tsc` printed nothing, which means no errors, and wrote `js/narx.js`. `node` ran it and printed `22`. Look at the
+JavaScript that `tsc` produced:
+
+```console
+$ cat js/narx.js
+"use strict";
+var item = JSON.parse('{"price": "2"}');
+console.log(item.price + 2);
+```
+
+There is no `Item` and no `number` in the file; the runtime never sees them. The TypeScript Handbook says it
+plainly: type annotations never change the runtime behavior of your program, they are completely erased (type
+erasure). The runtime sees only the string `"2"`. And JavaScript's `+` operator, when one side is a string, turns
+the other side into a string too and joins them (MDN). Node 24 can also run the `.ts` file directly
+(`node js/narx.ts` also gives `22`): it just strips the types and does not check them.
+
+The same code in Python:
+
+```python filename="js/narx.py"
+import json
+
+item = json.loads('{"price": "2"}')
+print(item["price"] + 2)
+```
+
+```console
+$ python3 js/narx.py
+Traceback (most recent call last):
+  File "…/js/narx.py", line 4, in <module>
+    print(item["price"] + 2)
+          ~~~~~~~~~~~~~~^~~
+TypeError: can only concatenate str (not "int") to str
+```
+
+(The full path in the output is shortened to `…`: it depends on the folder on your computer.) Python raises a
+`TypeError`, but only when this line runs, which may be in production.
+
+## Static types: in Go `"2" + 2` does not build
+
+The same addition in Go, `hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	price := "2"
+	count := 2
+	fmt.Println(price + count)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | the package of an executable program (GO-X.01) |
+| 3 | `import "fmt"` | `fmt` — the package for printing |
+| 5 | `func main() {` | the program starts in this function |
+| 6 | `price := "2"` | `price` — a new variable; `:=` takes the type from the right side: `string` |
+| 7 | `count := 2` | `count` — type `int` |
+| 8 | `fmt.Println(price + count)` | `string` + `int`: Go does not accept this |
+
+```console
+$ go run hook/main.go
+# command-line-arguments
+hook/main.go:8:14: invalid operation: price + count (mismatched types string and int)
+```
+
+`hook/main.go:8:14` — line 8, column 14 (a tab counts as one column), which is where `price` starts. *invalid
+operation: price + count (mismatched types string and int)* — "the operation is not allowed: the types do not
+match, `string` and `int`". The `# command-line-arguments` on the first line is the package with the error: when
+the command names `.go` files, Go builds an unnamed package from them and calls it that (`go help packages`).
+
+In Go the type of every variable is fixed at build time and never changes. This is a **static type**. `:=` takes
+the type from the value on the right, like `let` in TypeScript. This is how the compiler sees `hook/main.go`:
+
+| Variable | Value | Type | From where |
+|---|---|---|---|
+| `price` | `"2"` | `string` | line 6, `:=` took it from the right side |
+| `count` | `2` | `int` | line 7, `:=` took it from the right side |
+| `price + count` | — | ⛔ | `string` and `int`: compile error, no binary |
+
+The Go spec says both sides of a binary operator must have the same type (except for shifts and
+untyped constants). Go does not convert variables of different types by itself. That is why the error came at build time
+and no binary was created.
+
+| | JavaScript / TypeScript | Python | Go |
+|---|---|---|---|
+| `"2" + 2` | `"22"` | `TypeError`, only when the line runs | compile error |
+| when the type is checked | during `tsc`, then erased | at runtime | at build time; type information exists at runtime too |
+
+In PHP, according to the [PHP manual](https://www.php.net/manual/en/language.operators.arithmetic.php), `"2" + 2`
+→ `4`: a numeric string is turned into a number, and joining strings has a separate `.` operator (PHP was not run
+for this lesson).
+
+## `int` and `float64`: explicit conversion
+
+Now both sides are numbers. `a` is 2, `b` is 1.5:
+
+```go
+a := 2
+b := 1.5
+fmt.Println(a + b)
+```
+
+What is printed? **A)** `3.5` · **B)** `3` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**C: a compile error.** JavaScript's `number` is really a `float64` (IEEE 754 double); there is no separate integer
+type. In Go, `:=` picks `int` for `2` and `float64` for `1.5`, and these are two different types. If you chose
+"`3.5`", you copied the JS/Python rule: both `node -p '2 + 1.5'` and Python give `3.5`. If you chose "`3`", you
+thought Go drops the fraction and makes an `int`: it does not add them at all.
+
+</details>
+
+```go filename="aralash/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	a := 2
+	b := 1.5
+	fmt.Println(a + b)
+}
+```
+
+```console
+$ go run aralash/main.go
+# command-line-arguments
+aralash/main.go:8:14: invalid operation: a + b (mismatched types int and float64)
+```
+
+Line 8, column 14: `a`. *mismatched types int and float64* — "the types do not match: `int` and `float64`".
+
+**Fix:** convert the type explicitly: `float64(a)`. The form `T(x)` is a **conversion**: it gives the value of `x`
+as type `T`. `aylantir/main.go` ("convert"):
+
+```go filename="aylantir/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	a := 2
+	b := 1.5
+	fmt.Printf("%T %T\n", a, b) // int float64
+	fmt.Println(float64(a) + b) // 3.5
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 8 | `fmt.Printf("%T %T\n", a, b)` | `Printf` — formatted printing; `%T` prints the type of a value; `\n` — a new line |
+| 9 | `fmt.Println(float64(a) + b)` | `float64(a)` — `2` is now a `float64`; both sides have the same type |
+
+```console
+$ go run aylantir/main.go
+int float64
+3.5
+```
+
+`%T` is like `typeof` in JavaScript, but more exact: `typeof 2` and `typeof 1.5` are both `number`, while Go says
+`int` and `float64`. Why does Go not convert by itself? The Go FAQ gives the reason: the convenience of automatic
+conversion between numeric types in C is outweighed by the confusion it causes. In short: mixed types are added
+only through an explicit conversion.
+
+## At runtime: `"2"` in JSON and an `int` field
+
+Now the JSON from the hook, in Go. `json/main.go`:
+
+```go filename="json/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Item struct {
+	Price int `json:"price"`
+}
+
+func main() {
+	body := `{"price": "2"}`
+	var item Item
+	err := json.Unmarshal([]byte(body), &item)
+	fmt.Println(item.Price, err)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( … )` | two packages in parentheses: `encoding/json` (JSON) and `fmt` |
+| 8–10 | `type Item struct { … }` | `Item` is a type, like `type Item = { price: number }` in TypeScript. In Go such a type is called a **struct** (details in [GO-1.10](/lab/youtube/go/go-1-10/en)) |
+| 9 | `Price int` + the text in backticks | the field `Price`, type `int`. The **tag** in backticks says that the JSON key `price` goes into this field. Capital letter: the field is exported (GO-X.01), and `encoding/json` fills only such fields |
+| 13 | `body := …` | a string in backticks: the `"` inside need no escaping |
+| 14 | `var item Item` | a variable of type `Item` with no value (more on this in the next section) |
+| 15 | `err := json.Unmarshal([]byte(body), &item)` | `Unmarshal` writes the JSON bytes into `item`. `[]byte(body)` converts the string to bytes. `&item` is the address of `item`, so `Unmarshal` can change it (pointers in [GO-X.04](/lab/youtube/go#go-x-04)). `err` is the error value (the topic of [GO-X.03](/lab/youtube/go#go-x-03)) |
+| 16 | `fmt.Println(item.Price, err)` | prints the field and the error |
+
+The TypeScript `Item` type was silent at runtime. What does Go's `Unmarshal` do?
+
+**A)** makes it `2`, no error · **B)** returns an error · **C)** the program crashes
+
+<details>
+<summary>Answer</summary>
+
+**B: it returns an error.** `Unmarshal` knows at runtime that the field type is `int`, and it does not accept a
+string. If you chose "makes it `2`", you remembered TypeScript's `as Item` or libraries that silently turn a string
+into a number. If you chose "crashes", you thought Go throws the error like an exception: here the error comes
+back as an ordinary value.
+
+</details>
+
+```console
+$ go run json/main.go
+0 json: cannot unmarshal string into Go struct field Item.price of type int
+```
+
+*json: cannot unmarshal string into Go struct field Item.price of type int* — "a JSON string cannot be written into
+the field `Item.price` of type `int`". The JSON key (`price`) stands where the field name would be. According to the
+documentation, `Unmarshal` skips the field that does not fit, fills the rest as best it can, and returns the first
+such error as an `UnmarshalTypeError`.
+
+| | TypeScript (`JSON.parse` + `: Item`) | Go (`json.Unmarshal` → `Item`) |
+|---|---|---|
+| `{"price": "2"}` | silent: `item.price` = `"2"`, then `22` | `err` is an error, `item.Price` = `0` |
+| who checks | nobody (unless you add a library such as zod) | `encoding/json`, at runtime |
+
+In TypeScript this information is gone after the build, so you need a validation library such as zod. In Go the
+type information stays in the binary, and `encoding/json` reads it (how — in the "Going deeper" section).
+
+Careful: `Unmarshal` checks only the **type**, it does not validate. The course README measured this on go1.26.8:
+`{"PRICE": 5}` → `5` (keys match regardless of case), `{"price": null}` → `0` with no error,
+`{"price": 2.0}` → an error, and unknown keys are silently dropped.
+
+Where did the `0` in the output come from? That is the next section.
+
+## The zero value instead of `undefined`
+
+A variable without a value is `undefined` in JavaScript (`NaN` after `+ 1`), and a `NameError` in Python:
+
+```console
+$ node -e 'let total; console.log(total + 1)'
+NaN
+```
+
+```console
+$ python3 -c 'print(total + 1)'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    print(total + 1)
+          ^^^^^
+NameError: name 'total' is not defined
+```
+
+(These two commands are not files in the course folder: the code is inside the command.)
+
+Go has no `undefined`. `var total int` is like `let total: number` in TypeScript, only the name comes first and the
+type second. If no value is given, the variable gets the zero of its type. This is called the **zero value**, the
+term the Go documentation uses. `nol/main.go` ("zero"):
+
+```go filename="nol/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var total int
+	var name string
+	var paid bool
+	fmt.Printf("%v %q %v\n", total, name, paid)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `var total int` | `int` → `0` |
+| 7 | `var name string` | `string` → `""` (the empty string) |
+| 8 | `var paid bool` | `bool` → `false` |
+| 9 | `fmt.Printf("%v %q %v\n", total, name, paid)` | `%v` — the value in its default form; `%q` — a string in quotes, so the empty string is visible too |
+
+```console
+$ go run nol/main.go
+0 "" false
+```
+
+| After line | `total` (`int`) | `name` (`string`) | `paid` (`bool`) |
+|---|---|---|---|
+| 6 | `0` | | |
+| 7 | `0` | `""` | |
+| 8 | `0` | `""` | `false` |
+
+Struct fields work the same way: if you write `var item Item`, `item.Price` is `0`. The `0` in `json/main.go` comes
+from here: `Unmarshal` wrote nothing into `Price`, so it stayed at its zero value.
+
+For the pointers, maps and slices of later lessons, the zero value is **`nil`**, meaning "nothing" (close to
+`null` in JS). Writing to a `nil` map crashes the program (a **panic**). Maps are in [GO-1.09](/lab/youtube/go/go-1-09/en); a
+short example is in the "Common mistakes" section.
+
+### When the field is missing from the JSON
+
+The zod schema `z.object({price: z.number()})` rejects `{}` with `Required` (measured with zod 3.25.76).
+`yoq/main.go` ("missing") is the same as `json/main.go`, except that on line 13 `body` is an empty JSON object
+`{}`. What does Go do?
+
+**A)** `0`, no error · **B)** returns an error · **C)** the program crashes
+
+<details>
+<summary>Answer</summary>
+
+**A: `0`, no error.** `Unmarshal` writes only the keys that arrived. `price` did not arrive, so `Price` stayed at
+the zero value that `var item Item` gave it. The zero value of `err` is also `nil`, which means "no error". If you
+chose "returns an error", you copied the zod habit. If you chose "crashes", you thought a missing field leads to an
+error like reading `undefined`: Go has no `undefined`.
+
+</details>
+
+```go filename="yoq/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Item struct {
+	Price int `json:"price"`
+}
+
+func main() {
+	body := `{}`
+	var item Item
+	err := json.Unmarshal([]byte(body), &item)
+	fmt.Println(item.Price, err)
+}
+```
+
+```console
+$ go run yoq/main.go
+0 <nil>
+```
+
+`Println` prints a `nil` error as `<nil>`. So a free product (`"price": 0`) and a forgotten field look the same.
+In a payment API that is a serious bug. For now, check important fields separately; the full solution comes after
+the pointer lesson. In short: a wrong type gives an error, a missing field silently becomes the zero value.
+
+| JSON | `item.Price` | `err` |
+|---|---|---|
+| `{"price": "2"}` | `0` | `json: cannot unmarshal string …` |
+| `{}` | `0` | `<nil>` |
+
+## `:=` and `=`
+
+`:=` declares a new variable, like `let` in TypeScript (**short variable declaration**). A plain `=` gives an
+existing variable a new value (**assignment**). There is one difference: if there are several names on the left,
+at least one must be new, and the others only get a value. This matters for `err` in the next lesson. `:=` works
+only inside a function; at package level you write `var`.
+
+`deklar/main.go` ("declaration") has two compile errors. Find them before you run it:
+
+```go filename="deklar/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	status := "new" // let status = "new"
+	status = "paid" // status = "paid"
+	status := "sent"
+	count := 0
+	fmt.Println(status)
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+Line 8: `status` already exists, so there is no new name on the left of `:=`. Line 9: `count` is declared but never
+used. The `=` on line 7 is fine: a new value for an existing variable.
+
+</details>
+
+```console
+$ go run deklar/main.go
+# command-line-arguments
+deklar/main.go:8:9: no new variables on left side of :=
+deklar/main.go:9:2: declared and not used: count
+```
+
+`deklar/main.go:8:9` is the column of `:=`. *no new variables on left side of :=* — "there are no new variables on
+the left of `:=`". `deklar/main.go:9:2` — *declared and not used: count*. The second one is specific to Go. In
+TypeScript an unused variable is a linter or `noUnusedLocals` (off by default) warning; in Go it is a compile
+error. According to the Go FAQ, an unused variable is often a sign of a bug.
+
+| Line | Code | What Go says |
+|---|---|---|
+| 6 | `status := "new"` | a new `status` ✅ |
+| 7 | `status = "paid"` | a new value for the existing one ✅ |
+| 8 | `status := "sent"` | no new name on the left ❌ |
+| 9 | `count := 0` | declared, never used ❌ |
+
+## Shadowing: `:=` inside an `if`
+
+Now the classic trap with `:=`. `soya/main.go` ("shadow"): `total` is 150, `discount` is 0. Inside the `if` we
+give `discount` the value 10, but with `:=`:
+
+```go filename="soya/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	total := 150
+	discount := 0
+	if total > 100 {
+		discount := 10
+		fmt.Println("chegirma:", discount)
+	}
+	fmt.Println(total - discount)
+}
+```
+
+The `if` condition on line 8: if `total` is greater than 100, the code inside `{ }` runs. What does the last
+`Println` print?
+
+**A)** `140` · **B)** `150` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `150`.** The `:=` inside the `if` created a new `discount`, and it hid the outer one. This is called
+**shadowing**. The inner `discount` disappears at `}`; the outer one is still `0`. If you chose "`140`", you read
+`:=` as a plain assignment. If you chose "a compile error", you remembered *no new variables* from `deklar`. But an
+inner block may declare a new variable with the same name (Go spec: Declarations and scope), and it is used on
+line 10.
+
+</details>
+
+```console
+$ go run soya/main.go
+chegirma: 10
+150
+```
+
+(`chegirma` means "discount".)
+
+| After line | `total` | `discount` (outer) | `discount` (inside `if`) | On screen |
+|---|---|---|---|---|
+| 7 | 150 | 0 | — | |
+| 9 | 150 | 0 | 10 | |
+| 10 | 150 | 0 | 10 | `chegirma: 10` |
+| 11 | 150 | 0 | — (block ended) | |
+| 12 | 150 | 0 | — | `150` |
+
+In TypeScript you see a new variable by the word `let`; in Go the difference is a single colon. **Fix:** write a
+plain `=` inside. `soya-tuzat/main.go` ("fix"):
+
+```go filename="soya-tuzat/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	total := 150
+	discount := 0
+	if total > 100 {
+		discount = 10
+		fmt.Println("chegirma:", discount)
+	}
+	fmt.Println(total - discount)
+}
+```
+
+```console
+$ go run soya-tuzat/main.go
+chegirma: 10
+140
+```
+
+Line 9 has `=` instead of `:=`: now there is only one `discount`. `go vet` does not catch shadowing by default, so
+look for it in code review.
+
+## `for` and `range`: one variable is the index
+
+Go has no `while`: if you write only a condition after `for` (`for n < 10 { … }`), that is a `while`. To walk over
+a list there is `range`. On each step it gives two values: the **index** and the **element**. `[]int{2, 3, 5}` is a
+**slice**, a list of `int`s (details in [GO-X.04](/lab/youtube/go#go-x-04)). `range/main.go` wants to add up the prices:
+
+```go filename="range/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	prices := []int{2, 3, 5}
+	total := 0
+	for p := range prices {
+		total += p
+	}
+	fmt.Println(total)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `prices := []int{2, 3, 5}` | `prices` — three `int`s |
+| 8 | `for p := range prices {` | a loop over `prices`; there is one variable: `p` |
+| 9 | `total += p` | `total = total + p` |
+
+There is only one variable here, `p`. What does `Println` print?
+
+**A)** `10` · **B)** `3` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `3`.** If you write one variable, it is the index: 0, 1, 2. 0 + 1 + 2 = 3. If you chose "`10`", you copied
+`for (const p of prices)` from TypeScript: that gives values. If you chose "a compile error", you thought Go
+requires both values: a `range` with one variable is valid Go code.
+
+</details>
+
+```console
+$ go run range/main.go
+3
+```
+
+| Step | `p` (index) | `prices[p]` (element) | `total` after the step |
+|---|---|---|---|
+| 1 | 0 | 2 | 0 |
+| 2 | 1 | 3 | 1 |
+| 3 | 2 | 5 | 3 |
+
+**Fix:** put an underscore `_` in place of the index, the **blank identifier**: it throws the value away. It is
+needed because an unused index would be a *declared and not used* compile error. `range-tuzat/main.go`:
+
+```go filename="range-tuzat/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	prices := []int{2, 3, 5}
+	total := 0
+	for _, p := range prices { // TS: for (const p of prices)
+		total += p
+	}
+	fmt.Println(total) // 10
+}
+```
+
+```console
+$ go run range-tuzat/main.go
+10
+```
+
+| What you need | TypeScript | Go |
+|---|---|---|
+| the element | `for (const p of prices)` | `for _, p := range prices` |
+| the index | — | `for i := range prices` |
+| both | — | `for i, p := range prices` |
+
+JavaScript's `for…in` also gives keys, but as strings: `"0"`, `"1"`, `"2"`. If you add them to `0`, you get
+`"0012"` (measured in the course README).
+
+## `string(65)`: the Redis key became `user:A`
+
+The last one is a mistake the Go team added a separate check for. We build a Redis key: `user:` and the id.
+Reminder: the Unicode code point of the letter `A` is 65. `id/main.go`:
+
+```go filename="id/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	id := 65
+	key := "user:" + string(id)
+	fmt.Println(key)
+}
+```
+
+On line 7, `string(id)` is a conversion `T(x)`, like `float64(a)` in `aylantir/`. What does `key` become?
+
+**A)** `user:65` · **B)** `user:A` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `user:A`.** In Go, `string(number)` works not like `String(65)` in JavaScript but like
+`String.fromCharCode(65)`: it gives the character with Unicode code point 65. The Go spec says this conversion is
+allowed "for historical reasons". If you chose "`user:65`", you copied the rule of JS `String(65)` or Python
+`str(65)`. If you chose "a compile error", you thought Go cannot turn a number into a string at all: it can, just
+with a different meaning.
+
+</details>
+
+```console
+$ go run id/main.go
+user:A
+```
+
+```console
+$ node -p 'String(65) + " " + String.fromCharCode(65)'
+65 A
+```
+
+(The second command is not a file in the course folder.) The compiler is silent. But **`go vet`**, the static
+checker that ships with Go, catches it:
+
+```console
+$ go vet id/main.go
+id/main.go:7:19: conversion from int to string yields a string of one rune, not a string of digits
+```
+
+`id/main.go:7:19` — line 7, column 19: `string`. *conversion from int to string yields a string of one rune, not a
+string of digits* — "converting an `int` to a `string` gives a string of one rune, not a string of digits". A
+**rune** is one Unicode character (details in [GO-1.04](/lab/youtube/go/go-1-04/en)). This check was added in Go 1.15. The
+release notes give the reason: experience showed that many such conversions wrongly assume that `string(x)` gives
+the number as text. `go test` also runs this check (`stringintconv`) by itself when it runs your tests.
+
+Also, every id above 1 114 111 becomes `"�"`. So with `string(id)`, all such ids land on one Redis key (measured in
+the course README).
+
+**Fix:** **`strconv.Itoa`** from the `strconv` package: it turns a number into a string of decimal digits.
+`id-tuzat/main.go`:
+
+```go filename="id-tuzat/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	id := 65
+	key := "user:" + strconv.Itoa(id)
+	fmt.Println(key)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( … )` | a second package: `strconv` (string ↔ number) |
+| 10 | `strconv.Itoa(id)` | `65` → `"65"` (`go doc strconv.Itoa`: the same as `FormatInt(int64(i), 10)`) |
+
+```console
+$ go run id-tuzat/main.go
+user:65
+```
+
+The reverse is `strconv.Atoi` (string → number). It returns a number and an error; its template is in the 🟡
+homework file.
+
+## Going deeper (optional): how type information lives at runtime
+
+`fmt.Println` accepts any type: its parameter is `any`. An `any` value holds two things: the value itself and its
+type information. The Go blog article *The Laws of Reflection* puts it this way: a variable of interface type
+stores a pair — the value and that value's type descriptor. `%T` reads this type information. `encoding/json` uses
+the `reflect` package to see struct fields and their types at runtime.
+
+```text
+a := 2;  fmt.Printf("%T", a)
+
+   an any value
+   ┌─────────────┬─────────────┐
+   │ type: int   │ value: 2    │
+   └─────────────┴─────────────┘
+          ▲
+          └── %T reads this → "int"
+
+json.Unmarshal([]byte(body), &item)
+   reflect → Item.Price: int, tag "price"
+   "2" in JSON (string) ≠ int → UnmarshalTypeError
+```
+
+In TypeScript the `Item` part of this pair is gone after the build. But in Go too, the main checks still happen at
+build time: type information at runtime is used only through interfaces (`any`) and reflection.
+
+One more point: `2 + 1.5` written without variables works. `chuqur/main.go` ("deep"):
+
+```go filename="chuqur/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(2 + 1.5) // konstantalar: tur hali tanlanmagan
+}
+```
+
+```console
+$ go run chuqur/main.go
+3.5
+```
+
+These are constants: their type has not been chosen yet, so Go can add them. In `aralash/main.go`, `a` and `b`
+are variables, and their types are already fixed as `int` and `float64`. Constants have their own lesson:
+[GO-1.03 · Constants and iota](/lab/youtube/go/go-1-03/en).
+
+## Common mistakes
+
+**1. Thinking Go converts types by itself, like JavaScript.** The most classic mistake of this topic.
+`price + count` (`string` + `int`) and `a + b` (`int` + `float64`) do not build: *mismatched types string and int*,
+*mismatched types int and float64*. The full examples are in the "Static types" and "`int` and `float64`"
+sections. **Fix:** an explicit conversion (`float64(a) + b`); for number → text, `strconv.Itoa`.
+
+**2. Expecting an error for a missing JSON field.** `{}` → `0 <nil>`: no error, the field silently has its zero
+value. You cannot tell it from a free product. This example is not in the course folder; it was run separately for
+this lesson:
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Item struct {
+	Price int `json:"price"`
+}
+
+func main() {
+	for _, body := range []string{`{"price": 0}`, `{}`, `{"price": null}`} {
+		var item Item
+		err := json.Unmarshal([]byte(body), &item)
+		fmt.Println(body, item.Price, err)
+	}
+}
+```
+
+```console
+$ go run zero/main.go
+{"price": 0} 0 <nil>
+{} 0 <nil>
+{"price": null} 0 <nil>
+```
+
+Three different JSON bodies, one result. **Fix:** check important fields separately; the full solution (a pointer
+field) comes after the pointer lesson.
+
+**3. `:=` inside an `if`.** The outer variable does not change: `150` instead of `140` (shadowing). The example is
+in the "Shadowing" section. **Fix:** assign to the existing variable with `=`.
+
+**4. A `range` with one variable.** In `for p := range prices`, `p` is the index, not the element: `3` instead of
+`10`. **Fix:** `for _, p := range prices`.
+
+**5. Number → text with `string(id)`.** `user:A`, and the compiler is silent. **Fix:** `strconv.Itoa(id)`;
+`go vet` (and `go test`) catch it.
+
+**6. Redeclaring with `:=`, and unused variables.** *no new variables on left side of :=* and *declared and not
+used* are both compile errors (`deklar/main.go`). **Fix:** `=` for an existing variable; delete the unneeded
+variable or write `_`.
+
+**7. Writing to a `nil` map.** The video only mentions it, and it is not in the course folder. This example was
+also run separately for this lesson:
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	var hits map[string]int // zero value: nil
+	fmt.Println(hits["/users"], len(hits))
+	hits["/users"]++
+}
+```
+
+```console
+$ go run nilmap/main.go
+0 0
+panic: assignment to entry in nil map
+
+goroutine 1 [running]:
+main.main()
+	…/nilmap/main.go:8 +0xa8
+exit status 2
+```
+
+`hits` is a `map[string]int` with no value, so it is `nil`. Line 7 worked: reading from a `nil` map gives `0`, and
+`len` is `0` too. Writing on line 8 is not a compile error but a **panic** while running: *assignment to entry in
+nil map*. `main.go:8` is the line where it crashed. `exit status 2` — the program ended with code 2. **Fix:**
+create the map: `hits := map[string]int{}` (details in [GO-1.09](/lab/youtube/go/go-1-09/en)).
+
+## Check yourself
+
+Answer first, then open the answer.
+
+**1.** The JSON `price` arrived as a string (`{"price": "2"}`), and the struct field is an `int`. What does Go do?
+
+<details>
+<summary>Answer</summary>
+
+`Unmarshal` returns an error (`json: cannot unmarshal string into Go struct field Item.price of type int`), and
+the field stays `0`: its zero value.
+
+</details>
+
+**2.** If you write `x := …` inside an `if`, does the outer `x` change?
+
+<details>
+<summary>Answer</summary>
+
+No. A new `x` appears inside and hides the outer one until the block ends: this is shadowing. To change the outer
+one, write `x = …`.
+
+</details>
+
+**3.** In `for p := range s`, what is `p`?
+
+<details>
+<summary>Answer</summary>
+
+The index: 0, 1, 2, … If you need the element, write an underscore in place of the index: `for _, p := range s`.
+
+</details>
+
+**4.** What does this program print? (It is not in the course folder; it was run separately for this lesson.)
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	status := "new"
+	status, code := "paid", 200
+	fmt.Println(status, code)
+}
+```
+
+**A)** `paid 200` · **B)** a compile error: *no new variables on left side of :=* · **C)** `new 200`
+
+<details>
+<summary>Answer</summary>
+
+**A: `paid 200`.** There are two names on the left: `code` is new, so `:=` is allowed. `status` already exists; it
+is not a new variable, it only gets a new value. If you chose "a compile error", you remembered the `:=` rule as
+"all names must be new": one is enough. If you chose "`new 200`", you thought `status` is new too (shadowing):
+shadowing happens only in an inner block.
+
+```console
+$ go run multi/main.go
+paid 200
+```
+
+</details>
+
+**5.** From GO-X.01: what do the three parts of `deklar/main.go:9:2: declared and not used: count` mean?
+
+<details>
+<summary>Answer</summary>
+
+The file `deklar/main.go`, line 9, column 2. The tab at the start of the line counts as one column, so column 2 is
+the first letter of `count`. The message itself: `count` is declared but not used.
+
+</details>
+
+## Homework
+
+The starter files are in the lesson folder on GitHub:
+[lessons/0x-02-types](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-02-types) (the `uyga/`
+folder). Run the commands from the lesson folder.
+
+🟢 **Easy** (`uyga/oson/main.go`): the cart total does not build. Fix the three errors. Predict the result first.
+
+```go filename="uyga/oson/main.go" showLineNumbers
+// Uy vazifasi 🟢: savat summasi build bo'lmaydi. Uchta xatoni toping va tuzating.
+// Avval natijani taxmin qiling, keyin: go run uyga/oson/main.go
+package main
+
+import "fmt"
+
+func main() {
+	prices := []float64{12.5, 7.5} // so'mda emas, misol uchun
+	qty := 2
+	total := 0
+	for i, p := range prices {
+		total = total + p*qty
+	}
+	fmt.Println("jami:", total)
+}
+```
+
+```console
+$ go run uyga/oson/main.go
+# command-line-arguments
+uyga/oson/main.go:11:6: declared and not used: i
+uyga/oson/main.go:12:19: invalid operation: p * qty (mismatched types float64 and int)
+```
+
+The compiler shows two errors first. Once you fix `p * qty`, the third one appears.
+
+🟡 **Medium** (`uyga/orta/main.go`): `GET /users/{id}` from GO-X.01. `r.PathValue("id")` returns a string. Turn it
+into an `int` and return `{"id": 42, "next": 43}`. `/users/abc` must return `400 Bad Request`. The file already
+has a `strconv.Atoi` template: `if err != nil` is the topic of [GO-X.03](/lab/youtube/go#go-x-03), just copy it for now.
+The task and the template are in the comment at the top of the file. Right now the handler returns `id` as a
+string (`map[string]string{"id": r.PathValue("id")}`): that is what you change.
+
+Run it (with `CGO_ENABLED=0` if you have no gcc) and check from another terminal:
+
+```bash
+CGO_ENABLED=0 go run uyga/orta/main.go
+curl -i localhost:3000/users/42    # correct solution: HTTP/1.1 200 OK … {"id":42,"next":43}
+curl -i localhost:3000/users/abc   # correct solution: HTTP/1.1 400 Bad Request … id son emas
+```
+
+Answers: the [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-02-types/uyga/javob)
+folder. Try it yourself first.
+
+<details>
+<summary>Answer</summary>
+
+🟢 There were three errors: `total := 0` is an `int`, and you cannot add a `float64` to it (`total := 0.0`);
+`p*qty` is `float64` × `int` (`float64(qty)`); `i` is unused (`_`). The result: 12.5 × 2 + 7.5 × 2 = 40.
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// Javob 🟢. Uchta xato edi:
+//  1. total := 0 → int; float64 qo'shib bo'lmaydi → total := 0.0 (yoki var total float64)
+//  2. p*qty: float64 * int → float64(qty)
+//  3. i ishlatilmagan (declared and not used) → _
+//
+// Natija: jami: 40
+package main
+
+import "fmt"
+
+func main() {
+	prices := []float64{12.5, 7.5}
+	qty := 2
+	total := 0.0
+	for _, p := range prices {
+		total = total + p*float64(qty)
+	}
+	fmt.Println("jami:", total)
+}
+```
+
+```console
+$ go run uyga/javob/oson/main.go
+jami: 40
+```
+
+(`jami` means "total".) 🟡 `strconv.Atoi` returns a number and an error. On error, `http.Error` replies with
+status 400, and `return` leaves the handler. Because of `map[string]int`, `id` and `next` come out as numbers in
+the JSON (`42`, not `"42"`).
+
+```go filename="uyga/javob/orta/main.go" showLineNumbers
+// Javob 🟡. map[string]int: JSON'da id va next son bo'lib chiqadi ("42" emas, 42).
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"strconv"
+)
+
+func main() {
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "id son emas", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"id": id, "next": id + 1})
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+While preparing the lesson it was run with `CGO_ENABLED=0`: `/users/42` → `200 OK` and `{"id":42,"next":43}`,
+`/users/abc` → `400 Bad Request` and `id son emas` ("id is not a number").
+
+</details>
+
+## Sources
+
+- The official Go rules (the Go spec, go1.26.8): [Operators](https://go.dev/ref/spec#Operators),
+  [Conversions](https://go.dev/ref/spec#Conversions),
+  [Conversions to and from a string type](https://go.dev/ref/spec#Conversions_to_and_from_a_string_type),
+  [The zero value](https://go.dev/ref/spec#The_zero_value), [Map types](https://go.dev/ref/spec#Map_types),
+  [Short variable declarations](https://go.dev/ref/spec#Short_variable_declarations),
+  [Declarations and scope](https://go.dev/ref/spec#Declarations_and_scope),
+  [For statements](https://go.dev/ref/spec#For_statements), [For range](https://go.dev/ref/spec#For_range),
+  [Blank identifier](https://go.dev/ref/spec#Blank_identifier),
+  [Constant expressions](https://go.dev/ref/spec#Constant_expressions)
+- Go FAQ: [implicit numeric conversions](https://go.dev/doc/faq#conversions) ·
+  [unused variables and imports](https://go.dev/doc/faq#unused_variables_and_imports)
+- [encoding/json.Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal) ·
+  [UnmarshalTypeError](https://pkg.go.dev/encoding/json#UnmarshalTypeError) · [strconv](https://pkg.go.dev/strconv#Atoi) ·
+  [fmt (%T, %q, %v)](https://pkg.go.dev/fmt) · [go build](https://pkg.go.dev/cmd/go#hdr-Compile_packages_and_dependencies) ·
+  [go help packages](https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns)
+- [Go 1.15 release notes: vet string(x)](https://go.dev/doc/go1.15#vet) · the Go blog:
+  [The Laws of Reflection](https://go.dev/blog/laws-of-reflection)
+- TypeScript: [Erased Types](https://www.typescriptlang.org/docs/handbook/2/basic-types.html#erased-types),
+  [noUnusedLocals](https://www.typescriptlang.org/tsconfig/#noUnusedLocals) ·
+  [Node.js: Type stripping](https://nodejs.org/api/typescript.html#type-stripping)
+- MDN: [Addition (+)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Addition),
+  [undefined](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/undefined) ·
+  ECMAScript: [The Number Type](https://tc39.es/ecma262/#sec-ecmascript-language-types-number-type)
+- [Zod](https://zod.dev/) · PHP: [Arithmetic operators](https://www.php.net/manual/en/language.operators.arithmetic.php)
+- The course folder and README: [lessons/0x-02-types](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-02-types)
+- All results come from `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15 and TypeScript 5.9.3, on
+  2026-11-26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-02-types)
+
+---
+
+← Previous lesson: [GO-X.01](/lab/youtube/go/go-x-01/en) · Next lesson: [GO-X.03](/lab/youtube/go#go-x-03) → · [All lessons](/lab/youtube/go)
+
+</div>
