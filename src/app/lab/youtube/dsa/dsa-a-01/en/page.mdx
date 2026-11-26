@@ -1,0 +1,1346 @@
+---
+title: "The RAM model and a real processor: how much the cache matters"
+date: "2026/11/26"
+description: "The same O(n) loop takes 0.3 ns to 137 ns per element depending on memory order: RAM model, L1/L2/L3 cache, cache line and prefetcher, measured with Go."
+tag: "youtube, dsa, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/dsa/dsa-a-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/dsa/dsa-a-01"
+    ru: "https://www.haywan.uz/lab/youtube/dsa/dsa-a-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/dsa/dsa-a-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/dsa/dsa-a-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/dsa/dsa-a-01) · [Русский](/lab/youtube/dsa/dsa-a-01/ru) · **English**  
+Lesson DSA-A.01 · [DSA + LeetCode (Go'da)](/lab/youtube/dsa#dsa-a-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+We add up sixteen million `int64` numbers in three different orders. Each number is read exactly once, and all three
+loops are O(n). The first one walks the slice in order and finishes in ~10 ms. The second reads the same numbers in
+shuffled order and is 15 times slower. The third also jumps around in shuffled order, but it takes the next address
+from the previous number, like a linked list: 1.8 seconds, 179 times slower. Big-O is the same, yet the times differ
+by more than a hundred times. Why?
+
+**The one idea:** Big-O tells you how the number of operations grows, but not what one operation costs. On a real
+processor the cost of one memory read depends on where the data is (L1, L2, L3 cache or main memory) and on the
+order of the reads. The same linear loop took from 0.3 ns to 137 ns per element. We can only find this difference by
+measuring.
+
+By the end of the lesson you will:
+
+- be able to say what the RAM model from algorithm textbooks does not take into account;
+- read the L1, L2 and L3 cache sizes of your machine and connect them with the "staircase" in a benchmark chart;
+- explain with two mechanisms, the prefetcher and parallel waiting, why a sequential read, a shuffled read and a
+  chain (linked list) differ by tens of times;
+- run a benchmark at a realistic size, pinned to one core.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| RAM model | the imaginary computer of algorithm textbooks: every simple operation, a memory read too, takes constant time | RAM model (random-access machine) |
+| cache hierarchy | three levels of fast memory inside the processor: a small L1, a larger L2, an L3 shared by all cores | cache hierarchy (L1, L2, L3) |
+| prefetcher | the part of the processor that notices a sequential walk and fetches the next cache lines in advance | prefetcher |
+
+Two helper words also appear. **Parallel waiting**: the processor waits for several independent reads at the same
+time (*memory-level parallelism*). **TLB**: a small cache of translations from virtual to physical addresses.
+**Cache line** (64 bytes) is not a new word: we met it in GO-1.10, and today it plays the main role.
+
+## Before you start
+
+- [GO-1.07 · Taxmin qilmang, oʻlchang: birinchi test va benchmark](/lab/youtube/go/go-1-07/en): `for b.Loop() { … }`,
+  sub-benchmarks with `b.Run`, and the rule "don't trust one measurement, measure many times".
+- [GO-1.08 · Slice'lar: append tuzogʻi va eskirgan 1024 qoidasi](/lab/youtube/go/go-1-08/en): the elements of a slice sit next to
+  each other in one array; `make([]int64, n)`.
+- [GO-1.11 · Pointer'lar: bu oʻzgaruvchi nega heap'ga qochdi?](/lab/youtube/go/go-1-11/en): `&Tugun{…}` gives a pointer; a value
+  that lives on after the function returns goes to the heap; the garbage collector.
+- [GO-1.10 · Struct'lar va xotira: bir xil maydonlar, 24 va 16 bayt](/lab/youtube/go/go-1-10/en): the cache and the 64-byte cache
+  line; `unsafe.Sizeof`.
+- [GO-1.05 · Go'da while yoʻq: bitta for va uning hamma shakllari](/lab/youtube/go/go-1-05/en): `for range len(s)` (no index,
+  `n` times) and `for _, i := range tartib`.
+- [GO-1.06 · Funksiyalar: ikki qiymat qaytarish, closure va variadic](/lab/youtube/go/go-1-06/en): a function that returns a
+  function (a closure): the benchmark's `tayyorla` works like that.
+
+Big-O itself (O(n), O(1)) is not explained here: we assume you know it from an algorithms course.
+
+**How to run the code.** The lesson's code is in the course folder `lessons/dsa-a01-cache` (link in "Homework"). It
+has several packages (`kesh/`, `jadval/`, `uyvazifa/`), uses up to 512 MiB of memory and reads Linux files, so
+go.dev/play can't run it. Open the terminal in that folder. Every command is run from there.
+
+Our machine has no C compiler (gcc), so cgo was switched off before every command:
+
+```console
+$ export CGO_ENABLED=0
+```
+
+This command prints nothing. This lesson uses no C code, so it does not change the results.
+
+**The video's numbers and ours.** The numbers in the video come from the file `natija.txt` («natija» — result) in the
+course folder: 10 measurements taken on this laptop on the night of 2026-11-26 (00:54–01:11). Other jobs were running
+on the machine then (load 3–7). The `go run ./jadval … < natija.txt` commands read that file, so they print exactly
+what the video shows on your machine too: we re-ran them and got the same output. The whole measurement
+(`./olchov.sh`) we ran again on the same laptop that evening (22:28–22:48). The machine was much quieter (load
+0.8–3.5), so our numbers are a bit smaller. The numbers are different every time. What matters is **the ratios
+and where the staircase steps are**: those came out the same in both runs.
+
+Before we start, one question from GO-1.08. After `s := make([]int64, 4)`, where in memory are the four numbers?
+
+**A)** each one separately on the heap, and the slice stores pointers to them · **B)** in one array, next to each
+other, 8 bytes each · **C)** inside the slice itself (next to the pointer, len and cap)
+
+<details>
+<summary>Answer</summary>
+
+**B.** A slice is three fields (a pointer to the array, `len`, `cap`), and the elements themselves sit next to each
+other in one array: `s[1]` is exactly 8 bytes after `s[0]`. "A" describes a Python list: in CPython a `list` holds an
+array of references to objects, and each number is a separate object (Python FAQ). If you chose "C", you mixed up the
+slice and its array. Today we measure the price of "next to each other" in nanoseconds.
+
+</details>
+
+## Same O(n), three different times
+
+This is the first lesson of the DSA track: algorithms and data structures, all in Go. The track has a simple rule: we
+don't guess the Big-O estimate, we check it with a benchmark. Here is the first measurement.
+
+Sixteen million (2²⁴ = 16,777,216) `int64` numbers, that is 128 MiB. Three functions add them up:
+
+| Method | How it reads |
+|---|---|
+| `Ketma` («ketma-ket» — sequential) | `s[0]`, `s[1]`, `s[2]`, … in memory order |
+| `Aralash` («aralash» — shuffled) | every element once, but in a pre-shuffled order of indexes |
+| `Zanjir` («zanjir» — chain) | shuffled too, but it takes the next index from the number it has just read |
+
+Guess: how many times slower is the slowest method than the fastest?
+
+**A)** about the same: each one is n additions · **B)** 2–3 times · **C)** more than a hundred times
+
+<details>
+<summary>Answer</summary>
+
+**C.** The `jadval` («jadval» — table) program takes the median of the 10 measurements in `natija.txt`.
+`-n 16777216` shows only this size, and `< natija.txt` feeds the file to the program's input:
+
+```console
+$ go run ./jadval -n 16777216 < natija.txt
+n = 2^24, slice 128M, 10 o'lchov mediani
+ketma      9.9 ms   0.59 ns/el     1×
+aralash    147 ms    8.8 ns/el    15×
+zanjir      1.8 s    106 ns/el   179×
+```
+
+The columns: the method, the time for the whole slice, the time per element (`ns/el`), and how many times slower
+than `ketma` (the first line says "10 measurements, median"). `Ketma` takes 9.9 ms, `Aralash` is 15 times slower,
+`Zanjir` 179 times. The number of additions is the same in all three. If you chose "A", you counted like the RAM
+model: it gives every read the same price. "B" is too little: the difference comes from memory, and in memory the
+differences are tens and hundreds of times.
+
+In our re-run (`./olchov.sh`, in the evening) the same line is: `ketma` 7.7 ms (0.46 ns/el), `aralash` 120 ms (16×), `zanjir` 1.5 s (92 ns/el, 201×). In the two earlier research runs these ratios were 12×/16× and 150×/195×: "more than a hundred times" holds every time.
+
+</details>
+
+The difference comes from memory: the cache and waiting. First we look at the model that Big-O relies on, then at
+where a real processor differs from it.
+
+## The RAM model: the computer in the textbook
+
+The classic algorithms textbook by Cormen, Leiserson, Rivest and Stein (*Introduction to Algorithms*, CLRS) analyses
+algorithms in the **RAM model** (3rd edition, §2.2). Here RAM does not mean main memory: it means *random-access
+machine*. To avoid confusion, on this page we call memory **main memory** (DRAM) and use the word "RAM" only for the
+model.
+
+The rules of the model:
+
+| Rule | What it means |
+|---|---|
+| operations: arithmetic, data movement (memory load/store), control | `sum += s[i]` is one read and one addition |
+| each operation takes constant time | reading `s[0]` and reading `s[i]` for any `i` cost the same |
+| the memory hierarchy (caches, virtual memory) is not modelled | the order of reads does not affect the time |
+
+The book says this openly: the model does not take caches and virtual memory into account, and still "RAM-model
+analyses are usually excellent predictors of performance on actual machines". It is a deliberate simplification.
+Today we measure what the model *does not see*: in the RAM model all three of our methods are `n` reads and `n`
+additions, so the same time.
+
+## Memory levels: L1, L2, L3 and main memory
+
+In a real processor memory has several levels (CS:APP 3rd ed., chapter 6; CMU 15-213 lecture):
+
+```text
+core ──▶ L1   small, fastest, inside each core
+         L2   larger, slower, one per core (or per group of cores)
+         L3   shared by all cores
+         DRAM main memory: the largest, the slowest
+```
+
+The video's picture: a pocket, a bag, a cupboard and a warehouse. The near one is small but within reach at once.
+
+Data comes into the cache not byte by byte but in 64-byte pieces. This piece is a **cache line** (GO-1.10). One line
+holds 8 `int64` values: when you read `s[0]`, `s[1]` … `s[7]` come with it (if the slice starts at the start of a
+line).
+
+We read this laptop's levels from Linux itself. `jadval -kesh` reads the files in the
+`/sys/devices/system/cpu/cpuN/cache` folder (Linux sysfs):
+
+```console
+$ go run ./jadval -kesh
+12th Gen Intel(R) Core(TM) i5-12450H
+cpu2 (P): L1d 48K · L2 1280K · L3 12M · qator 64 bayt
+cpu8 (E): L1d 32K · L2 2M · L3 12M · qator 64 bayt
+```
+
+This command shows your own machine's caches, so it may print something else for you. When we re-ran it, it printed
+exactly this (`qator 64 bayt` = "line 64 bytes"). The processor has two kinds of cores: performance (P) and efficient
+(E). On a P-core the L1 data cache (`L1d`) is 48 KiB and L2 is 1280 KiB. L3 is 12 MiB and shared by all cores. The
+E-core caches are different (32 KiB and 2 MiB). That is why every measurement is pinned to one P-core (cpu2) with
+`taskset -c 2`: otherwise Linux might move the benchmark to an E-core halfway through. `taskset -c 2 command` runs
+the command only on core 2.
+
+To compare with slice sizes: `n` `int64` values = `8·n` bytes. L1 holds 2¹² elements (32 KiB), but not 2¹³
+(64 KiB). L2 holds up to 2¹⁷ (1 MiB), L3 up to 2²⁰ (8 MiB).
+
+## The experiment's code: three loops
+
+All three functions are in the `kesh` («kesh» — cache) package, in `kesh/kesh.go`:
+
+```go filename="kesh/kesh.go" showLineNumbers
+// Package kesh: bitta O(n) ish — n ta sonni qo'shish — uch xil xotira tartibida.
+package kesh
+
+// Ketma: elementlarni xotirada turgan tartibda qo'shadi.
+func Ketma(s []int64) int64 {
+	var sum int64
+	for i := 0; i < len(s); i++ {
+		sum += s[i]
+	}
+	return sum
+}
+
+// Aralash: o'sha elementlarni, har birini bir martadan, aralash tartibda qo'shadi.
+func Aralash(s []int64, tartib []int32) int64 {
+	var sum int64
+	for _, i := range tartib {
+		sum += s[i]
+	}
+	return sum
+}
+
+// Zanjir: har element keyingi elementning indeksini saqlaydi (pointer o'rniga indeks).
+// Keyingi manzil faqat oldingi o'qish tugagach ma'lum bo'ladi.
+func Zanjir(s []int64) int64 {
+	var sum int64
+	i := int64(0)
+	for range len(s) {
+		sum += s[i]
+		i = s[i]
+	}
+	return sum
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `func Ketma(s []int64) int64` | takes a slice, returns the sum |
+| 6 | `var sum int64` | the sum, 0 at the start (zero value) |
+| 7–9 | `for i := 0; i < len(s); i++ { sum += s[i] }` | the elements in memory order: `s[0]`, `s[1]`, … |
+| 14 | `func Aralash(s []int64, tartib []int32) int64` | the second slice `tartib` («tartib» — order): the indexes 0 … n−1, shuffled |
+| 16–18 | `for _, i := range tartib { sum += s[i] }` | reads `tartib` in order, but jumps around `s` by those indexes. In Go an index can be any integer type, `int32` too |
+| 24 | `func Zanjir(s []int64) int64` | here each element of `s` is both a number and the index of "who is next" |
+| 26 | `i := int64(0)` | start at element 0. `int64`, because line 29 assigns `s[i]` (an `int64`) to `i` |
+| 27 | `for range len(s)` | loops `len(s)` times, no loop variable needed (GO-1.05) |
+| 28 | `sum += s[i]` | adds the current element |
+| 29 | `i = s[i]` | the next index is the number just read. The next address is unknown until the previous read finishes |
+
+`Zanjir` is a **linked list** that uses indexes instead of pointers: `s[i]` is the "address" of the next node. How the
+two slices are prepared is in `kesh/tayyor.go` («tayyor» — ready):
+
+```go filename="kesh/tayyor.go" showLineNumbers
+package kesh
+
+import "math/rand/v2"
+
+// Qadam: har k-elementni qo'shadi (uy vazifasi va pauza savoli).
+func Qadam(s []int64, k int) int64 {
+	var sum int64
+	for i := 0; i < len(s); i += k {
+		sum += s[i]
+	}
+	return sum
+}
+
+// Sonlar: 0..n-1 sonlari bilan slice.
+func Sonlar(n int) []int64 {
+	s := make([]int64, n)
+	for i := range s {
+		s[i] = int64(i)
+	}
+	return s
+}
+
+// Tartib: 0..n-1 indekslarini tasodifiy aralashtiradi.
+func Tartib(n int, r *rand.Rand) []int32 {
+	t := make([]int32, n)
+	for i := range t {
+		t[i] = int32(i)
+	}
+	r.Shuffle(n, func(i, j int) { t[i], t[j] = t[j], t[i] })
+	return t
+}
+
+// TartibliZanjir: zanjir, lekin keyingi element doim yonidagisi: s[i] = i+1.
+// Har o'qish yana oldingisini kutadi, faqat manzillar ketma-ket.
+func TartibliZanjir(n int) []int64 {
+	s := make([]int64, n)
+	for i := range s {
+		s[i] = int64((i + 1) % n)
+	}
+	return s
+}
+
+// ZanjirSlice: 0 dan boshlanib har elementdan bir marta o'tadigan bitta aylana.
+// Qiymatlar yana 0..n-1, faqat endi har biri "keyingisi kim" degan indeks.
+func ZanjirSlice(n int, r *rand.Rand) []int64 {
+	t := Tartib(n, r)
+	for k, v := range t { // 0 ni boshiga olib kelamiz
+		if v == 0 {
+			t[0], t[k] = t[k], t[0]
+			break
+		}
+	}
+	s := make([]int64, n)
+	for k := range t {
+		s[t[k]] = int64(t[(k+1)%n])
+	}
+	return s
+}
+```
+
+| Lines | Function | What it does |
+|---|---|---|
+| 6–12 | `Qadam(s, k)` | («qadam» — step) adds every `k`-th element: for the pause question, below |
+| 15–21 | `Sonlar(n)` | («sonlar» — numbers) a slice with `0, 1, …, n−1`. It writes every element: this matters ("Going deeper") |
+| 24–31 | `Tartib(n, r)` | shuffles 0 … n−1 with `r.Shuffle` (`math/rand/v2`; `r` gives the same sequence every time) |
+| 35–41 | `TartibliZanjir(n)` | («tartibli zanjir» — ordered chain) `s[i] = i+1`, the last one back to `0`: a chain whose next element is always the neighbour. Needed in "Two mechanisms" |
+| 45–58 | `ZanjirSlice(n, r)` | takes a shuffled order, moves 0 to the front and sets `s[t[k]] = t[k+1]`: one cycle that visits every element once |
+
+A small example, `n = 8`. Say the shuffled order came out as `0 5 2 7 1 3 6 4`. `ZanjirSlice` writes, for each
+number, the one that follows it:
+
+| index `i` | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| `s[i]` | 5 | 3 | 7 | 6 | 0 | 2 | 4 | 1 |
+
+`Zanjir` starts at `i = 0`: `s[0] = 5` → `s[5] = 2` → `s[2] = 7` → `s[7] = 1` → `s[1] = 3` → `s[3] = 6` →
+`s[6] = 4` → `s[4] = 0`. In eight steps every element is read once. The values are again 0 … 7, so the sum is the
+same as `Ketma`'s: 28. The course test `TestBirXilYigindi` («bir xil yigʻindi» — same sum) checks that all five
+methods give n(n−1)/2. So the speed difference does not come from the amount of work.
+
+## The measurement: b.Loop and 17 sizes
+
+The benchmarks are in `kesh/kesh_test.go`:
+
+```go filename="kesh/kesh_test.go" showLineNumbers
+package kesh
+
+import (
+	"math/rand/v2"
+	"testing"
+)
+
+func yangiRand() *rand.Rand { return rand.New(rand.NewPCG(1, 2)) }
+
+func TestBirXilYigindi(t *testing.T) {
+	for _, n := range []int{1, 2, 7, 1 << 10, 1 << 16} {
+		want := int64(n) * int64(n-1) / 2
+		s := Sonlar(n)
+		got := []int64{Ketma(s), Aralash(s, Tartib(n, yangiRand())), Zanjir(ZanjirSlice(n, yangiRand())), Zanjir(TartibliZanjir(n)),
+			Royxat(RoyxatYangi(n)), Royxat(RoyxatSochilgan(n, yangiRand()))}
+		for i, g := range got {
+			if g != want {
+				t.Fatalf("n=%d, %d-usul: %d, kutilgan %d", n, i, g, want)
+			}
+		}
+	}
+	if got := Qadam(Sonlar(16), 8); got != 0+8 {
+		t.Fatalf("Qadam: %d", got)
+	}
+}
+
+func BenchmarkKetma(b *testing.B) {
+	olcha(b, func(n int) func() int64 {
+		s := Sonlar(n)
+		return func() int64 { return Ketma(s) }
+	})
+}
+
+func BenchmarkAralash(b *testing.B) {
+	olcha(b, func(n int) func() int64 {
+		s, t := Sonlar(n), Tartib(n, yangiRand())
+		return func() int64 { return Aralash(s, t) }
+	})
+}
+
+func BenchmarkTZanjir(b *testing.B) {
+	olcha(b, func(n int) func() int64 {
+		s := TartibliZanjir(n)
+		return func() int64 { return Zanjir(s) }
+	})
+}
+
+func BenchmarkZanjir(b *testing.B) {
+	olcha(b, func(n int) func() int64 {
+		s := ZanjirSlice(n, yangiRand())
+		return func() int64 { return Zanjir(s) }
+	})
+}
+```
+
+| Lines | What they do |
+|---|---|
+| 8 | `yangiRand()` («yangi» — new) a generator with the same seed every time (`NewPCG(1, 2)`): the shuffled order is the same on every run |
+| 10–25 | `TestBirXilYigindi`: for different `n`, does every method give `n(n−1)/2`; `Qadam(Sonlar(16), 8)` = 0 + 8 |
+| 27–53 | four benchmarks. Each one gives `olcha` a function: it takes `n`, prepares the slice and returns the work to measure (another function, a closure) |
+
+`olcha` («oʻlcha» — measure) is in `kesh/olcha_test.go`:
+
+```go filename="kesh/olcha_test.go" showLineNumbers
+package kesh
+
+import (
+	"fmt"
+	"runtime"
+	"testing"
+)
+
+// 2^10 dan 2^26 gacha element: 8 KiB dan 512 MiB gacha.
+func olcha(b *testing.B, tayyorla func(n int) func() int64) {
+	for k := 10; k <= 26; k++ {
+		n := 1 << k
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			ish := tayyorla(n) // tayyorlash o'lchanmaydi: b.Loop birinchi chaqiruvda taymerni nolga qaytaradi
+			runtime.GC()       // tayyorlashdan qolgan axlat o'lchov paytida yig'ilmasin
+			for b.Loop() {
+				ish() // b.Loop natijani o'zi "tirik" ushlaydi (GO-1.07)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/el")
+		})
+	}
+}
+```
+
+| Lines | Code | What it does |
+|---|---|---|
+| 11–12 | `for k := 10; k <= 26; k++ { n := 1 << k` | 17 sizes: 2¹⁰ to 2²⁶ elements, 8 KiB to 512 MiB. `1 << k` = 2ᵏ |
+| 13 | `b.Run(fmt.Sprintf("n=%d", n), …)` | each size is its own sub-benchmark: `BenchmarkKetma/n=1024` and so on (GO-1.07) |
+| 14 | `ish := tayyorla(n)` | («ish» — work, «tayyorla» — prepare) prepares the slice. This time is not counted: `b.Loop` resets the timer the first time it is called (`go doc testing.B.Loop`) |
+| 15 | `runtime.GC()` | the garbage collector collects the setup's garbage in advance, so it does not run during the measurement |
+| 16–18 | `for b.Loop() { ish() }` | the measured loop. `b.Loop` keeps the result "alive" by itself, so the compiler does not delete the work (GO-1.07) |
+| 19 | `b.ReportMetric(…, "ns/el")` | divides the total time by the number of iterations and by `n`: nanoseconds per element, a new column `ns/el` |
+
+The whole measurement is done by the `olchov.sh` («oʻlchov» — measurement) script:
+
+```bash filename="olchov.sh" showLineNumbers
+#!/usr/bin/env bash
+# Butun o'lchov: 4 usul × 17 o'lcham (2^10 … 2^26), 10 marta, navbat bilan
+# (bir "shovqinli" daqiqa bitta o'lchamning hamma natijasini buzmasin).
+# Ishlatish: ./olchov.sh [yadro]   — yadro raqami lscpu -e dan (standart: 2, P-yadro).
+# Natija: natija.txt. Bu noutbukda ~20 daqiqa.
+set -euo pipefail
+cd "$(dirname "$0")"
+yadro=${1:-2}
+pin=()
+if command -v taskset > /dev/null; then pin=(taskset -c "$yadro"); fi
+: > natija.txt
+for i in $(seq 10); do
+	"${pin[@]}" go test -run '^$' -bench 'Ketma|Aralash|Zanjir' -count 1 ./kesh >> natija.txt
+done
+go run ./jadval -cpu "$yadro" -tarqoq < natija.txt
+```
+
+Lines 8–10: the core number comes from the first argument (default 2); without `taskset` (macOS) it runs unpinned.
+Lines 12–14: run the four methods (`Ketma|Aralash|Zanjir` is a regex, `TZanjir` matches too) 10 times, `-count 1`
+each time, **interleaved**. Interleaved, so that one "noisy" minute does not spoil all results of one size. The output
+goes to `natija.txt`. Line 15 prints the spread ("Going deeper"). On this laptop the video's run took 17 minutes,
+ours 16 minutes.
+
+Note: `./olchov.sh` overwrites `natija.txt` in the course folder. If you want to keep the video's file, copy it first
+(`cp natija.txt natija-video.txt`) or restore it afterwards with `git checkout natija.txt`.
+
+## The chart: a staircase
+
+In the video's chart the horizontal axis is the number of elements and the vertical axis is the time per element,
+both on a logarithmic scale. Here are the same numbers as a table (the medians that
+`go run ./jadval -xy <Method> < natija.txt` prints, ns/element). The bold rows are the cache boundaries:
+
+| n | slice | ketma | aralash | zanjir |
+|---|---|---|---|---|
+| 2¹⁰ | 8 KiB | 0.314 | 0.417 | 1.52 |
+| 2¹¹ | 16 KiB | 0.314 | 0.410 | 1.57 |
+| 2¹² | 32 KiB | 0.310 | 0.424 | 1.66 |
+| — | **L1 48 KiB** | | | |
+| 2¹³ | 64 KiB | 0.321 | 0.445 | 2.50 |
+| 2¹⁴ | 128 KiB | 0.317 | 0.494 | 3.81 |
+| 2¹⁵ | 256 KiB | 0.328 | 0.516 | 4.23 |
+| 2¹⁶ | 512 KiB | 0.327 | 0.548 | 5.07 |
+| 2¹⁷ | 1 MiB | 0.324 | 0.825 | 7.12 |
+| — | **L2 1280 KiB** | | | |
+| 2¹⁸ | 2 MiB | 0.320 | 1.25 | 16.9 |
+| 2¹⁹ | 4 MiB | 0.361 | 2.18 | 49.8 |
+| 2²⁰ | 8 MiB | 0.487 | 3.78 | 81.3 |
+| — | **L3 12 MiB** | | | |
+| 2²¹ | 16 MiB | 0.581 | 5.92 | 93.9 |
+| 2²² | 32 MiB | 0.576 | 7.54 | 98.2 |
+| 2²³ | 64 MiB | 0.589 | 8.08 | 101.7 |
+| 2²⁴ | 128 MiB | 0.591 | 8.76 | 105.8 |
+| 2²⁵ | 256 MiB | 0.578 | 8.93 | 115.1 |
+| 2²⁶ | 512 MiB | 0.583 | 9.98 | 137.2 |
+
+In the terminal the same chart has a short form (each column is one size; the taller the bar, the slower; the scale
+is logarithmic; `|` marks the cache boundaries):
+
+```console
+$ go run ./jadval < natija.txt
+ns/element, n = 2^10 … 2^26, | = L1d 48K · L2 1280K · L3 12M
+ketma    ▁▁▁▁▁▁|▁▁▁▁▁▁▁▁▁▁|▁▁▁▁▂▂|▂▂▂▂▂▂▂▂▂▂▂▂  0.31 → 0.58
+aralash  ▁▁▁▁▁▁|▁▁▂▂▂▂▂▂▂▂|▃▃▃▃▄▄|▄▄▅▅▅▅▅▅▅▅▅▅  0.42 → 10.0
+zanjir   ▃▃▃▃▃▃|▃▃▄▄▄▄▄▄▅▅|▆▆▇▇▇▇|████████████  1.5 → 137
+```
+
+What you can see:
+
+- **ketma** stays almost flat: from 0.31 to 0.58 ns.
+- **aralash** rises as L2 fills up: from 2¹⁶ (512 KiB), and then 6–10 ns in DRAM.
+- **zanjir** jumps after every boundary: L1, L2, L3. A staircase.
+
+The steps start a little **before** the boundary. For example, 2 MiB fits easily into L3, yet the chain takes
+16.9 ns, and 81 ns at 8 MiB. The reason: the cache never belongs fully to one slice. Other data, the second
+hyperthread (the second hardware thread on the same core) and other programs live there too. Also, each address can
+go only to a few places in the cache (associativity, CS:APP §6.4).
+
+Our re-run (the same command, but `natija.txt` now comes from our `./olchov.sh`):
+
+```console
+$ go run ./jadval < natija.txt
+ns/element, n = 2^10 … 2^26, | = L1d 48K · L2 1280K · L3 12M
+ketma    ▁▁▁▁▁▁|▁▁▁▁▁▁▁▁▁▁|▁▁▁▁▁▁|▂▂▂▂▂▂▂▂▂▂▂▂  0.23 → 0.45
+aralash  ▁▁▁▁▁▁|▁▁▁▁▁▁▂▂▂▂|▂▂▃▃▄▄|▄▄▅▅▅▅▅▅▅▅▅▅  0.29 → 8.2
+zanjir   ▃▃▃▃▃▃|▃▃▄▄▄▄▄▄▅▅|▅▅▆▆▇▇|▇▇██████████  1.2 → 103
+```
+
+All numbers are smaller (ketma 0.23 ns in L1, zanjir 103 ns in DRAM): the machine was quiet. But the shape is the same: ketma flat, aralash rising after L2, zanjir a staircase. `-daraja` with this `natija.txt`: zanjir L1 1.2, L2 1.9…5.5, L3 10…32, DRAM 64…103 ns; L1 → DRAM again ~50–85 times. `-ikki`: 0.45 / 1.3 / 8.2 / 103 ns, the shuffled chain again 13 times slower than independent reads (103 / 8.2 = 12.6).
+
+## Sequential reads: almost flat
+
+`-daraja` («daraja» — level) takes, for each cache, **all** sizes that fit into that cache but not into the previous
+one, and shows the smallest … largest of their medians:
+
+```console
+$ go run ./jadval -daraja < natija.txt
+qayer slice           ketma    aralash     zanjir
+L1    8K…32K           0.31  0.41…0.42    1.5…1.7
+L2    64K…1M      0.32…0.33  0.44…0.83    2.5…7.1
+L3    2M…8M       0.32…0.49    1.2…3.8      17…81
+DRAM  16M…512M    0.58…0.59   5.9…10.0     94…137
+```
+
+(`qayer` = "where".) First the `ketma` column. Inside L1 one element takes about a third of a nanosecond (0.31 ns),
+in main memory a little more than half a nanosecond (0.58). The slice grew 65,536 times (8 KiB → 512 MiB), and the
+time grew 1.9 times: not even twice.
+
+Inside the caches the loop itself sets the limit: every addition waits for the previous sum. In `go tool objdump` the
+loop body is one instruction: `ADDQ 0(CX)(AX*8), BX` (the sum is in the `BX` register). One addition per cycle is
+~0.25–0.3 ns on this processor (CS:APP §5.7–5.8). The cache delivers faster than that, so L1, L2 and L3 look almost
+the same.
+
+In main memory two things help:
+
+1. **The cache line.** One 64-byte line brings 8 `int64` values: memory is visited once per 8 elements.
+2. **The prefetcher.** The processor notices the sequential walk and loads the next lines before they are asked for.
+   Drepper: "the processor automatically prefetches data when memory is accessed sequentially".
+
+```text
+sequential:  s[0..7] s[8..15] s[16..23] s[24..31] …
+             line 1  line 2   line 3    line 4
+             ▲ being read     ▲ the prefetcher has already requested it
+```
+
+## The chain: each read waits for the previous one
+
+Only the `zanjir` column. `cut -c1-16,39-` keeps characters 1–16 and from 39 to the end of each line:
+
+```console
+$ go run ./jadval -daraja < natija.txt | cut -c1-16,39-
+qayer slice          zanjir
+L1    8K…32K        1.5…1.7
+L2    64K…1M        2.5…7.1
+L3    2M…8M           17…81
+DRAM  16M…512M       94…137
+```
+
+A completely different picture. Inside L1 one step takes 1.5 ns. Inside L2 it grows from 2.5 to 7, inside L3 from 17
+to 81. In main memory from 94 to 137 ns. L1 → DRAM: roughly 60–90 times.
+
+Why? `i = s[i]`: the next address is the *result* of the current read. The processor cannot start the next read
+before the current one finishes. So we see roughly the **latency** of each level. An independent check: Chips and
+Cheese measured the L1D of this core type (Golden Cove) at 5 cycles and L2 at ~15 cycles, that is ~1.1–1.4 and
+~3.4–4.3 ns. Our 1.5 and 2.5–7.1 are close to that.
+
+At large sizes two more things add up:
+
+- **TLB misses.** A program works with virtual addresses; the processor translates them to physical addresses (in
+  4 KiB pages). The results of the translation live in a small cache, the **TLB**. When you walk 512 MiB in shuffled
+  order, on many steps the translation is not in the TLB either (Drepper §3.3.2; CS:APP §9.6).
+- **The shared L3.** During the measurement other programs were using L3 too.
+
+## Two mechanisms: order and independence
+
+Now the main question: what exactly makes the chain slow? There are two differences: (1) the order is shuffled,
+(2) each read depends on the previous one. To separate them, a fourth variant was measured: `TZanjir`, the `Zanjir`
+function with the `TartibliZanjir` slice (`s[i] = i+1`). This is a chain too: each read waits for the previous one.
+Only the addresses are sequential.
+
+Guess: at 512 MiB, how long does the ordered chain take per element?
+
+**A)** ~0.6 ns, like `ketma` · **B)** ~2 ns · **C)** ~137 ns, like the shuffled chain: the dependency is still there
+
+<details>
+<summary>Answer</summary>
+
+**B.** `-ikki` («ikki» — two) prints the 2×2 table at the largest size (2²⁶):
+
+```console
+$ go run ./jadval -ikki < natija.txt
+n = 2^26 (512M), ns/element    mustaqil   zanjir
+ketma-ket tartib                0.58      1.7
+aralash tartib                  10.0      137
+```
+
+(`mustaqil` = "independent", `ketma-ket tartib` = "sequential order", `aralash tartib` = "shuffled order".) The
+ordered chain takes 1.7 ns, the shuffled chain 137 ns. In both, each read waits for the previous one, yet the
+difference is 80 times. If you chose "C", you thought the dependency was the only cause. When the order is
+sequential, the prefetcher brings the next lines in advance and the wait ends in the cache. "A" is not right either:
+the dependency still makes every step cost about the L1 latency (~1.5 ns).
+
+</details>
+
+| | independent reads | chain (dependent) |
+|---|---|---|
+| **sequential order** | `Ketma` 0.58 ns: prefetcher + line | `TZanjir` 1.7 ns: the prefetcher works, but each step waits |
+| **shuffled order** | `Aralash` 10.0 ns: no prefetcher, but the reads are waited for at the same time | `Zanjir` 137 ns: neither helps |
+
+So there are two different mechanisms:
+
+- **The prefetcher needs order.** When addresses come with a predictable step, the processor fetches them before
+  they are asked for.
+- **Parallel waiting needs independence.** In `Aralash` the next index comes from the `tartib` slice, not from the
+  number just read. The processor starts several next reads early and waits for them at the same time (out-of-order
+  execution and a cache that can wait for several misses at once, a *nonblocking cache*: Hennessy & Patterson, §2.3).
+  `Zanjir` has no such chance: the next address is still unknown.
+
+That is why, in shuffled order, the chain is 13 times slower than independent reads (137 / 10). A rough estimate:
+about 13–14 reads were "in flight" at the same time (course README).
+
+## The pause question: every 8th element
+
+In a 128 MiB slice (2²⁴ `int64` values) we add not every element, but only every 8th one. The function is `Qadam(s, 8)`
+from above (`kesh/tayyor.go`, lines 6–12). The work went down 8 times. Does the time go down 8 times too? Remember the
+cache line: an `int64` is 8 bytes, a line is 64 bytes.
+
+**A)** yes, ~8 times · **B)** no, much less · **C)** the opposite, it slows down: jumping confuses the prefetcher
+
+The benchmark is in `kesh/qadam_test.go` (the second benchmark, `Royxat`, is needed in the next section):
+
+```go filename="kesh/qadam_test.go" showLineNumbers
+package kesh
+
+import (
+	"fmt"
+	"testing"
+)
+
+// Pauza savoli: har elementni yoki har 8-elementni (64 baytda bitta) qo'shamiz.
+func BenchmarkQadam(b *testing.B) {
+	for _, n := range []int{1 << 12, 1 << 24} {
+		s := Sonlar(n)
+		for _, k := range []int{1, 8} {
+			b.Run(fmt.Sprintf("n=%d/k=%d", n, k), func(b *testing.B) {
+				for b.Loop() {
+					Qadam(s, k)
+				}
+			})
+		}
+	}
+}
+
+// Haqiqiy pointer'li ro'yxat: 2^20 tugun (16 MiB), yonma-yon va sochilgan.
+func BenchmarkRoyxat(b *testing.B) {
+	n := 1 << 20
+	b.Run("yangi", func(b *testing.B) {
+		t := RoyxatYangi(n)
+		for b.Loop() {
+			Royxat(t)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/el")
+	})
+	b.Run("sochilgan", func(b *testing.B) {
+		t := RoyxatSochilgan(n, yangiRand())
+		for b.Loop() {
+			Royxat(t)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/el")
+	})
+	b.Run("slice", func(b *testing.B) {
+		s := Sonlar(n)
+		for b.Loop() {
+			Ketma(s)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/el")
+	})
+}
+```
+
+Lines 10–19: two sizes (2¹² = 32 KiB, fits into L1; 2²⁴ = 128 MiB, fits into no cache) and two steps (`k = 1` and
+`k = 8`), each a separate sub-benchmark. The output is in `qadam-royxat.txt`. It was produced like this (10 times, on
+core 2; we re-ran this command too, see below):
+
+```console
+$ taskset -c 2 go test -run '^$' -bench 'Qadam|Royxat' -count 10 ./kesh > qadam-royxat.txt
+```
+
+`-run '^$'` matches no test, so only the benchmarks run; `>` writes the output to the file, nothing is printed.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `-median` prints the median and the `[smallest … largest]` range of any benchmark result; `grep Qadam` keeps
+only those lines:
+
+```console
+$ go run ./jadval -median < qadam-royxat.txt | grep Qadam
+Qadam/n=2^12/k=1  1.7 µs  [1.6 µs … 2.4 µs]
+Qadam/n=2^12/k=8  217 ns  [210 ns … 244 ns]
+Qadam/n=2^24/k=1   10 ms  [10 ms … 11 ms]
+Qadam/n=2^24/k=8  6.3 ms  [6.2 ms … 8.9 ms]
+```
+
+In a slice that fits into L1, `k = 8` really is almost 8 times faster: 1.7 µs / 217 ns = 7.8. In the large slice it
+is only 1.6 times faster: 10 ms / 6.3 ms. The reason is the cache line. Every 8th element sits on a new line:
+
+```text
+line:    [s0 s1 s2 s3 s4 s5 s6 s7] [s8 … s15] [s16 … s23] …
+k = 1:    ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓    ✓ … ✓      ✓ … ✓
+k = 8:    ✓                         ✓          ✓
+          ↑ every line still comes from main memory
+```
+
+The processor still brings *every* line from main memory. The 1.5× comes from fewer additions, and the main cost is
+those lines. If you chose "A", you counted like the RAM model: 8 times fewer operations. That is true for a small
+slice, not for a large one. "C" is not right either: the step is constant, the prefetcher notices it too, and the time
+still goes down. CS:APP draws this as the *memory mountain* (§6.6.1): read throughput by working-set size and stride.
+Ostrovsky showed the same in 2010: multiplying every element and every 16th element took almost the same time (80
+and 78 ms).
+
+Our re-run:
+
+```console
+$ go run ./jadval -median < qadam-royxat.txt | grep Qadam
+Qadam/n=2^12/k=1  1.4 µs  [1.4 µs … 1.7 µs]
+Qadam/n=2^12/k=8  177 ns  [162 ns … 202 ns]
+Qadam/n=2^24/k=1   10 ms  [8.9 ms … 14 ms]
+Qadam/n=2^24/k=8  6.7 ms  [6.0 ms … 8.9 ms]
+```
+
+For us: in L1 1.4 µs / 177 ns = 7.9 times, in the large slice 10 / 6.7 ms = 1.5 times. Different numbers, the same picture.
+
+</details>
+
+## A real linked list: pointers and the allocator
+
+`Zanjir` was an index-based list. Now a real linked list with pointers (`kesh/royxat.go`, «roʻyxat» — list):
+
+```go filename="kesh/royxat.go" showLineNumbers
+package kesh
+
+import "math/rand/v2"
+
+// Tugun: bog'langan ro'yxat (linked list) tuguni, 16 bayt.
+type Tugun struct {
+	Qiymat  int64
+	Keyingi *Tugun
+}
+
+// Royxat: ro'yxat bo'ylab yurib qiymatlarni qo'shadi.
+func Royxat(t *Tugun) int64 {
+	var sum int64
+	for ; t != nil; t = t.Keyingi {
+		sum += t.Qiymat
+	}
+	return sum
+}
+
+// RoyxatYangi: har tugun new bilan, ketma-ket yaratiladi.
+// Go allocator'i ularni odatda xotirada yonma-yon qo'yadi.
+func RoyxatYangi(n int) *Tugun {
+	var bosh, oxir *Tugun
+	for i := range n {
+		t := &Tugun{Qiymat: int64(i)}
+		if bosh == nil {
+			bosh = t
+		} else {
+			oxir.Keyingi = t
+		}
+		oxir = t
+	}
+	return bosh
+}
+
+// RoyxatSochilgan: o'sha ro'yxat, lekin tugunlar xotirada aralash joylarda turadi
+// (uzoq ishlagan dasturda qo'shish/o'chirishlardan keyin shunday bo'ladi).
+func RoyxatSochilgan(n int, r *rand.Rand) *Tugun {
+	joy := make([]Tugun, n)
+	t := Tartib(n, r)
+	for k := range n {
+		joy[t[k]].Qiymat = int64(k)
+		if k+1 < n {
+			joy[t[k]].Keyingi = &joy[t[k+1]]
+		}
+	}
+	return &joy[t[0]]
+}
+```
+
+| Lines | Code | What it does |
+|---|---|---|
+| 6–9 | `type Tugun struct { Qiymat int64; Keyingi *Tugun }` | («tugun» — node, «qiymat» — value, «keyingi» — next) a number and a pointer to the next node: 8 + 8 = 16 bytes |
+| 12–18 | `Royxat(t)` | `for ; t != nil; t = t.Keyingi`: walks to the end of the list (`nil`) and adds the values |
+| 22–34 | `RoyxatYangi(n)` | («yangi» — new) creates `n` nodes one after another with `&Tugun{…}` and appends each to the end |
+| 25 | `t := &Tugun{Qiymat: int64(i)}` | the node is needed after the function returns (it stays in the list), so it goes to the heap (GO-1.11) |
+| 38–48 | `RoyxatSochilgan(n, r)` | («sochilgan» — scattered) `n` nodes in one `[]Tugun`, but linked in shuffled order: after many inserts and deletes in a long-running program nodes end up scattered like this |
+
+In Python a `list`, and in JS an array of objects, store references to the elements; the object itself is elsewhere.
+In Go a `[]int64` holds the numbers themselves next to each other, while in a `*Tugun` list every node is a separate
+heap object. The question: where in memory are separate objects?
+
+Go's allocator (the part that hands out heap memory) gives out objects of the same size one after another from one
+large block (a *span*): address = base address + index × size (`runtime/malloc.go`, `nextFreeFast`). In a fresh heap,
+nodes created one after another usually sit next to each other. A test checks this (`kesh/royxat_test.go`):
+
+```go filename="kesh/royxat_test.go" showLineNumbers
+package kesh
+
+import (
+	"testing"
+	"unsafe"
+)
+
+// new bilan ketma-ket yaratilgan tugunlar xotirada yonma-yon turadimi?
+// go test -run Yonma -v ./kesh
+func TestYonmaYon(t *testing.T) {
+	n := 1 << 20
+	yonma := 0
+	for p := RoyxatYangi(n); p.Keyingi != nil; p = p.Keyingi {
+		if uintptr(unsafe.Pointer(p.Keyingi))-uintptr(unsafe.Pointer(p)) == unsafe.Sizeof(Tugun{}) {
+			yonma++
+		}
+	}
+	foiz := 100 * float64(yonma) / float64(n-1)
+	t.Logf("%d tugun: %.1f%% da keyingisi roppa-rosa +%d bayt", n, foiz, unsafe.Sizeof(Tugun{}))
+	if foiz < 90 {
+		t.Errorf("kutilganidan kam: %.2f%%", foiz)
+	}
+}
+```
+
+Line 13 walks the list. Line 14 subtracts the current node's address from the next node's address: `unsafe.Pointer` →
+`uintptr` turns an address into a plain number (for measuring only; ordinary code does not need `unsafe`).
+`unsafe.Sizeof(Tugun{})` = 16. Lines 18–19 compute and print the percentage. `-v` shows the `t.Logf` line,
+`grep bayt` keeps only that line, and `sed 's/^ *//'` strips the leading spaces:
+
+```console
+$ go test -run YonmaYon -v ./kesh | grep bayt | sed 's/^ *//'
+royxat_test.go:19: 1048576 tugun: 99.8% da keyingisi roppa-rosa +16 bayt
+```
+
+("1048576 nodes: in 99.8% the next one is exactly +16 bytes".) In 99.8 % of a million nodes the next node is exactly
+16 bytes further on. We re-ran it too: exactly the same.
+
+Guess: a walk over 2²⁰ nodes (16 MiB). How long does the list created one node after another take per node?
+
+**A)** like a slice, ~0.4 ns · **B)** ~2 ns · **C)** like the scattered list, ~90 ns: a pointer is a pointer
+
+<details>
+<summary>Answer</summary>
+
+**B.**
+
+```console
+$ go run ./jadval -median < qadam-royxat.txt | grep Royxat
+Royxat/yangi      2.2 ms  [1.9 ms … 2.6 ms]  2.1 ns/el
+Royxat/sochilgan   94 ms  [81 ms … 126 ms]  90 ns/el
+Royxat/slice      427 µs  [406 µs … 525 µs]  0.41 ns/el
+```
+
+The list created in order takes 2.1 ns per node: the nodes are next to each other, the addresses are sequential, the
+prefetcher works. It is the same case as `TZanjir` (1.7 ns): dependent, but in order. The scattered nodes take 90 ns:
+like `Zanjir`, each step waits for main memory. The slice takes 0.41 ns. So the adjacent list is ~5 times slower than
+the slice, and the scattered one ~220 times.
+
+If you chose "C", you thought a linked list is slow because of pointers. The slowness is not in the pointer but in
+**where the nodes are**. "A" is not right either: each step waits until the previous node has been read.
+
+Our re-run:
+
+```console
+$ go run ./jadval -median < qadam-royxat.txt | grep Royxat
+Royxat/yangi      1.9 ms  [1.8 ms … 2.2 ms]  1.8 ns/el
+Royxat/sochilgan   92 ms  [73 ms … 130 ms]  88 ns/el
+Royxat/slice      369 µs  [353 µs … 409 µs]  0.35 ns/el
+```
+
+For us the adjacent list takes 1.8 ns, the scattered one 88 ns, the slice 0.35 ns: again ~5 and ~250 times. `TestYonmaYon` again gives 99.8 %.
+
+</details>
+
+One important fact: Go's garbage collector does **not move** objects. At the top of `runtime/mgc.go`: "It is
+non-generational and non-compacting". Nodes that got scattered once stay scattered: the GC does not put them back
+next to each other.
+
+## Summary: Big-O and the cost of one operation
+
+| Method | Big-O | one element (2²⁶ or 2²⁰) | what decided it |
+|---|---|---|---|
+| `Ketma` | O(n) | 0.58 ns | line + prefetcher, the loop itself is the limit |
+| `TZanjir` / adjacent list | O(n) | 1.7 / 2.1 ns | the prefetcher works, but each step waits |
+| `Aralash` | O(n) | 10.0 ns | no prefetcher, parallel waiting works |
+| `Zanjir` / scattered list | O(n) | 137 / 90 ns | neither: each step pays the main-memory latency |
+
+Big-O tells you how the number of operations grows, but not what one operation costs. The same linear loop took
+from 0.3 ns to more than 100 ns per element, depending on the memory order.
+
+There are also models that take the cache into account. The I/O model of Aggarwal and Vitter (1988) and the ideal-cache
+model of Frigo, Leiserson, Prokop and Ramachandran (1999) measure the cost as the number of cache misses (lines
+brought from memory). In such a model `Ketma` is ~n/8 cache misses (64 / 8), `Zanjir` ~n.
+
+What it means in Go practice:
+
+- **Keep values next to each other in a slice.** A `[]T` is usually faster than a list of pointers (`[]*T`, a linked
+  list).
+- **Run benchmarks at a realistic size.** A test with 1000 elements lives in L1: there `Aralash` is only 1.3 times
+  slower than `Ketma` (0.42 and 0.31 ns), at 512 MiB it is 17 times.
+- **Pin to one core** (`taskset -c N`), measure many times and take the median.
+
+In the next lesson ([DSA-A.02 · Big-O'ni oʻlchab topamiz: doubling usuli](/lab/youtube/dsa#dsa-a-02)) we write a tool that
+doubles the size and finds the Big-O exponent from the time ratio. Today's cache boundaries show up there too: for
+example, `Zanjir` from 2¹⁸ to 2¹⁹ goes 16.9 → 49.8 ns, so T(2n)/T(n) ≈ 5.9 for linear code.
+
+## Going deeper (optional): measurement traps and noise
+
+This section is not in the video: it comes from the course README. It is useful if you want to write your own
+benchmark.
+
+**Noise.** During the video's measurement the machine was also running speech synthesis and a video render.
+`taskset` only pins our process to cpu2; it does not keep others off cpu2 (or off its hyperthread sibling cpu3). And
+`b.Loop` measures wall-clock time. That is why: 10 samples, interleaved, the median. The spread is measured in two
+ways: IQR/median (the range of the middle 50 % of results, relative to the median) and (max−min)/median:
+
+```console
+$ go run ./jadval -tarqoq < natija.txt
+tarqoqlik, 10 o'lchov: IQR/median · (max-min)/median
+ketma    IQR  6.1% (eng ko'pi 11.7%) · max-min 31.0% ( 66.4%)
+aralash  IQR  8.5% (eng ko'pi 40.2%) · max-min 43.7% ( 77.3%)
+zanjir   IQR  6.4% (eng ko'pi 39.7%) · max-min 35.5% (116.7%)
+t.zanjir IQR  6.7% (eng ko'pi 10.2%) · max-min 32.8% ( 39.6%)
+```
+
+(`tarqoqlik` = "spread", `eng ko'pi` = "the largest".) For each method, over the 17 sizes: the median and the largest
+IQR/median, then the same for (max−min)/median. At a typical size the middle results are within 6–9 %, while the
+extreme ones differ by up to 30–45 %: that is why you can't trust one measurement. In our run on a quiet machine:
+
+```console
+$ go run ./jadval -tarqoq < natija.txt
+tarqoqlik, 10 o'lchov: IQR/median · (max-min)/median
+ketma    IQR  6.4% (eng ko'pi 15.4%) · max-min 14.5% ( 29.4%)
+aralash  IQR 12.8% (eng ko'pi 21.6%) · max-min 36.0% ( 59.2%)
+zanjir   IQR  7.9% (eng ko'pi 67.1%) · max-min 11.5% ( 98.6%)
+t.zanjir IQR  6.5% (eng ko'pi  7.3%) · max-min  8.4% ( 10.3%)
+```
+
+**Memory that was never written.** If you don't write to the elements after `make([]int64, n)`, Linux maps those
+pages to one shared zero page, and reads come from the cache. That is why `Sonlar` and the homework's `toldir` write
+every element.
+
+**Don't write the loop inside the `b.Loop` body.** `b.Loop` keeps the variables in its body "alive". When the loop was
+written directly inside `for b.Loop() { … }`, `sum` lived on the stack instead of in a register
+(`ADDQ BX, 0x18(SP)`), and the loop became several times slower (README: `Int32` 72 ms and `Int64` 20–30 ms, the
+correct values being 5.9 and 8.0). The measured code lives in a separate function.
+
+**Setup garbage.** `runtime.GC()` after the 512 MiB slices are prepared: otherwise the GC might run during the loop
+(because `taskset` gives one core, Go runs with `GOMAXPROCS=1`, and the GC runs on that core too).
+
+**`Aralash`'s hidden cost.** It also reads the extra `[]int32` order slice (4·n bytes) sequentially. That slice comes
+with the prefetcher, but it takes space in the cache. The cache boundaries in the table are based on the main slice
+(8·n) only.
+
+## Common mistakes
+
+**1. "Same Big-O, so same time" (the main misconception).** No error is printed, the program just runs 100 times
+slower. The RAM model gives every read the same price, a real processor does not ("Same O(n), three different times"
+section). **Fix:** when comparing algorithms, take the memory order into account too, and measure at a realistic size.
+
+**2. "A linked list is slow because of pointers" (the wrong reason).** A list created in order is ~5 times slower than
+a slice, a scattered list ~220 times ("A real linked list" section). The reason is where the nodes are in memory.
+**Fix:** keep data that is read a lot in a `[]T`; if you need a list, measure how scattered it is. Go's GC does not put
+scattered nodes back together.
+
+**3. Making the chain index an `int`.** If line 26 of `kesh.go` says `i := 0` instead of `i := int64(0)` (this change
+is not in the course folder; we tried it in a copy):
+
+```go
+func Zanjir(s []int64) int64 {
+	var sum int64
+	i := 0
+	for range len(s) {
+		sum += s[i]
+		i = s[i]
+	}
+	return sum
+}
+```
+
+```console
+$ go build ./kesh
+# github.com/abdurahmon27/go-backend-uz/lessons/dsa-a01-cache/kesh
+kesh/kesh.go:29:7: cannot use s[i] (variable of type int64) as int value in assignment
+```
+
+How to read it: `kesh/kesh.go:29:7` is the file, line 29, column 7 (where `s[i]` starts). *cannot use s[i] (variable
+of type int64) as int value in assignment*: the `int64` value `s[i]` can't be used as an `int` in an assignment.
+`i := 0` gives `i` the type `int`, and Go does not convert `int64` to `int` by itself (in Python or JS this question
+does not even exist). **Fix:** `i := int64(0)`, as in the course code. An `int64` works as an index: in Go an index can
+be any integer type.
+
+**4. Benchmarking at a small size (a silent bug).** A slice of 1000 elements lives in L1: all methods look almost the
+same there, `Aralash` is only 1.3 times slower. In production it is 10–17 times. **Fix:** measure at the real data
+size, or try a range of sizes (with `b.Run`).
+
+**5. Not pinning on a hybrid processor (a silent bug).** Without `taskset` Linux may move the benchmark to an E-core:
+there L1 is 32 KiB and L2 2 MiB, and the staircase appears in a different place. **Fix:** `taskset -c N` with one
+P-core (from `lscpu -e`), and `jadval -cpu N` for that core's caches.
+
+**6. Writing the measured loop inside `b.Loop`, and not writing the memory (silent bugs).** Both spoil the result
+several times over and print no error ("Going deeper" section). **Fix:** the loop in a separate function; fill the
+slice before measuring.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** What does the RAM model not take into account, and why is it still used?
+
+<details>
+<summary>Answer</summary>
+
+Caches and virtual memory (the memory hierarchy): in it every operation, a memory read too, takes constant time. It is
+used because it correctly tells how the number of operations grows and, according to CLRS, usually predicts real
+performance well. Today's example takes it outside that "usually".
+
+</details>
+
+**2.** Both `Aralash` and `Zanjir` jump around in shuffled order. Why is `Zanjir` 13 times slower at 512 MiB?
+
+<details>
+<summary>Answer</summary>
+
+In `Aralash` the next index comes from the `tartib` slice: the processor starts several next reads early and waits
+for them at the same time (parallel waiting). In `Zanjir` the next index is the result of the current read: each
+read waits fully for the previous one. 10.0 ns and 137 ns.
+
+</details>
+
+**3.** In a 128 MiB `[]int64`, why is adding every 8th element only ~1.6 times faster, not 8 times?
+
+<details>
+<summary>Answer</summary>
+
+Every 8th element sits on a new 64-byte cache line (8 × 8 bytes = 64). The processor still brings every line from
+main memory. The cost depends on the number of lines brought, not on the number of additions. In a slice that fits
+into L1 it is ~7.8 times faster.
+
+</details>
+
+**4.** Predict the result. We add up an `[]int32` (4-byte numbers) sequentially. How many elements fit into one
+64-byte cache line, and how many times faster should `[]int32` be than `[]int64` at 2²⁴ elements, if the time
+depended only on the bytes brought in?
+
+<details>
+<summary>Answer</summary>
+
+16 elements; half as many bytes (64 MiB and 128 MiB), so ~2 times. The real measurement is in the homework's "Hard"
+level: only 1.36 times, because the loop itself also takes time.
+
+</details>
+
+**5.** From GO-1.07: in `olcha` the slice is prepared *before* `for b.Loop()`. Why is that time not in the result?
+
+<details>
+<summary>Answer</summary>
+
+`b.Loop` resets the benchmark timer the first time it is called (`go doc testing.B.Loop`). The old `b.N` style needed
+`b.ResetTimer()` for this. On top of that, `runtime.GC()` collects the setup garbage before the measurement.
+
+</details>
+
+## Homework
+
+The tasks and answers are in the lesson folder on GitHub:
+[lessons/dsa-a01-cache](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache). The answer
+code is [uyvazifa/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache/uyvazifa)
+(«uy vazifasi» — homework), the raw measurement is
+[uyvazifa.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/dsa-a01-cache/uyvazifa.txt). Try it
+yourself first.
+
+- 🟢 **Easy:** run `./olchov.sh N` on your own machine (`N` is a P-core number from `lscpu -e`) and draw the chart with
+  `go run ./jadval -cpu N < natija.txt`. At which sizes are your steps?
+- 🟡 **Medium:** change the step to `k = 1, 2, 4, 8, 16, 32` (2²⁴ elements). How does the time change, and why?
+- 🟠 **Hard:** add up an `[]int32` slice instead of `int64`, sequentially (2²⁴ elements, main memory). How many times
+  different is it?
+- 🔴 **Guru:** from a slice of four-field structs (`[]Nuqta{X, Y, Z, W}`, 32 bytes) sum only `X`, and compare with a
+  separate `[]int64`. How many times different? (This is the idea of "data-oriented design".)
+
+<details>
+<summary>Answer</summary>
+
+The answer code:
+
+```go filename="uyvazifa/uyvazifa.go" showLineNumbers
+// Package uyvazifa: DSA-A.01 uy vazifasi javoblari (o'lchov: uyvazifa_test.go, natija: README.md).
+package uyvazifa
+
+// Qadam: har k-elementni qo'shadi.
+func Qadam(s []int64, k int) int64 {
+	var sum int64
+	for i := 0; i < len(s); i += k {
+		sum += s[i]
+	}
+	return sum
+}
+
+// Yig64 va Yig32: bir xil ish, element 8 yoki 4 bayt.
+func Yig64(s []int64) int64 {
+	var sum int64
+	for i := 0; i < len(s); i++ {
+		sum += s[i]
+	}
+	return sum
+}
+
+func Yig32(s []int32) int64 {
+	var sum int64
+	for i := 0; i < len(s); i++ {
+		sum += int64(s[i])
+	}
+	return sum
+}
+
+// Nuqta: 32 bayt. Bitta kesh qatoriga ikkitasi sig'adi.
+type Nuqta struct{ X, Y, Z, W int64 }
+
+// YigX: struct'lar slice'idan (AoS) faqat X ni yig'adi.
+func YigX(s []Nuqta) int64 {
+	var sum int64
+	for i := 0; i < len(s); i++ {
+		sum += s[i].X
+	}
+	return sum
+}
+```
+
+The benchmarks:
+
+```go filename="uyvazifa/uyvazifa_test.go" showLineNumbers
+// go test -run '^$' -bench . -count 10 ./uyvazifa   (taskset -c 2 bilan)
+//
+// Diqqat: o'lchanadigan siklni to'g'ridan-to'g'ri `for b.Loop() { ... }` ichiga yozmang.
+// b.Loop tanasidagi o'zgaruvchilarni "tirik" ushlaydi (go doc testing.B.Loop), shunda `sum`
+// registrda emas, stack'da yashaydi va sikl bir necha barobar sekinlashadi. Funksiyaga chiqaring.
+package uyvazifa
+
+import (
+	"fmt"
+	"testing"
+)
+
+const n = 1 << 24 // 16 777 216 element: hech bir keshga sig'maydi
+
+// toldir: har elementga yozamiz. Hech yozilmagan xotirani Linux bitta umumiy nol sahifaga
+// ulaydi va uni o'qish keshdan keladi — o'lchov yolg'on bo'lardi.
+func toldir[T int32 | int64](s []T) []T {
+	for i := range s {
+		s[i] = T(i)
+	}
+	return s
+}
+
+func TestYigindi(t *testing.T) {
+	s64, s32 := toldir(make([]int64, 1000)), toldir(make([]int32, 1000))
+	nq := make([]Nuqta, 1000)
+	for i := range nq {
+		nq[i].X = int64(i)
+	}
+	if Yig64(s64) != 499500 || Yig32(s32) != 499500 || YigX(nq) != 499500 || Qadam(s64, 1) != 499500 {
+		t.Fatal("yig'indi noto'g'ri")
+	}
+}
+
+// O'rta: qadam k = 1 … 32. 64 baytlik qatorda 8 ta int64 bor.
+func BenchmarkQadam(b *testing.B) {
+	s := toldir(make([]int64, n))
+	for _, k := range []int{1, 2, 4, 8, 16, 32} {
+		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
+			for b.Loop() {
+				Qadam(s, k)
+			}
+		})
+	}
+}
+
+// Qiyin: int32 ikki barobar kam bayt.
+func BenchmarkInt64(b *testing.B) {
+	s := toldir(make([]int64, n))
+	for b.Loop() {
+		Yig64(s)
+	}
+}
+
+func BenchmarkInt32(b *testing.B) {
+	s := toldir(make([]int32, n))
+	for b.Loop() {
+		Yig32(s)
+	}
+}
+
+// Guru: struct'lar slice'i (AoS) va alohida slice (SoA). Faqat X kerak.
+func BenchmarkAoS(b *testing.B) {
+	s := make([]Nuqta, n)
+	for i := range s {
+		s[i] = Nuqta{int64(i), 1, 2, 3}
+	}
+	for b.Loop() {
+		YigX(s)
+	}
+}
+
+func BenchmarkSoA(b *testing.B) {
+	xs := toldir(make([]int64, n)) // Y, Z, W boshqa slice'larda
+	for b.Loop() {
+		Yig64(xs)
+	}
+}
+```
+
+`toldir` («toʻldir» — fill) is a generic function (`[T int32 | int64]`: in GO-1.17) that writes every element.
+`n = 1 << 24` fits into no cache. The result in the course README (`taskset -c 2 go test -run '^$' -bench . -count 5
+./uyvazifa` twice, 10 samples):
+
+```console
+$ go run ./jadval -median < uyvazifa.txt
+Qadam/k=1         8.9 ms  [8.6 ms … 9.2 ms]
+Qadam/k=2         7.1 ms  [6.9 ms … 7.5 ms]
+Qadam/k=4         6.5 ms  [6.2 ms … 7.7 ms]
+Qadam/k=8         6.5 ms  [5.9 ms … 7.6 ms]
+Qadam/k=16        5.5 ms  [5.2 ms … 6.6 ms]
+Qadam/k=32        3.2 ms  [3.2 ms … 3.3 ms]
+Int64             8.0 ms  [7.8 ms … 8.2 ms]
+Int32             5.9 ms  [5.6 ms … 6.2 ms]
+AoS                24 ms  [24 ms … 26 ms]
+SoA               8.2 ms  [7.9 ms … 9.9 ms]
+```
+
+This command reads the file, so it prints exactly this for you too. We re-ran the benchmark on a quiet machine:
+
+```console
+$ go run ./jadval -median < uyvazifa.txt
+Qadam/k=1          12 ms  [11 ms … 13 ms]
+Qadam/k=2         8.9 ms  [7.1 ms … 9.3 ms]
+Qadam/k=4         7.3 ms  [6.3 ms … 9.1 ms]
+Qadam/k=8         7.0 ms  [6.1 ms … 7.7 ms]
+Qadam/k=16        6.1 ms  [5.5 ms … 6.7 ms]
+Qadam/k=32        3.7 ms  [3.3 ms … 4.3 ms]
+Int64             8.8 ms  [7.9 ms … 9.8 ms]
+Int32             6.4 ms  [5.7 ms … 7.3 ms]
+AoS                28 ms  [25 ms … 32 ms]
+SoA               9.2 ms  [8.1 ms … 10 ms]
+```
+
+🟢 Our steps are as in `natija.txt` and the table above. On your machine they will sit where your L1d/L2/L3 sizes are
+(8·n ≈ cache size), but they will start a little earlier.
+
+🟡 From `k = 1 → 8` the additions went down 8 times, but the time only 1.4 times (8.9 → 6.5 ms). `k = 4` and `8` are
+almost the same: we still touch every line. At `k = 16` every second line is skipped, yet the time goes down only
+~15 %: the L2 *spatial prefetcher* completes every fetched line to its pair, a 128-byte block, so the skipped line
+comes anyway (Intel Optimization Reference Manual, L2 spatial prefetcher). At `k = 32` half of the 128-byte pairs are
+skipped: the time is 2 times less than at `k = 8` (3.2 ms). The rule: time ≈ bytes brought from memory, not the
+number of additions. In our re-run: `k = 1 → 8` 1.7 times, `k = 16` 13 % faster than `k = 8`, `k = 32` 1.9 times faster. (The `k = 1` line is 12 ms while `Int64`, which does the same work, is 8.8 ms: noise in one line; that is why you look at the median and the range.)
+
+🟠 `[]int32` (64 MiB) 5.9 ms, `[]int64` (128 MiB) 8.0 ms: half the bytes, but only 1.36 times faster. One core cannot
+fully use the memory channel: the loop (each addition waits for the previous one) also takes time. For us 8.8 / 6.4 ms = 1.38 times.
+
+🔴 AoS (*array of structs*: `[]Nuqta`, 32 bytes, of which the needed `X` is only 8) 24 ms, SoA (*struct of arrays*:
+a separate `[]int64`) 8.2 ms: 2.9 times. One 64-byte line holds 2 `Nuqta` («nuqta» — point) or 8 `X` values: AoS
+brings 4 times more bytes. "Data-oriented design" (Mike Acton, CppCon 2014): keep the fields that are used together
+next to each other. For us 28 / 9.2 ms = 3.0 times.
+
+</details>
+
+## Sources
+
+- T. Cormen, C. Leiserson, R. Rivest, C. Stein. [*Introduction to Algorithms*, 3rd ed.](https://mitpress.mit.edu/9780262033848/introduction-to-algorithms/),
+  §2.2 "Analyzing algorithms": the RAM model (from the book itself; no online copy was opened).
+- R. Bryant, D. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed.: §5.7–5.8, chapter 6 (§6.4,
+  §6.6.1 memory mountain), §9.6 (TLB). CMU 15-213 lectures:
+  [The Memory Hierarchy](https://www.cs.cmu.edu/~213/lectures/09-memory-hierarchy.pdf) ·
+  [Cache Memories](https://www.cs.cmu.edu/~213/lectures/10-cache-memories.pdf)
+- U. Drepper, *What Every Programmer Should Know About Memory* (2007):
+  [LWN, part 2: CPU caches, §3.3.2](https://lwn.net/Articles/252125/) ·
+  [LWN, part 5: prefetching](https://lwn.net/Articles/255364/) · [PDF](https://www.akkadia.org/drepper/cpumemory.pdf)
+- J. Hennessy, D. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed., §2.3 (nonblocking caches)
+- I. Ostrovsky, [Gallery of Processor Cache Effects](https://igoro.com/archive/gallery-of-processor-cache-effects/) (2010), example 1
+- [Chips and Cheese: Golden Cove's caches](https://old.chipsandcheese.com/2022/02/11/going-armchair-quarterback-on-golden-coves-caches/) (2022)
+- Cache-aware models: A. Aggarwal, J. Vitter, "The input/output complexity of sorting and related problems", CACM
+  31(9), 1988 · M. Frigo, C. Leiserson, H. Prokop, S. Ramachandran,
+  ["Cache-oblivious algorithms", FOCS 1999](https://doi.org/10.1109/SFFCS.1999.814600)
+- Go: [`testing.B.Loop`, `B.ReportMetric`](https://pkg.go.dev/testing#B.Loop) ·
+  [`runtime/malloc.go`](https://github.com/golang/go/blob/go1.26.8/src/runtime/malloc.go#L27-L35) ·
+  [`nextFreeFast`](https://github.com/golang/go/blob/go1.26.8/src/runtime/malloc.go#L969-L981) ·
+  [`runtime/mgc.go`: "non-compacting"](https://github.com/golang/go/blob/go1.26.8/src/runtime/mgc.go#L7-L9)
+- [Linux sysfs: `cpu/cpuN/cache/indexM`](https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-devices-system-cpu)
+- [Python FAQ: How are lists implemented in CPython?](https://docs.python.org/3/faq/design.html#how-are-lists-implemented-in-cpython)
+- Intel 64 and IA-32 Architectures Optimization Reference Manual, "Data Prefetching" (L2 spatial prefetcher) ·
+  Mike Acton, "Data-Oriented Design and C++", CppCon 2014
+- The course folder and README: [lessons/dsa-a01-cache](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache) ·
+  [natija.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/dsa-a01-cache/natija.txt)
+- Results from `go1.26.8 linux/amd64`, Intel Core i5-12450H, Linux 6.18, `CGO_ENABLED=0`, `taskset -c 2`, 2026-11-26.
+  Video: `natija.txt` (00:54–01:11, load 3–7), `qadam-royxat.txt` (07:48–07:50), `uyvazifa.txt` (08:04–08:07). The
+  re-run on this page: the same day, 22:28–22:48, load 0.8–3.5. The Golden Cove cache latency numbers are from
+  Chips and Cheese, not re-measured.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/dsa-a01-cache)
+
+---
+
+← Previous lesson: [LC-05](/lab/youtube/dsa#lc-05) · Next lesson: [DSA-A.02](/lab/youtube/dsa#dsa-a-02) → · [All lessons](/lab/youtube/dsa)
+
+</div>
