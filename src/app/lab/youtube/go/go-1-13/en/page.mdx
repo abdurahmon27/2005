@@ -1,0 +1,1384 @@
+---
+title: "Interfaces: why is nil not equal to nil?"
+date: "2026/11/26"
+description: "Go interfaces: implicit implementation, the (type, value) pair, type assertion, type switch, the typed nil bug and the staticcheck check that finds it."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-13/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-13"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-13/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-13/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-13"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-13) · [Русский](/lab/youtube/go/go-1-13/ru) · **English**  
+Lesson GO-1.13 · [Go: 0 → Guru](/lab/youtube/go#go-1-13) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/013-interfaces-nil)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+A function returns `nil` when there is no error. We call it with a valid order and print the result. The screen
+says `err: <nil>`. But the `if err != nil` on the next line still runs and prints "xato bor!" ("there is an error!").
+At work, this is a handler that returns an error even for a valid request. The official Go FAQ has a separate
+question about this case. The returned value prints as `nil`, but it is not equal to `nil`. Why?
+
+**One idea:** an interface value is a (type, value) pair. It equals `nil` only when both parts are empty.
+
+By the end of the lesson you will be able to:
+
+- explain when a type implements an interface without `implements`, and when the compiler rejects it;
+- see the type and the value inside an interface with `%T`, and know how it is laid out in memory;
+- get the value back out of an interface without a panic, using type assertion (`v, ok := x.(T)`) and type switch;
+- recognize the typed nil bug, fix it, and find it with staticcheck.
+
+Three core new words today:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| interface | a list of methods; any type that has these methods implements it by itself, no `implements` is written | interface |
+| type assertion | getting the value out of an interface with its concrete type: `x.(T)`; the type is checked at runtime | type assertion |
+| typed nil | an interface that holds a type, while its value is `nil`; it is not equal to `nil` | typed nil |
+
+Two helper words also appear: **type switch** (checking several types in one `switch`) and **`any`** (the empty
+interface: it has no methods, so every type implements it). We explain both where they are needed.
+
+## Before you start
+
+- [GO-1.12 · Methods: value receiver or pointer receiver?](/lab/youtube/go/go-1-12/en): method, receiver and **method set**.
+  The method set of a type `T` has only the value-receiver methods; the method set of `*T` has both kinds.
+- [GO-1.11 · Pointers: why did this variable escape to the heap?](/lab/youtube/go/go-1-11/en): `*Buyurtma`, `&b`, the zero value
+  of a pointer is `nil`, reading a field through a `nil` pointer panics.
+- [GO-1.10 · Structs and memory: same fields, 24 and 16 bytes](/lab/youtube/go/go-1-10/en): the `Buyurtma` struct,
+  composite literal (`Buyurtma{Summa: 150000}`), `unsafe.Sizeof`.
+- [GO-1.09 · Maps: why the order is random and why recover does not save you](/lab/youtube/go/go-1-09/en): comma ok
+  (`n, bor := narx[k]`), panic, and catching it with `recover` inside `defer`.
+- [GO-1.06 · Functions: two return values, closure and variadic](/lab/youtube/go/go-1-06/en): a function that returns `error`,
+  `errors.New`, `%T` in `fmt.Printf`, and the linter (staticcheck).
+- [GO-1.05 · Go has no while: one for and all its forms](/lab/youtube/go/go-1-05/en): `switch` and `case`.
+- [GO-1.07 · Don't guess, measure: first test and benchmark](/lab/youtube/go/go-1-07/en): `go test -v` (for the homework).
+
+**How to run the code.** You can paste any program from the course folder into [go.dev/play](https://go.dev/play)
+and run it. For `go vet`, staticcheck and reading the Go source with `sed`, you need Go on your computer. Open a
+terminal in the course folder (`lessons/013-interfaces-nil`). The `./hook` in `go run ./hook` is a package folder
+inside it. The results come from `go1.26.8 linux/amd64` and staticcheck `2026.2.1`. The TypeScript, Python and PHP
+comparisons are not in the course folder: their full code is on this page, and they were run on Node 24, Python 3.13
+and PHP 8.4.
+
+First, a question about the previous lesson. The receiver of the `Tola` method is a pointer. Does this code compile?
+
+```go
+func (b *Buyurtma) Tola() { b.Tolandi = true }
+
+m := map[string]Buyurtma{"a1": {Summa: 100}}
+m["a1"].Tola()
+```
+
+<details>
+<summary>Answer</summary>
+
+**No:** `cannot call pointer method Tola on Buyurtma`. `Tola` is only in the method set of `*Buyurtma`. For a
+variable, Go rewrites `b.Tola()` as `(&b).Tola()` for you. But you cannot take the address of a map element (it is
+not addressable). One reason: when a map grows, its elements move to a new place. Today the same method set rule
+decides whether a type implements an interface.
+
+</details>
+
+## The puzzle: nil, but not nil
+
+This is `hook/main.go` from the course folder. The bug in it is **on purpose**:
+
+```go filename="hook/main.go" showLineNumbers
+// hook: funksiya nil qaytaradi, ekranga <nil> chiqadi, lekin err != nil.
+// ATAYLAB XATO (typed nil). Tuzatilgani: ../fix
+// go run ./hook
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func tekshir(b Buyurtma) error {
+	var xato *SummaXato
+	if b.Summa <= 0 {
+		xato = &SummaXato{Summa: b.Summa}
+	}
+	return xato
+}
+
+func main() {
+	err := tekshir(Buyurtma{Summa: 150000})
+	fmt.Println("err:", err)
+	if err != nil {
+		fmt.Println("xato bor!")
+	}
+	fmt.Printf("ichida: %T, %v\n", err, err)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 8–11 | `type Buyurtma struct {…}` | the order from the previous lessons: amount and "paid?" (`Buyurtma` = "order", `Summa` = "amount", `Tolandi` = "paid") |
+| 13 | `type SummaXato struct{ Summa int64 }` | our own error type (`SummaXato` = "amount error"): it stores the wrong amount |
+| 15 | `func (e *SummaXato) Error() string {…}` | an `Error` method with a pointer receiver. A type with an `Error() string` method can be returned as `error`; why is in the next section |
+| 17 | `func tekshir(b Buyurtma) error {` | `tekshir` ("check") checks the order and returns `error` |
+| 18 | `var xato *SummaXato` | a pointer of type `*SummaXato` (`xato` = "error"); its zero value is `nil` |
+| 19–21 | `if b.Summa <= 0 {…}` | if the amount is wrong, it stores the address of a new error in the pointer |
+| 22 | `return xato` | returns the pointer as `error`; for a valid amount it is `nil` |
+| 26 | `err := tekshir(Buyurtma{Summa: 150000})` | a valid amount: there should be no error |
+| 27 | `fmt.Println("err:", err)` | prints `err` |
+| 28–30 | `if err != nil {…}` | if there is an error, prints "xato bor!" |
+| 31 | `fmt.Printf("ichida: %T, %v\n", err, err)` | `%T` is the type, `%v` is the value (`ichida` = "inside"). We come back to this line later |
+
+First we look only at the first two lines (`| head -2` keeps the first two lines of the output). Think before you
+run it: what is printed? **A)** only `err: <nil>` · **B)** `err: <nil>` and `xato bor!` ·
+**C)** `err: summa notoʻgʻri: 150000` and `xato bor!`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The screen says `nil`, but `if err != nil` ran. If you chose "A", you thought that returning a `nil` pointer
+is the same as returning a `nil` error: that is how `null` in JS and `None` in Python work. In Go it is not, and
+this whole lesson is about that. If you chose "C", you thought the `Error()` method runs normally. It was called, but
+its text did not reach the screen. Why is in the section "Why the screen lied too".
+
+</details>
+
+```console
+$ go run ./hook | head -2
+err: <nil>
+xato bor!
+```
+
+In JavaScript `null === null` is always `true`, and in Python `None is None` is too. In Go, comparing `nil` with
+`nil` can give `false`. To find the reason, we go inside the interface. The plan: first how an interface is
+implemented in Go, then what is inside an interface value, then type assertion and type switch, and at the end this
+puzzle.
+
+## Interface: a list of methods, without implements
+
+`fmt.Println` should print our `Buyurtma` nicely. But the `fmt` package was written long before `Buyurtma` and knows
+nothing about it. `fmt` asks only one thing: "does the value have a `String() string` method?". This requirement is
+written as the **interface** `fmt.Stringer`:
+
+```go
+type Stringer interface {
+	String() string
+}
+```
+
+An interface is a list of methods. A type that has all the methods in the list **implements** the interface. Small
+interfaces with one or two methods are normal in Go (Effective Go: *"Interfaces with only one or two methods are
+common in Go code"*). The `error` we have been returning since [GO-1.06](/lab/youtube/go/go-1-06/en) is such an interface too
+(Go spec, "Errors"):
+
+```go
+type error interface {
+	Error() string
+}
+```
+
+Now `stringer/main.go`:
+
+```go filename="stringer/main.go" showLineNumbers
+// stringer: Buyurtma hech qayerda "fmt.Stringer'ni bajaraman" demaydi.
+// go run ./stringer
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b Buyurtma) String() string {
+	return fmt.Sprintf("buyurtma: %d soʻm, toʻlandi: %v", b.Summa, b.Tolandi)
+}
+
+type Mijoz struct{ Ism string }
+
+func (m Mijoz) String() string { return "mijoz: " + m.Ism }
+
+func main() {
+	royxat := []fmt.Stringer{
+		Buyurtma{Summa: 150000},
+		Mijoz{Ism: "Aziza"},
+	}
+	for _, s := range royxat {
+		fmt.Println(s)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7–10 | `type Buyurtma struct {…}` | a plain struct. Nowhere does it say "I implement `fmt.Stringer`" |
+| 12–14 | `func (b Buyurtma) String() string {…}` | a `String` method with a value receiver. `fmt.Sprintf` does not print the text, it returns it |
+| 16 | `type Mijoz struct{ Ism string }` | a completely different type: a customer (`Mijoz` = "customer"), with an `Ism` ("name") field |
+| 18 | `func (m Mijoz) String() string {…}` | it has a `String` method too |
+| 21 | `royxat := []fmt.Stringer{` | a slice of `fmt.Stringer` (`royxat` = "list"): any value with a `String() string` method fits in it |
+| 22–23 | `Buyurtma{Summa: 150000},` `Mijoz{Ism: "Aziza"},` | two different types in one slice |
+| 25–27 | `for _, s := range royxat {…}` | prints each one with `fmt.Println` |
+
+```console
+$ go run ./stringer
+buyurtma: 150000 soʻm, toʻlandi: false
+mijoz: Aziza
+```
+
+`fmt.Println` printed both values through their `String` method. Both `Buyurtma` and `Mijoz` implement
+`fmt.Stringer`, because they have the needed method. That is all: Go has no `implements` keyword.
+
+**Compare with TypeScript, Python and PHP.** We wrote the same idea in the three languages and ran it.
+
+TypeScript also checks by shape (*structural* typing): even without `implements`, `Buyurtma` can be used as a
+`Stringer` because it has the needed method. But a TS interface lives only at compile time: it is removed when the
+code becomes JS (TS Handbook: *erased types*). Node 24 runs a `.ts` file by stripping the types, so you can see this
+directly (`stringer.ts`):
+
+```ts
+interface Stringer {
+  string(): string;
+}
+
+class Buyurtma {
+  // "implements Stringer" yozilmagan
+  string() { return "buyurtma: 150000 soʻm"; }
+}
+
+const s: Stringer = new Buyurtma(); // TS shaklni solishtiradi va qabul qiladi
+console.log(s.string());
+
+const x: unknown = s;
+console.log(x instanceof Stringer); // runtime'da Stringer degan narsa yoʻq
+```
+
+```console
+$ node --input-type=module-typescript < stringer.ts 2>&1 | head -6
+buyurtma: 150000 soʻm
+[eval]:14
+console.log(x instanceof Stringer); // runtime'da Stringer degan narsa yoʻq
+                         ^
+
+ReferenceError: Stringer is not defined
+```
+
+The first line worked. The last line gives `Stringer is not defined`: while the program runs, there is no `Stringer`
+at all.
+
+In Python nothing is declared (*duck typing*): the method is looked up at call time. The error appears only when that
+line runs (`duck.py`):
+
+```python
+class Buyurtma:
+    def string(self):
+        return "buyurtma: 150000 soʻm"
+
+class Mijoz:  # string() metodi yoʻq
+    pass
+
+def chop(x):
+    print(x.string())  # tekshiruv faqat shu qatorda, chaqiruv paytida
+
+chop(Buyurtma())
+chop(Mijoz())
+```
+
+```console
+$ python3 - < duck.py
+buyurtma: 150000 soʻm
+Traceback (most recent call last):
+  File "<stdin>", line 15, in <module>
+  File "<stdin>", line 11, in chop
+AttributeError: 'Mijoz' object has no attribute 'string'
+```
+
+Python also has a way closer to Go: `typing.Protocol` ([PEP 544](https://peps.python.org/pep-0544/), *"static duck
+typing"*). But a separate checker such as mypy checks it, not Python itself.
+
+PHP is the opposite: a class implements an interface only with `implements`. Even with the same methods, PHP does not
+accept it without `implements` (`narxli.php`):
+
+```php
+<?php
+interface Narxli {
+    public function narx(): int;
+}
+
+class Buyurtma { // "implements Narxli" yozilmagan
+    public function narx(): int { return 150000; }
+}
+
+function korsat(Narxli $x): void { echo $x->narx(), "\n"; }
+
+var_dump(new Buyurtma() instanceof Narxli);
+korsat(new Buyurtma());
+```
+
+```console
+$ php < narxli.php
+bool(false)
+
+Fatal error: Uncaught TypeError: korsat(): Argument #1 ($x) must be of type Narxli, Buyurtma given, called in Standard input code on line 13 and defined in Standard input code:10
+Stack trace:
+#0 Standard input code(13): korsat(Object(Buyurtma))
+#1 {main}
+  thrown in Standard input code on line 10
+```
+
+| Language | `implements` needed? | When it is checked | Does the interface exist while the program runs? |
+|---|---|---|---|
+| TypeScript | no, by shape | at compile time | no, it is erased |
+| Python | no, duck typing | when the method is called | no (`Protocol` is for a checker program) |
+| PHP | yes | when the function is called (`TypeError`) | yes |
+| Go | no, by methods | at compile time | yes: the type and its methods are inside the interface value |
+
+Go takes the good side of both worlds. As in TS and Python, you do not write `implements`. As in PHP and Java, the
+check is strict: a wrong type does not compile (we will see this below). Unlike TS, the interface also exists while
+the program runs, and `fmt` relies on exactly that. In Java a class implements an interface only with `implements`
+(Java Language Specification, §8.1.5).
+
+Why did Go drop `implements`? The Go FAQ: *"A Go type implements an interface by implementing the methods of that
+interface, nothing more. This property allows interfaces to be defined and used without needing to modify existing
+code."* So you can write the interface later, in your own package, and use it with old types.
+
+## Pointer receiver: the method set decides again
+
+In [GO-1.12](/lab/youtube/go/go-1-12/en) we saw that when `String` has a pointer receiver, `fmt` does not call it for a value.
+Now the reason is clear. `ptrrecv/main.go`:
+
+```go filename="ptrrecv/main.go" showLineNumbers
+// ptrrecv: String pointer receiver bilan. Buyurtma qiymatining method set'ida
+// String yoʻq (GO-1.12), shuning uchun fmt uni koʻrmaydi.
+// go run ./ptrrecv
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) String() string {
+	return fmt.Sprintf("buyurtma: %d soʻm, toʻlandi: %v", b.Summa, b.Tolandi)
+}
+
+func main() {
+	b := Buyurtma{Summa: 150000}
+	fmt.Println(b)  // qiymat: String ishlamaydi
+	fmt.Println(&b) // pointer: String ishlaydi
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13 | `func (b *Buyurtma) String() string {` | `String` now has a **pointer** receiver |
+| 19 | `fmt.Println(b)` | passes the `Buyurtma` value |
+| 20 | `fmt.Println(&b)` | passes `*Buyurtma`, that is, the address |
+
+Think: do the two lines print the same thing?
+
+<details>
+<summary>Answer</summary>
+
+**No.** The method set of a `Buyurtma` value has no `String`, so it does not implement `fmt.Stringer`. `fmt` prints it
+as a plain struct: `{150000 false}`. The method set of `*Buyurtma` does have `String`, so the second line is
+formatted.
+
+</details>
+
+```console
+$ go run ./ptrrecv
+{150000 false}
+buyurtma: 150000 soʻm, toʻlandi: false
+```
+
+```console
+$ go vet ./ptrrecv && echo vet: jim
+vet: jim
+```
+
+`fmt.Println` takes any value as `any` and looks for `String` only while the program runs. So both the compiler and
+`go vet` are silent: `vet: jim` ("vet is silent") is printed only because `go vet` found nothing (`&&` means: run
+the next command if the previous one succeeded).
+
+If we put the value directly into a variable of type `fmt.Stringer`, the compiler says it openly and refuses.
+`xato/main.go` **does not compile on purpose**:
+
+```go filename="xato/main.go" showLineNumbers
+// xato: ATAYLAB kompilyatsiya boʻlmaydi.
+// Buyurtma emas, faqat *Buyurtma fmt.Stringer'ni bajaradi.
+// go build ./xato
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) String() string { return fmt.Sprint("buyurtma: ", b.Summa) }
+
+func main() {
+	b := Buyurtma{Summa: 150000}
+	var s fmt.Stringer = b
+	fmt.Println(s)
+}
+```
+
+```console
+$ go build -o /dev/null ./xato
+# github.com/abdurahmon27/go-backend-uz/lessons/013-interfaces-nil/xato
+xato/main.go:17:23: cannot use b (variable of struct type Buyurtma) as fmt.Stringer value in variable declaration: Buyurtma does not implement fmt.Stringer (method String has pointer receiver)
+```
+
+`-o /dev/null` throws the built program away instead of saving it: we only need the compile result. Reading the
+message: `xato/main.go:17:23` is line 17, column 23, the `b` in `var s fmt.Stringer = b`. *cannot use b (variable of
+struct type Buyurtma) as fmt.Stringer value in variable declaration* means `b`, a variable of the struct type
+`Buyurtma`, cannot be used as a `fmt.Stringer` value in this variable declaration. The reason is at the end:
+*Buyurtma does not implement fmt.Stringer (method String has pointer receiver)*. **Fix:** `var s fmt.Stringer = &b`,
+or write `String` with a value receiver.
+
+Why does Go not take `&b` by itself here? The Go FAQ: if an interface holds a value `T`, there is no safe way for a
+method call to get a pointer to it. Even if there were, the method would change the copy inside the interface.
+
+## What is inside an interface: (type, value)
+
+How does an interface value sit in memory? It is two machine words (8 bytes each on a 64-bit system):
+
+1. **type**: which type the value inside has. In an interface with methods (`fmt.Stringer`, `error`) this word also
+   leads to a method table: `fmt` finds `String` in exactly that table.
+2. **value**: the value itself or a pointer to it.
+
+In the Go runtime source these are two structs:
+
+```console
+$ sed -n 184,192p $(go env GOROOT)/src/runtime/runtime2.go
+type iface struct {
+	tab  *itab
+	data unsafe.Pointer
+}
+
+type eface struct {
+	_type *_type
+	data  unsafe.Pointer
+}
+```
+
+`iface` is an interface with methods: `tab` points to the type and the method table (`itab`). `eface` is the empty
+interface (`any`): there are no methods, so only the type (`_type`). In both, `data` is a pointer to the value
+(`unsafe.Pointer` is an address of any type). `$(go env GOROOT)` is the folder where Go is installed, and
+`sed -n 184,192p` prints lines 184–192 of the file.
+
+**`any`** is an interface with no methods, a short name for `interface{}` (Go spec). It requires no methods, so every
+type implements it. It is close to `unknown` in TS, with one difference: inside `any` the type itself is stored.
+
+This is new if you come from JS or Python. In Python every object carries its type with it (`type(x)` always
+works). In Go an `int64` variable is just 8 bytes: only the compiler knows its type. The type is written next to the
+value only when the value is put into an interface. That is why an interface is two words.
+
+```text
+var a any = 42                      var s fmt.Stringer = Buyurtma{Summa: 150000}
+┌────────────┬────────────┐         ┌──────────────────────────┬────────────┐
+│ type: int  │ value ──────► 42     │ type: Buyurtma           │ value ──────► {150000 false}
+└────────────┴────────────┘         │ + methods: String        │            │
+                                    └──────────────────────────┴────────────┘
+
+nil interface:            ( type: —,          value: — )     → == nil  true
+nil pointer inside:       ( type: *Buyurtma,  value: nil )   → == nil  false
+```
+
+The Go FAQ calls this the (T, V) pair: *"An interface value is nil only if the V and T are both unset"*.
+
+Let's see it. `juftlik/main.go` ("pair") puts each value into the empty interface and prints the type and the value
+inside:
+
+```go filename="juftlik/main.go" showLineNumbers
+// juftlik: interface qiymati = (tur, qiymat) juftligi.
+// go run ./juftlik
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func korsat(nom string, a any) {
+	qiymat := fmt.Sprint(a)
+	fmt.Printf("%-9s tur: %-15T qiymat: %-14s a == nil: %v\n", nom, a, qiymat, a == nil)
+}
+
+func main() {
+	var p *Buyurtma // nil pointer
+
+	korsat("nil", nil)
+	korsat("42", 42)
+	korsat("Buyurtma", Buyurtma{Summa: 150000})
+	korsat("p", p)
+
+	var a any
+	fmt.Println("any hajmi:", unsafe.Sizeof(a), "bayt")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7 | `"unsafe"` | for `unsafe.Sizeof` ([GO-1.10](/lab/youtube/go/go-1-10/en)) |
+| 15 | `func korsat(nom string, a any) {` | `korsat` ("show") takes any value as `any` (`nom` = "name") |
+| 16 | `qiymat := fmt.Sprint(a)` | turns the value into text (`qiymat` = "value") |
+| 17 | `fmt.Printf("%-9s tur: %-15T …", …)` | `%T` is the type inside the interface, `%s` is the value text; `-9`, `-15`, `-14` are column widths (left-aligned, padded with spaces). `a == nil`: is the interface equal to `nil` |
+| 21 | `var p *Buyurtma` | a `nil` pointer |
+| 23–26 | `korsat(…)` | four cases: a real `nil`, `42`, a `Buyurtma` and a `nil` pointer |
+| 28–29 | `var a any` … `unsafe.Sizeof(a)` | how many bytes the empty interface takes |
+
+Think: in the last case (`p`, the `nil` pointer), what does `a == nil` give? **A)** `true` · **B)** `false`
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** The value is `nil`, but the type is set: `*main.Buyurtma`. An interface equals `nil` only when both
+parts are empty. If you chose "A", you thought an interface looks only at the value.
+
+</details>
+
+```console
+$ go run ./juftlik
+nil       tur: <nil>           qiymat: <nil>          a == nil: true
+42        tur: int             qiymat: 42             a == nil: false
+Buyurtma  tur: main.Buyurtma   qiymat: {150000 false} a == nil: false
+p         tur: *main.Buyurtma  qiymat: <nil>          a == nil: false
+any hajmi: 16 bayt
+```
+
+| Case | type word | value word | `a == nil` |
+|---|---|---|---|
+| `nil` | — | — | `true` |
+| `42` | `int` | `42` | `false` |
+| `Buyurtma{…}` | `main.Buyurtma` | `{150000 false}` | `false` |
+| `p` (`nil` pointer) | `*main.Buyurtma` | `nil` | `false` |
+
+`main.Buyurtma` is `Buyurtma` from the `main` package (`tur` = "type", `hajmi` = "size"). At the bottom,
+`any hajmi: 16 bayt`: on a 64-bit system that is two words of eight bytes. `<nil>` appears twice on the screen, but
+they are different: the first has no type, the fourth has one.
+
+## Type assertion: getting the value back
+
+A `Buyurtma` sits inside `any`. How do we reach its `Summa` field? `a.Summa` does not compile: `any` has no fields
+and no methods. For this there is **type assertion**: after a dot, in parentheses, you write the type you expect,
+`a.(Buyurtma)`. The Go runtime checks the type word of the interface.
+
+It looks like `x as Buyurtma` in TS, but `as` in TS checks nothing while the program runs (`as.ts`):
+
+```ts
+const x: unknown = "150000";
+const n = x as number; // TS: "menga ishon, bu number"
+console.log(typeof n, n + 1);
+```
+
+```console
+$ node --input-type=module-typescript < as.ts
+string 1500001
+```
+
+TS believed our "this is a `number`", but a string stayed inside: `n + 1` gave `1500001`. Go's `x.(T)` checks the
+real type every time. The closest thing in Python is `isinstance(x, Buyurtma)`.
+
+`assert/main.go`:
+
+```go filename="assert/main.go" showLineNumbers
+// assert: type assertion — interface ichidagi turni tekshirish.
+// go run ./assert
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func main() {
+	var a any = Buyurtma{Summa: 150000}
+
+	b, ok := a.(Buyurtma) // comma-ok: panic yoʻq
+	fmt.Println("Buyurtma?", ok, b.Summa)
+
+	s, ok := a.(string)
+	fmt.Printf("string?   %v %q\n", ok, s)
+
+	n := a.(int) // ok'siz: tur mos kelmasa — panic
+	fmt.Println(n)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13 | `var a any = Buyurtma{Summa: 150000}` | a `Buyurtma` inside `any` |
+| 15 | `b, ok := a.(Buyurtma)` | type assertion in the comma ok form: `ok` says whether the type matched |
+| 16 | `fmt.Println("Buyurtma?", ok, b.Summa)` | `b` is now a plain `Buyurtma`, so `b.Summa` works |
+| 18 | `s, ok := a.(string)` | is there a `string` inside? `:=` works if at least one variable on the left is new (`s`); `ok` is reused |
+| 19 | `fmt.Printf("string?   %v %q\n", ok, s)` | `%q` prints the text in quotes, so an empty string is visible too |
+| 21 | `n := a.(int)` | an assertion without comma ok: if the type does not match, panic |
+
+Think: what does line 19 print? **A)** `string?   false ""` · **B)** `string?   false <nil>` · **C)** a panic
+
+<details>
+<summary>Answer</summary>
+
+**A.** In the comma ok form, if the type does not match, `ok` is `false` and you get the zero value of that type:
+`""` for `string`. No panic. If you chose "B", you thought a mismatch returns `nil`: a `string` cannot be `nil`.
+"C" happens only on line 21, in the form without ok.
+
+</details>
+
+The panic message goes to stderr. `2>&1` sends it to `head` too, and `head -3` keeps the first three lines:
+
+```console
+$ go run ./assert 2>&1 | head -3
+Buyurtma? true 150000
+string?   false ""
+panic: interface conversion: interface {} is main.Buyurtma, not int
+```
+
+The third line: *interface conversion: interface \{\} is main.Buyurtma, not int* means the `interface {}` (that is,
+`any`) holds a `main.Buyurtma`, not an `int`. The full output then shows the line where the panic happened
+(`assert/main.go:21`) and `exit status 2`. The rule: if you are not sure about the type, use the `v, ok := x.(T)`
+form. It is the same idea as the comma ok form of a map in [GO-1.09](/lab/youtube/go/go-1-09/en).
+
+## Type switch: several types
+
+When there are many types, a **type switch** is easier than a chain of assertions. It compares types, not values.
+`tswitch/main.go`:
+
+```go filename="tswitch/main.go" showLineNumbers
+// tswitch: type switch — bir nechta turni bitta switch'da tekshirish.
+// go run ./tswitch
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func tavsifla(a any) string {
+	switch v := a.(type) {
+	case nil:
+		return "hech narsa"
+	case int, int64:
+		return fmt.Sprintf("son: %v", v)
+	case Buyurtma:
+		return fmt.Sprintf("buyurtma, summa: %d", v.Summa)
+	case error:
+		return "xato: " + v.Error()
+	default:
+		return fmt.Sprintf("notanish tur: %T", v)
+	}
+}
+
+func main() {
+	for _, a := range []any{nil, 42, Buyurtma{Summa: 150000}, errors.New("disk toʻla"), 3.14} {
+		fmt.Println(tavsifla(a))
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 15 | `func tavsifla(a any) string {` | `tavsifla` ("describe") describes a value by its type |
+| 16 | `switch v := a.(type) {` | `.(type)` is written only inside `switch`. `v` is a new variable that gets its own type in each case |
+| 17–18 | `case nil:` | chosen when the interface is empty (no type, no value) |
+| 19–20 | `case int, int64:` | two types in one case: here `v` stays `any`, so we only print it |
+| 21–22 | `case Buyurtma:` | one type: `v` is a `Buyurtma`, so `v.Summa` works |
+| 23–24 | `case error:` | a case can also be an interface: any type with an `Error()` method |
+| 25–26 | `default:` | all other types |
+| 31 | `[]any{nil, 42, …, 3.14}` | five different values; `errors.New` makes an error, as in [GO-1.06](/lab/youtube/go/go-1-06/en) |
+
+Think: what is printed for `3.14`? **A)** `son: 3.14` · **B)** `notanish tur: float64`
+
+<details>
+<summary>Answer</summary>
+
+**B** (`notanish tur` = "unknown type"). `3.14` is an untyped constant; when it goes into `any`, it gets its
+default type: `float64`. `case int, int64:` does not match it, so `default` runs. If you chose "A" (`son` = "number"), you
+thought as in JS, where "a number is a number": in Go `int` and `float64` are two different types.
+
+</details>
+
+```console
+$ go run ./tswitch
+hech narsa
+son: 42
+buyurtma, summa: 150000
+xato: disk toʻla
+notanish tur: float64
+```
+
+Each value went to its own case (`hech narsa` = "nothing", `xato` = "error", `disk toʻla` = "disk full"). In TS you
+can narrow a type with `typeof`/`instanceof`, but not by an interface: we saw above that a TS interface does not exist
+while the program runs. In Go, `case error:` works.
+
+Now we know how `fmt` found the `String` method of `Buyurtma`. The `fmt` package itself has exactly such a type
+switch:
+
+```console
+$ sed -n 658,676p $(go env GOROOT)/src/fmt/print.go
+		switch verb {
+		case 'v', 's', 'x', 'X', 'q':
+			// Is it an error or Stringer?
+			// The duplication in the bodies is necessary:
+			// setting handled and deferring catchPanic
+			// must happen before calling the method.
+			switch v := p.arg.(type) {
+			case error:
+				handled = true
+				defer p.catchPanic(p.arg, verb, "Error")
+				p.fmtString(v.Error(), verb)
+				return
+
+			case Stringer:
+				handled = true
+				defer p.catchPanic(p.arg, verb, "String")
+				p.fmtString(v.String(), verb)
+				return
+			}
+```
+
+For `Println`, `verb` is `'v'`. `fmt` checks whether the value is an `error` or a `Stringer`, and `error` comes
+first. Thanks to this check, `fmt` calls a method of your type without knowing the type in advance. Before this
+switch, `fmt` also checks `Formatter` (described in the README). Remember the `defer p.catchPanic(…)` line: it is the
+last piece of the puzzle.
+
+## Pause: are 0 and 0 equal?
+
+Both hold zero:
+
+```go
+var a any = 0        // int
+var b any = int64(0) // int64
+fmt.Println("a == b:", a == b)
+```
+
+What does `a == b` give? **A)** `true` · **B)** `false` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** Two interfaces are equal only if both the types inside and the values are the same. Here the values
+are zero, but the types differ: `int` and `int64`. The Go spec: *"Two interface values are equal if they have
+identical dynamic types and equal dynamic values or if both have value nil."* (The dynamic type is the type inside
+the interface.)
+
+If you chose "A", you thought an interface compares only values. If you chose "C", you thought Go does not allow
+comparing `int` and `int64`. That is true for two plain variables (`mismatched types int and int64`). But here both
+have type `any`, so the comparison compiles and runs while the program runs.
+
+</details>
+
+The full program is `savol/main.go` ("question"):
+
+```go filename="savol/main.go" showLineNumbers
+// savol: ikkalasida ham nol. Ular tengmi?
+// go run ./savol
+package main
+
+import "fmt"
+
+func main() {
+	var a any = 0        // int
+	var b any = int64(0) // int64
+	fmt.Println("a == b:", a == b)
+	fmt.Printf("a: %T, b: %T\n", a, b)
+}
+```
+
+```console
+$ go run ./savol
+a == b: false
+a: int, b: int64
+```
+
+## Typed nil: back to the puzzle
+
+Now we have everything we need to solve the puzzle from the start. Let's run `hook` in full. The third line shows
+what is inside the interface:
+
+```console
+$ go run ./hook
+err: <nil>
+xato bor!
+ichida: *main.SummaXato, <nil>
+```
+
+`tekshir` keeps the error in a `*SummaXato` pointer and returns it as `error`. If the amount is valid, the pointer
+stays `nil`. But `error` is an interface. When `return xato` turns the pointer into an `error`, `*SummaXato` is
+written into the type word of the interface, and the value word becomes `nil`:
+
+| Line | `xato` (`*SummaXato`) | inside `err`: type | inside `err`: value | `err != nil` |
+|---|---|---|---|---|
+| 18 `var xato *SummaXato` | `nil` | — | — | — |
+| 22 `return xato` → 26 `err := …` | `nil` | `*SummaXato` | `nil` | `true` |
+| correct: `return nil` | — | — | — | `false` |
+
+An interface equals `nil` only when both the type and the value are empty. Here the type is set, so the condition
+`err != nil` is always `true`. Such an interface is called a **typed nil**: a `nil` with a type written on it. The
+example in the Go FAQ is exactly this: *"(T=\*int, V=nil). Such an interface value will therefore be non-nil even
+when the pointer value V inside is nil."*
+
+In JS, `null` is a single value without a type, and so is `None` in Python. In Go, a `nil` pointer inside an
+interface remembers its type.
+
+## Why the screen lied too
+
+Then why did the screen show `err: <nil>`? Look at the `Error` method:
+
+```console
+$ sed -n 15p hook/main.go
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+```
+
+`Println` got `err`, went into `case error` of its type switch and called `Error()`. The method tried to read
+`e.Summa` through a `nil` pointer and panicked (the *nil pointer dereference* from [GO-1.11](/lab/youtube/go/go-1-11/en)). But
+before calling `Error()`, `fmt` had set up `defer p.catchPanic(…)`:
+
+```console
+$ sed -n 588,596p $(go env GOROOT)/src/fmt/print.go
+func (p *pp) catchPanic(arg any, verb rune, method string) {
+	if err := recover(); err != nil {
+		// If it's a nil pointer, just say "<nil>". The likeliest causes are a
+		// Stringer that fails to guard against nil or a nil pointer for a
+		// value receiver, and in either case, "<nil>" is a nice result.
+		if v := reflect.ValueOf(arg); v.Kind() == reflect.Pointer && v.IsNil() {
+			p.buf.writeString(nilAngleString)
+			return
+		}
+```
+
+`catchPanic` catches the panic with `recover` ([GO-1.09](/lab/youtube/go/go-1-09/en)). The argument is a `nil` pointer, so it
+just writes `<nil>`. The comment says: *"If it's a nil pointer, just say "&lt;nil>""*. So the screen misled us too: the
+`<nil>` was the trace of a panic. `%T` tells the truth: `*main.SummaXato`. When you check an error, look at `%T` and
+`err == nil`, not at the text on the screen.
+
+## The fix: an explicit return nil
+
+The fix is simple. When there is no error, return `nil` directly, not the pointer variable. `fix/main.go`:
+
+```go filename="fix/main.go" showLineNumbers
+// fix: xato yoʻq boʻlsa, oddiy nil qaytaramiz.
+// go run ./fix
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func tekshir(b Buyurtma) error {
+	if b.Summa <= 0 {
+		return &SummaXato{Summa: b.Summa}
+	}
+	return nil
+}
+
+func main() {
+	for _, b := range []Buyurtma{{Summa: 150000}, {Summa: -5}} {
+		err := tekshir(b)
+		fmt.Printf("summa %d → err == nil: %v, err: %v\n", b.Summa, err == nil, err)
+	}
+}
+```
+
+| Line | Code | What changed |
+|---|---|---|
+| 17–19 | `if b.Summa <= 0 { return &SummaXato{…} }` | on an error, its address is returned at once; there is no `*SummaXato` variable any more |
+| 20 | `return nil` | no error: an explicit `nil`, both words of the interface are empty |
+| 24 | `for _, b := range []Buyurtma{{Summa: 150000}, {Summa: -5}} {` | two orders: a valid one and an invalid one. Inside a slice literal you do not need to repeat the `Buyurtma` type |
+| 26 | `fmt.Printf("summa %d → err == nil: %v, err: %v\n", …)` | prints the amount, `err == nil` and `err` |
+
+```console
+$ go run ./fix
+summa 150000 → err == nil: true, err: <nil>
+summa -5 → err == nil: false, err: summa notoʻgʻri: -5
+```
+
+Now the valid amount gives `err == nil: true`, and the invalid one prints the error text ("summa notoʻgʻri" = "wrong
+amount"): this time `Error()` was called with a real pointer.
+
+The Go FAQ gives two rules: *"the function must return an explicit nil"*, and a function that returns errors should
+use `error` in its signature, not the concrete type (`*SummaXato`): *"It's a good idea for functions that return
+errors always to use the error type in their signature … rather than a concrete type such as \*MyError, to help
+guarantee the error is created correctly."*
+
+## Who finds this bug?
+
+The compiler compiled `hook` without a word. `go vet` is silent too:
+
+```console
+$ go vet ./hook && echo vet: jim
+vet: jim
+```
+
+But **staticcheck** (the linter from [GO-1.06](/lab/youtube/go/go-1-06/en)) finds this case:
+
+```console
+$ ~/go/bin/staticcheck ./hook
+hook/main.go:28:5: this comparison is always true (SA4023)
+	hook/main.go:26:9: the lhs of the comparison is the 1st return value of this function call
+	hook/main.go:17:6: github.com/abdurahmon27/go-backend-uz/lessons/013-interfaces-nil/hook.tekshir never returns a nil interface value
+```
+
+Reading it: `hook/main.go:28:5` is the `if err != nil` line. *this comparison is always true (SA4023)*. The next
+lines give the reason: the left side is the first return value of the function call on line 26, and *tekshir never
+returns a nil interface value*. Because it found a problem, the command exits with a non-zero code, so you can run it
+in CI.
+
+staticcheck does not ship with Go. To install it: `go install honnef.co/go/tools/cmd/staticcheck@latest`; it goes
+into `~/go/bin`. Add it to your project's checks.
+
+## Summary: interface rules
+
+1. **An interface is implemented implicitly.** If you need to be sure that a type implements an interface, add a
+   compile-time check (Effective Go, "Interface checks"):
+
+```go
+   var _ fmt.Stringer = Buyurtma{}
+```
+
+   `_` is a variable with no name: the value is thrown away, only the compiler's check stays. If you delete `String`,
+   the program does not compile. For a pointer receiver: `var _ fmt.Stringer = (*Buyurtma)(nil)` (Go FAQ).
+2. **An interface value is a (type, value) pair.** It is `nil` only when both parts are empty.
+3. **If you are not sure about the type, check with comma ok:** `v, ok := x.(T)`. With many types, use a type
+   switch.
+4. **In a function that returns an error, return the `error` type and an explicit `nil`.** staticcheck SA4023 finds
+   a typed nil.
+5. **Keep interfaces small.** Rob Pike (Go Proverbs, 2015): *"The bigger the interface, the weaker the
+   abstraction"*.
+
+In the next lesson we go deeper into errors: wrapping an error (`%w`), `errors.Is` and `errors.AsType`.
+
+## Going deeper (optional): `<nil>` is a coincidence
+
+That `hook` printed `<nil>` is a coincidence: `Error()` read a field and panicked, and `fmt` hid that. If `Error()`
+does not touch the receiver, it prints its own text even for a typed nil. A separate program checks this (it is not
+in the course folder; it was run as `matn/main.go`):
+
+```go
+package main
+
+import "fmt"
+
+type AXato struct{ Kod int }
+
+// Error receiver'ga tegmaydi: nil pointer bilan ham ishlaydi.
+func (e *AXato) Error() string { return "A xato" }
+
+type BXato struct{ Kod int }
+
+// Error e.Kod ni oʻqiydi: nil pointer bilan panic.
+func (e *BXato) Error() string { return fmt.Sprint("B xato: ", e.Kod) }
+
+func main() {
+	var a *AXato
+	var b *BXato
+	var errA, errB error = a, b
+	fmt.Println(errA, errB)
+}
+```
+
+```console
+$ go run -trimpath matn/main.go
+A xato <nil>
+```
+
+Both are typed nils, and neither is equal to `nil`. But `AXato` printed `A xato` ("error A"), and `BXato` printed
+`<nil>`. So the text on the screen does not tell you whether the interface is `nil`. `-trimpath` only shortens the
+file paths in messages.
+
+The full order in `fmt` (`handleMethods`, README): first `Formatter`, then `GoStringer` for `%#v`, then for `%v`,
+`%s`, `%x`, `%X`, `%q` first `error`, then `Stringer`.
+
+There have been proposals to change this trap (Dave Cheney, "Typed nils in Go 2", 2017; Go issue #22729). None was
+accepted: on 2026-11-25 #22729 is still open (`LanguageChangeReview`), and the main objection in the discussion is
+backward compatibility (old code must not break).
+
+## Common mistakes
+
+**1. Returning a `nil` pointer as `error` (typed nil).** The classic mistake of this topic. The compiler and
+`go vet` are silent, and `if err != nil` is always `true` (section "Typed nil: back to the puzzle"). **Fix:** with no
+error, an explicit `return nil`; `error` in the signature. Add staticcheck to CI: SA4023 finds it.
+
+**2. Trusting the `<nil>` on the screen.** Even if `fmt.Println(err)` prints `<nil>`, `err` may not be `nil`
+(section "Why the screen lied too"). **Fix:** when checking, print `fmt.Printf("%T %v\n", err, err)` or `err == nil`.
+
+**3. A pointer-receiver method and a value.** If `String` is declared on `*Buyurtma`, `var s fmt.Stringer = b` does
+not compile (*method String has pointer receiver*), and `fmt.Println(b)` silently prints the raw struct (section
+"Pointer receiver"). **Fix:** pass `&b`, or write the method with a value receiver. The compile-time check
+`var _ fmt.Stringer = Buyurtma{}` shows this at once.
+
+**4. A type assertion without comma ok.** If `n := a.(int)` holds another type, the program stops with a panic
+(section "Type assertion"). **Fix:** `n, ok := a.(int)` and check `ok`, or use a type switch.
+
+**5. Comparing interfaces that hold a slice with `==`.** The compiler allows comparing `any` values, but if the type
+inside cannot be compared, the program panics while it runs. (Not in the course folder; it was run as
+`slicecmp/main.go`.)
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	var a, b any = []int{1}, []int{1}
+	fmt.Println(a == b)
+}
+```
+
+```console
+$ go run -trimpath slicecmp/main.go
+panic: runtime error: comparing uncomparable type []int
+
+goroutine 1 [running]:
+main.main()
+	./main.go:7 +0x72
+exit status 2
+```
+
+*runtime error: comparing uncomparable type []int*: a slice cannot be compared. `./main.go:7` is line 7, `a == b`.
+Slices, maps and functions cannot be compared with `==`. When they are inside an interface, the compiler does not see
+it. **Fix:** get the type out with an assertion and compare with a function such as `slices.Equal`. A general
+solution without a panic is the "Hard" homework task.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** When is an interface value equal to `nil`?
+
+<details>
+<summary>Answer</summary>
+
+Only when both words are empty: there is no type and no value inside. If there is a `nil` pointer inside, the type
+word is set, so the interface is not `nil`.
+
+</details>
+
+**2.** What does this code print? **A)** `true true` · **B)** `true false` · **C)** `false false`
+
+```go
+var e *SummaXato
+var err error = e
+fmt.Println(e == nil, err == nil)
+```
+
+<details>
+<summary>Answer</summary>
+
+**B: `true false`.** `e` is a plain pointer, and it is `nil`. `err` is an interface: inside it is
+`(type: *SummaXato, value: nil)`, so it is not `nil`. If you chose "A", you thought only the value is copied into
+`err`.
+
+The full program (not in the course folder; it was run as `tekshir2/main.go`):
+
+```go
+package main
+
+import "fmt"
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return "summa notoʻgʻri" }
+
+func main() {
+	var e *SummaXato
+	var err error = e
+	fmt.Println(e == nil, err == nil)
+}
+```
+
+```console
+$ go run tekshir2/main.go
+true false
+```
+
+</details>
+
+**3.** In `v, ok := x.(T)`, what are `v` and `ok` if the type does not match? And without `ok`?
+
+<details>
+<summary>Answer</summary>
+
+`ok` is `false`, `v` is the zero value of `T`, and there is no panic. Without `ok` (`v := x.(T)`), a mismatch stops
+the program with a panic: `interface conversion: …`.
+
+</details>
+
+**4.** In a type switch, what is the type of `v` inside `case int, int64:`?
+
+<details>
+<summary>Answer</summary>
+
+The type of the expression in the switch, that is, `any`. In a case with one type (`case Buyurtma:`) `v` gets that
+type; in a case with several types it stays an interface.
+
+</details>
+
+**5.** Both TypeScript and Go accept an interface without `implements`. Then why does `a.(fmt.Stringer)` work in Go,
+while `x instanceof Stringer` does not work in TS?
+
+<details>
+<summary>Answer</summary>
+
+A TS interface exists only at compile time and is erased when the code becomes JS. In Go an interface value keeps the
+type word while the program runs, so the runtime can check that type's methods. That is also how `fmt` finds
+`String`.
+
+</details>
+
+**6.** From [GO-1.11](/lab/youtube/go/go-1-11/en): `var p *Buyurtma`, then `fmt.Println(p.Summa)`. What happens? Where did such
+a panic hide today?
+
+<details>
+<summary>Answer</summary>
+
+A panic: *invalid memory address or nil pointer dereference*. Today exactly this panic happened inside `Error()` in
+`hook` (`e.Summa`), but `fmt` caught it with `catchPanic` and wrote `<nil>` instead.
+
+</details>
+
+## Homework
+
+Tasks at four levels. All files are in the lesson folder on GitHub:
+[lessons/013-interfaces-nil](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/013-interfaces-nil).
+Answers: the [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/013-interfaces-nil/homework)
+folder. Try it yourself first.
+
+🟢 **Easy:** write a `String` method for the `Mahsulot` ("product") type and add a compile-time check.
+
+<details>
+<summary>Answer</summary>
+
+```go filename="homework/oson/main.go" showLineNumbers
+// Uy vazifasi (oson): Mahsulot turi fmt.Stringer'ni bajarsin, buni kompilyator tekshirsin.
+// go run ./homework/oson
+package main
+
+import "fmt"
+
+type Mahsulot struct {
+	Nom  string
+	Narx int64
+}
+
+func (m Mahsulot) String() string { return fmt.Sprintf("%s (%d soʻm)", m.Nom, m.Narx) }
+
+// Kompilyatsiya vaqtidagi tekshiruv (Effective Go: Interface checks).
+// String metodini oʻchirsangiz, dastur kompilyatsiya boʻlmaydi.
+var _ fmt.Stringer = Mahsulot{}
+
+func main() {
+	fmt.Println(Mahsulot{Nom: "choynak", Narx: 85000})
+}
+```
+
+`var _ fmt.Stringer = Mahsulot{}` on line 16 is the check. If you delete the `String` method, the program does not
+compile.
+
+```console
+$ go run ./homework/oson
+choynak (85000 soʻm)
+```
+
+</details>
+
+🟡 **Medium:** a type has both an `Error` and a `String` method. Which one does `fmt.Println` call? Guess first.
+
+<details>
+<summary>Answer</summary>
+
+```go filename="homework/orta/main.go" showLineNumbers
+// Uy vazifasi (oʻrta): tur ham Error, ham String metodiga ega. fmt.Println qaysi birini chaqiradi?
+// go run ./homework/orta
+package main
+
+import "fmt"
+
+type Ikkalasi struct{}
+
+func (Ikkalasi) Error() string  { return "Error() chaqirildi" }
+func (Ikkalasi) String() string { return "String() chaqirildi" }
+
+func main() {
+	fmt.Println(Ikkalasi{})
+}
+```
+
+```console
+$ go run ./homework/orta
+Error() chaqirildi
+```
+
+**`Error`.** In the type switch of `fmt`, `case error` comes before `case Stringer` (the `print.go` lines in the
+"Type switch" section). The `Ikkalasi` ("both") type implements both interfaces, and the first matching case wins.
+
+</details>
+
+🟠 **Hard:** write a function `teng(a, b any) bool` ("equal") that compares two `any` values without a panic. If
+`[]int{1}` is inside, `a == b` panics; it does too if it is inside a `struct{ X any }`.
+
+<details>
+<summary>Answer</summary>
+
+```go filename="homework/qiyin/qiyin.go" showLineNumbers
+// Uy vazifasi (qiyin): ikki interface'ni panic'siz solishtirish.
+// a == b kompilyatsiya boʻladi, lekin ichidagi tur solishtirib boʻlmaydigan boʻlsa
+// (slice, map, funksiya — yoki ularni ichida saqlagan struct) — runtime panic.
+// go test -v ./homework/qiyin
+package qiyin
+
+// teng: a == b, lekin panic oʻrniga false.
+// reflect.TypeOf(a).Comparable() yetarli emas: struct{ X any } "comparable" turi,
+// ichidagi X esa slice boʻlishi mumkin. Shuning uchun panic'ni ushlaymiz.
+func teng(a, b any) (natija bool) {
+	defer func() {
+		if recover() != nil {
+			natija = false
+		}
+	}()
+	return a == b
+}
+```
+
+The `recover` inside `defer` catches the panic and sets the result to `false` ([GO-1.09](/lab/youtube/go/go-1-09/en); in detail
+in GO-1.15). `(natija bool)` is a named return value (`natija` = "result"): `defer` can change it even after
+`return`. `reflect.TypeOf(a).Comparable()` is not enough: the type `struct{ X any }` is "comparable", but if `X`
+holds a slice, it still panics. The tests are in `homework/qiyin/qiyin_test.go`. `TestPanic` shows the panic, and the
+table-driven test `TestTeng` also checks the `struct ichida slice` ("slice inside a struct") case:
+
+```console
+$ go test -v ./homework/qiyin
+=== RUN   TestPanic
+    qiyin_test.go:14: panic: runtime error: comparing uncomparable type []int
+--- PASS: TestPanic (0.00s)
+=== RUN   TestTeng
+--- PASS: TestTeng (0.00s)
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/013-interfaces-nil/homework/qiyin	0.002s
+```
+
+The time on the last line changes a little on every run. If the tests have not changed, a second run shows `(cached)`
+instead of the time: Go reused the previous result.
+
+</details>
+
+🔴 **Guru:** write a function `bosh(a any) bool` ("empty"): `true` if `a == nil` or if it holds a `nil` pointer, map,
+slice, chan or func (a typed nil).
+
+<details>
+<summary>Answer</summary>
+
+```go filename="homework/guru/guru.go" showLineNumbers
+// Uy vazifasi (guru): interface ichida typed nil bormi? go test -v ./homework/guru
+package guru
+
+import "reflect"
+
+// bosh: a == nil yoki ichida nil pointer/map/slice/chan/func (typed nil) boʻlsa true.
+func bosh(a any) bool {
+	if a == nil {
+		return true
+	}
+	v := reflect.ValueOf(a)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return v.IsNil()
+	}
+	return false
+}
+```
+
+The `reflect` package examines the value inside an interface while the program runs. `reflect.ValueOf(a)` takes the
+value out, `Kind()` names its kind (pointer, map, slice…), and `IsNil()` says whether a value of this kind is `nil`.
+`reflect.ValueOf` never returns the `Interface` kind, because it takes the value out of the interface. This is for
+diagnostics; in normal code the right way is not to create a typed nil at all (`return nil`).
+
+```console
+$ go test -v ./homework/guru
+=== RUN   TestBosh
+--- PASS: TestBosh (0.00s)
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/013-interfaces-nil/homework/guru	0.002s
+```
+
+</details>
+
+## Sources
+
+- Go spec: [Interface types](https://go.dev/ref/spec#Interface_types), [Method sets](https://go.dev/ref/spec#Method_sets),
+  [Type assertions](https://go.dev/ref/spec#Type_assertions), [Type switches](https://go.dev/ref/spec#Type_switches),
+  [Comparison operators](https://go.dev/ref/spec#Comparison_operators), [Errors](https://go.dev/ref/spec#Errors)
+- Go FAQ: [Why is my nil error value not equal to nil?](https://go.dev/doc/faq#nil_error),
+  [Why doesn't Go have "implements" declarations?](https://go.dev/doc/faq#implements_interface),
+  [How can I guarantee my type satisfies an interface?](https://go.dev/doc/faq#guarantee_satisfies_interface),
+  [Why do T and \*T have different method sets?](https://go.dev/doc/faq#different_method_sets)
+- Effective Go: [Interfaces](https://go.dev/doc/effective_go#interfaces),
+  [Interface checks](https://go.dev/doc/effective_go#blank_implements)
+- [A Tour of Go: Interface values with nil underlying values](https://go.dev/tour/methods/12)
+- Go source (go1.26.8): [runtime/runtime2.go](https://github.com/golang/go/blob/go1.26.8/src/runtime/runtime2.go#L184-L192)
+  (`iface`, `eface`), [fmt/print.go: catchPanic](https://github.com/golang/go/blob/go1.26.8/src/fmt/print.go#L588-L596),
+  [fmt/print.go: handleMethods](https://github.com/golang/go/blob/go1.26.8/src/fmt/print.go#L622-L680)
+- Russ Cox, [Go Data Structures: Interfaces](https://research.swtch.com/interfaces) (2009)
+- Francesc Campoy, [Understanding nil](https://speakerdeck.com/campoy/understanding-nil) (GopherCon 2016)
+- [staticcheck SA4023](https://staticcheck.dev/docs/checks/#SA4023)
+- Rob Pike, [Go Proverbs](https://go-proverbs.github.io/) (2015)
+- Dave Cheney, [Typed nils in Go 2](https://dave.cheney.net/2017/08/09/typed-nils-in-go-2) (2017);
+  [golang/go#22729](https://github.com/golang/go/issues/22729)
+- Other languages: [TypeScript Handbook: Erased Types](https://www.typescriptlang.org/docs/handbook/2/basic-types.html#erased-types),
+  [Node.js: TypeScript (type stripping)](https://nodejs.org/api/typescript.html),
+  [PEP 544: Protocols](https://peps.python.org/pep-0544/),
+  [PHP: Object Interfaces](https://www.php.net/manual/en/language.oop5.interfaces.php),
+  [Java: JLS §8.1.5 Superinterfaces](https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.1.5)
+- Go results from `go1.26.8 linux/amd64` and staticcheck `2026.2.1`, 2026-11-26. Comparisons: Node.js v24.10.0,
+  Python 3.13.15, PHP 8.4.26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/013-interfaces-nil)
+
+---
+
+← Previous lesson: [GO-1.12](/lab/youtube/go/go-1-12/en) · Next lesson: [GO-1.14](/lab/youtube/go/go-1-14/en) → · [All lessons](/lab/youtube/go)
+
+</div>
