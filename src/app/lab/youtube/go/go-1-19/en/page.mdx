@@ -1,0 +1,1351 @@
+---
+title: "io.Reader and io.Writer: the two most beautiful lines in Go"
+date: "2026/11/26"
+description: "Read a 1 GiB file in 2.5 MiB of memory: io.Reader, io.Writer, io.EOF, your own Writer, io.Copy and gzip as a stream."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-19/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-19"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-19/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-19/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-19"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-19) · [Русский](/lab/youtube/go/go-1-19/ru) · **English**  
+Lesson GO-1.19 · [Go: 0 → Guru](/lab/youtube/go#go-1-19) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/019-io-reader-writer)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+An orders export is a 1 GiB CSV file with 61,003,111 lines. Two Go programs count the lines and give the same
+answer. One uses at most 1028 MiB of memory, the other 2.5 MiB. The second one is almost the same as an empty Go
+program that does nothing. What if the file is 10 GiB? What if the container has a 512 MiB memory limit? In Node
+this is the choice between `fs.readFile` and `fs.createReadStream`. What does this choice look like in Go?
+
+**The one idea:** read and write big data in small pieces, not all at once. In Go two interfaces with one method
+each do this: `io.Reader` and `io.Writer`. `io.Copy` connects them, so memory does not depend on the file size.
+
+By the end of the lesson you will:
+
+- read a file of any size in constant memory with an `f.Read(buf)` loop, and check `n` and `io.EOF` in the right
+  order;
+- write your own `io.Writer` and know the rules of its contract (`n < len(p)` → error, don't keep `p`);
+- connect a Reader and a Writer with `io.Copy(dst, src)` without mixing up the argument order;
+- put a Writer inside a Writer (gzip) and compress a 1 GiB file in a few MiB of memory.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| stream | reading and writing data piece by piece, not all at once | stream |
+| `io.Reader` / `io.Writer` | two interfaces with one method each: `Read(p)` fills your buffer, `Write(p)` takes a full buffer | Reader, Writer |
+| `io.Copy` | a ready-made loop that reads from a Reader and writes to a Writer, with one buffer in the middle | io.Copy |
+
+Two helper words also appear. A **buffer** is a `[]byte` allocated once for one piece. The comments in the course
+code call it «chelak» ("bucket"). **Peak RSS** is the most physical memory the process held while it ran. That is
+the "eng koʻp xotira" ("peak memory") that the code prints. `io.EOF` is not a new word: it is the sentinel error
+from GO-1.14.
+
+## Before you start
+
+- [GO-1.13 · Interface'lar: nil nega nil'ga teng emas?](/lab/youtube/go/go-1-13/en): an interface is a list of methods; a type
+  satisfies it by itself, without `implements`; the `var _ I = (*T)(nil)` check.
+- [GO-1.04 · len("oʻzbek") = 7? Bayt, rune va UTF-8](/lab/youtube/go/go-1-04/en): a string is bytes, `len` counts bytes, `ʻ`
+  is 2 bytes in UTF-8, `'\n'` is one byte (10).
+- [GO-1.08 · Slice'lar: append tuzogʻi va eskirgan 1024 qoidasi](/lab/youtube/go/go-1-08/en): `make([]byte, n)`, `buf[:n]`
+  (the first `n` elements of a slice; no new array is created).
+- [GO-1.12 · Metodlar: value receiver yoki pointer receiver?](/lab/youtube/go/go-1-12/en): pointer receivers and method sets;
+  the `&` in `io.Copy(&h, f)` comes from there.
+- [GO-1.14 · Xato ham qiymat: %w, errors.Is, AsType va Join](/lab/youtube/go/go-1-14/en): `io.EOF` is a sentinel error.
+- [GO-1.15 · defer, panic, recover: nimani qutqarib boʻlmaydi](/lab/youtube/go/go-1-15/en): `defer f.Close()`.
+- [GO-1.05 · Go'da while yoʻq: bitta for va uning hamma shakllari](/lab/youtube/go/go-1-05/en): a `for { … }` with no condition,
+  and `break`.
+- [GO-1.06 · Funksiyalar: ikki qiymat qaytarish, closure va variadic](/lab/youtube/go/go-1-06/en): `n, err :=` and `:=`
+  shadowing inside a loop.
+
+**How to run the code.** This lesson's programs run in the course folder (`lessons/019-io-reader-writer`): they
+import the shared `ozim` package and read a 1 GiB test file. Open the terminal in that folder. `ozim.RSS()` reads
+memory from `/proc/self/status` on Linux. macOS and Windows don't have this file, so it prints `-1.0MiB`; the other
+results are the same. The test file lives only in `/tmp` and needs ~1.5 GiB of free space (the file plus its
+compressed copy). The course's own Reader creates it (see "Going deeper"):
+
+```console
+$ mkdir -p /tmp/io19
+$ go run ./yarat 1024 /tmp/io19/buyurtma.csv
+yozildi: 1073741824 bayt · eng koʻp xotira: 2.7MiB
+```
+
+`mkdir -p` printed nothing. Even while writing the file, memory stayed at 2.7 MiB: writing is a stream too
+(`yozildi` = "written", `bayt` = "bytes").
+
+The start of the file: each line is one order (`buyurtma`), `id,summa,tolandi` ("id, amount, paid": 1 or 0).
+
+```console
+$ head -3 /tmp/io19/buyurtma.csv
+1,8919,1
+2,16838,1
+3,24757,1
+```
+
+The Python and Node comparisons are not in the course folder: their full code is on this page, run with Python 3.13
+and Node 24.
+
+First, one question from GO-1.04. What does `fmt.Println(len("soʻm"))` print? (*soʻm* is the Uzbek currency.)
+
+**A)** `4` · **B)** `5` · **C)** `6`
+
+<details>
+<summary>Answer</summary>
+
+**B: `5`.** In Go `len` counts bytes: `s`, `o`, `m` are one byte each, and `ʻ` (U+02BB) is two bytes in UTF-8
+(`ca bb`). If you chose `4`, you counted like Python or JavaScript: both say 4.
+
+```console
+$ go run soz.go
+5
+```
+
+(`soz.go` is not in the course folder: it is one file with `package main` and `fmt.Println(len("soʻm"))`.) You will
+need this today: a Reader gives you bytes, not characters.
+
+</details>
+
+## Two programs, one answer
+
+First, the file size. `du -h --apparent-size` prints the real length of the file in human-readable units:
+
+```console
+$ du -h --apparent-size /tmp/io19/buyurtma.csv
+1.0G	/tmp/io19/buyurtma.csv
+```
+
+To be exact, 1,073,741,824 bytes, that is exactly 1 GiB (2³⁰). On this page MiB = 2²⁰ bytes, KiB = 1024 bytes.
+
+The first program loads the whole file into memory at once. `fs.readFileSync(path)` in Node or
+`open(path, "rb").read()` in Python do the same.
+
+```go filename="hammasi/main.go" showLineNumbers
+// hammasi: butun faylni bir yoʻla xotiraga yuklab, buyurtmalarni (qatorlarni) sanaydi.
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	data, err := os.ReadFile(os.Args[1]) // butun fayl — bitta katta slice
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	buyurtma := bytes.Count(data, []byte{'\n'}) // har buyurtma — bitta qator
+	fmt.Printf("buyurtmalar: %d · eng koʻp xotira: %.1fMiB\n", buyurtma, ozim.RSS())
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `// hammasi: …` | comment: «hammasi» ("all of it") loads the whole file at once |
+| 4–10 | `import ( … )` | `bytes` (working with byte slices), `fmt`, `os` and the course's `ozim` package (it measures memory) |
+| 13 | `data, err := os.ReadFile(os.Args[1])` | `os.Args[1]` is the first argument of the command, the file path. `os.ReadFile` reads the whole file into one `[]byte` |
+| 14–17 | `if err != nil { … os.Exit(1) }` | if the file can't be opened, prints the error and exits with code 1 |
+| 18 | `bytes.Count(data, []byte{'\n'})` | counts `'\n'` bytes: each order is on its own line. `[]byte{'\n'}` is a one-byte slice |
+| 19 | `fmt.Printf(… %.1fMiB …, ozim.RSS())` | the result and peak memory, with one decimal place |
+
+```console
+$ go run ./hammasi /tmp/io19/buyurtma.csv
+buyurtmalar: 61003111 · eng koʻp xotira: 1028.1MiB
+```
+
+1028 MiB of memory for a 1024 MiB file (`buyurtmalar` = "orders"). `os.ReadFile` first asks for the file size,
+then allocates one slice of that size (go1.26.8, `os/file.go`, `readFileContents`). The remaining ~4 MiB is the Go
+runtime itself.
+
+The second program reads the file in 32 KiB pieces. Its code comes in the next sections. For now we look only at the
+first line of its output (`| head -1` keeps the first line):
+
+```console
+$ go run ./oqim /tmp/io19/buyurtma.csv | head -1
+buyurtmalar: 61003111 · eng koʻp xotira: 2.5MiB
+```
+
+Same answer, and hundreds of times less memory. This is the same difference as between `readFile` and
+`createReadStream` in Node. In this lesson we see how Go builds it.
+
+### What "memory" measures here
+
+`ozim.RSS()` returns the **peak RSS** of the process: the largest number of its pages held in physical memory while
+the program ran. Linux gives it in the `VmHWM` line of `/proc/self/status` (proc_pid_status(5)).
+
+```go filename="ozim/rss.go" showLineNumbers
+package ozim
+
+import (
+	"bytes"
+	"os"
+	"strconv"
+)
+
+// RSS — shu jarayon (dasturning oʻzi) egallagan eng katta operativ xotira (peak RSS), MiB. Faqat Linux:
+// /proc/self/status dagi VmHWM. getrusage'ning Maxrss'i bu yerga yaramaydi: `go run` va shell
+// dasturni fork/vfork + exec bilan ishga tushiradi, Maxrss esa ota jarayonning xotirasini ham "meros" oladi.
+func RSS() float64 {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return -1
+	}
+	_, s, _ := bytes.Cut(b, []byte("VmHWM:"))
+	s, _, _ = bytes.Cut(s, []byte("kB"))
+	kb, err := strconv.ParseInt(string(bytes.TrimSpace(s)), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return float64(kb) / 1024
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13 | `os.ReadFile("/proc/self/status")` | reads the process status file (it is small, so reading it whole is fine) |
+| 17–18 | `bytes.Cut(…)` | takes the part after `VmHWM:` and before `kB` |
+| 19 | `strconv.ParseInt(…)` | turns text like `"2560"` into a number |
+| 23 | `float64(kb) / 1024` | kB → MiB |
+
+Two subtle points. First, the Linux file cache (page cache) is not counted in this number. The kernel may keep the
+file in memory for both programs, but that memory does not belong to the process. Second, `Maxrss` from `getrusage`
+gives a wrong result here. The reason is in "Going deeper".
+
+## The contract: `io.Reader`
+
+The second program reads the file in pieces. Other languages have a separate API for this: `stream` in Node,
+`f.read(n)` in Python. Go has one small interface in the standard `io` package. `io/io.go` (go1.26.8):
+
+```go
+type Reader interface {
+	Read(p []byte) (n int, err error)
+}
+```
+
+**You** give the `Read` method a buffer: `p` is an empty `[]byte`. `Read` writes at most `len(p)` bytes into it and
+returns two things:
+
+| What | Meaning |
+|---|---|
+| `p` | the caller's buffer: `Read` writes the bytes here |
+| `n` | how many bytes were written: `0 <= n <= len(p)`. Only `p[:n]` is new data |
+| `err` | an error, or `io.EOF`, the "no more data" signal |
+
+Why does this shape matter? The caller gives the buffer, not the Reader. So you can reuse one buffer a million
+times, and no new memory is allocated per call. Node's `'data'` event gives each piece as a new `Buffer`. Python's
+`f.read(n)` also returns new `bytes` every time. The closest thing to Go in Python is `f.readinto(buf)`: it also
+fills a buffer you allocated in advance.
+
+One more rule from the documentation: `Read` does not have to fill the buffer to the end. The documentation says: if
+some data is available but not `len(p)` bytes, `Read` conventionally returns what is available instead of waiting for
+more. A file on disk usually gives a full buffer; a network connection may give less. So always look at `n`. If you
+need exactly `N` bytes, there is `io.ReadFull`.
+
+Who satisfies this interface? `*os.File`, `os.Stdin`, `net.Conn`, the body of an HTTP request (`r.Body`),
+`strings.Reader`, `bytes.Buffer`, `gzip.Reader`. All with one method. As in GO-1.13, none of them writes
+`implements io.Reader`.
+
+## The contract: `io.Writer`
+
+The second interface is the reverse: you give it a buffer **full** of bytes.
+
+```go
+type Writer interface {
+	Write(p []byte) (n int, err error)
+}
+```
+
+`n` is how many bytes from `p` were written. The rules in the documentation are short but strict:
+
+| Rule (io.go) | Meaning |
+|---|---|
+| *Write must return a non-nil error if it returns n &lt; len(p)* | if you can't write everything, return an error |
+| *Write must not modify the slice data, even temporarily* | don't change the contents of `p` |
+| *Implementations must not retain p* | don't keep `p` for yourself: the caller reuses it for the next piece |
+
+Writers: `*os.File`, `os.Stdout`, `http.ResponseWriter`, `bytes.Buffer`, `gzip.Writer`, `net.Conn`. A hash like
+SHA-256 is a Writer too (`hash.Hash` embeds `io.Writer`). A file on disk (`*os.File`) satisfies both interfaces: you
+can read from it and write to it.
+
+Both interfaces know only bytes. A file, a network, gzip: it makes no difference to them. You saw Rob Pike's proverb
+"The bigger the interface, the weaker the abstraction" in GO-1.13. `io.Reader` and `io.Writer` are its best example.
+
+## The buffer loop: `oqim/main.go`
+
+Now the full code of the second program (`oqim` = "stream"):
+
+```go filename="oqim/main.go" showLineNumbers
+// oqim: xuddi shu sanoq, lekin fayl 32 KiB'lik "chelak" bilan boʻlakma-boʻlak oʻqiladi.
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"os"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	f, err := os.Open(os.Args[1]) // f — ochilgan fayl
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	buyurtma, chaqiruv := 0, 0
+	buf := make([]byte, 32*1024) // 32 KiB'lik boʻsh chelak
+	for {
+		n, err := f.Read(buf) // fayl chelakni toʻldiradi
+		chaqiruv++
+		buyurtma += bytes.Count(buf[:n], []byte{'\n'}) // chelakning toʻlgan qismida qator oxirlarini sanaymiz
+
+		if err == io.EOF { // fayl tugadi
+			break // takrorlashni toʻxtatamiz
+		}
+		if err != nil { // boshqa xato: toʻxtaymiz
+			log.Fatal(err)
+		}
+	}
+	fmt.Printf("buyurtmalar: %d · eng koʻp xotira: %.1fMiB\n", buyurtma, ozim.RSS())
+	fmt.Printf("Read chaqiruvi: %d\n", chaqiruv)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 15 | `f, err := os.Open(os.Args[1])` | opens the file for reading: `f` is an `*os.File`, both a Reader and a Writer |
+| 16–18 | `log.Fatal(err)` | prints the error with a timestamp and exits with code 1 |
+| 19 | `defer f.Close()` | closes the file when `main` returns (GO-1.15) |
+| 21 | `buyurtma, chaqiruv := 0, 0` | two counters: lines (`buyurtma`, "order") and `Read` calls (`chaqiruv`, "call") |
+| 22 | `buf := make([]byte, 32*1024)` | a 32,768-byte buffer, allocated **once** |
+| 23 | `for {` | a `for` with no condition: `while (true)` in other languages (GO-1.05) |
+| 24 | `n, err := f.Read(buf)` | the file fills the buffer. `:=` creates new `n` and `err` inside the loop: they shadow the `err` from line 15 (shadowing, GO-1.06), harmless here |
+| 25 | `chaqiruv++` | counts the calls |
+| 26 | `bytes.Count(buf[:n], …)` | counts `'\n'` only in the **filled** part of the buffer |
+| 28–30 | `if err == io.EOF { break }` | the file is over: leave the loop |
+| 31–33 | `if err != nil { log.Fatal(err) }` | any other error: stop the program |
+| 35–36 | `fmt.Printf(…)` | the result, memory and the number of `Read` calls |
+
+On line 28 we compare with `io.EOF` using `==`. In GO-1.14 we learned `errors.Is`. But the documentation of
+`io.EOF` is explicit: `Read` must return `EOF` itself, not an error wrapping it, because callers test for it with
+`==`.
+
+Look at the order: the bytes are counted first on line 26, then `err` is checked on line 28. The rule in the
+documentation: *Callers should always process the n > 0 bytes returned before considering the error err*. Some
+Readers return the last bytes together with `io.EOF` in **one** call. If you check `err` first, those bytes are lost
+(a running example of this mistake is in "Common mistakes").
+
+What is in memory during one call:
+
+```text
+        disk                               process memory
+ ┌──────────────────────────┐        ┌──────────────────────────────────┐
+ │ buyurtma.csv  1 GiB       │  Read  │ buf  [32,768 bytes]  ← one,       │
+ │ ██████████████████████████│ ─────► │                   reused again    │
+ └──────────────────────────┘        │ buyurtma, chaqiruv  (two numbers) │
+                                     │ Go runtime          (~2.4 MiB)    │
+                                     └──────────────────────────────────┘
+
+ hammasi/:   data [1,073,741,824 bytes]  ← the whole file at once
+```
+
+Now a question. The file is 1 GiB, the buffer is 32 KiB, and kilo means 1024 here (1 GiB = 1024 × 1024 KiB). How
+many times is `Read` called before the file ends?
+
+**A)** `32768` · **B)** `32769` · **C)** `31250`
+
+<details>
+<summary>Answer</summary>
+
+**B: `32769`.** 1,073,741,824 ÷ 32,768 = 32,768 full buffers. After that one more call is needed: it returns
+`n = 0` and `io.EOF`, and the loop ends. If you chose `32768`, you forgot the last empty call: even when the file
+ends exactly, `Read` says so only on the next call. If you chose `31250`, you computed 1 GB ÷ 32 KB in decimal units
+(1,000,000,000 ÷ 32,000).
+
+| Call | `n` | `err` | What happens |
+|---|---|---|---|
+| 1 | 32,768 | `nil` | bytes 0…32,767 are in `buf`, lines are counted |
+| 2 | 32,768 | `nil` | the next 32,768 bytes are written over the same `buf` |
+| … | 32,768 | `nil` | … |
+| 32,768 | 32,768 | `nil` | the last bytes of the file |
+| 32,769 | 0 | `io.EOF` | `buf[:0]` is empty, 0 is added; `break` |
+
+</details>
+
+```console
+$ go run ./oqim /tmp/io19/buyurtma.csv
+buyurtmalar: 61003111 · eng koʻp xotira: 2.5MiB
+Read chaqiruvi: 32769
+```
+
+Is 2.5 MiB a lot? For comparison, a Go program that does nothing (`bosh` = "empty"):
+
+```go filename="bosh/main.go" showLineNumbers
+// bosh: hech narsa qilmaydigan Go dasturi — taqqoslash uchun: Go runtime'ning oʻzi qancha xotira oladi?
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	fmt.Printf("boʻsh dastur · eng koʻp xotira: %.1fMiB\n", ozim.RSS())
+}
+```
+
+```console
+$ go run ./bosh
+boʻsh dastur · eng koʻp xotira: 2.4MiB
+```
+
+The empty program takes almost the same: this is the Go runtime itself (a few goroutine stacks, the initial part of
+the heap, the program code). VmHWM varies by ±0.3 MiB between runs (course README: `oqim` 2.4–2.6, empty program
+2.3–2.5). So reading the 1 GiB file added almost nothing on top of the runtime: only one 32 KiB buffer was in memory
+at any time.
+
+### The same loop in Python
+
+In Python `f.read(n)` returns empty `bytes` at the end of the file, not an error. The code is not in the course
+folder:
+
+```python
+# Python: faylni 32 KiB'lik boʻlaklarda oʻqib, qator oxirlarini sanaydi.
+import re
+import sys
+
+buyurtma = chaqiruv = 0
+with open(sys.argv[1], "rb") as f:
+    while True:
+        chunk = f.read(32 * 1024)
+        chaqiruv += 1
+        if not chunk:  # fayl oxiri: boʻsh bytes
+            break
+        buyurtma += chunk.count(b"\n")
+
+hwm = int(re.search(r"VmHWM:\s+(\d+)", open("/proc/self/status").read()).group(1))
+print(f"buyurtmalar: {buyurtma} · read chaqiruvi: {chaqiruv} · eng koʻp xotira: {hwm / 1024:.1f}MiB")
+```
+
+```console
+$ python3 oqim.py /tmp/io19/buyurtma.csv
+buyurtmalar: 61003111 · read chaqiruvi: 32769 · eng koʻp xotira: 12.0MiB
+```
+
+Even the number of calls is the same: 32,768 full pieces and one empty one. The differences:
+
+| | Python `f.read(n)` | Go `f.Read(buf)` |
+|---|---|---|
+| buffer | new `bytes` on every call | one buffer owned by the caller |
+| end of file | empty `b""` | `n = 0`, `err == io.EOF` |
+| last bytes and the end signal | never together | may come in one call: `n` first |
+| error | an exception | an `err` value |
+
+## Measurement: memory and file size
+
+Two points are not yet a pattern. `olch.sh` creates files of four sizes and measures the memory of both programs. The
+files are created in a temporary folder and deleted at the end:
+
+```bash filename="olch.sh" showLineNumbers
+#!/usr/bin/env bash
+# Videodagi diagramma: fayl hajmi (MiB) va eng koʻp xotira (peak RSS, MiB): butun faylni yuklash va oqim.
+# Fayllar /tmp ga yoziladi (gitga emas): eng kattasi 1 GiB, oxirida oʻchiriladi.
+set -euo pipefail
+cd "$(dirname "$0")"
+dir=${TMPDIR:-/tmp}/io19-olch
+mkdir -p "$dir/bin"
+go build -o "$dir/bin/" ./yarat ./hammasi ./oqim
+rss() { "$@" | grep -oE '[0-9.]+MiB' | tr -d 'MiB'; }
+for mb in 16 64 256 1024; do
+  f=$dir/b$mb.csv
+  "$dir/bin/yarat" "$mb" "$f" > /dev/null
+  echo "hammasi $mb $(rss "$dir/bin/hammasi" "$f")"
+  echo "oqim $mb $(rss "$dir/bin/oqim" "$f")"
+  rm -f "$f"
+done
+rm -rf "$dir"
+```
+
+`go build -o "$dir/bin/" …` builds the three programs once. The `rss` function takes the `…MiB` number from the
+output.
+
+```console
+$ ./olch.sh
+hammasi 16 18.9
+oqim 16 2.5
+hammasi 64 67.0
+oqim 64 2.5
+hammasi 256 259.2
+oqim 256 2.5
+hammasi 1024 1028.1
+oqim 1024 2.5
+```
+
+| File, MiB | whole file (`hammasi/`), MiB | in pieces (`oqim/`), MiB |
+|---:|---:|---:|
+| 16 | 18.9 | 2.5 |
+| 64 | 67.0 | 2.5 |
+| 256 | 259.2 | 2.5 |
+| 1024 | 1028.1 | 2.5 |
+
+The memory of the program that loads the whole file is "file + ~3 MiB". The program that reads in pieces uses the
+same amount at all four sizes. We did not measure a 10 GiB file, but this pattern means ~10 GiB for the first
+program and still a few MiB for the second. (The course's `olch.txt` is an earlier result of the same script: values
+like 66.9 and 2.4, the same ±0.3 MiB.)
+
+## Our own Writer: `Hisoblagich`
+
+Now we satisfy the interface ourselves. `Hisoblagich` ("counter") does not store the bytes, it only counts them:
+
+```go filename="ozim/hisoblagich.go" showLineNumbers
+package ozim
+
+import "bytes"
+
+// Hisoblagich — oʻz io.Writer'imiz: kelgan baytlar va qatorlarni sanaydi, chelakni saqlamaydi.
+type Hisoblagich struct{ Bayt, Qator int64 } // ikkita sanoq
+
+func (h *Hisoblagich) Write(p []byte) (int, error) {
+	h.Bayt += int64(len(p))                        // kelgan baytlar soni
+	h.Qator += int64(bytes.Count(p, []byte{'\n'})) // qator oxirlari
+	return len(p), nil                             // hammasini oldim, muammo yoʻq
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `type Hisoblagich struct{ Bayt, Qator int64 }` | two fields, both `int64`: the number of bytes (`Bayt`) and lines (`Qator`) |
+| 8 | `func (h *Hisoblagich) Write(p []byte) (int, error)` | the same signature as the method of `io.Writer`. A pointer receiver: the method changes the fields of `h` (GO-1.12) |
+| 9 | `h.Bayt += int64(len(p))` | the number of bytes that came in; `len` returns `int`, so we convert with `int64(…)` |
+| 10 | `h.Qator += int64(bytes.Count(p, []byte{'\n'}))` | the line ends in this piece |
+| 11 | `return len(p), nil` | the answer to the contract: "I took all the bytes, no error" |
+
+`implements io.Writer` is written nowhere: the signature matches, so `*Hisoblagich` satisfies `io.Writer` by itself
+(GO-1.13). Because the receiver is a pointer, the interface is satisfied by `*Hisoblagich`, not by a `Hisoblagich`
+value. This is the reason for `&h` in the next section.
+
+Hisoblagich does not store `p` anywhere, it only counts from it. That is the "must not retain p" rule. `io.Copy`
+passes the same buffer again and again. If you append `p` to a slice to keep it, all the stored "pieces" point to the
+same 32 KiB of memory, and each new piece overwrites them.
+
+## `io.Copy`: connecting a Reader to a Writer
+
+Now we connect the Reader (the file) and the Writer (Hisoblagich). We don't need the hand-written loop from `oqim/`:
+the standard library has a ready-made one.
+
+```go
+func Copy(dst Writer, src Reader) (written int64, err error)
+```
+
+Careful: **destination first, then source.** In Node's `pipeline(source, destination)` and Python's
+`shutil.copyfileobj(fsrc, fdst)` the source comes first. In Go the destination comes first, as in the built-in
+`copy(dst, src)`.
+
+```go filename="sanash/main.go" showLineNumbers
+// sanash: oqim/ dagi siklni io.Copy bajaradi: manba — fayl (Reader), manzil — Hisoblagich (Writer).
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	var h ozim.Hisoblagich
+	_, err = io.Copy(&h, f) // qayerga ← qayerdan: Hisoblagich (&h — nusxasi emas, oʻzi) ← fayl
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	fmt.Printf("buyurtmalar: %d · bayt: %d · eng koʻp xotira: %.1fMiB\n", h.Qator, h.Bayt, ozim.RSS())
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13–18 | `os.Open`, `defer f.Close()` | as in `oqim/` |
+| 20 | `var h ozim.Hisoblagich` | zero value: `Bayt` and `Qator` are 0 |
+| 21 | `_, err = io.Copy(&h, f)` | the destination is `&h` (the address of Hisoblagich), the source is `f`. The first result (bytes written) goes to `_`: we have it in `h.Bayt` |
+| 22–25 | `if err != nil { … }` | on success `io.Copy` returns `nil`, not `io.EOF` |
+| 26 | `fmt.Printf(…, h.Qator, h.Bayt, …)` | the numbers Hisoblagich counted |
+
+Why `&h`? There are two reasons. First, `Write` has a pointer receiver, so only `*Hisoblagich` satisfies
+`io.Writer`. Second, if you passed `h` by value, `io.Copy` would get a copy and the counts would stay in the copy.
+With `&h`, `io.Copy` writes into our own `h`. (What happens without `&` is in "Common mistakes".)
+
+The documentation of `io.Copy` says: a successful `Copy` returns `err == nil`, not `err == EOF`. It is defined to read
+the source until `EOF`, so it does not treat `EOF` as an error to report.
+
+```console
+$ go run ./sanash /tmp/io19/buyurtma.csv
+buyurtmalar: 61003111 · bayt: 1073741824 · eng koʻp xotira: 2.5MiB
+```
+
+The same number of lines, exactly 1 GiB of bytes, and again 2.5 MiB of memory. Here `io.Copy` ran the `oqim/` loop
+with one 32 KiB buffer in the middle. The file and Hisoblagich don't know each other: they only know a contract with
+one method. That is why any Reader can be connected to any Writer.
+
+```text
+  f (*os.File)                io.Copy                     &h (*Hisoblagich)
+ ┌────────────┐  Read(buf)  ┌──────────────┐  Write(buf[:n]) ┌──────────────┐
+ │ 1 GiB file │ ──────────► │ buf 32 KiB   │ ──────────────► │ Bayt, Qator  │
+ └────────────┘             └──────────────┘                 └──────────────┘
+                 repeated 32,769 times, one buffer
+```
+
+"Always 32 KiB in the middle"? No: `io.Copy` looks for shortcuts first. That is in "Going deeper".
+
+## A Writer inside a Writer: gzip
+
+Now the strongest side of connecting. `gzip.Writer` is a Writer too: it compresses the bytes it gets and writes them
+**to another Writer inside it**. The video calls it a matryoshka: a Writer inside a Writer. (`siqish` = "compress".)
+
+```go filename="siqish/main.go" showLineNumbers
+// siqish: Writer ichida Writer — gzip baytlarni siqadi va ichidagi faylga yozadi.
+package main
+
+import (
+	"compress/gzip"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	f, err := os.Open(os.Args[1])
+	tek(err)
+	defer f.Close()
+	out, err := os.Create(os.Args[2])
+	tek(err)
+
+	gz, _ := gzip.NewWriterLevel(out, gzip.BestSpeed) // gz — arxivlovchi: yangi faylni (out) oʻrab oladi, eng tez rejimda
+	n, err := io.Copy(gz, f)                          // nasos: fayl → arxivlovchi → yangi fayl
+	tek(err)
+	tek(gz.Close()) // qolgan siqilgan baytlarni yozib tugatadi
+	tek(out.Close())
+
+	st, err := os.Stat(os.Args[2])
+	tek(err)
+	mib := func(b int64) float64 { return float64(b) / (1 << 20) }
+	fmt.Printf("oʻqildi: %.1fMiB · yozildi: %.1fMiB · eng koʻp xotira: %.1fMiB\n", mib(n), mib(st.Size()), ozim.RSS())
+}
+
+func tek(err error) {
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 17 | `out, err := os.Create(os.Args[2])` | a new file (`*os.File`, a Writer) |
+| 20 | `gz, _ := gzip.NewWriterLevel(out, gzip.BestSpeed)` | `gz` is a gzip Writer wrapping `out`, at the fastest compression level. It can fail only for a wrong level constant, hence `_` |
+| 21 | `n, err := io.Copy(gz, f)` | file → `gz` → `out`. `n` is the bytes read (uncompressed) |
+| 23 | `tek(gz.Close())` | writes the bytes left inside gzip and the final trailer. Without it the `.gz` file is incomplete |
+| 24 | `tek(out.Close())` | closes the new file |
+| 26–29 | `os.Stat`, `mib(…)` | the size of the written file; `mib` is a small function that converts bytes to MiB (a closure, GO-1.06) |
+| 32–37 | `func tek(err error)` | `tek` ("check"): on error, prints it and exits with code 1 |
+
+```text
+ f (*os.File) ──Read──► io.Copy [32 KiB] ──Write──► gz (gzip.Writer) ──Write──► out (*os.File)
+ buyurtma.csv                                        compresses                 buyurtma.csv.gz
+```
+
+```console
+$ go run ./siqish /tmp/io19/buyurtma.csv /tmp/io19/buyurtma.csv.gz
+oʻqildi: 1024.0MiB · yozildi: 384.6MiB · eng koʻp xotira: 3.1MiB
+```
+
+1 GiB was read (`oʻqildi`), 384.6 MiB was written (`yozildi`, 37.6 %), memory 3.1 MiB. This takes ~17 seconds. Is the
+compressed file correct? `zcat` decompresses it to its output. `cmp -` compares that output with the original file
+byte by byte and stays silent if they are the same. `&& echo` runs only if the previous command succeeded:
+
+```console
+$ zcat /tmp/io19/buyurtma.csv.gz | cmp - /tmp/io19/buyurtma.csv && echo 'bir xil'
+bir xil
+```
+
+(`bir xil` = "the same".) The whole file never came into memory: the bytes flowed from the file into gzip, and from
+gzip into the new file. The same chain in other languages:
+
+| Language | Chain |
+|---|---|
+| Node | `pipeline(fs.createReadStream(a), zlib.createGzip(), fs.createWriteStream(b))` |
+| Python | `with open(a, "rb") as f, gzip.open(b, "wb") as g: shutil.copyfileobj(f, g)` |
+| Go | `gz := gzip.NewWriter(out)` and `io.Copy(gz, f)` |
+
+In Node the chain is built on separate stream types (Readable, Transform, Writable). In Go it is all the same
+interfaces with one method each.
+
+## Summary: the whole lesson in one table
+
+| Thing | Rule |
+|---|---|
+| `io.Reader` | `Read(p)`: you give the buffer, it fills `p[:n]` |
+| `io.Writer` | `Write(p)`: takes a full buffer; error if `n < len(p)`; does not keep `p` |
+| `io.EOF` | "no more data", not a failure; first the `n` bytes, then `err` |
+| `io.Copy(dst, src)` | a ready-made loop; destination first; `nil` on success |
+| result | a 1 GiB file in ~2.5 MiB of memory: one buffer, the file never enters memory |
+
+## Going deeper (optional): the buffer cuts a letter, io.Copy's shortcuts
+
+### The buffer gives bytes, not letters
+
+`utf8/main.go` reads `"7000 soʻm"` with a 4-byte buffer. `ʻ` is 2 bytes (`ca bb`, GO-1.04):
+
+```go filename="utf8/main.go" showLineNumbers
+// utf8: chelak baytlarni beradi, harflarni emas — boʻlak chegarasi "ʻ" ni (2 bayt) kesib oʻtadi.
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+	"unicode/utf8"
+)
+
+func main() {
+	r := strings.NewReader("7000 soʻm")
+	buf := make([]byte, 4) // 4 baytlik chelak
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			fmt.Printf("%q  toʻgʻri UTF-8: %v\n", buf[:n], utf8.Valid(buf[:n]))
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+}
+```
+
+```console
+$ go run ./utf8
+"7000"  toʻgʻri UTF-8: true
+" so\xca"  toʻgʻri UTF-8: false
+"\xbbm"  toʻgʻri UTF-8: false
+```
+
+(`toʻgʻri` = "valid".) The piece boundary went through the middle of `ʻ`: both pieces are invalid UTF-8. This does
+not affect our line count. `'\n'` is `0x0A`, and every byte of a multi-byte UTF-8 character is `0x80` or higher
+(RFC 3629 §3). So `'\n'` is never part of another character. To read text by characters or by lines there is `bufio`
+([GO-1.20](/lab/youtube/go#go-1-20)). The 🔴 homework solves exactly this cut.
+
+### Our own Reader: `Generator`
+
+`yarat/` ("create"), which made the test file, uses the course's own Reader as its source. It does not store the
+orders in advance: when `Read(p)` is called, it makes as many lines as fit into `p`:
+
+```go filename="ozim/generator.go" showLineNumbers
+// Package ozim — bu darsda oʻzimiz yozgan io.Reader va io.Writer.
+package ozim
+
+import (
+	"io"
+	"strconv"
+)
+
+// Generator — oʻz io.Reader'imiz. Buyurtma qatorlarini oldindan saqlamaydi:
+// Read chaqirilganda p ga sigʻadigan qatorlarni yasaydi va beradi.
+type Generator struct {
+	qoldi  int64  // yana nechta bayt yasash kerak
+	id     int64  // oxirgi buyurtma raqami
+	navbat []byte // yasalgan, lekin hali berilmagan baytlar
+}
+
+// NewGenerator kamida hajm bayt beradi (oxirgi qator butun qoladi, shuning uchun bir necha bayt ortiq boʻlishi mumkin).
+func NewGenerator(hajm int64) *Generator { return &Generator{qoldi: hajm} }
+
+func (g *Generator) Read(p []byte) (int, error) {
+	if len(p) == 0 { // boʻsh chelak: hech narsa bermaymiz, lekin EOF ham emas
+		return 0, nil
+	}
+	for len(g.navbat) < len(p) && g.qoldi > 0 {
+		oldin := len(g.navbat)
+		g.id++
+		g.navbat = Yoz(g.navbat, g.id)
+		g.qoldi -= int64(len(g.navbat) - oldin)
+	}
+	if len(g.navbat) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, g.navbat)
+	g.navbat = g.navbat[:copy(g.navbat, g.navbat[n:])]
+	return n, nil
+}
+
+// Yoz bitta "id,summa,tolandi" qatorini b ga qoʻshadi.
+func Yoz(b []byte, id int64) []byte {
+	b = strconv.AppendInt(b, id, 10)
+	b = append(b, ',')
+	b = strconv.AppendInt(b, 1000+id*7919%499000, 10)
+	if id%4 == 0 {
+		return append(b, ",0\n"...)
+	}
+	return append(b, ",1\n"...)
+}
+```
+
+Lines 21–23: if `len(p) == 0`, return `0, nil` (the documentation: with an empty `p`, `Read` should always return
+`n == 0`). 24–29: new lines are made until the `navbat` ("queue") has enough to fill `p`. 30–32: if nothing is left
+to give, `0, io.EOF`. 33–34: `copy` fills `p` and moves the part that did not fit to the start of `navbat`. The
+course's `ozim/ozim_test.go` checks it with the standard `iotest.TestReader`, which tests the `Read` contract with
+different buffer sizes.
+
+### Inside `io.Copy`: two shortcuts
+
+Before it starts the buffered loop, `io.Copy` checks two things (go1.26.8, `io/io.go`, `copyBuffer`):
+
+```go
+if wt, ok := src.(WriterTo); ok {
+	return wt.WriteTo(dst)
+}
+if rf, ok := dst.(ReaderFrom); ok {
+	return rf.ReadFrom(src)
+}
+```
+
+This is the type assertion from GO-1.13: does the source have a `WriteTo` method, does the destination have a
+`ReadFrom` method? If so, the work goes to them. Only when neither exists is a 32 KiB buffer allocated.
+
+One important conclusion follows. "Constant memory" is a property of the source and the destination, not of
+`io.Copy`. `io.Copy(&bytes.Buffer{}, f)` collects the whole file in memory through `bytes.Buffer.ReadFrom`:
+`bytes.Buffer` is a Writer that stores the bytes.
+
+Copying a file to a file (`nusxa/`, "copy") is the most interesting case. The destination is an `*os.File`, which has
+`ReadFrom`. On Linux it uses the `copy_file_range` system call: the bytes never enter the program, the kernel copies
+them. `strace` shows the system calls a program makes (`-e trace=copy_file_range` means only this call):
+
+```console
+$ strace -f -qq -e signal=none -e trace=copy_file_range /tmp/io19/nusxa /tmp/io19/buyurtma.csv /tmp/io19/nusxa.csv
+[pid 1101867] copy_file_range(3, NULL, 6, NULL, 2147479552, 0) = 1073741824
+[pid 1101867] copy_file_range(3, NULL, 6, NULL, 2147479552, 0) = 0
+nusxa: 1073741824 bayt · eng koʻp xotira: 2.5MiB
+```
+
+(`/tmp/io19/nusxa` is a binary built with `go build -o /tmp/io19/nusxa ./nusxa`; the `pid` number differs every
+time.) One call copied 1,073,741,824 bytes, the next one returned 0: the file was over. If the destination is a pipe
+or `/dev/null`, it falls back to a plain `read`/`write` loop.
+
+### When reading the whole file is fine
+
+A small file with a known size (settings, `/proc/self/status`): `os.ReadFile` is fine. Input of unknown size (an
+uploaded file, an HTTP request body): only in pieces. `io.ReadAll` is even more expensive: according to the course
+README, in go1.26 it collects growing pieces and copies them into one slice at the end; 2096 MiB was measured for a
+1 GiB file. In an HTTP server, limit the body with `http.MaxBytesReader`: past the limit it returns an error.
+`io.LimitReader`, on the other hand, silently returns `EOF` at the limit. With it, read `n+1` bytes and reject
+anything longer than `n`.
+
+### Why `getrusage` did not work
+
+The first version measured memory with `syscall.Getrusage(RUSAGE_SELF).Maxrss`. Under `go run` the stream program
+showed 19–20 MiB, and as a binary 2 MiB. The reason: `go run` starts the program with vfork + exec. On `exec`, Linux
+keeps the peak value of the old memory space in `Maxrss`, so it "inherits" the ~20 MiB of the `go` command. `VmHWM`
+belongs only to the current memory space of the process. So it shows the same ~2.5 MiB under `go run` and as a
+binary (a measurement from the lesson research).
+
+## Common mistakes
+
+**1. Checking `err` before `n`.** This is the classic mistake of this topic. `iotest.DataErrReader` returns the last
+bytes together with `io.EOF` in one call. This is allowed behaviour; `*os.File` doesn't do it, so with a file the bug
+stays hidden. Not in the course folder, run separately for this lesson (create `tartib.go`, "order", in an empty
+folder):
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"strings"
+	"testing/iotest"
+)
+
+func sana(r io.Reader, avvalErr bool) int {
+	buf := make([]byte, 32*1024)
+	qator := 0
+	for {
+		n, err := r.Read(buf)
+		if avvalErr && err == io.EOF {
+			break // ❌ oxirgi n baytni sanamay chiqib ketadi
+		}
+		qator += bytes.Count(buf[:n], []byte{'\n'})
+		if err == io.EOF {
+			break
+		}
+	}
+	return qator
+}
+
+func main() {
+	matn := "1,8919,1\n2,16838,1\n3,24757,1\n"
+	fmt.Println("avval err:", sana(iotest.DataErrReader(strings.NewReader(matn)), true))
+	fmt.Println("avval n:  ", sana(iotest.DataErrReader(strings.NewReader(matn)), false))
+}
+```
+
+```console
+$ go run tartib.go
+avval err: 0
+avval n:   3
+```
+
+(`avval` = "first".) No error, no warning: just 0 lines instead of 3. **Fix:** use `buf[:n]` first, then look at
+`err` (the order of lines 26 → 28 in `oqim/main.go`).
+
+**2. The whole `buf` instead of `buf[:n]`.** The last piece is usually shorter than the buffer, and old bytes of the
+previous piece stay behind it. This example is not in the course folder either (`butunbuf.go`):
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"strings"
+)
+
+func main() {
+	r := strings.NewReader("1\n2\n3\n") // 3 ta qator, 6 bayt
+	buf := make([]byte, 4)              // 4 baytlik chelak
+	xato, togri := 0, 0
+	for {
+		n, err := r.Read(buf)
+		xato += bytes.Count(buf, []byte{'\n'})      // ❌ butun chelak
+		togri += bytes.Count(buf[:n], []byte{'\n'}) // ✅ faqat toʻlgan qismi
+		if err == io.EOF {
+			break
+		}
+	}
+	fmt.Println("buf:", xato, "· buf[:n]:", togri)
+}
+```
+
+```console
+$ go run butunbuf.go
+buf: 6 · buf[:n]: 3
+```
+
+The second call gives 2 bytes (`"3\n"`), and the other two bytes of the buffer are the `"2\n"` left from the first
+call. The third call gives `n = 0`, but the buffer does not change. **Fix:** only `buf[:n]`.
+
+**3. Passing a Writer to `io.Copy` without `&`.** When `Write` has a pointer receiver (`manzilsiz.go`, "without an
+address", not in the course folder):
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+)
+
+type Hisoblagich struct{ Bayt int64 }
+
+func (h *Hisoblagich) Write(p []byte) (int, error) {
+	h.Bayt += int64(len(p))
+	return len(p), nil
+}
+
+func main() {
+	var h Hisoblagich
+	io.Copy(h, strings.NewReader("salom\n"))
+	fmt.Println(h.Bayt)
+}
+```
+
+```console
+$ go run manzilsiz.go
+# command-line-arguments
+./manzilsiz.go:18:10: cannot use h (variable of struct type Hisoblagich) as io.Writer value in argument to io.Copy: Hisoblagich does not implement io.Writer (method Write has pointer receiver)
+```
+
+How to read it: `manzilsiz.go:18:10` is line 18, column 10. *cannot use h … as io.Writer value*: `h` can't be used
+as an io.Writer value. *Hisoblagich does not implement io.Writer (method Write has pointer receiver)*: Hisoblagich
+doesn't satisfy io.Writer because Write has a pointer receiver. This is the method set rule from GO-1.12. **Fix:**
+`io.Copy(&h, …)`.
+
+**4. A Writer returns `n < len(p)` and `nil`.** A Writer that didn't write everything but reported no error breaks the
+contract (`qisqa.go`, "short", not in the course folder):
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+)
+
+type Yarim struct{}
+
+// ❌ yarmini "yozadi", lekin xato qaytarmaydi
+func (Yarim) Write(p []byte) (int, error) { return len(p) / 2, nil }
+
+func main() {
+	n, err := io.Copy(Yarim{}, strings.NewReader("salom dunyo"))
+	fmt.Println(n, err)
+}
+```
+
+```console
+$ go run qisqa.go
+5 short write
+```
+
+`io.Copy` caught it itself: 5 of 11 bytes were written and the error is `io.ErrShortWrite`, *short write*. But not
+every caller is this careful. **Fix:** if it doesn't fit, return an explicit error (like `ErrToldi` in the 🟠
+homework).
+
+**5. Reading input of unknown size whole.** `os.ReadFile` or `io.ReadAll` work without an error, but memory grows with
+the file ("Two programs, one answer" and "Measurement": 1 GiB → 1028 MiB). **Fix:** `io.Copy` or a buffer loop;
+`http.MaxBytesReader` in HTTP.
+
+**6. Keeping `p` in a Writer.** `saqlangan = append(saqlangan, p)` inside `Write` runs without an error, but all the
+stored pieces point to one buffer and the next `Write` overwrites them ("Our own Writer"). **Fix:** if you must keep
+it, take a copy: `append([]byte(nil), p...)`.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** In `io.Reader` and `io.Writer`, who gives the buffer, and what does `n` mean?
+
+<details>
+<summary>Answer</summary>
+
+In both, the caller gives the buffer. In `Read`, `n` is how many bytes were written into the buffer (only `p[:n]` is
+new); in `Write`, how many bytes from the buffer were written (if `n < len(p)`, there must also be an error). Because
+the buffer belongs to the caller, one buffer can be reused again and again.
+
+</details>
+
+**2.** Why does the buffer loop use `buf[:n]` first and check `err == io.EOF` after?
+
+<details>
+<summary>Answer</summary>
+
+`Read` may return the last bytes together with `io.EOF` in one call. If you check `err` first, those bytes are lost
+(`tartib.go`: 0 instead of 3). The documentation says the same: process the `n > 0` bytes first.
+
+</details>
+
+**3.** Out of the habit of Node's `pipeline(src, dst)`, we swapped the arguments. What does this program do? (Not in
+the course folder, run separately for this lesson.)
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+)
+
+type Hisoblagich struct{ Bayt int64 }
+
+func (h *Hisoblagich) Write(p []byte) (int, error) {
+	h.Bayt += int64(len(p))
+	return len(p), nil
+}
+
+func main() {
+	f, _ := os.Open("teskari.go")
+	var h Hisoblagich
+	io.Copy(f, &h) // Node'dagi pipeline(src, dst) tartibida
+	fmt.Println(h.Bayt)
+}
+```
+
+**A)** counts and prints the file's bytes · **B)** prints `0` · **C)** build error
+
+<details>
+<summary>Answer</summary>
+
+**C: build error.** The second argument of `io.Copy` must be an `io.Reader`, and `*Hisoblagich` has no `Read` method.
+Go stops it before running:
+
+```console
+$ go run teskari.go
+# command-line-arguments
+./teskari.go:19:13: cannot use &h (value of type *Hisoblagich) as io.Reader value in argument to io.Copy: *Hisoblagich does not implement io.Reader (missing method Read)
+```
+
+*missing method Read*: there is no Read method. If you chose `0`, you thought Go would find this at runtime. The first
+argument `f` is fine: `*os.File` has `Write`. Remember the order: `io.Copy(dst, src)`.
+
+</details>
+
+**4.** `io.Copy(&h, f)` took ~2.5 MiB for a 1 GiB file. How much does `io.Copy(&buf, f)` take (`buf` is a
+`bytes.Buffer`), and why?
+
+<details>
+<summary>Answer</summary>
+
+At least the file size. `bytes.Buffer` is a Writer that stores the bytes; it also has `ReadFrom`, and `io.Copy` hands
+the work to it. Constant memory is a property of the source and the destination, not of `io.Copy` ("Going deeper").
+
+</details>
+
+**5.** From GO-1.13: how do you check at compile time that `Hisoblagich` satisfies `io.Writer`, without writing
+`implements`?
+
+<details>
+<summary>Answer</summary>
+
+Write `var _ io.Writer = (*Hisoblagich)(nil)` at package level. If the signature doesn't match (or the receiver is
+wrong), the build stops on this line. `(*Hisoblagich)(nil)` is a `nil` of type `*Hisoblagich`: no memory is
+allocated, only the type is checked.
+
+</details>
+
+## Homework
+
+The tasks and the answers are in the lesson folder on GitHub:
+[lessons/019-io-reader-writer](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/019-io-reader-writer).
+The answers, with their tests, are in the
+[homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/019-io-reader-writer/homework)
+folder. Try it yourself first.
+
+- 🟢 **Easy:** print a file to the screen with `io.Copy` (your own `cat`) and measure memory on the 1 GiB file.
+- 🟡 **Medium:** `CRsiz{R io.Reader}` ("without CR"): a Reader that removes the `\r` bytes of Windows line endings.
+- 🟠 **Hard:** `Chekli{W io.Writer; Qoldi int64}` ("limited", "remaining"): a Writer that refuses to write after a
+  set number of bytes (`n < len(p)` → error).
+- 🔴 **Guru:** `RuneSanagich` ("rune counter"): a Writer that counts letters correctly even when the buffer cuts
+  them (without `bufio`).
+
+Check the answers from the lesson folder (this machine has no C compiler, hence `CGO_ENABLED=0`):
+
+```bash
+CGO_ENABLED=0 go test ./homework/...
+```
+
+<details>
+<summary>Answer</summary>
+
+🟢 The Reader is the file, the Writer is `os.Stdout`. The memory line goes to `os.Stderr`, so `> /dev/null` hides
+the 1 GiB of text while the memory line stays visible:
+
+```go filename="homework/oson/main.go" showLineNumbers
+// Oson: oʻz `cat`ingiz. Fayl hajmi qancha boʻlsa ham xotira oʻzgarmaydi.
+//
+//	go run ./homework/oson /tmp/io19/buyurtma.csv > /dev/null
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/abdurahmon27/go-backend-uz/lessons/019-io-reader-writer/ozim"
+)
+
+func main() {
+	for _, nom := range os.Args[1:] {
+		f, err := os.Open(nom)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		_, err = io.Copy(os.Stdout, f)
+		f.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "eng koʻp xotira: %.1fMiB\n", ozim.RSS())
+}
+```
+
+```console
+$ go run ./homework/oson /tmp/io19/buyurtma.csv > /dev/null
+eng koʻp xotira: 2.5MiB
+```
+
+`os.Args[1:]` is all the arguments, so like `cat` it prints several files one after another.
+
+🟡 Read from the inner Reader and move the bytes other than `\r` inside `p[:n]` to the start of the buffer. Return
+the new length. If a piece had only `\r`, don't return `(0, nil)`; read again: the documentation treats `0, nil` as
+"nothing happened".
+
+```go filename="homework/orta/orta.go" showLineNumbers
+// Package orta — Oʻrta: boshqa Reader'ni oʻrab, Windows qator oxiridagi '\r' baytlarini olib tashlaydigan Reader.
+package orta
+
+import "io"
+
+type CRsiz struct{ R io.Reader }
+
+func (c CRsiz) Read(p []byte) (int, error) {
+	for {
+		n, err := c.R.Read(p) // avval ichki Reader'dan oʻqiymiz
+		k := 0
+		for _, b := range p[:n] { // '\r' dan boshqa baytlarni chelak boshiga suramiz
+			if b != '\r' {
+				p[k] = b
+				k++
+			}
+		}
+		// Chelakda faqat '\r' boʻlgan boʻlsa, (0, nil) qaytarmaymiz — hujjat buni tavsiya qilmaydi, qayta oʻqiymiz.
+		if k > 0 || err != nil || n == 0 {
+			return k, err
+		}
+	}
+}
+```
+
+The test checks it with `iotest.OneByteReader` (one byte each time) and `iotest.TestReader`.
+
+🟠 Write what fits and return `ErrToldi` ("limit reached"). `io.Copy` sees the error and stops: in the test `n=5`,
+the buffer is `"salom"`.
+
+```go filename="homework/qiyin/qiyin.go" showLineNumbers
+// Package qiyin — Qiyin: N baytdan keyin yozishni rad etadigan Writer.
+// Shartnoma: n < len(p) boʻlsa, xato nil boʻlmasligi shart.
+package qiyin
+
+import (
+	"errors"
+	"io"
+)
+
+var ErrToldi = errors.New("chegara toʻldi")
+
+type Chekli struct {
+	W     io.Writer
+	Qoldi int64
+}
+
+func (c *Chekli) Write(p []byte) (int, error) {
+	if int64(len(p)) <= c.Qoldi {
+		n, err := c.W.Write(p)
+		c.Qoldi -= int64(n)
+		return n, err
+	}
+	n, err := c.W.Write(p[:c.Qoldi]) // sigʻganini yozamiz
+	c.Qoldi -= int64(n)
+	if err == nil {
+		err = ErrToldi
+	}
+	return n, err
+}
+```
+
+🔴 If a piece ends with an unfinished rune (`utf8.FullRune` is false), keep its 1–3 bytes in `dum` ("tail") until
+the next `Write`. This does not break the "don't keep `p`" rule: `append([]byte(nil), b...)` takes a copy. When the
+stream ends, `Close` counts the bytes that are left.
+
+```go filename="homework/guru/guru.go" showLineNumbers
+// Package guru — Guru: rune'larni sanaydigan Writer. Boʻlak chegarasi rune'ni kesib oʻtsa ham
+// toʻgʻri sanaydi: tugallanmagan 1–3 baytni keyingi Write'gacha saqlab turadi.
+// Oqim tugaganda dum'da qolgan baytlarni Close sanaydi (buzuq oxir — har bayt bitta RuneError, utf8.RuneCount kabi).
+package guru
+
+import "unicode/utf8"
+
+type RuneSanagich struct {
+	Rune int64
+	dum  []byte // oldingi boʻlakdan qolgan, hali tugallanmagan rune baytlari (≤ 3)
+}
+
+func (s *RuneSanagich) Write(p []byte) (int, error) {
+	b := p
+	if len(s.dum) > 0 {
+		b = append(s.dum, p...) // faqat dum boʻlganda nusxa (koʻpi bilan 3 + len(p))
+		s.dum = nil
+	}
+	for len(b) > 0 {
+		if !utf8.FullRune(b) { // rune keyingi boʻlakda davom etadi
+			s.dum = append([]byte(nil), b...)
+			break
+		}
+		_, size := utf8.DecodeRune(b)
+		s.Rune++
+		b = b[size:]
+	}
+	return len(p), nil
+}
+
+// Close oqim oxirida qolgan tugallanmagan baytlarni ham sanaydi.
+func (s *RuneSanagich) Close() error {
+	s.Rune += int64(utf8.RuneCount(s.dum))
+	s.dum = nil
+	return nil
+}
+```
+
+The test uses `iotest.OneByteReader` to cut every multi-byte rune (`ʻ`, `😀`) for sure and compares the result with
+`utf8.RuneCountInString`.
+
+</details>
+
+## Sources
+
+- The `io` package: [pkg.go.dev/io](https://pkg.go.dev/io) · [io.Copy](https://pkg.go.dev/io#Copy) · source:
+  [io/io.go (go1.26.8)](https://github.com/golang/go/blob/go1.26.8/src/io/io.go) (EOF L37–L44, Reader L55–L88,
+  Writer L90–L101, copyBuffer L407–L450)
+- `os`: [os.ReadFile](https://pkg.go.dev/os#ReadFile) · [os.File](https://pkg.go.dev/os#File) ·
+  [os/file.go (go1.26.8)](https://github.com/golang/go/blob/go1.26.8/src/os/file.go)
+- [compress/gzip.NewWriterLevel](https://pkg.go.dev/compress/gzip#NewWriterLevel) ·
+  [testing/iotest](https://pkg.go.dev/testing/iotest) · [hash.Hash](https://pkg.go.dev/hash#Hash) ·
+  [net/http.MaxBytesReader](https://pkg.go.dev/net/http#MaxBytesReader)
+- Rob Pike, [Go Proverbs](https://go-proverbs.github.io/)
+- UTF-8, [RFC 3629 §3](https://www.rfc-editor.org/rfc/rfc3629#section-3)
+- Linux: [proc_pid_status(5), VmHWM](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) ·
+  [copy_file_range(2)](https://man7.org/linux/man-pages/man2/copy_file_range.2.html)
+- Node: [fs.createReadStream](https://nodejs.org/api/fs.html#fscreatereadstreampath-options) ·
+  [stream.pipeline](https://nodejs.org/api/stream.html#streampipelinesource-transforms-destination-callback)
+- Python: [io: read, readinto](https://docs.python.org/3/library/io.html) ·
+  [shutil.copyfileobj](https://docs.python.org/3/library/shutil.html#shutil.copyfileobj)
+- Course folder and README: [lessons/019-io-reader-writer](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/019-io-reader-writer)
+- All results were taken with `go1.26.8 linux/amd64`, Python 3.13.15, gzip (`zcat`) and strace 7.2 on Linux 6.18,
+  on 2026-11-26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/019-io-reader-writer)
+
+---
+
+← Previous lesson: [GO-1.18](/lab/youtube/go/go-1-18/en) · Next lesson: [GO-1.20](/lab/youtube/go#go-1-20) → · [All lessons](/lab/youtube/go)
+
+</div>

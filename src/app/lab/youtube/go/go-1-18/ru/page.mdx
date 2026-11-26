@@ -1,0 +1,1559 @@
+---
+title: "Итераторы: range теперь работает и по функции"
+date: "2026/11/26"
+description: "Свой итератор на iter.Seq и yield, правило panic после break, скорость и правильная работа с пакетами slices, maps и cmp."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-18/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-18"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-18/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-18/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-18"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-18) · **Русский** · [English](/lab/youtube/go/go-1-18/en)  
+Урок GO-1.18 · [Go: 0 → Guru](/lab/youtube/go#go-1-18) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/018-iterators)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Функция `Tolanganlar(bb)` («оплаченные») не возвращает слайс, но `for range` по ней проходит. Цикл делает `break` на
+маленькой сумме, и всё работает. Теперь уберём из итератора один `if`. `go vet` молчит, компилятор тоже, а программа
+при запуске падает с `panic`. Почему? В этом уроке разберём это правило и то, что на самом деле происходит внутри
+итератора.
+
+**Одна идея:** итератор в Go — обычная функция, которая вызывает **функцию yield** с каждым элементом. `for range`
+превращает тело цикла в этот `yield`. Если `yield` вернул `false`, итератор обязан сразу сделать `return`.
+
+К концу урока вы:
+
+- напишете свой итератор, возвращающий `iter.Seq` и `iter.Seq2`, в том числе для рекурсивной структуры;
+- объясните, во что превращаются `break`, `continue` и `return` внутри итератора и как нарушение правила даёт
+  `panic`;
+- проверите через `-gcflags=-m` и бенчмарк, когда итератор так же быстр, как обычный цикл, а когда медленнее;
+- правильно используете `slices.Sorted(maps.Keys(m))`, `cmp.Compare` и `cmp.Or` и узнаете ловушку одноразового
+  итератора.
+
+Три новых главных слова сегодня:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| итератор | функция, которая по одному передаёт элементы последовательности другой функции | iterator |
+| функция yield | функция, которую итератор вызывает с каждым элементом; в `range` это тело цикла: `true` — продолжай, `false` — стоп | yield function |
+| функция сравнения | функция, которая сравнивает два элемента и возвращает отрицательное число, `0` или положительное; по ней сортирует `slices.SortFunc` | comparison function |
+
+По дороге встретятся ещё два вспомогательных слова: **одноразовый итератор** (*single-use iterator*, во второй раз не
+начинает с начала) и **встраивание** (*inlining*, знакомо по [GO-1.07](/lab/youtube/go/go-1-07/ru): компилятор переносит тело
+функции на место вызова).
+
+## Что нужно знать заранее
+
+- [GO-1.06 · Функции: два возвращаемых значения, замыкание и variadic](/lab/youtube/go/go-1-06/ru): функцию можно передать и
+  вернуть как значение; **замыкание** (closure) держит не копию внешней переменной, а её саму.
+- [GO-1.17 · Дженерики и generic-методы: когда они не нужны](/lab/youtube/go#go-1-17): type parameter пишется в квадратных
+  скобках (`Katta[T cmp.Ordered]`), `cmp.Ordered` — типы, для которых работают `<` и `>`.
+- [GO-1.09 · Map: почему порядок случайный и почему recover не спасает](/lab/youtube/go/go-1-09/ru): порядок обхода map не
+  гарантирован, стабильный порядок даёт `slices.Sorted(maps.Keys(m))`.
+- [GO-1.07 · Не гадайте, измеряйте: первый тест и бенчмарк](/lab/youtube/go/go-1-07/ru): `go test -bench`, `ns/op`,
+  `allocs/op`, встраивание.
+- [GO-1.11 · Указатели: почему эта переменная убежала в кучу?](/lab/youtube/go/go-1-11/ru): escape-анализ и `moved to heap` в
+  выводе `go build -gcflags=-m`.
+- [GO-1.15 · defer, panic, recover: что нельзя спасти](/lab/youtube/go/go-1-15/ru): `defer` срабатывает, когда функция
+  завершается, `panic` печатает stack trace, и программа выходит с `exit status 2`.
+- [GO-1.16 · Одна строка в go.mod меняет поведение программы](/lab/youtube/go/go-1-16/ru): строка `go` в `go.mod` задаёт версию
+  языка модуля.
+
+Где запускать код. Range over func есть начиная с Go 1.23, вам нужен Go 1.23 или новее. Примеры из одного
+`main.go` (`hook`, `iz`, `daraxt`, `seq2`, `birmarta`, `tartib`, `saralash`, `nan`, `savol`) можно скопировать на
+[go.dev/play](https://go.dev/play). Для `eski/` (отдельный модуль), `tezlik/` (бенчмарк) и `gopls` нужна папка курса.
+Откройте терминал в папке `lessons/018-iterators`. `go run ./hook` запускает пакет из папки `hook`. `cd eski && …`
+сначала переходит в папку `eski`, потом выполняет команду.
+
+Сначала вспомним прошлый урок. `func Katta[T cmp.Ordered](a, b T) T` возвращает большее из двух («katta» —
+«большой»). Скомпилируется ли `Katta(3, 2.5)`? Если да, что выведет и каким будет тип `T`?
+
+<details>
+<summary>Ответ</summary>
+
+**Скомпилируется, выведет `3`, а `T` будет `float64`.** Оба аргумента — нетипизированные константы. По спецификации
+Go, если смешаны целая и дробная константы, выбирается дробный тип (тип по умолчанию из [GO-1.03](/lab/youtube/go/go-1-03/ru)).
+`float64(3)` на экране выглядит просто как `3` ([Go spec: Type inference](https://go.dev/ref/spec#Type_inference)).
+
+</details>
+
+## for range по функции
+
+Предметная область знакома: заказы (`Buyurtma`, «заказ»), суммы в сумах. Нам нужны только оплаченные заказы. Вместо
+того чтобы собрать и вернуть слайс, `Tolanganlar` возвращает функцию, которая **выдаёт** их по одному.
+
+```go filename="hook/main.go" showLineNumbers
+// Hook: Tolanganlar slice qaytarmaydi, u funksiya qaytaradi.
+// for range esa shu funksiya ustida aylanadi (Go 1.23+).
+package main
+
+import (
+	"fmt"
+	"iter"
+)
+
+type Buyurtma struct {
+	ID      int
+	Summa   int64
+	Tolandi bool
+}
+
+// iter paketida: type Seq[V any] func(yield func(V) bool)
+//
+// Tolanganlar faqat toʻlangan buyurtmalarni beradi.
+func Tolanganlar(bb []Buyurtma) iter.Seq[Buyurtma] {
+	return func(yield func(Buyurtma) bool) {
+		for _, b := range bb {
+			if !b.Tolandi {
+				continue
+			}
+			if !yield(b) {
+				return
+			}
+		}
+	}
+}
+
+func main() {
+	bb := []Buyurtma{
+		{1, 150000, true},
+		{2, 99000, false},
+		{3, 42000, true},
+		{4, 310000, true},
+	}
+	for b := range Tolanganlar(bb) {
+		fmt.Println("buyurtma", b.ID, b.Summa)
+		if b.Summa < 50000 {
+			fmt.Println("kichik summa, toʻxtaymiz")
+			break
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–2 | `// Hook: …` | комментарий: `Tolanganlar` возвращает функцию, `for range` проходит по ней (Go 1.23+) |
+| 5–8 | `import ("fmt"; "iter")` | `iter` — пакет из Go 1.23, в нём типы итераторов |
+| 10–14 | `type Buyurtma struct {…}` | заказ: номер, сумма (`int64`, в сумах) и оплачен ли (`Tolandi`) |
+| 16 | `// iter paketida: type Seq[V any] func(yield func(V) bool)` | определение `iter.Seq`, подробно ниже |
+| 19 | `func Tolanganlar(bb []Buyurtma) iter.Seq[Buyurtma] {` | принимает слайс, возвращает `iter.Seq[Buyurtma]`: итератор, выдающий `Buyurtma`. Квадратные скобки — type argument ([GO-1.17](/lab/youtube/go#go-1-17)) |
+| 20 | `return func(yield func(Buyurtma) bool) {` | возвращает анонимную функцию. Она принимает параметр `yield`: функцию, которая берёт `Buyurtma` и возвращает `bool` |
+| 21 | `for _, b := range bb {` | обходит слайс `bb`; `bb` — переменная, захваченная замыканием ([GO-1.06](/lab/youtube/go/go-1-06/ru)) |
+| 22–24 | `if !b.Tolandi { continue }` | пропускает неоплаченные |
+| 25 | `if !yield(b) {` | передаёт оплаченный заказ в `yield` и проверяет ответ |
+| 26 | `return` | `yield` вернул `false`: «больше не нужно». Итератор сразу завершается |
+| 33–38 | `bb := []Buyurtma{…}` | четыре заказа, 2-й не оплачен |
+| 39 | `for b := range Tolanganlar(bb) {` | **range over func**: `range` не по слайсу, а по функции |
+| 40 | `fmt.Println("buyurtma", b.ID, b.Summa)` | тело цикла: печатает заказ |
+| 41–44 | `if b.Summa < 50000 { …; break }` | на маленькой сумме печатает сообщение («маленькая сумма, останавливаемся») и выходит из цикла |
+
+Подумайте: что выведет `go run ./hook`?
+
+**A)** `buyurtma 1`, `buyurtma 3`, `buyurtma 4` — все оплаченные · **B)** `buyurtma 1`, `buyurtma 3`, затем
+`kichik summa, toʻxtaymiz` · **C)** ошибка компиляции: по функции нельзя делать `range`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** 2-й заказ не оплачен, итератор его пропускает. У 3-го заказа сумма `42000 < 50000`, цикл делает `break`, и до
+4-го заказа очередь не доходит. Если вы выбрали «A», вы забыли про `break`. Если «C», вы были бы правы до Go 1.22: эта
+возможность появилась в Go 1.23, это покажем в следующем разделе.
+
+</details>
+
+```console
+$ go run ./hook
+buyurtma 1 150000
+buyurtma 3 42000
+kichik summa, toʻxtaymiz
+```
+
+Если вы пришли из JS или Python, это напомнит вам **генератор**. Тот же итератор на JavaScript:
+
+```js
+function* tolanganlar(bb) {
+  for (const b of bb) {
+    if (!b.tolandi) continue;
+    yield b;            // generator shu yerda pauza qiladi
+  }
+}
+
+for (const b of tolanganlar(bb)) {
+  console.log("buyurtma", b.id, b.summa);
+  if (b.summa < 50000) break;   // for...of generator'ni oʻzi yopadi
+}
+```
+
+(Комментарии в коде: «здесь генератор встаёт на паузу», «for...of сам закрывает генератор».) В Python тоже
+`def tolanganlar(bb): … yield b`, в PHP тоже `function tolanganlar(array $bb) { … yield $b; }`. Снаружи выглядит
+одинаково, внутри устроено по-разному:
+
+| | генератор в JS / Python / PHP | итератор в Go |
+|---|---|---|
+| что такое `yield` | ключевое слово языка: функция встаёт здесь на паузу | обычное имя параметра (по соглашению `yield`, документация iter: *"conventionally named yield"*) |
+| кто кого вызывает | цикл просит у генератора следующее значение (`next()`, *pull*) | итератор сам вызывает тело цикла и отдаёт значение (*push*) |
+| если `break` | язык сам закрывает генератор (в JS вызывается `return()`) | `yield` возвращает `false`; остановиться — задача итератора |
+
+Последняя строка — главная ловушка урока. В JS при `break` цикл `for...of` сам вызывает метод `return()` генератора
+([MDN: for...of](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/for...of)). В Go
+`yield(b)` — обычный вызов функции, он возвращает `bool`. Если итератор его не проверит, никто не остановит его
+принудительно. Что тогда будет, увидим в разделе «Panic».
+
+## Зачем это нужно: до Go 1.23 у каждого пакета свой способ
+
+До Go 1.23 `range` работал только по слайсу, массиву, строке, map, каналу и (с Go 1.22) целому числу. Для обхода своей
+структуры каждый пакет придумывал свой способ:
+
+| Пакет | Как обходит |
+|---|---|
+| `sync.Map` | `m.Range(func(k, v any) bool { … })` — передаёте функцию, вернёте `false` — остановится |
+| `path/filepath` | `filepath.Walk(root, func(path string, info fs.FileInfo, err error) error { … })` — передаёте функцию, вернёте ошибку — остановится |
+| `bufio.Scanner` | `for sc.Scan() { sc.Text() }` — сами вызываете `Scan` в цикле |
+
+В блоге Go И. Л. Тейлор пишет: *"when you start using a new Go container package you may have to learn a new looping
+mechanism"* — «начиная пользоваться новым пакетом-контейнером в Go, вам, возможно, придётся выучить новый способ
+обхода» ([Range Over Function Types](https://go.dev/blog/range-functions), 2024). Range over func сводит всё к одной
+форме: пакет возвращает итератор, а вы пишете обычный `for range`.
+
+Возможность пришла в два этапа. В [Go 1.22](https://go.dev/doc/go1.22) это был эксперимент, он включался только через
+`GOEXPERIMENT=rangefunc`. В [Go 1.23](https://go.dev/doc/go1.23#language) он стал частью языка. В папке `eski/`
+(«старый») лежит точная копия `hook/main.go`, но это отдельный модуль:
+
+```console
+$ cat eski/go.mod
+// Alohida modul: til versiyasi go 1.22. Range over func Go 1.23 dan boshlab bor.
+module eski
+
+go 1.22
+```
+
+Вы знаете из [GO-1.16](/lab/youtube/go/go-1-16/ru): строка `go` — версия языка этого модуля. На компьютере Go 1.26.8, но модуль
+он компилирует языком Go 1.22:
+
+```console
+$ cd eski && go build -o /dev/null .
+# eski
+./main.go:38:17: cannot range over Tolanganlar(bb) (value of func type iter.Seq[Buyurtma]): requires go1.23 or later (-lang was set to go1.22; check go.mod)
+```
+
+Читаем ошибку: `./main.go:38:17` — файл, строка 38, столбец 17 (`Tolanganlar(bb)`). *cannot range over
+Tolanganlar(bb) (value of func type iter.Seq[Buyurtma])* — «нельзя делать range по `Tolanganlar(bb)` (это значение
+функционального типа `iter.Seq[Buyurtma]`)». *requires go1.23 or later* — «нужен go1.23 или новее». В скобках
+причина: `-lang` установлен в go1.22, проверьте go.mod.
+
+А настоящий Go 1.22 с флагом эксперимента этот код запускает. `GOTOOLCHAIN=go1.22.12` в первый раз скачивает Go
+1.22.12:
+
+```console
+$ cd eski && GOTOOLCHAIN=go1.22.12 go version && GOTOOLCHAIN=go1.22.12 GOEXPERIMENT=rangefunc go run .
+go version go1.22.12 linux/amd64
+buyurtma 1 150000
+buyurtma 3 42000
+kichik summa, toʻxtaymiz
+```
+
+Без флага Go 1.22.12 даже не начинает сборку: `imports iter: build constraints exclude all Go files` — файлы пакета
+`iter` компилируются только при включённом эксперименте. Исправление простое: в `go.mod` должно стоять `go 1.23` или
+выше.
+
+## iter.Seq и yield: что такое итератор
+
+Определение в пакете `iter` — одна строка:
+
+```go
+type Seq[V any] func(yield func(V) bool)
+```
+
+Читаем её справа налево:
+
+| Часть | Смысл |
+|---|---|
+| `func(V) bool` | функция, которая принимает значение типа `V` и возвращает `bool`. Это — **функция yield** (*yield function*) |
+| `func(yield func(V) bool)` | функция, которая принимает такую функцию параметром и ничего не возвращает. Это — **итератор** |
+| `Seq[V any]` | generic-тип, `V` — type parameter ([GO-1.17](/lab/youtube/go#go-1-17)). В `iter.Seq[Buyurtma]` `V = Buyurtma` |
+
+Имя читается как *seek*: первый слог слова *sequence* (документация iter). Определение из документации: *"An iterator
+is a function that passes successive elements of a sequence to a callback function, conventionally named yield."* —
+«Итератор — функция, которая по очереди передаёт элементы последовательности callback-функции, обычно называемой
+`yield`». *"The function stops either when the sequence is finished or when yield returns false"* — «она
+останавливается, когда последовательность закончилась или когда `yield` вернул `false`».
+
+Теперь перечитаем `Tolanganlar` из `hook/main.go` этими глазами:
+
+| Строка | Что происходит |
+|---|---|
+| 19 | `Tolanganlar` — не сам итератор: она **создаёт** итератор и возвращает его |
+| 20 | возвращённая анонимная функция — итератор. У неё есть параметр `yield` |
+| 21 | итератор захватил `bb`: `bb` ему видна и после возврата из `Tolanganlar` (замыкание) |
+| 25 | каждый оплаченный заказ отдаётся через `yield(b)` |
+| 25–27 | если `yield` вернул `false` — сразу `return` |
+| 39 | `for b := range …` — проходит по этому итератору. Что передано в `yield`, то и станет `b` |
+
+`slices.Values` написан точно так же: `for _, v := range s { if !yield(v) { return } }`
+([slices/iter.go](https://github.com/golang/go/blob/go1.26.8/src/slices/iter.go#L37-L45)). В итераторах
+стандартной библиотеки нет магии: это такой же код, как ваш.
+
+## Кто когда работает: оставляем след
+
+В каком порядке работают итератор и тело цикла? В `iz/` («след») в оба добавлен `Println`:
+
+```go filename="iz/main.go" showLineNumbers
+// Iz: kim qachon ishlaydi? Iterator va sikl tanasi navbatma-navbat gapiradi.
+package main
+
+import (
+	"fmt"
+	"iter"
+)
+
+func Summalar(ss []int64) iter.Seq[int64] {
+	return func(yield func(int64) bool) {
+		for _, s := range ss {
+			fmt.Println("iterator:", s, "ni beraman")
+			davom := yield(s)
+			fmt.Println("iterator: yield", davom, "qaytardi")
+			if !davom {
+				return
+			}
+		}
+		fmt.Println("iterator: hammasi berildi")
+	}
+}
+
+func main() {
+	for s := range Summalar([]int64{150000, 42000, 310000}) {
+		fmt.Println("  sikl:", s)
+		if s < 50000 {
+			break
+		}
+	}
+	fmt.Println("sikldan keyin")
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 9 | `func Summalar(ss []int64) iter.Seq[int64] {` | создаёт итератор, выдающий суммы `int64` |
+| 12 | `fmt.Println("iterator:", s, "ni beraman")` | итератор говорит до `yield` («отдаю s») |
+| 13 | `davom := yield(s)` | сохраняет ответ `yield` в переменную (`davom` — «продолжать») |
+| 14 | `fmt.Println("iterator: yield", davom, "qaytardi")` | печатает ответ («yield вернул …») |
+| 15–17 | `if !davom { return }` | при `false` останавливается |
+| 19 | `fmt.Println("iterator: hammasi berildi")` | печатается, если цикл дошёл до конца («всё отдано») |
+| 24 | `for s := range Summalar([]int64{150000, 42000, 310000}) {` | проходит по трём суммам |
+| 25 | `fmt.Println("  sikl:", s)` | говорит тело цикла (с двумя пробелами; `sikl` — «цикл») |
+| 26–28 | `if s < 50000 { break }` | на `42000` выходит |
+| 30 | `fmt.Println("sikldan keyin")` | строка после цикла («после цикла») |
+
+Подумайте: появится ли строка про `310000`? Появится ли `iterator: hammasi berildi`?
+
+**A)** появятся обе · **B)** `310000` не появится, `hammasi berildi` появится · **C)** не появится ни одна
+
+<details>
+<summary>Ответ</summary>
+
+**C.** На `42000` цикл делает `break`, `yield` возвращает `false`, и итератор завершается через `return` в строке 16.
+До строки 19 и до третьей суммы очередь не доходит. Если вы выбрали «A» или «B», вы думали, что итератор заранее
+готовит все значения. Итератор вычисляет значение только тогда, когда его просят.
+
+</details>
+
+```console
+$ go run ./iz
+iterator: 150000 ni beraman
+  sikl: 150000
+iterator: yield true qaytardi
+iterator: 42000 ni beraman
+  sikl: 42000
+iterator: yield false qaytardi
+sikldan keyin
+```
+
+По времени:
+
+| Шаг | Кто работает | На экране |
+|---|---|---|
+| 1 | итератор, `s = 150000` | `iterator: 150000 ni beraman` |
+| 2 | `yield(150000)` → тело цикла | `  sikl: 150000` |
+| 3 | тело дошло до конца → `yield` вернул `true` | `iterator: yield true qaytardi` |
+| 4 | итератор, `s = 42000` | `iterator: 42000 ni beraman` |
+| 5 | `yield(42000)` → тело цикла, `break` | `  sikl: 42000` |
+| 6 | `yield` вернул `false`, итератор делает `return` | `iterator: yield false qaytardi` |
+| 7 | `range` закончился | `sikldan keyin` |
+
+Итератор и тело цикла работают по очереди, **в одной горутине**. Go wiki: *"we're going to have everything on one
+stack"* — «всё будет на одном стеке» ([Rangefunc Experiment](https://go.dev/wiki/RangefuncExperiment)). Ни канала, ни
+дополнительной горутины. (Это верно для `range`. А `iter.Pull`, который мы увидим позже, создаёт внутри отдельную
+корутину.)
+
+## Компилятор превращает тело цикла в функцию
+
+Кто возвращает значение из `yield`? Её создаёт компилятор. Он заворачивает тело цикла в новую анонимную функцию и
+передаёт её итератору как `yield`. Это описано в пакете `rangefunc` компилятора Go
+([rewrite.go, *Theory of Operation*](https://github.com/golang/go/blob/go1.26.8/src/cmd/compile/internal/rangefunc/rewrite.go)).
+Цикл из `hook` становится примерно таким:
+
+```text
+// что вы написали:
+for b := range Tolanganlar(bb) {
+    fmt.Println("buyurtma", b.ID, b.Summa)
+    if b.Summa < 50000 {
+        fmt.Println("kichik summa, toʻxtaymiz")
+        break
+    }
+}
+
+// что сделал компилятор (упрощённо):
+Tolanganlar(bb)(func(b Buyurtma) bool {
+    fmt.Println("buyurtma", b.ID, b.Summa)
+    if b.Summa < 50000 {
+        fmt.Println("kichik summa, toʻxtaymiz")
+        return false    // был break
+    }
+    return true         // конец тела: давай следующий
+})
+```
+
+Каждое ключевое слово в теле заменяется так:
+
+| В теле цикла | В функции `yield` | Смысл для итератора |
+|---|---|---|
+| конец тела | `return true` | давай следующий элемент |
+| `continue` | `return true` | давай следующий элемент |
+| `break` | `return false` | стоп |
+| `return` | `#next = -1; return false` | стоп; после возврата итератора внешняя функция тоже делает `return` |
+
+`return` — самый интересный случай. `return` в теле должен выйти из внешней функции, но теперь он внутри другой
+функции. Поэтому компилятор сначала возвращает `false` и ставит метку в скрытую переменную `#next`. Когда итератор
+сделает `return`, добавленный компилятором код проверит `if #next == -1 { return }` и выйдет из внешней функции.
+Имена, начинающиеся с `#`, написать нельзя: это внутренние переменные компилятора.
+
+Кроме того, для каждого цикла компилятор создаёт переменную состояния (`#stateK`). Сгенерированный `yield` проверяет
+это состояние при каждом вызове. Это важно для следующего раздела.
+
+## Panic: после того как yield вернул false
+
+Вернёмся к `panic` из начала урока. Код в папке `buzuq/` («сломанный») такой же, как в `hook/`, отличие только в одном
+месте:
+
+```console
+$ diff hook/main.go buzuq/main.go | tail -5
+< 			if !yield(b) {
+< 				return
+< 			}
+---
+> 			yield(b)
+```
+
+`<` — строки из `hook/main.go`, `>` — из `buzuq/main.go`. В `buzuq` ответ `yield(b)` выбрасывается. `go vet` эту ошибку
+не находит:
+
+```console
+$ go vet ./buzuq && echo 'vet: jim'
+vet: jim
+```
+
+`vet: jim` («vet молчит») — `go vet` ничего не нашёл, и сработал `echo`. Подумайте: что сделает `go run ./buzuq`?
+
+**A)** те же три строки, что у `hook` · **B)** появится и `buyurtma 4 310000`: итератор не остановился ·
+**C)** три строки, затем `panic`
+
+<details>
+<summary>Ответ</summary>
+
+**C.** После `break` `yield` вернул `false`, но итератор `buzuq` это не проверил и снова вызвал `yield` с 4-м заказом.
+Сгенерированный компилятором `yield` проверяет состояние и останавливает программу. Если вы выбрали «B», вы считали
+`yield` обычным callback: после `break` тело заново не выполняется. Если «A», вы думали, что Go молча это пропустит.
+
+</details>
+
+Флаг `-trimpath` пишет пути файлов в stack trace через имя модуля, а не через папку на компьютере:
+
+```console
+$ go run -trimpath ./buzuq
+buyurtma 1 150000
+buyurtma 3 42000
+kichik summa, toʻxtaymiz
+panic: runtime error: range function continued iteration after function for loop body returned false
+
+goroutine 1 [running]:
+main.main-range1(...)
+	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/buzuq/main.go:34
+main.main.Tolanganlar.func1(...)
+	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/buzuq/main.go:22
+main.main()
+	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/buzuq/main.go:34 +0x20f
+exit status 2
+```
+
+Читаем ошибку:
+
+| Строка | Смысл |
+|---|---|
+| `panic: runtime error: range function continued iteration after function for loop body returned false` | «range-функция продолжила обход после того, как тело цикла вернуло `false`» |
+| `goroutine 1 [running]:` | горутина `main`, в момент работы |
+| `main.main-range1(...)` | функция, которую компилятор сделал из **первого** цикла `range` в `main`, — тело цикла, то есть `yield` |
+| `buzuq/main.go:34` | тот самый цикл: `for b := range Tolanganlar(bb) {` |
+| `main.main.Tolanganlar.func1(...)` | итератор (анонимная функция внутри `Tolanganlar`), встроенный в `main` |
+| `buzuq/main.go:22` | `yield(b)` — вызов после `false` |
+| `exit status 2` | код выхода программы, завершившейся `panic` ([GO-1.15](/lab/youtube/go/go-1-15/ru)) |
+
+Правило записано в спецификации Go: *"If the loop body terminates (such as by a break statement), yield returns false
+and must not be called again."* — «Если тело цикла завершилось (например, через `break`), `yield` возвращает `false`,
+и вызывать его снова нельзя» ([Go spec: For statements with range clause](https://go.dev/ref/spec#For_range)). В
+документации iter короче: *"Yield panics if called after it returns false."*
+
+`go vet` (go1.26.8) эту ошибку не проверяет. Но **gopls** в редакторе (языковой сервер Go в VS Code, GoLand, Neovim)
+её показывает. `gopls check` выводит то же в терминале (`sed` сокращает полный путь к файлу):
+
+```console
+$ gopls check buzuq/main.go 2>&1 | sed 's|.*/buzuq/|buzuq/|'
+buzuq/main.go:22:4-12: yield may be called again after returning false
+```
+
+*yield may be called again after returning false* — «`yield` может быть вызван снова после того, как вернул `false`».
+`22:4-12` — строка 22, столбцы 4–12: `yield(b)`. Для `hook/main.go` `gopls check` ничего не выводит. Исправление:
+всегда проверяйте ответ `yield`, `if !yield(b) { return }`.
+
+## Дерево: рекурсивный итератор
+
+Главная польза итераторов видна на сложных структурах. В `daraxt/` («дерево») — generic **двоичное дерево поиска**
+(*binary search tree*): в левой ветви каждого узла значения меньше него, в правой — больше или равные.
+
+```go filename="daraxt/main.go" showLineNumbers
+// Daraxt: rekursiv tuzilmani iterator bilan aylanish.
+// Slice yaratilmaydi, channel ham, goroutine ham kerak emas.
+package main
+
+import (
+	"cmp"
+	"fmt"
+	"iter"
+)
+
+type Daraxt[T cmp.Ordered] struct {
+	chap, ong *Daraxt[T]
+	qiymat    T
+}
+
+func (d *Daraxt[T]) Qosh(v T) *Daraxt[T] {
+	if d == nil {
+		return &Daraxt[T]{qiymat: v}
+	}
+	if v < d.qiymat {
+		d.chap = d.chap.Qosh(v)
+	} else {
+		d.ong = d.ong.Qosh(v)
+	}
+	return d
+}
+
+// All qiymatlarni oʻsish tartibida beradi.
+func (d *Daraxt[T]) All() iter.Seq[T] {
+	return func(yield func(T) bool) {
+		d.aylan(yield)
+	}
+}
+
+func (d *Daraxt[T]) aylan(yield func(T) bool) bool {
+	if d == nil {
+		return true
+	}
+	return d.chap.aylan(yield) && yield(d.qiymat) && d.ong.aylan(yield)
+}
+
+func main() {
+	var d *Daraxt[int64]
+	for _, s := range []int64{150000, 42000, 310000, 99000, 7000} {
+		d = d.Qosh(s)
+	}
+	for s := range d.All() {
+		fmt.Println(s)
+		if s >= 100000 {
+			break
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `type Daraxt[T cmp.Ordered] struct {` | generic-тип; `T` — тип, который можно сравнивать через `<` ([GO-1.17](/lab/youtube/go#go-1-17)) |
+| 12 | `chap, ong *Daraxt[T]` | указатели на левую (`chap`) и правую (`ong`) ветви; нет ветви — `nil` |
+| 13 | `qiymat T` | значение в узле |
+| 16 | `func (d *Daraxt[T]) Qosh(v T) *Daraxt[T] {` | добавляет значение (`Qosh` — «добавить») и возвращает корень дерева |
+| 17–19 | `if d == nil { return &Daraxt[T]{qiymat: v} }` | на пустом месте — новый узел. Метод с pointer receiver можно вызвать и на `nil` |
+| 20–24 | `if v < d.qiymat { … } else { … }` | меньшее налево, остальное направо |
+| 29 | `func (d *Daraxt[T]) All() iter.Seq[T] {` | возвращает итератор. Документация iter: метод, отдающий все элементы коллекции, по соглашению называется `All` |
+| 31 | `d.aylan(yield)` | передаёт работу рекурсивной `aylan` («обойти») |
+| 35 | `func (d *Daraxt[T]) aylan(yield func(T) bool) bool {` | возвращает `bool`: `true` — продолжаем, `false` — остановились |
+| 36–38 | `if d == nil { return true }` | пустая ветвь: обходить нечего, продолжаем |
+| 39 | `return d.chap.aylan(yield) && yield(d.qiymat) && d.ong.aylan(yield)` | сначала левая ветвь, потом узел, потом правая |
+| 44–46 | `for _, s := range []int64{…} { d = d.Qosh(s) }` | добавляет пять сумм в дерево |
+| 47–52 | `for s := range d.All() { …; if s >= 100000 { break } }` | печатает по возрастанию, останавливается после `100000` |
+
+Вся работа — в строке 39. `&&` — сокращённое вычисление (*short-circuit*): если левая часть `false`, правая вообще не
+вычисляется. Значит, если какой-то `yield` вернул `false`, остальные шаги не вызываются, и `false` поднимается вверх по
+рекурсии. Итератор выполняет правило одной этой строкой. Пример `Tree.walk` из спецификации Go построен на той же идее.
+
+Дерево выглядит так (порядок добавления: `150000, 42000, 310000, 99000, 7000`):
+
+```text
+              150000
+             /      \
+         42000      310000
+        /     \
+     7000    99000
+
+порядок обхода: левая → узел → правая
+7000 → 42000 → 99000 → 150000 → (break) → до 310000 очередь не доходит
+```
+
+```console
+$ go run ./daraxt
+7000
+42000
+99000
+150000
+```
+
+Результат вышел по возрастанию, а после `150000` цикл остановился. Для этого не понадобились ни слайс, ни канал, ни
+дополнительная горутина. Без итератора у вас было бы два пути: собрать все значения в слайс (память) или принимать
+callback, как `filepath.Walk` (у каждого пакета свой способ).
+
+## Скорость: измеряем
+
+Вызов функции на каждый элемент — разве это не медленно? Не гадаем, измеряем ([GO-1.07](/lab/youtube/go/go-1-07/ru)). В `tezlik/`
+(«скорость») одна и та же сумма считается четырьмя способами:
+
+```go filename="tezlik/tezlik.go" showLineNumbers
+// Tezlik: bir xil yigʻindi toʻrt usulda.
+package tezlik
+
+import (
+	"iter"
+	"slices"
+)
+
+// 1. Oddiy range slice ustida.
+func JamiOddiy(ss []int64) int64 {
+	var j int64
+	for _, s := range ss {
+		j += s
+	}
+	return j
+}
+
+// 2. Standart iterator: slices.Values.
+func JamiValues(ss []int64) int64 {
+	var j int64
+	for s := range slices.Values(ss) {
+		j += s
+	}
+	return j
+}
+
+// Barchasi — oʻzimiz yozgan iterator.
+func Barchasi(ss []int64) iter.Seq[int64] {
+	return func(yield func(int64) bool) {
+		for _, s := range ss {
+			if !yield(s) {
+				return
+			}
+		}
+	}
+}
+
+// 3. Oʻz iteratorimiz.
+func JamiOz(ss []int64) int64 {
+	var j int64
+	for s := range Barchasi(ss) {
+		j += s
+	}
+	return j
+}
+
+// 4. Iterator qiymat sifatida keladi, funksiya inline qilinmaydi:
+// endi har bir element uchun yield haqiqiy chaqiruv boʻladi.
+//
+//go:noinline
+func JamiSeq(seq iter.Seq[int64]) int64 {
+	var j int64
+	for s := range seq {
+		j += s
+	}
+	return j
+}
+```
+
+| Строка | Способ | Что делает |
+|---|---|---|
+| 10–16 | `JamiOddiy` | обычный `range` по слайсу (`jami` — «итого», `oddiy` — «обычный») |
+| 19–25 | `JamiValues` | стандартный итератор: `slices.Values(ss)` |
+| 28–36 | `Barchasi` | наш собственный итератор («все»), тот же код, что у `slices.Values` |
+| 39–45 | `JamiOz` | `range` по `Barchasi` (`oʻz` — «свой») |
+| 50 | `//go:noinline` | указание компилятору (*directive*): не встраивать эту функцию. После `//` нет пробела |
+| 51–57 | `JamiSeq` | итератор приходит параметром как значение; функция не встраивается |
+
+Бенчмарки лежат в `tezlik/tezlik_test.go`: каждый считает сумму 1000 чисел `int64` внутри `for b.Loop()`. `olch.sh`
+запускает каждый бенчмарк 7 раз (`-count 7 -cpu 1`) и печатает медиану `ns/op`.
+
+Подумайте: какой из них заметно медленнее?
+
+**A)** никакой: все одинаковые · **B)** три с итераторами (`Values`, `Oz`, `Seq`) · **C)** только `Seq`
+
+<details>
+<summary>Ответ</summary>
+
+**C.** В `Values` и `Oz` компилятор встраивает и итератор, и тело цикла, и получается код, близкий к обычному циклу. В
+`Seq` итератор приходит как неизвестное значение-функция, и каждый элемент — настоящий вызов. Если вы выбрали «B», вы
+думали, что каждый `yield` остаётся вызовом. Если «A», вы думали, что компилятор всегда может встроить.
+
+</details>
+
+Диаграмма из видео — медиана шести замеров `olch.sh` на слабо загруженной машине (go1.26.8, i5-12450H):
+
+| Способ | ns/op (одна сумма) | `allocs/op` | Относительно Oddiy |
+|---|---|---|---|
+| `JamiOddiy` | 246 | 0 | 1,00 |
+| `JamiValues` | 270 | 0 | 1,10 |
+| `JamiOz` | 265 | 0 | 1,08 |
+| `JamiSeq` | 2145 | 2 | 8,7 |
+
+Для этой страницы мы запустили его ещё раз. Машина была занята другой работой, поэтому числа больше, но соотношение то
+же:
+
+```console
+$ ./tezlik/olch.sh
+BenchmarkOddiy      365 ns/op  0 allocs/op
+BenchmarkValues     373 ns/op  0 allocs/op
+BenchmarkOz         384 ns/op  0 allocs/op
+BenchmarkSeq       2843 ns/op  2 allocs/op
+```
+
+Первые три близки друг к другу (разница около десяти процентов). `Seq` медленнее в семь–девять раз (в шести замерах
+7,3–9,6). На вашем компьютере числа будут другими: смотрите на соотношение.
+
+Спросим причину у компилятора. `-gcflags=-m` печатает решения о встраивании и escape-анализе
+([GO-1.11](/lab/youtube/go/go-1-11/ru)), а `grep` оставляет нужные строки:
+
+```console
+$ go build -gcflags=-m ./tezlik 2>&1 | grep -E 'inlining call to (Barchasi|JamiOz.Barchasi.func1|JamiOz-range1)|moved to heap: j|tezlik.go:53:2: func literal'
+tezlik/tezlik.go:41:25: inlining call to Barchasi
+tezlik/tezlik.go:41:2: inlining call to JamiOz.Barchasi.func1
+tezlik/tezlik.go:41:2: inlining call to JamiOz-range1
+tezlik/tezlik.go:52:6: moved to heap: j
+tezlik/tezlik.go:53:2: func literal escapes to heap
+```
+
+| Строка | Смысл |
+|---|---|
+| `41:25: inlining call to Barchasi` | в `JamiOz` вызов `Barchasi(ss)` встроен |
+| `41:2: inlining call to JamiOz.Barchasi.func1` | сам итератор (анонимная функция внутри `Barchasi`) тоже встроен |
+| `41:2: inlining call to JamiOz-range1` | `yield`, сделанный из тела цикла, тоже встроен. Итог — обычный цикл |
+| `52:6: moved to heap: j` | `j` в `JamiSeq` переехала в кучу |
+| `53:2: func literal escapes to heap` | функция, сделанная из тела цикла в `JamiSeq`, ушла в кучу |
+
+В `JamiSeq` `seq` — функция, пришедшая снаружи. Компилятор не знает, что у неё внутри, и не может встроить `yield`.
+Тело цикла остаётся настоящим замыканием и захватывает переменную `j`. Замыкание передаётся неизвестной функции,
+поэтому `j` тоже переезжает в кучу: это escape-анализ из [GO-1.11](/lab/youtube/go/go-1-11/ru). На каждую сумму всего два
+выделения памяти (`j` и замыкание, `40 B/op`). А основная цена — 1000 настоящих вызовов функции.
+
+Когда эта цена важна? Наше тело совсем маленькое: одно сложение. Go wiki: *"For more complex bodies or iterators, the
+overhead of the function calls is insignificant."* — «для более сложного тела или итератора накладные расходы на
+вызовы функций несущественны» ([Rangefunc Experiment](https://go.dev/wiki/RangefuncExperiment)). Wiki также
+предупреждает: эти оптимизации зависят от версии Go. Поэтому в своём коде не гадайте, а измеряйте.
+
+## iter.Seq2: два значения на каждом шаге
+
+`range` принимает функции трёх видов ([Go 1.23 release notes](https://go.dev/doc/go1.23#language)):
+
+| Тип функции | Имя в `iter` | Форма `for` |
+|---|---|---|
+| `func(func() bool)` | — | `for range f` |
+| `func(func(V) bool)` | `iter.Seq[V]` | `for v := range f` |
+| `func(func(K, V) bool)` | `iter.Seq2[K, V]` | `for k, v := range f` |
+
+`Seq2` обычно отдаёт пару ключ–значение или индекс–значение. `slices.All` — индекс и значение, `maps.All` — ключ и
+значение.
+
+```go filename="seq2/main.go" showLineNumbers
+// Seq2: har qadamda ikki qiymat (indeks va qiymat, kalit va qiymat).
+package main
+
+import (
+	"fmt"
+	"iter"
+	"slices"
+	"sync"
+)
+
+func main() {
+	summalar := []int64{150000, 42000}
+	for i, s := range slices.All(summalar) { // iter.Seq2[int, int64]
+		fmt.Println(i, s)
+	}
+
+	// sync.Map'ning Range metodi Go 1.9 dan beri bor va aynan Seq2 shaklida.
+	var m sync.Map
+	m.Store("Aziz", 150000)
+	var _ iter.Seq2[any, any] = m.Range
+	for k, v := range m.Range {
+		fmt.Println(k, v)
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 13 | `for i, s := range slices.All(summalar) {` | `slices.All` — `iter.Seq2[int, int64]`: индекс и значение (`summalar` — «суммы») |
+| 18 | `var m sync.Map` | map, безопасная для горутин (горутины — в следующих уроках) |
+| 19 | `m.Store("Aziz", 150000)` | записывает ключ и значение; оба хранятся как `any` |
+| 20 | `var _ iter.Seq2[any, any] = m.Range` | проверка: подходит ли метод `m.Range` под тип `iter.Seq2[any, any]`? Если нет — ошибка компиляции. `_` выбрасывает значение |
+| 21 | `for k, v := range m.Range {` | `range` прямо по старому методу |
+
+```console
+$ go run ./seq2
+0 150000
+1 42000
+Aziz 150000
+```
+
+Интересно, что `sync.Map.Range` есть с Go 1.9, задолго до итераторов. Но его сигнатура
+`Range(f func(key, value any) bool)` — ровно форма `Seq2`. Поэтому по нему можно делать `range` без всяких изменений.
+
+А если нужно вести два итератора бок о бок (например, сопоставить имена и суммы)? `range` для этого не хватает: он
+управляет одним итератором. Для этого есть `iter.Pull`: он превращает итератор в *pull*-форму (функции `next` и
+`stop`). Вы напишете его в задании уровня Guru.
+
+Куда в итераторе девать ошибку? В `iter.Seq[T]` для ошибки места нет. Есть два обычных пути: `iter.Seq2[T, error]`
+(ошибка вместе с каждым значением) или отдельный метод `Err()`, как у `bufio.Scanner`.
+
+## Одноразовый итератор
+
+Теперь одна скрытая ловушка. В Go 1.24 появился `strings.SplitSeq`: делит строку на части, как `strings.Split`, но не
+создаёт слайс, а возвращает итератор.
+
+```go filename="birmarta/main.go" showLineNumbers
+// Bir martalik iterator: strings.SplitSeq ikkinchi marta boshidan boshlamaydi.
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	qismlar := strings.SplitSeq("Aziz,Bobur,Dilnoz", ",")
+	for q := range qismlar {
+		fmt.Println("1-marta:", q)
+	}
+	for q := range qismlar {
+		fmt.Println("2-marta:", q)
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10 | `qismlar := strings.SplitSeq("Aziz,Bobur,Dilnoz", ",")` | итератор, делящий по запятой; `qismlar` («части») — `iter.Seq[string]` |
+| 11–13 | первый `for q := range qismlar` | печатает части с `1-marta:` («1-й раз») |
+| 14–16 | второй `for q := range qismlar` | ещё раз по тому же итератору (`2-marta:` — «2-й раз») |
+
+Подумайте: что выведет второй цикл?
+
+**A)** снова три имени · **B)** ничего · **C)** только `Dilnoz`
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Удивительно, но так. Внутри `SplitSeq` замыкание укорачивает захваченную строку `s`: после каждой части
+`s = s[i+len(sep):]`. Когда первый цикл закончился, в `s` осталась только последняя часть, `Dilnoz`. Второй цикл
+начинает с этого остатка. Если вы выбрали «A», вы думали, что итератор каждый раз начинает сначала: `Tolanganlar` из
+`hook` так и делает, а `SplitSeq` — нет. Если «B», вы думали в верном направлении, но не учли, что последняя часть
+остаётся в `s`.
+
+</details>
+
+```console
+$ go run ./birmarta
+1-marta: Aziz
+1-marta: Bobur
+1-marta: Dilnoz
+2-marta: Dilnoz
+```
+
+Это не баг, а документированное поведение. В документации `strings.SplitSeq`: *"It returns a single-use iterator."* —
+«он возвращает **одноразовый итератор**» ([strings/iter.go](https://github.com/golang/go/blob/go1.26.8/src/strings/iter.go)).
+В документации iter для таких итераторов есть отдельный раздел
+([Single-Use Iterators](https://pkg.go.dev/iter#hdr-Single_Use_Iterators)). `strings.Lines`, `strings.SplitAfterSeq`
+из Go 1.24 и их пары в пакете `bytes` тоже одноразовые.
+
+Причина — замыкание из [GO-1.06](/lab/youtube/go/go-1-06/ru): оно держит не копию переменной, а её саму, и меняет её. Правило:
+прежде чем использовать функцию, возвращающую итератор, прочитайте её документацию. Если значения нужны дважды,
+соберите их в слайс через `slices.Collect(qismlar)` или создайте итератор заново (вызовите `strings.SplitSeq` ещё раз).
+
+## Пакеты slices, maps и cmp
+
+### maps.Keys — не слайс
+
+В [GO-1.09](/lab/youtube/go/go-1-09/ru) мы видели, что порядок map не гарантирован, а стабильный порядок даёт
+`slices.Sorted(maps.Keys(m))`. Теперь поймём, почему это работает.
+
+```go filename="tartib/main.go" showLineNumbers
+// Tartib: map tartibsiz, maps.Keys esa slice emas — iterator.
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+)
+
+func main() {
+	jami := map[string]int64{
+		"Aziz":   150000,
+		"Bobur":  99000,
+		"Dilnoz": 42000,
+		"Kamola": 310000,
+	}
+
+	for range 3 {
+		var nomlar []string
+		for k := range jami {
+			nomlar = append(nomlar, k)
+		}
+		fmt.Println(nomlar)
+	}
+
+	fmt.Printf("%T\n", maps.Keys(jami))
+	fmt.Println(slices.Sorted(maps.Keys(jami)))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11–16 | `jami := map[string]int64{…}` | клиент → общая сумма |
+| 18 | `for range 3 {` | три раза (`range` по целому числу с Go 1.22, [GO-1.05](/lab/youtube/go/go-1-05/ru)) |
+| 19–23 | `for k := range jami { nomlar = append(nomlar, k) }` | собирает ключи map в том порядке, в каком они пришли (`nomlar` — «имена»), и печатает |
+| 26 | `fmt.Printf("%T\n", maps.Keys(jami))` | печатает, что возвращает `maps.Keys` (`%T` — имя типа) |
+| 27 | `fmt.Println(slices.Sorted(maps.Keys(jami)))` | отсортированные ключи |
+
+```console
+$ go run ./tartib
+[Aziz Bobur Dilnoz Kamola]
+[Bobur Dilnoz Kamola Aziz]
+[Kamola Aziz Bobur Dilnoz]
+iter.Seq[string]
+[Aziz Bobur Dilnoz Kamola]
+```
+
+Первые три строки при каждом запуске могут быть разными: порядок map случаен. Иногда две строки совпадают, это тоже
+случайность. Посмотрите на четвёртую строку: `maps.Keys` возвращает не слайс, а `iter.Seq[string]`. Он не хранит ключи
+в себе, а отдаёт их по одному по запросу. А `slices.Sorted` принимает любой `iter.Seq`, собирает все значения в слайс
+и возвращает их отсортированными. Если сортировка не нужна, `slices.Collect(maps.Keys(m))` просто соберёт слайс.
+
+Часть функций для работы с итераторами (Go 1.23):
+
+| Функция | Что делает |
+|---|---|
+| `slices.All(s)`, `slices.Values(s)`, `slices.Backward(s)` | итератор из слайса |
+| `maps.All(m)`, `maps.Keys(m)`, `maps.Values(m)` | итератор из map (порядок случайный) |
+| `slices.Collect(seq)`, `slices.Sorted(seq)`, `slices.SortedFunc(seq, cmp)` | слайс из итератора |
+| `maps.Collect(seq2)` | map из `Seq2` |
+
+### Функция сравнения: не разность
+
+Сортируем товары по рейтингу, больший первым. Привычный способ в JS: `mm.sort((a, b) => b.reyting - a.reyting)`. В Go
+в `slices.SortFunc` передаётся **функция сравнения** (*comparison function*). По документации она должна вернуть
+отрицательное число при `a < b`, положительное при `a > b` и `0` при равенстве. А тип результата — `int`.
+
+```go filename="saralash/main.go" showLineNumbers
+// Saralash: reyting boʻyicha kamayish tartibida. Ikki xato va bitta toʻgʻri usul.
+package main
+
+import (
+	"cmp"
+	"fmt"
+	"slices"
+)
+
+type Mahsulot struct {
+	Nom     string
+	Reyting float64
+}
+
+func main() {
+	mm := []Mahsulot{{"choynak", 4.2}, {"dazmol", 4.8}, {"fen", 3.9}, {"blender", 4.5}}
+
+	// Xato: ayirma int'ga aylanganda 0.6 → 0 boʻladi, ya'ni "teng".
+	slices.SortFunc(mm, func(a, b Mahsulot) int {
+		return int(b.Reyting - a.Reyting)
+	})
+	fmt.Println("int(ayirma):  ", mm)
+
+	// Toʻgʻri: cmp.Compare manfiy, nol yoki musbat qaytaradi.
+	slices.SortFunc(mm, func(a, b Mahsulot) int {
+		return cmp.Compare(b.Reyting, a.Reyting)
+	})
+	fmt.Println("cmp.Compare:  ", mm)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10–13 | `type Mahsulot struct { Nom string; Reyting float64 }` | товар (`Mahsulot`): название и рейтинг (дробное число) |
+| 16 | `mm := []Mahsulot{…}` | четыре товара: `choynak` («чайник») 4.2, `dazmol` («утюг») 4.8, `fen` 3.9, `blender` 4.5 |
+| 19–21 | `slices.SortFunc(mm, func(a, b Mahsulot) int { return int(b.Reyting - a.Reyting) })` | `b - a` как в JS, но результат приводится к `int` |
+| 22 | `fmt.Println("int(ayirma):  ", mm)` | первый результат (`ayirma` — «разность») |
+| 25–27 | `… return cmp.Compare(b.Reyting, a.Reyting) …` | правильный способ |
+| 28 | `fmt.Println("cmp.Compare:  ", mm)` | второй результат |
+
+Подумайте: какой будет первая строка?
+
+**A)** правильная: `dazmol, blender, choynak, fen` · **B)** без изменений: `choynak, dazmol, fen, blender` ·
+**C)** обратная: `fen, choynak, blender, dazmol`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `4.8 − 4.2 = 0.6`. При приведении дробного числа к `int` Go отбрасывает дробную часть (к нулю), `0.6` → `0`, то
+есть «равны». Здесь самая большая разность `4.8 − 3.9 = 0.9`, все разности меньше единицы. `slices.SortFunc` считает
+всех равными и ничего не двигает. Если вы выбрали «A», вы думали, что это работает как в JS: в JS `sort` принимает и
+дробный результат и смотрит только на знак. Если «C», вы прочитали порядок `b, a` наоборот.
+
+</details>
+
+```console
+$ go run ./saralash
+int(ayirma):   [{choynak 4.2} {dazmol 4.8} {fen 3.9} {blender 4.5}]
+cmp.Compare:   [{dazmol 4.8} {blender 4.5} {choynak 4.2} {fen 3.9}]
+```
+
+Исправление — [`cmp.Compare`](https://pkg.go.dev/cmp#Compare) (Go 1.21). Он возвращает `-1` при `x < y`, `0` при
+равенстве, `+1` при `x > y` и не теряет дробную часть. Аргументы в порядке `b, a`, поэтому больший идёт первым. Это
+точный аналог `$b <=> $a` (*spaceship*) в PHP. И для целых чисел не пишите `a - b`: на больших числах разность может
+переполниться (*overflow*).
+
+### NaN и cmp.Or
+
+Ещё одна ловушка. Что, если рейтинг нового товара без отзывов — `0/0`? Для дробных чисел `0/0` — **NaN** (*Not a
+Number*, «не число»), правило IEEE 754. В JS тоже `0/0` → `NaN`.
+
+```go filename="nan/main.go" showLineNumbers
+// NaN: sharhi yoʻq mahsulotning reytingi 0/0 = NaN. Qoʻlda yozilgan taqqoslash buziladi.
+package main
+
+import (
+	"cmp"
+	"fmt"
+	"slices"
+	"strings"
+)
+
+type Mahsulot struct {
+	Nom     string
+	Reyting float64
+}
+
+func main() {
+	var nol float64
+	yangi := Mahsulot{"yangi", nol / nol} // 0/0 = NaN
+	asl := []Mahsulot{
+		{"dazmol", 4.8}, {"fen", 3.9}, yangi,
+		{"choynak", 4.2}, {"mikser", 4.5}, {"blender", 4.5},
+	}
+
+	// Xato: NaN hech narsadan katta ham, kichik ham emas — "hammaga teng".
+	mm := slices.Clone(asl)
+	slices.SortFunc(mm, func(a, b Mahsulot) int {
+		if a.Reyting > b.Reyting {
+			return -1
+		}
+		if a.Reyting < b.Reyting {
+			return 1
+		}
+		return 0
+	})
+	fmt.Println("qoʻlda:", nomlar(mm))
+
+	// Toʻgʻri: cmp.Compare NaN'ni eng kichik deb hisoblaydi.
+	// cmp.Or: reyting teng boʻlsa, nom boʻyicha.
+	mm = slices.Clone(asl)
+	slices.SortFunc(mm, func(a, b Mahsulot) int {
+		return cmp.Or(
+			cmp.Compare(b.Reyting, a.Reyting),
+			strings.Compare(a.Nom, b.Nom),
+		)
+	})
+	fmt.Println("cmp.Or:", nomlar(mm))
+}
+
+func nomlar(mm []Mahsulot) []string {
+	var s []string
+	for _, m := range mm {
+		s = append(s, fmt.Sprintf("%s=%.1f", m.Nom, m.Reyting))
+	}
+	return s
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 17–18 | `var nol float64`; `yangi := Mahsulot{"yangi", nol / nol}` | `0/0 = NaN` (`nol` — «ноль», `yangi` — «новый»). Константу `0.0/0.0` компилятор отвергает (*division by zero*), поэтому через переменную |
+| 19–22 | `asl := []Mahsulot{…}` | шесть товаров (`asl` — «исходный»), у `mikser` и `blender` одинаковый рейтинг (4.5) |
+| 25 | `mm := slices.Clone(asl)` | копия: исходный порядок сохраняется для второй сортировки |
+| 26–34 | `if a.Reyting > b.Reyting { return -1 }`… | сравнение вручную: больший первым |
+| 35 | `fmt.Println("qoʻlda:", nomlar(mm))` | первый результат (`qoʻlda` — «вручную») |
+| 40–45 | `cmp.Or(cmp.Compare(b.Reyting, a.Reyting), strings.Compare(a.Nom, b.Nom))` | по рейтингу, при равенстве — по названию |
+| 49–55 | `func nomlar(mm []Mahsulot) []string` | строки вида `название=рейтинг` (`%.1f` — один знак после запятой) |
+
+Подумайте: куда попадёт `yangi=NaN` при ручной функции?
+
+**A)** в конец · **B)** в начало · **C)** в середину, и сломает остальных
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Любое сравнение `<` или `>` с NaN даёт `false`. Значит, ручная функция для NaN всегда возвращает `0`: NaN
+«равен» и `4.8`, и `3.9`. Но `4.8` и `3.9` не равны друг другу. А сортировка требует, чтобы отношение «равны» было
+транзитивным (*strict weak ordering*). Из-за нарушения этого правила `fen=3.9` поднялся на второе место. Если вы
+выбрали «A» или «B», вы думали, что NaN ведёт себя как обычное маленькое или большое число.
+
+</details>
+
+```console
+$ go run ./nan
+qoʻlda: [dazmol=4.8 fen=3.9 yangi=NaN mikser=4.5 blender=4.5 choynak=4.2]
+cmp.Or: [dazmol=4.8 blender=4.5 mikser=4.5 choynak=4.2 fen=3.9 yangi=NaN]
+```
+
+В первой строке `fen=3.9` стоит раньше `mikser=4.5`: сортировка сломана. Вторая строка правильная, по двум причинам:
+
+1. `cmp.Compare` считает NaN самым маленьким. Документация: *"a NaN is considered less than any non-NaN, a NaN is
+   considered equal to a NaN"*. А при порядке `b, a` самый маленький оказывается в конце.
+2. [`cmp.Or`](https://pkg.go.dev/cmp#Or) (Go 1.22) возвращает первый ненулевой из своих аргументов. Если рейтинги
+   разные, берётся результат `cmp.Compare`. Если равны (`0`), берётся `strings.Compare(a.Nom, b.Nom)`: `blender`
+   раньше `mikser`. Точный аналог `ORDER BY reyting DESC, nom` в SQL.
+
+`slices.SortFunc` не стабильна: порядок равных элементов не гарантирован. Поэтому второй ключ (`cmp.Or`) делает
+результат каждый раз одинаковым. Если нужно сохранить исходный порядок, есть `slices.SortStableFunc`.
+
+## Вопрос: defer и break
+
+А если итератор открывает ресурс? Например, файл. В `savol/` («вопрос») есть такой итератор:
+
+```go
+func Qatorlar() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		fmt.Println("fayl ochildi")
+		defer fmt.Println("fayl yopildi")
+		for _, q := range []string{"birinchi", "ikkinchi", "uchinchi"} {
+			if !yield(q) {
+				return
+			}
+		}
+	}
+}
+```
+
+Итератор «открывает файл» (`fayl ochildi`) и «закрывает» его через `defer` (`fayl yopildi`; вместо настоящего файла —
+`Println`). А цикл делает `break` уже на первой строке (`birinchi`), затем печатает `sikldan keyin` («после цикла»).
+
+Подумайте: появится ли `fayl yopildi`? Если да, до `sikldan keyin` или после?
+
+**A)** не появится: `break` бросает итератор посередине · **B)** появится, после `sikldan keyin` ·
+**C)** появится, до `sikldan keyin`
+
+<details>
+<summary>Ответ</summary>
+
+**C.** После `break` `yield` возвращает `false`, итератор делает `return`, и срабатывает его `defer`. Только после
+этого заканчивается `range`. Итератор — обычная функция, а `defer` срабатывает при завершении функции
+([GO-1.15](/lab/youtube/go/go-1-15/ru)). Go wiki: *"If an iterator function defers a call, the call runs when the iterator function
+returns."* Если вы выбрали «A», вы думали, что он застынет на паузе, как генератор в JS/Python. Если «B», вы думали,
+что `defer` относится к `main`.
+
+</details>
+
+```go filename="savol/main.go" showLineNumbers
+// Savol: sikl birinchi qatordayoq break qiladi. "fayl yopildi" chiqadimi? Qachon?
+package main
+
+import (
+	"fmt"
+	"iter"
+)
+
+func Qatorlar() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		fmt.Println("fayl ochildi")
+		defer fmt.Println("fayl yopildi")
+		for _, q := range []string{"birinchi", "ikkinchi", "uchinchi"} {
+			if !yield(q) {
+				return
+			}
+		}
+	}
+}
+
+func main() {
+	for q := range Qatorlar() {
+		fmt.Println(q)
+		break
+	}
+	fmt.Println("sikldan keyin")
+}
+```
+
+```console
+$ go run ./savol
+fayl ochildi
+birinchi
+fayl yopildi
+sikldan keyin
+```
+
+Значит, итератор, используемый через `range`, надёжно закрывает свой файл. Но эта гарантия есть только у `range`. Если в
+`iter.Pull` не вызвать `stop`, итератор зависнет посередине, и этот `defer` не сработает. Документация iter: *"If
+clients do not consume the sequence to completion, they must call stop"* — «если вы не дочитали последовательность до
+конца, вы обязаны вызвать `stop`». Это и проверяет `TestStop` из домашнего задания.
+
+## Итог: правила итераторов
+
+| Правило | Почему |
+|---|---|
+| итератор = обычная функция, вызывающая `yield` | `iter.Seq[V]` — `func(yield func(V) bool)`, никакой магии |
+| `yield` вернул `false` — сразу `return` | иначе `panic`; `go vet` молчит, gopls показывает |
+| не гадайте о скорости, измеряйте | простые случаи встраиваются, неизвестный итератор в 7–9 раз медленнее (на маленьком теле) |
+| осторожно с одноразовыми итераторами | `strings.SplitSeq` во второй раз не начинает сначала: читайте документацию |
+| в сортировке не разность, а `cmp.Compare` и `cmp.Or` | `int(0.6) = 0`, NaN ломает порядок |
+
+## Частые ошибки
+
+**1. Не проверять ответ `yield`.** Самая частая. После `break` итератор снова вызывает `yield`, и программа падает с
+`range function continued iteration after function for loop body returned false`. Полный пример, ошибка и stack trace
+— в разделе «Panic». Как читать: `main.main-range1` — тело цикла, а строка под итератором (`buzuq/main.go:22`) — место
+незаконного вызова `yield`. Исправление: пишите каждый `yield` в форме `if !yield(v) { return }`. Если `yield`
+несколько (например, в адаптере `Filtr`), то каждый. Включите gopls в редакторе: он предупредит `yield may be called
+again after returning false`.
+
+**2. Использовать функцию, возвращающую итератор, в модуле со старой строкой `go`.** В модуле `go 1.22` (или ниже)
+— `requires go1.23 or later (-lang was set to go1.22; check go.mod)` (раздел «Зачем это нужно»). Даже если Go на
+компьютере новый, решает строка в `go.mod`. Исправление: поднимите строку `go` до `1.23` или выше.
+
+**3. Дважды обходить одноразовый итератор.** Ни ошибки, ни `panic`: второй цикл просто выдаёт меньше (или ничего)
+(раздел «Одноразовый итератор», `2-marta: Dilnoz`). Исправление: ищите в документации слово *single-use*. Если значения
+нужны дважды, соберите их в слайс через `slices.Collect`.
+
+**4. Разность в функции сравнения.** `int(b.Reyting - a.Reyting)` отбрасывает дробную часть и делает `0.6` «равенством».
+Сортировка молчит, а результат не изменился (раздел «Функция сравнения»). Для целых чисел разность может переполниться.
+Исправление: `cmp.Compare(b.Reyting, a.Reyting)`.
+
+**5. Сравнивать дробные числа вручную через `<` и `>`.** При NaN сортировка ломается, и тоже молча (раздел «NaN и
+cmp.Or»). Исправление: `cmp.Compare`, он считает NaN самым маленьким.
+
+**6. Не вызвать `stop` после `iter.Pull`.** Итератор остаётся посередине, его `defer` (закрытие файла) не срабатывает.
+Ошибки нет. Исправление: сразу после `next, stop := iter.Pull(seq)` — `defer stop()`.
+
+## Проверьте себя
+
+**1.** Почему внутри итератора нужно писать не `yield(v)`, а `if !yield(v) { return }`?
+
+<details>
+<summary>Ответ</summary>
+
+Если `yield` вернул `false`, тело цикла завершилось (`break`, `return` или `goto`). По спецификации вызывать `yield`
+больше нельзя. Сгенерированный компилятором `yield` это проверяет и при нарушении делает `panic`. В отличие от
+генератора JS/Python, итератор никто принудительно не останавливает: остановиться — его собственная задача.
+
+</details>
+
+**2.** Во что компилятор превращает `continue`, `break` и `return` в теле цикла?
+
+<details>
+<summary>Ответ</summary>
+
+`continue` → `return true` (давай следующий). `break` → `return false` (стоп). `return` → сначала `#next = -1;
+return false`, а после возврата итератора внешняя функция тоже делает `return`. Конец тела → `return true`.
+
+</details>
+
+**3.** В `daraxt/main.go` мы заменили строку 49 на `if s > 40000 {` (этого нет в папке курса, запускали отдельно).
+Что выведет `go run .`?
+
+<details>
+<summary>Ответ</summary>
+
+`7000` и `42000`. По возрастанию `7000` (меньше `40000`, продолжаем), затем `42000` (больше `40000`, `break`). `yield`
+возвращает `false`, `&&` не вызывает остальные шаги, и рекурсия останавливается.
+
+```console
+$ go run .
+7000
+42000
+```
+
+</details>
+
+**4.** Что выведет `fmt.Printf("%T\n", maps.Keys(m))` (`m` — `map[string]int64`)? Почему `slices.Sorted` его
+принимает?
+
+<details>
+<summary>Ответ</summary>
+
+`iter.Seq[string]`. `maps.Keys` возвращает не слайс, а итератор. `slices.Sorted` принимает любой `iter.Seq`, собирает
+все значения в слайс и возвращает их отсортированными.
+
+</details>
+
+**5.** Какой порядок даёт `cmp.Or(cmp.Compare(jami[b], jami[a]), strings.Compare(a, b))`?
+
+<details>
+<summary>Ответ</summary>
+
+По убыванию общей суммы (`b, a` — больший первым). Если суммы равны, первый результат `0`, и `cmp.Or` берёт второй: по
+имени в алфавитном порядке. Это ответ на задачу уровня «Сложно» из домашнего задания.
+
+</details>
+
+**6.** Из [GO-1.11](/lab/youtube/go/go-1-11/ru): почему в `JamiSeq` `j` переехала в кучу, а в `JamiOz` — нет?
+
+<details>
+<summary>Ответ</summary>
+
+В `JamiSeq` тело цикла остаётся замыканием и захватывает `j` ([GO-1.06](/lab/youtube/go/go-1-06/ru): замыкание держит саму
+переменную). Это замыкание передаётся в `seq`, содержимое которой компилятор не знает. Компилятор не может доказать,
+что `j` не нужна после функции, и кладёт её в кучу (`moved to heap: j`). В `JamiOz` всё встраивается, замыкания не
+остаётся, и `j` живёт на стеке.
+
+</details>
+
+## Домашнее задание
+
+Задания четырёх уровней. Все файлы — в папке урока на GitHub:
+[lessons/018-iterators](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/018-iterators). Ответы с
+тестами: папка
+[homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/018-iterators/homework). Сначала
+попробуйте сами. Проверка (из папки урока; `-count=1` запускает тесты заново, не беря результат из кэша):
+
+```console
+$ go vet ./... && go test -count=1 ./tezlik ./homework/...
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/tezlik	0.005s
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/homework/guru	0.002s
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/homework/orta	0.002s
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/homework/oson	0.002s
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/018-iterators/homework/qiyin	0.002s
+```
+
+🟢 **Легко:** `Oraliq(a, b int) iter.Seq[int]` («промежуток») — выдаёт числа от `a` до `b` (оба включительно).
+Проверьте тестом с `break`.
+
+<details>
+<summary>Ответ</summary>
+
+Обычный `for` и на каждом шаге `if !yield(i) { return }`:
+
+```go filename="homework/oson/oson.go" showLineNumbers
+// Oson: Oraliq(a, b) a dan b gacha (b ham kiradi) sonlarni beradi.
+package oson
+
+import "iter"
+
+func Oraliq(a, b int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := a; i <= b; i++ {
+			if !yield(i) {
+				return
+			}
+		}
+	}
+}
+```
+
+`TestBreak` делает `break` в `Oraliq(1, 1000)` на `3`: `panic` нет, и получено только `[1 2 3]`. `Oraliq(5, 4)`
+выдаёт пустую последовательность: `slices.Collect` возвращает `nil`.
+
+</details>
+
+🟡 **Средне:** перепишите `Filtr` и `Aylantir` («фильтр» и «преобразовать») из [GO-1.17](/lab/youtube/go#go-1-17) как
+generic-функции над итератором: `Filtr[V any](seq iter.Seq[V], f func(V) bool) iter.Seq[V]` и
+`Aylantir[V, W any](seq iter.Seq[V], f func(V) W) iter.Seq[W]`. Соберите цепочку со `slices.Values`.
+
+<details>
+<summary>Ответ</summary>
+
+```go filename="homework/orta/orta.go" showLineNumbers
+// Oʻrta: iterator'ni oladigan va iterator qaytaradigan generic adapterlar (GO-1.17).
+package orta
+
+import "iter"
+
+// Filtr faqat f true qaytargan qiymatlarni beradi.
+func Filtr[V any](seq iter.Seq[V], f func(V) bool) iter.Seq[V] {
+	return func(yield func(V) bool) {
+		for v := range seq {
+			if f(v) && !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+// Aylantir har bir qiymatni f orqali boshqa turga aylantiradi.
+func Aylantir[V, W any](seq iter.Seq[V], f func(V) W) iter.Seq[W] {
+	return func(yield func(W) bool) {
+		for v := range seq {
+			if !yield(f(v)) {
+				return
+			}
+		}
+	}
+}
+```
+
+Внутри обычный `for v := range seq`. Если внешний `yield` вернул `false`, делаем `return`. Тогда и внутренний цикл
+заканчивается: его `yield` (тело нашего цикла) возвращает `false`, и внутренний итератор сам останавливается. В `Filtr`
+`f(v) && !yield(v)`: если `f` дал `false`, то из-за `&&` `yield` вообще не вызывается. `TestZanjir`:
+`Aylantir(Filtr(slices.Values(summalar), …), …)` → `["150000 soʻm" "310000 soʻm" "99000 soʻm"]`.
+
+</details>
+
+🟠 **Сложно:** посчитайте по заказам общую сумму каждого клиента и верните клиентов по убыванию общей суммы, при
+равенстве — по имени (`maps.Keys`, `slices.SortedFunc`, `cmp.Or`). Будет ли результат каждый раз одинаковым?
+
+<details>
+<summary>Ответ</summary>
+
+```go filename="homework/qiyin/qiyin.go" showLineNumbers
+// Qiyin: mijozlar boʻyicha jami summa; jami kamayish tartibida, teng boʻlsa ism boʻyicha.
+package qiyin
+
+import (
+	"cmp"
+	"maps"
+	"slices"
+	"strings"
+)
+
+type Buyurtma struct {
+	Mijoz string
+	Summa int64
+}
+
+func Reyting(bb []Buyurtma) []string {
+	jami := map[string]int64{}
+	for _, b := range bb {
+		jami[b.Mijoz] += b.Summa
+	}
+	return slices.SortedFunc(maps.Keys(jami), func(a, b string) int {
+		return cmp.Or(
+			cmp.Compare(jami[b], jami[a]), // summa: kattasi oldin
+			strings.Compare(a, b),         // teng boʻlsa: ism boʻyicha
+		)
+	})
+}
+```
+
+Да, каждый раз одинаковым. `maps.Keys` выдаёт ключи в случайном порядке, но функция сравнения задаёт полный порядок:
+два разных имени никогда не окажутся «равными». В тесте у Aziz, Bobur и Kamola общая сумма одинаковая (150000), поэтому
+они стоят по имени. `TestReyting` проверяет это 50 раз.
+
+</details>
+
+🔴 **Guru:** `Zip[A, B any](a iter.Seq[A], b iter.Seq[B]) iter.Seq2[A, B]` — ведите два итератора бок о бок,
+останавливаясь, когда закончится более короткий. Почему `range` для этого не хватает и почему `stop` нужно делать
+через `defer`?
+
+<details>
+<summary>Ответ</summary>
+
+```go filename="homework/guru/guru.go" showLineNumbers
+// Guru: ikki iterator'ni yonma-yon yurgizish. range bunga yetmaydi — iter.Pull kerak.
+package guru
+
+import "iter"
+
+// Zip a va b dan navbatma-navbat bittadan qiymat oladi; qisqasi tugaganda toʻxtaydi.
+func Zip[A, B any](a iter.Seq[A], b iter.Seq[B]) iter.Seq2[A, B] {
+	return func(yield func(A, B) bool) {
+		nextA, stopA := iter.Pull(a)
+		defer stopA()
+		nextB, stopB := iter.Pull(b)
+		defer stopB()
+		for {
+			va, ok1 := nextA()
+			vb, ok2 := nextB()
+			if !ok1 || !ok2 || !yield(va, vb) {
+				return
+			}
+		}
+	}
+}
+```
+
+`range` управляет одним итератором: итератор сам проталкивает значения (*push*), вы только принимаете. Чтобы брать по
+одному из двух по очереди, нужно **вытягивание** (*pull*). `iter.Pull(a)` превращает итератор в две функции: `next()`
+возвращает следующее значение и `ok`, `stop()` останавливает итератор. Это похоже на `next()` у генератора JS/Python.
+Внутри Go создаёт для этого корутину.
+
+Зачем `defer stop()`: когда короткий кончился или внешний цикл сделал `break`, второй итератор остаётся посередине.
+Документация iter: *"If clients do not consume the sequence to completion, they must call stop, which allows the
+iterator function to finish and return."* — «если вы не дочитали последовательность до конца, вы обязаны вызвать
+`stop`, чтобы функция-итератор завершилась и вернулась». `TestStop` это показывает: в `iter.Pull` без `stop` `defer`
+итератора не срабатывает.
+
+</details>
+
+## Источники
+
+- [Go spec: For statements with range clause](https://go.dev/ref/spec#For_range) (правило `yield`, порядок map,
+  пример `Tree.walk`), [Go spec: Type inference](https://go.dev/ref/spec#Type_inference) (вопрос на повторение)
+- [Пакет `iter`](https://pkg.go.dev/iter): определение, [Single-Use Iterators](https://pkg.go.dev/iter#hdr-Single_Use_Iterators),
+  [Pulling Values](https://pkg.go.dev/iter#hdr-Pulling_Values),
+  [Standard Library Usage](https://pkg.go.dev/iter#hdr-Standard_Library_Usage);
+  исходник: [iter.go](https://github.com/golang/go/blob/go1.26.8/src/iter/iter.go)
+- Release notes: [Go 1.23: Changes to the language](https://go.dev/doc/go1.23#language),
+  [Go 1.22](https://go.dev/doc/go1.22) (`GOEXPERIMENT=rangefunc`)
+- I. L. Taylor, [Range Over Function Types](https://go.dev/blog/range-functions) (Go blog, 2024-08-20)
+- [Go wiki: Rangefunc Experiment](https://go.dev/wiki/RangefuncExperiment) (один стек, `defer`, цена вызовов)
+- Proposal [#61405](https://github.com/golang/go/issues/61405) (R. Cox, 2023), обсуждение
+  [#56413](https://github.com/golang/go/discussions/56413) (2022)
+- Исходный код Go (go1.26.8):
+  [cmd/compile/internal/rangefunc/rewrite.go](https://github.com/golang/go/blob/go1.26.8/src/cmd/compile/internal/rangefunc/rewrite.go)
+  (*Theory of Operation*), [runtime/panic.go L371–374](https://github.com/golang/go/blob/go1.26.8/src/runtime/panic.go#L371-L374)
+  (сообщения panic), [slices/iter.go](https://github.com/golang/go/blob/go1.26.8/src/slices/iter.go#L37-L45),
+  [slices/sort.go](https://github.com/golang/go/blob/go1.26.8/src/slices/sort.go#L21-L33),
+  [cmp/cmp.go](https://github.com/golang/go/blob/go1.26.8/src/cmp/cmp.go#L32-L72),
+  [strings/iter.go](https://github.com/golang/go/blob/go1.26.8/src/strings/iter.go)
+- Пакеты: [cmp](https://pkg.go.dev/cmp) ([Compare](https://pkg.go.dev/cmp#Compare), [Or](https://pkg.go.dev/cmp#Or)),
+  [slices](https://pkg.go.dev/slices) ([SortFunc](https://pkg.go.dev/slices#SortFunc)), [maps](https://pkg.go.dev/maps)
+- Другие языки: [MDN: for...of](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/for...of)
+  (`return()` при `break`), [Python: yield expressions](https://docs.python.org/3/reference/expressions.html#yield-expressions),
+  [PHP: Generators](https://www.php.net/manual/en/language.generators.overview.php)
+- Папка курса: [lessons/018-iterators](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/018-iterators)
+- Результаты получены на `go1.26.8 linux/amd64` (Intel i5-12450H) 2026-11-26; эксперимент Go 1.22 — через
+  `GOTOOLCHAIN=go1.22.12`; `gopls` v0.22.0.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/018-iterators)
+
+---
+
+← Предыдущий урок: [GO-1.17](/lab/youtube/go#go-1-17) · Следующий урок: [GO-1.19](/lab/youtube/go/go-1-19/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
