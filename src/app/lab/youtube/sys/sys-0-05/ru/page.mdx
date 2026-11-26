@@ -1,0 +1,1161 @@
+---
+title: "Docker: решение проблемы «на моём компьютере работает»"
+date: "2026/11/26"
+description: "Как многоэтапный Dockerfile уменьшает образ Go-сервера с 969 МБ до 8 МБ, чем образ отличается от контейнера, порты, тома и ловушка PID 1 в docker stop."
+tag: "youtube, sys, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/sys/sys-0-05/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/sys/sys-0-05"
+    ru: "https://www.haywan.uz/lab/youtube/sys/sys-0-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/sys/sys-0-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/sys/sys-0-05"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/sys/sys-0-05) · **Русский** · [English](/lab/youtube/sys/sys-0-05/en)  
+Урок SYS-0.05 · [Kompyuter, OS va tarmoq](/lab/youtube/sys#sys-0-05) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-05-docker)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Один Go-сервер и два Docker-образа. Один весит 969 МБ, другой — 8,36 МБ. Запускаем оба и отправляем запрос: ответ
+совершенно одинаковый. Разница — в нескольких строках Dockerfile. Почему программа работает у вас и падает на
+сервере? И почему `docker stop` иногда висит 10 секунд, а потом возвращает 137?
+
+**Одна идея:** образ (image) — неизменяемый пакет, в котором собрана программа и всё, что ей нужно для работы.
+Контейнер — обычный процесс Linux, запущенный из этого пакета. Поэтому в образ кладём только то, что нужно для
+запуска, а порт и данные подключаем при запуске контейнера.
+
+После урока вы:
+
+- напишете многоэтапный Dockerfile для Go-сервиса и уменьшите образ с 969 МБ до 8,36 МБ;
+- будете знать, зачем нужен `CGO_ENABLED=0`, и сможете прочитать ошибку `exec /server: no such file or directory`;
+- запустите контейнер с `-p` (порт) и `-v` (том) и покажете через `ps`, что контейнер — обычный процесс;
+- найдёте причину, если `docker stop` ждёт 10 секунд и возвращает 137, и исправите её одним словом (`exec`).
+
+Три главных новых слова урока:
+
+| Слово | Простое значение | По-английски |
+|---|---|---|
+| образ | неизменяемый пакет: программа, её файлы и команда запуска | image |
+| контейнер | процесс, запущенный из образа, со своим записываемым слоем сверху | container |
+| том | папка, которой управляет Docker: данные остаются, даже если контейнер удалён | volume |
+
+И два вспомогательных. **Многоэтапная сборка (multi-stage build)** — Dockerfile из нескольких этапов: на первом
+собираем, в последний берём только готовый бинарник. **Пространство имён (namespace)** — способ ядра показать
+процессу «свои» номера PID, свою сеть и свои файлы.
+
+## Что нужно знать заранее
+
+- [SYS-0.02 · Процесс и окружение: ps, kill, $PATH и переменные окружения](/lab/youtube/sys/sys-0-02/ru): программа и процесс,
+  `ps` и PPID (родительский процесс), сигналы (SIGTERM = 15, SIGKILL = 9), код выхода 128 + N, переменная окружения
+  (`PORT`), функция `kut` для корректной остановки сервера.
+- [GO-1.01 · Зачем нужен Go? Что внутри go build](/lab/youtube/go/go-1-01/ru): `go build` даёт один статический бинарник, а `ldd`
+  показывает, какие библиотеки бинарник запрашивает. Там мы сказали: «если используется cgo, это не всегда так». Сегодня
+  увидим это сами.
+- [SYS-0.01 · Терминал: pipe, grep и задачи в одну строку](/lab/youtube/sys/sys-0-01/ru): вертикальная черта (pipe, `|`) и `>/dev/null`
+  (выбросить вывод).
+- Необязательно: [GO-X.01 · HTTP API в 20 строк: первый сервис на Go и один бинарник](/lab/youtube/go/go-x-01/ru) тоже показывает
+  `FROM scratch` и ловушку cgo. Если вы его читали, раздел «Вопрос» будет знакомым.
+
+**Как запускать код.** Все команды урока выполняются в папке курса (`lessons/sys-05-docker`). Нужен Docker Engine.
+На Linux работает и доказательство через `ps` и `/proc`. На Windows и macOS Docker Desktop запускает контейнеры внутри
+виртуальной машины Linux: все остальные команды работают, но доказательство через `ps` из раздела «Контейнер — обычный
+процесс» на хосте не видно. Порты 8077, 8078 и 9000 должны быть свободны.
+
+Сначала собираем все образы из видео. `./yigish.sh` («сборка») — скрипт из папки курса: он запускает семь команд
+`docker build` и выводит размеры. В первый раз скачивается образ `golang:1.26.8` (874 МБ на диске). У нас базовые
+образы уже были скачаны:
+
+```console
+$ ./yigish.sh
+sha256:a771b1a8923d79007e32b2497bb5090a2bcfd7ce453301f35dd2d0a509754ada
+sha256:24a42ee1e95189abd1fba310c37b120a8e069bd5f0e614ae0561bd759b5652ed
+sha256:68c8def6126209b17eef7f55673a78ca9e96bca8786e19d059809e55d3d08409
+sha256:317537e439bb02d65f35ae34ada3abacb7b563c8280407b5e5739a1ee5a91589
+sha256:8ca451f166381c61fceb1d9982eb6a3b25c0c75f03136f1cea717e5a9de5ee29
+sha256:b1fbe3c0474748281e3a490375d2ec5b0e8ee241d414193745a8de520046b1c3
+sha256:35942256f72f8c456b33b8e0f0b5dd472d8fef00d3aab339431ab14aa489179a
+REPOSITORY:TAG             SIZE
+mehmon-boshqa:guru         8.36MB
+mehmon-tuzoq:latest        16.8MB
+mehmon-boshqa:distroless   10.7MB
+mehmon-boshqa:alpine       16.8MB
+mehmon-boshqa:cgo          8.44MB
+mehmon-boshqa:cgo-build    969MB
+mehmon:kichik              8.36MB
+mehmon:bir                 969MB
+```
+
+Каждая строка `sha256:…` — ID собранного образа. `mehmon-boshqa:guru` скрипт `yigish.sh` не собирает: его собирают
+ответы к домашнему заданию, у нас он уже был. `mehmon` («гость») — имя нашего сервера: он считает каждого гостя.
+
+Вопрос из SYS-0.02. Процесс убит через `kill -9`. Какой код выхода покажет bash?
+
+**A)** `9` · **B)** `137` · **C)** `143`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `137`.** Если процесс остановлен сигналом, bash возвращает код выхода 128 + номер сигнала. SIGKILL — 9, значит
+128 + 9 = 137. «`143`» — это 128 + 15, то есть SIGTERM (обычный `kill`). Сегодня увидим 137 от `docker stop`.
+
+</details>
+
+## Два образа, один ответ
+
+`docker image ls` показывает собранные образы. Через `--format` оставляем только имя, тег и размер (`{{.Size}}` —
+шаблон Go `text/template`: Docker использует шаблоны Go в `--format`):
+
+```console
+$ docker image ls mehmon --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}'
+REPOSITORY:TAG   SIZE
+mehmon:kichik    8.36MB
+mehmon:bir       969MB
+```
+
+`mehmon:bir` («один» — один этап) весит 969 МБ, `mehmon:kichik` («маленький») — 8,36 МБ. Разница в 116 раз. Теперь
+запускаем оба по очереди и отправляем запрос:
+
+```console
+$ for t in bir kichik; do docker run -d --rm --name sinov -p 8078:8077 mehmon:$t >/dev/null; sleep 0.3; echo -n "$t: "; curl -s localhost:8078; docker rm -f sinov >/dev/null; done
+bir: Salom! Siz 1-mehmonsiz
+kichik: Salom! Siz 1-mehmonsiz
+```
+
+| Часть | Что делает |
+|---|---|
+| `for t in bir kichik; do …; done` | цикл bash: `t` сначала `bir`, потом `kichik` |
+| `docker run -d --rm --name sinov` | запускает контейнер из образа: в фоне (`-d`), с удалением после остановки (`--rm`), с именем `sinov` («проба») |
+| `-p 8078:8077` | связывает порт 8078 хоста с портом 8077 внутри контейнера (подробно в разделе «Порт») |
+| `>/dev/null` | прячет длинный ID контейнера, который печатает `docker run -d` |
+| `sleep 0.3` | даёт серверу 0,3 секунды на запуск |
+| `echo -n "$t: "` | печатает имя образа без перевода строки |
+| `curl -s localhost:8078` | отправляет запрос серверу |
+| `docker rm -f sinov` | принудительно останавливает и удаляет контейнер |
+
+Ответ одинаковый («Salom! Siz 1-mehmonsiz» — «Привет! Вы 1-й гость»): в обоих образах один и тот же сервер. В этом
+уроке разберём, откуда взялись 969 МБ, как от них избавиться и как правильно запустить образ на 8 МБ.
+
+## «У меня работает»: что нужно программе, кроме кода
+
+Почему программа работает у вас и падает на сервере? В GO-1.01 мы видели, что бинарник Go статический: его легко
+перенести на другой Linux-сервер. Но для **сборки** нужна конкретная версия Go, а иногда и библиотеки C. А для
+**запуска** нужны порт, переменные окружения и папка для данных.
+
+| Что нужно | На нашем сервере | Где может отличаться |
+|---|---|---|
+| версия Go | Go 1.26.8 | если в CI стоит Go 1.22, результат будет другим |
+| библиотеки C | libc (если cgo включён) | на пустом сервере или в пустом образе libc нет |
+| переменные окружения | `PORT`, `DATA` | на сервере другое значение или их нет вовсе |
+| папка для данных | `/data` | папки нет или в неё нельзя писать |
+
+У вас всё это есть. У коллеги или на сервере может быть иначе. В Node версии библиотек фиксируют `.nvmrc` и
+`package-lock.json`, в Python — `requirements.txt` и venv. Но системные библиотеки, окружение и папки они не
+фиксируют. Docker собирает программу вместе с этим окружением в один пакет. Этот пакет называется **образ** (image).
+
+## Сегодняшний сервер: `mehmon`
+
+Посмотрим, что мы кладём в образ. В папке `server/` — маленький HTTP-сервер. Он записывает каждого гостя в файл и
+говорит, каким по счёту тот пришёл. Три файла, один пакет `main`.
+
+```go filename="server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+)
+
+func main() {
+	port := os.Getenv("PORT") // sozlama muhitdan (SYS-0.02)
+	if port == "" {
+		port = "8077"
+	}
+	dir := os.Getenv("DATA") // mehmonlar daftari shu papkada
+	if dir == "" {
+		dir = "data"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Println("server:", err)
+		os.Exit(1)
+	}
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		fmt.Println("server:", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{Handler: daftar(dir)}
+	go srv.Serve(ln)
+	fmt.Println("server: :" + port + " da tinglayapman")
+	kut(srv)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 5 | `"net"` | сетевой пакет. Сегодня он важен: при включённом cgo `net` связывается с библиотекой C (раздел «Вопрос») |
+| 11–14 | `os.Getenv("PORT")` | читает порт из переменной окружения, если пусто — 8077 (как `process.env.PORT \|\| 8077` в Node) |
+| 15–18 | `os.Getenv("DATA")` | папка для данных, если пусто — `data` в текущей папке |
+| 19–22 | `os.MkdirAll(dir, 0o755)` | создаёт папку (как `mkdir -p`). `0o755` — права доступа в восьмеричной записи |
+| 23–27 | `net.Listen("tcp", ":"+port)` | открывает порт. Если порт занят, выходит с ошибкой |
+| 28 | `&http.Server{Handler: daftar(dir)}` | отдаёт каждый запрос обработчику (handler), который вернула функция `daftar` |
+| 29 | `go srv.Serve(ln)` | принимает запросы в отдельной горутине (горутины — в GO-1.21) |
+| 30 | `fmt.Println(…)` | печатает `server: :8077 da tinglayapman` («слушаю на :8077») |
+| 31 | `kut(srv)` | ждёт сигнала и корректно останавливает сервер |
+
+```go filename="server/daftar.go" showLineNumbers
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+// daftar har bir mehmonni faylga yozadi va nechanchi ekanini aytadi.
+func daftar(dir string) http.Handler {
+	var mu sync.Mutex
+	fayl := filepath.Join(dir, "mehmonlar.txt")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		f, err := os.OpenFile(fayl, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		fmt.Fprintln(f, "mehmon")
+		b, _ := os.ReadFile(fayl)
+		fmt.Fprintf(w, "Salom! Siz %d-mehmonsiz\n", bytes.Count(b, []byte("\n")))
+	})
+}
+```
+
+`daftar` («журнал») возвращает функцию, похожую на `(req, res) => {…}` в Express. `sync.Mutex` в строке 14 следит,
+чтобы два одновременных запроса писали в файл по очереди (мьютекс подробно — в GO-1.22). Строка 15 строит путь к
+файлу: `$DATA/mehmonlar.txt`. Строка 19 открывает файл на дозапись и создаёт его, если его нет
+(`O_APPEND|O_CREATE|O_RDWR`). Строка 25 добавляет одну строку `mehmon`, строки 26–27 читают файл, считают строки и пишут
+ответ. Значит, счётчик живёт в файле: пропадёт файл — счёт снова начнётся с 1. Это станет важно в разделе «Том».
+
+```go filename="server/kut.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+// kut signal kelguncha kutadi, keyin serverni toza toʻxtatadi (SYS-0.02).
+func kut(srv *http.Server) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	<-ctx.Done()
+	fmt.Println("server: signal keldi, toʻxtayapman")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Println("server: ulgurmadi:", err)
+	}
+	fmt.Println("server: xayr")
+}
+```
+
+`kut` («жди») — файл из SYS-0.02. Строка 15 **перехватывает сигнал**, чтобы дождаться SIGTERM или Ctrl+C. Строка 17
+стоит, пока сигнал не придёт. Затем `Shutdown` перестаёт принимать новые соединения и ждёт начатые запросы до 5 секунд.
+Подробнее о `context` — в GO-1.23. В разделе «Ловушка PID 1» именно эти две строки («signal keldi» — «пришёл сигнал»,
+«xayr» — «пока») покажут, дошёл ли сигнал до сервера.
+
+## Dockerfile → образ → контейнер
+
+**Dockerfile** — рецепт образа: текстовый файл, каждая строка — одна инструкция. `docker build` собирает по нему
+образ. В образе записаны все файлы, нужные контейнеру, и команда, которая запустится. Образ не меняется и состоит из
+**слоёв** (layers): каждая строка Dockerfile, которая добавляет файлы, даёт один слой.
+
+`docker run` запускает из образа **контейнер**. Контейнер берёт слои образа без изменений и добавляет сверху свой
+тонкий записываемый слой. Из одного образа можно запустить сколько угодно контейнеров.
+
+```text
+Dockerfile ──docker build──▶ образ ──docker run──▶ контейнер
+ (рецепт)                    (неизменяемый,        (процесс + свой
+                              слои)                 записываемый слой)
+```
+
+Вспомните программу и процесс из SYS-0.02:
+
+| SYS-0.02 | Сегодня | Что общего |
+|---|---|---|
+| программа (файл на диске) | образ | неизменяемый, не запущен |
+| процесс (работающая программа) | контейнер | из одной программы — несколько процессов, из одного образа — несколько контейнеров |
+| `ps` | `docker ps` | показывает работающие |
+
+Контейнер — не виртуальная машина. Это обычный процесс, который использует ядро хоста. Докажем это через `ps` в
+разделе «Контейнер — обычный процесс».
+
+## Первый Dockerfile: один этап, 969 МБ
+
+Первый Dockerfile совсем простой:
+
+```dockerfile filename="Dockerfile.bir" showLineNumbers
+# Bitta bosqich: Go kompilyatori ham image ichida qoladi
+FROM golang:1.26.8
+WORKDIR /src
+COPY . .
+RUN go build -o /server ./server
+CMD ["/server"]
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `# …` | комментарий: «компилятор Go тоже остаётся в образе» |
+| 2 | `FROM golang:1.26.8` | выбирает базовый образ: официальный `golang`, Go 1.26.8 |
+| 3 | `WORKDIR /src` | рабочая папка внутри образа (следующие команды выполняются в ней) |
+| 4 | `COPY . .` | копирует папку проекта в `/src` внутри образа |
+| 5 | `RUN go build -o /server ./server` | выполняется **во время сборки**: собирает сервер в бинарник `/server` |
+| 6 | `CMD ["/server"]` | говорит, какая команда запустится при старте контейнера |
+
+Разница между `RUN` и `CMD`: `RUN` выполняется один раз при сборке образа (как `npm run build`), `CMD` — при каждом
+запуске контейнера (как `npm start`).
+
+`COPY . .` копирует всё, кроме того, что указано в `.dockerignore`. Он похож на `.gitignore`:
+
+```text
+# image'ga keraksiz narsalar build context'ga ham yuborilmaydi
+data
+srv
+*.md
+homework
+```
+
+(Комментарий: «ненужное образу не отправляется и в build context».) **Build context** — папка `.` в конце
+`docker build`: Docker целиком отправляет её на сборку.
+
+`docker build` собирает образ по этому рецепту. `-t` даёт ему имя, `-f` указывает Dockerfile, `-q` печатает только ID
+образа:
+
+```console
+$ docker build -q -t mehmon:bir -f Dockerfile.bir .
+sha256:a771b1a8923d79007e32b2497bb5090a2bcfd7ce453301f35dd2d0a509754ada
+```
+
+Что осталось в образе? `docker run --rm IMAGE команда` запускает другую команду вместо `CMD` образа:
+
+```console
+$ docker run --rm mehmon:bir go version
+go version go1.26.8 linux/amd64
+$ docker run --rm mehmon:bir sh -c 'gcc --version | head -1; head -1 /etc/os-release'
+gcc (Debian 14.2.0-19) 14.2.0
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+```
+
+Компилятор Go здесь, компилятор C gcc тоже здесь, а под ними весь Debian 13. Они были нужны только для сборки. Для
+запуска сервера достаточно одного бинарника. Из чего складываются 969 МБ — в разделе «Глубже».
+
+## Многоэтапная сборка: компилятор остаётся позади
+
+Решение называется **многоэтапная сборка** (multi-stage build). Шаблон знаком по фронтенду: на одном этапе
+`npm ci && npm run build` (с `node_modules`), на следующем в Nginx попадает только папка `dist`. В Go на последний этап
+попадает один файл:
+
+```dockerfile filename="Dockerfile" showLineNumbers
+# 1-bosqich: yigʻish, Go kompilyatori shu yerda qoladi
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+
+# 2-bosqich: boʻm-boʻsh image, faqat binary
+FROM scratch
+COPY --from=build /server /server
+ENV DATA=/data
+EXPOSE 8077
+CMD ["/server"]
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `FROM golang:1.26.8 AS build` | первый этап, его имя `build` |
+| 4–5 | `COPY go.mod ./` · `COPY server ./server` | копирует только нужное: `go.mod` и папку `server` |
+| 6 | `RUN CGO_ENABLED=0 go build …` | собирает. Обратите внимание на `CGO_ENABLED=0`: вернёмся к нему в разделе «Вопрос» |
+| 9 | `FROM scratch` | второй этап начинается с совершенно пустого образа: в нём нет даже shell |
+| 10 | `COPY --from=build /server /server` | берёт с первого этапа только готовый бинарник. Всё остальное остаётся позади |
+| 11 | `ENV DATA=/data` | сообщает серверу папку для данных через переменную окружения (`main.go`, строка 15) |
+| 12 | `EXPOSE 8077` | только документация: «сервер слушает 8077». Порт **не открывает** (раздел «Порт») |
+| 13 | `CMD ["/server"]` | квадратные скобки — **exec-форма**: без shell, сервер запускается напрямую |
+
+(Комментарии в файле: «1-й этап: сборка, компилятор Go остаётся здесь», «2-й этап: пустой образ, только бинарник».)
+В образе остаётся только последний этап. Первый этап (Go, gcc, Debian) в итоговый образ не попадает.
+
+У `CMD` две формы. `CMD ["/server"]` (exec-форма) запускает программу напрямую. `CMD /server` (shell-форма) запускает
+её через `/bin/sh -c`. В `scratch` нет shell, поэтому здесь работает только exec-форма. Эта разница ещё понадобится в
+разделе «Ловушка PID 1».
+
+```console
+$ docker build -q -t mehmon:kichik -f Dockerfile .
+sha256:24a42ee1e95189abd1fba310c37b120a8e069bd5f0e614ae0561bd759b5652ed
+```
+
+Результат — `mehmon:kichik` на 8,36 МБ из раздела «Два образа».
+
+## Вопрос: а если без `CGO_ENABLED=0`?
+
+Уберём `CGO_ENABLED=0` из строки 6 `Dockerfile`:
+
+```dockerfile
+RUN go build -o /server ./server
+```
+
+В GO-1.01 `ldd` показал, что бинарник статический. Запустится ли сервер в `scratch`?
+
+**A)** да, ответит как раньше · **B)** нет, `docker build` выдаст ошибку · **C)** сборка пройдёт, но контейнер не
+запустится
+
+Подумайте, потом откройте ответ.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Сборка проходит, а контейнер не запускается. И ошибка очень сбивает с толку. Файл `boshqa/Dockerfile.cgo` в
+папке курса — именно этот вариант:
+
+```dockerfile filename="boshqa/Dockerfile.cgo" showLineNumbers
+# Xato variant: CGO_ENABLED=0 yoʻq. golang image'da gcc bor, shuning uchun cgo yoqilgan.
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN go build -o /server ./server
+
+FROM scratch
+COPY --from=build /server /server
+CMD ["/server"]
+```
+
+```console
+$ docker run --rm mehmon-boshqa:cgo
+exec /server: no such file or directory
+```
+
+*no such file or directory* — «нет такого файла или папки». Хотя `/server` на месте: `COPY` его скопировал. Если вы
+выбрали «A», вы думали, что бинарник Go всегда статический. Если «B» — что Go заметит это при сборке: нет, на этапе
+сборки libc есть, всё в порядке.
+
+</details>
+
+Причина — **cgo**, то есть возможность вызывать код C из Go. По документации `cmd/cgo`, если найден компилятор C,
+cgo включается сам. В образе `golang` есть gcc. Проверим в образе первого этапа (`mehmon-boshqa:cgo-build` — `yigish.sh`
+собирает его с `--target build`, то есть только до этапа `build`):
+
+```console
+$ docker run --rm mehmon-boshqa:cgo-build sh -c 'which gcc; go env CGO_ENABLED'
+/usr/bin/gcc
+1
+```
+
+При включённом cgo пакет `net` для разрешения имён вызывает функции библиотеки C вроде `getaddrinfo`. Тогда бинарник
+связывается с системной библиотекой C — **libc**. Это показывает `ldd`:
+
+```console
+$ docker run --rm mehmon-boshqa:cgo-build ldd /server
+	linux-vdso.so.1 (0x00007f57f7d2f000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f57f7b30000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f57f7d31000)
+```
+
+(Адреса в скобках каждый раз разные: адреса в памяти выбираются случайно.) Бинарник запрашивает две вещи:
+`libc.so.6` и `/lib64/ld-linux-x86-64.so.2`. Второе — **динамический загрузчик** (dynamic loader). Ядро сначала
+запускает загрузчик, а загрузчик подключает libc и запускает бинарник. Строка `#!/usr/bin/env node` в скрипте работает
+так же. В `scratch` загрузчика нет. Документация `execve(2)`: если ELF-интерпретатор (загрузчик) не найден, ядро
+возвращает `ENOENT`. Docker показывает это как `no such file or directory`.
+
+```text
+docker run mehmon-boshqa:cgo   (cgo включён)
+  └─ ядро: запусти /server
+       └─ /server: «пусть меня запустит /lib64/ld-linux-x86-64.so.2»
+            └─ в scratch этого файла нет → ENOENT → "exec /server: no such file or directory"
+
+docker run mehmon:kichik       (CGO_ENABLED=0)
+  └─ ядро: запусти /server
+       └─ /server: статический, ничего не просит → работает
+```
+
+Это и есть «у меня работает»: на компьютере с libc (на этапе сборки с Debian) этот бинарник работает, а в пустом
+образе — нет. Исправление: `CGO_ENABLED=0`. Тогда `net` использует резолвер на чистом Go, и бинарник становится
+статическим.
+
+## Четыре базы, четыре размера
+
+Кладём один и тот же бинарник на четыре разные базы и измеряем. Два новых варианта лежат в папке `boshqa/` («другие»)
+курса. От `Dockerfile` они отличаются только строкой `FROM` (и в них нет `EXPOSE`):
+
+```dockerfile filename="boshqa/Dockerfile.alpine" showLineNumbers
+# Oʻlchov uchun: xuddi shu binary, lekin alpine ustida (shell va paket menejeri bor)
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+
+FROM alpine:3.24
+COPY --from=build /server /server
+ENV DATA=/data
+CMD ["/server"]
+```
+
+```dockerfile filename="boshqa/Dockerfile.distroless" showLineNumbers
+# Oʻlchov uchun: distroless/static — CA sertifikatlar, tzdata, /etc/passwd bor, shell yoʻq
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+
+FROM gcr.io/distroless/static-debian13
+COPY --from=build /server /server
+ENV DATA=/data
+CMD ["/server"]
+```
+
+Размеры — из вывода `./yigish.sh` (выше, в разделе «Что нужно знать заранее»):
+
+| Образ | База | Размер | Что внутри |
+|---|---|---|---|
+| `mehmon:bir` | `golang:1.26.8`, один этап | 969 МБ | Debian, Go, gcc, кеш сборки |
+| `mehmon-boshqa:alpine` | `alpine:3.24` | 16,8 МБ | shell и пакетный менеджер (`apk`) |
+| `mehmon-boshqa:distroless` | `distroless/static-debian13` | 10,7 МБ | shell нет; CA-сертификаты для HTTPS, часовые пояса, `/etc/passwd` |
+| `mehmon:kichik` | `scratch` | 8,36 МБ | почти только сам бинарник |
+
+Что выбрать? Если серверу не нужны исходящие HTTPS-запросы (сертификаты) или часовые пояса, хватит `scratch`. Если
+нужны — удобнее distroless. Если внутри нужен shell (для отладки) — alpine. У вас числа могут немного отличаться: у нас
+старый драйвер хранения `overlay2`, а в новых установках Docker Engine 29 по умолчанию другой (containerd image store).
+`SIZE` в `docker image ls` — распакованный размер образа на диске, а не сжатый размер для скачивания.
+
+## Порт: `-p` и `docker ps`
+
+Теперь запускаем `mehmon:kichik`. `docker run -d` запускает контейнер в фоне. Сервер слушает 8077, в Dockerfile есть
+`EXPOSE 8077`. Потом отправляем запрос через `curl -sS` (`-S` показывает ошибку).
+
+Каким будет результат?
+
+**A)** `Salom! Siz 1-mehmonsiz` · **B)** `curl` не сможет подключиться · **C)** сервер вернёт 404
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `curl` не может подключиться:
+
+```console
+$ docker run -d --name mehmon mehmon:kichik >/dev/null; sleep 0.3; curl -sS localhost:8077
+curl: (7) Failed to connect to localhost:8077 after 0 ms: Could not connect to server
+```
+
+*Failed to connect* — «не удалось подключиться». Контейнер работает в своей сети, а на порту 8077 хоста никого нет.
+`EXPOSE` порт не открывает: по документации Dockerfile он «на самом деле не публикует порт, а служит документацией».
+Если вы выбрали «A», вы думали, что `EXPOSE` открывает порт. А для «C» запрос должен был бы дойти до сервера.
+
+</details>
+
+`-p ХОСТ:КОНТЕЙНЕР` связывает порт хоста с портом внутри контейнера (публикует порт). Удаляем прежний контейнер и
+запускаем заново с `-p 8077:8077`:
+
+```console
+$ docker rm -f mehmon >/dev/null; docker run -d --name mehmon -p 8077:8077 mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:8077; curl -s localhost:8077
+Salom! Siz 1-mehmonsiz
+Salom! Siz 2-mehmonsiz
+```
+
+Теперь `curl` получил ответ, и второй гость тоже. `docker ps` показывает работающие контейнеры. `--filter name=mehmon`
+оставляет только наш:
+
+```console
+$ docker ps --filter name=mehmon --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+NAMES     IMAGE           PORTS
+mehmon    mehmon:kichik   0.0.0.0:8077->8077/tcp, [::]:8077->8077/tcp
+```
+
+`docker image ls` показывает пакеты, а `docker ps` — то, что работает. Что напечатал сервер, показывает `docker logs`
+(stdout контейнера):
+
+```console
+$ docker logs mehmon
+server: :8077 da tinglayapman
+```
+
+**Осторожно на сервере.** `0.0.0.0` и `[::]` в столбце `PORTS` — все адреса хоста. То есть `-p 8077:8077` открывает
+порт и для внешнего мира. Документация Docker говорит об этом прямо: «Publishing container ports is insecure by
+default» (публикация портов по умолчанию небезопасна). Если порт нужен только вам, укажите перед ним адрес localhost.
+Мы запустили это отдельно (прежний `mehmon` удалён):
+
+```console
+$ docker run -d --name mehmon -p 127.0.0.1:8077:8077 mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:8077; docker ps --filter name=mehmon --format 'table {{.Names}}\t{{.Ports}}'
+Salom! Siz 1-mehmonsiz
+NAMES     PORTS
+mehmon    127.0.0.1:8077->8077/tcp
+```
+
+Теперь порт есть только на `127.0.0.1`: снаружи подключиться нельзя.
+
+## Контейнер — обычный процесс
+
+Теперь обещанное доказательство. `docker inspect` даёт PID контейнера на хосте:
+
+```console
+$ docker inspect -f '{{.State.Pid}}' mehmon
+28200
+```
+
+`ps` показывает его как обычный процесс, как в SYS-0.02. `-o pid,ppid,comm` — только PID, PID родителя и имя команды.
+PID родителя мы нашли через `ps -o ppid= -p 28200`:
+
+```console
+$ ps -o pid,ppid,comm -p 28200,28176
+    PID    PPID COMMAND
+  28200   28176 server
+  28176       1 containerd-shim
+```
+
+У вас PID будут другими (в видео были 199934 и 199908): подставьте свои. Наш `server` — обычный процесс на хосте. Его
+родитель `containerd-shim` — вспомогательный процесс Docker, который присматривает за контейнерами.
+
+Строка `NSpid` файла `/proc/PID/status` даёт номер процесса в каждом пространстве имён PID:
+
+```console
+$ grep NSpid /proc/28200/status
+NSpid:	28200	1
+```
+
+Два числа: PID на хосте (28200) и PID внутри контейнера — 1. Это обеспечивает **пространство имён** (namespace). Ядро
+показывает процессу свои номера PID, свою сеть и свои файлы. Процесс считает, что работает на отдельном компьютере.
+
+```text
+хост (ядро Linux одно)
+├─ PID 1        systemd
+├─ PID 28176    containerd-shim
+│   └─ PID 28200  server   ← если смотреть с хоста
+│
+└─ если смотреть изнутри контейнера (своё пространство имён PID):
+     PID 1      server     ← тот же самый процесс
+     сеть:      своя сеть (не localhost:8077 хоста)
+     файлы:     только /server из образа + записываемый слой
+```
+
+Поэтому `curl` сначала и не смог подключиться: у контейнера своя сеть, а `-p` соединяет две сети. Виртуальная машина
+запускает собственное ядро, а контейнер делит ядро хоста с другими процессами.
+
+На Windows и macOS Docker Desktop запускает контейнеры внутри виртуальной машины Linux. Поэтому это доказательство
+вы увидите на компьютере с Linux.
+
+## Том: данные живут дольше контейнера
+
+Сервер записывает каждого гостя в `/data/mehmonlar.txt` (`ENV DATA=/data`). Удаляем текущий контейнер и запускаем
+новый. С какого числа начнётся счёт?
+
+**A)** продолжится (после счёта прежнего контейнера) · **B)** снова с 1 · **C)** сервер выдаст ошибку
+
+<details>
+<summary>Ответ</summary>
+
+**B: снова с 1.**
+
+```console
+$ docker rm -f mehmon >/dev/null; docker run -d --name mehmon -p 8077:8077 mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:8077
+Salom! Siz 1-mehmonsiz
+```
+
+Файл был в записываемом слое контейнера и удалился вместе с ним. Документация Docker: данные, записанные в слой
+контейнера, не сохраняются после его удаления. Если вы выбрали «A», вы думали, что файл сохраняется в образе: образ не
+меняется. «C» не будет: `main.go` сам создаёт папку через `MkdirAll`.
+
+</details>
+
+`-v daftar:/data` подключает **том** (volume) с именем `daftar` к папке `/data` контейнера. Томом управляет Docker:
+при первом использовании он создаётся сам.
+
+```console
+$ docker rm -f mehmon >/dev/null; docker run -d --name mehmon -p 8077:8077 -v daftar:/data mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:8077; curl -s localhost:8077
+Salom! Siz 1-mehmonsiz
+Salom! Siz 2-mehmonsiz
+```
+
+Сервер записал двух гостей в том. Снова удаляем контейнер и запускаем новый с тем же томом:
+
+```console
+$ docker rm -f mehmon >/dev/null; docker run -d --name mehmon -p 8077:8077 -v daftar:/data mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:8077
+Salom! Siz 3-mehmonsiz
+```
+
+Счёт продолжился с 3. Том живёт отдельно от контейнера.
+
+| Шаг | Контейнер | Где `mehmonlar.txt` | Ответ |
+|---|---|---|---|
+| 1 | новый, без тома | в записываемом слое контейнера | 1 |
+| 2 | новый, `-v daftar:/data` | в томе `daftar` | 1, 2 |
+| 3 | снова новый, `-v daftar:/data` | в том же томе `daftar` | 3 |
+
+Кто запускал Postgres в Docker, это знает: если не подключить том к папке данных, база пропадёт вместе с контейнером.
+В следующем уроке (SYS-0.06) сделаем именно это через `docker compose`.
+
+Мы закончили, убираем за собой:
+
+```console
+$ docker rm -f mehmon; docker volume rm daftar
+mehmon
+daftar
+```
+
+## Ловушка PID 1: почему `docker stop` ждёт 10 секунд
+
+Ловушка, обещанная в SYS-0.02. `docker stop` отправляет SIGTERM главному процессу контейнера (PID 1 внутри
+контейнера). Через 10 секунд — SIGKILL. Во многих проектах сервер запускается не напрямую, а через стартовый скрипт:
+сначала подготовка (миграции, настройки), потом сервер. Папка `tuzoq/` («ловушка») в курсе устроена именно так:
+
+```sh filename="tuzoq/start.sh" showLineNumbers
+#!/bin/sh
+echo "start.sh: tayyorlanyapman"
+/server
+```
+
+```dockerfile filename="tuzoq/Dockerfile" showLineNumbers
+# PID 1 tuzogʻi: server shell skript ichidan ishga tushadi
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+
+FROM alpine:3.24
+COPY --from=build /server /server
+COPY tuzoq/start.sh tuzoq/start-exec.sh /
+CMD ["/start.sh"]
+```
+
+Строка 1 `start.sh` отдаёт скрипт `/bin/sh`, строка 2 сообщает о подготовке («tayyorlanyapman» — «готовлюсь»),
+строка 3 запускает сервер. В Dockerfile нужен shell, поэтому база — alpine (строка 8). Строка 10 копирует оба скрипта
+в корень образа, строка 11 запускает `start.sh`.
+
+В таком образе первый процесс контейнера — не сервер, а shell. `toxtat.sh` («останови») из папки курса измеряет,
+сколько ждал `docker stop`:
+
+```bash filename="toxtat.sh" showLineNumbers
+#!/usr/bin/env bash
+# ./toxtat.sh IMAGE [buyruq]
+# Container'ni ishga tushiradi, docker stop qancha kutganini oʻlchaydi va chiqish kodini aytadi.
+exec 2>&1
+docker rm -f toxtat >/dev/null 2>&1
+docker run -d --name toxtat "$@" >/dev/null || exit 1
+sleep 0.5
+bosh=$(date +%s%N)
+docker stop toxtat >/dev/null              # SIGTERM, 10 soniyadan keyin SIGKILL
+tugash=$(date +%s%N)
+docker logs toxtat
+ms=$(( (tugash - bosh) / 1000000 ))
+kod=$(docker inspect -f '{{.State.ExitCode}}' toxtat)
+printf 'docker stop: %d.%d s, chiqish kodi: %s\n' $((ms / 1000)) $((ms % 1000 / 100)) "$kod"
+docker rm toxtat >/dev/null
+```
+
+Главные строки: строка 6 `"$@"` передаёт в `docker run` все аргументы скрипта (образ и, если задана, команду вместо
+`CMD`). Строки 8 и 10 берут время в наносекундах до и после `docker stop`. Строка 11 выводит, что напечатал контейнер.
+Строка 13 берёт код выхода контейнера (`chiqish kodi` — «код выхода»).
+
+Что выведет `./toxtat.sh mehmon-tuzoq`?
+
+**A)** `docker stop: 0.1 s, chiqish kodi: 0` · **B)** `docker stop: 10.1 s, chiqish kodi: 137` ·
+**C)** `docker stop: 0.1 s, chiqish kodi: 143`
+
+<details>
+<summary>Ответ</summary>
+
+**B.**
+
+```console
+$ ./toxtat.sh mehmon-tuzoq
+start.sh: tayyorlanyapman
+server: :8077 da tinglayapman
+docker stop: 10.1 s, chiqish kodi: 137
+```
+
+`docker stop` висел 10 секунд и вернул 137. Строки «signal keldi» нет: сервер сигнал вообще не получил. Если вы
+выбрали «A», вы думали, что SIGTERM дойдёт до сервера. Если «C» — что shell умрёт от SIGTERM (как обычный процесс из
+SYS-0.02, 128 + 15). PID 1 — исключение, см. ниже.
+
+</details>
+
+Общее правило: если `docker stop` висит 10 секунд и возвращает 137, сервер либо вообще не получил сигнал, либо не
+успел за 10 секунд. У нас сервер запущен через стартовый скрипт, а PID 1 в контейнере — shell.
+
+В SYS-0.02 мы говорили: «программа, которая не перехватила сигнал, останавливается». PID 1 — исключение. По
+`pid_namespaces(7)` ядро доставляет процессу PID 1 пространства имён только те сигналы, которые он перехватывает
+(для которых установлен обработчик, handler). SIGKILL — исключение из этого правила. Shell SIGTERM не перехватывает и
+серверу не передаёт. Через 10 секунд приходит SIGKILL: 128 + 9 = 137.
+
+Решение — одно слово, `exec`. Он заменяет shell самим сервером, не создавая нового процесса:
+
+```sh filename="tuzoq/start-exec.sh" showLineNumbers
+#!/bin/sh
+echo "start.sh: tayyorlanyapman"
+exec /server
+```
+
+Тот же образ, только вместо `CMD` передаём `/start-exec.sh` (`toxtat.sh` передаёт его в `docker run`):
+
+```console
+$ ./toxtat.sh mehmon-tuzoq /start-exec.sh
+start.sh: tayyorlanyapman
+server: :8077 da tinglayapman
+server: signal keldi, toʻxtayapman
+server: xayr
+docker stop: 0.1 s, chiqish kodi: 0
+```
+
+Теперь сервер — PID 1. Функция `kut` перехватывает сигнал, и сервер корректно останавливается за 0,1 секунды, код
+выхода 0.
+
+Посмотрим изнутри контейнера. `docker exec` выполняет команду внутри работающего контейнера. В Alpine есть `ps`:
+
+```console
+$ docker run -d --name tuzoqps mehmon-tuzoq >/dev/null; sleep 0.5; docker exec tuzoqps ps -o pid,ppid,comm; docker rm -f tuzoqps >/dev/null
+PID   PPID  COMMAND
+    1     0 start.sh
+    7     1 server
+   14     0 ps
+$ docker run -d --name tuzoqps mehmon-tuzoq /start-exec.sh >/dev/null; sleep 0.5; docker exec tuzoqps ps -o pid,ppid,comm; docker rm -f tuzoqps >/dev/null
+PID   PPID  COMMAND
+    1     0 server
+   13     0 ps
+```
+
+Без `exec` PID 1 — shell, который выполняет `start.sh`, а сервер — его потомок (PID 7). С `exec` сервер — PID 1.
+(Сам `ps` тоже в списке: его запустил `docker exec`.) Этих двух команд нет в видео, но они запущены с образом из
+папки курса.
+
+```text
+start.sh (без exec)                     start-exec.sh (с exec)
+PID 1  start.sh (sh)                    PID 1  server   (занял место sh)
+└─ PID 7  server
+docker stop → SIGTERM → PID 1           docker stop → SIGTERM → PID 1
+sh: обработчика нет → ядро отбрасывает  server: kut перехватывает → Shutdown
+сервер ничего не знает                  "signal keldi", "xayr"
+10 с → SIGKILL → 137                    0,1 с → 0
+```
+
+В нашем основном образе на `scratch` этой проблемы нет: shell вообще нет, `CMD ["/server"]` в exec-форме, сервер сам
+PID 1. Проверим:
+
+```console
+$ ./toxtat.sh mehmon:kichik
+server: :8077 da tinglayapman
+server: signal keldi, toʻxtayapman
+server: xayr
+docker stop: 0.1 s, chiqish kodi: 0
+```
+
+Этой команды нет в видео, но она запущена с `toxtat.sh` из папки курса.
+
+## Глубже (необязательно): что внутри 969 МБ, кеш и shell-форма
+
+**Откуда 969 МБ.** Сам `golang:1.26.8` весит 874 МБ: Debian 13, Go (270 МБ), gcc и git. `docker history` показывает
+слои образа (`head -4` — первые четыре строки):
+
+```console
+$ docker history mehmon:bir --format 'table {{.Size}}\t{{.CreatedBy}}' | head -4
+SIZE      CREATED BY
+0B        CMD ["/server"]
+94.9MB    RUN /bin/sh -c go build -o /server ./server …
+5.09kB    COPY . . # buildkit
+```
+
+Слой `RUN go build` добавил 94,9 МБ: бинарник и кеш сборки Go (`/root/.cache/go-build`, по README курса 88 МБ). Ничего
+из этого для запуска сервера не нужно.
+
+**Кеш слоёв и `go.mod`.** Docker кеширует каждый слой: если входные данные строки не изменились, слой берётся из кеша.
+Поэтому в реальном проекте пишите `COPY go.mod go.sum ./` и `RUN go mod download` **до** копирования кода. Когда код
+меняется, слой зависимостей берётся из кеша. Шаблон `COPY package*.json ./` → `RUN npm ci` → `COPY . .` в Node нужен
+по той же причине. В нашем проекте внешних зависимостей нет (нет и `go.sum`), поэтому этот шаг пропущен.
+
+**Shell-форма — не всегда ловушка.** Измерено в README курса (мы не перезапускали): если в alpine написать
+`CMD /server` (shell-форма), `sh` в alpine выполняет единственную команду через `exec`. Сервер всё равно становится
+PID 1, `docker stop` — 0,1 секунды, код 0. Ловушка появляется, когда в скрипте несколько команд, как в нашем
+`start.sh`.
+
+**Сигнал и Go-сервер.** Наш сервер ставит обработчик SIGTERM через `signal.NotifyContext`. Поэтому он получает сигнал,
+даже будучи PID 1. Правило PID 1 зависит именно от вопроса «есть ли обработчик».
+
+## Частые ошибки
+
+**1. «`EXPOSE` открывает порт».** Самое распространённое заблуждение. `EXPOSE 8077` есть, `-p` нет — результат
+`curl: (7) Failed to connect` (раздел «Порт»). `EXPOSE` — только документация. **Исправление:** `-p 8077:8077` (или
+только для себя `-p 127.0.0.1:8077:8077`).
+
+**2. Бинарник с cgo в `scratch`.** `exec /server: no such file or directory`, хотя файл на месте (раздел «Вопрос»).
+Сообщение не про `/server`, а про отсутствующий динамический загрузчик. **Исправление:**
+`RUN CGO_ENABLED=0 go build …`.
+
+**3. Имя контейнера занято.** Второй `docker run` с тем же `--name`:
+
+```console
+$ docker run -d --name mehmon -p 8077:8077 mehmon:kichik
+48f170e52766df023a9c1f892a3df1c8b87edde701cd35859d407f034419c92d
+$ docker run -d --name mehmon -p 8077:8077 mehmon:kichik
+docker: Error response from daemon: Conflict. The container name "/mehmon" is already in use by container "48f170e52766df023a9c1f892a3df1c8b87edde701cd35859d407f034419c92d". You have to remove (or rename) that container to be able to reuse that name.
+
+Run 'docker run --help' for more information
+```
+
+Первая команда вывела ID контейнера. Вторая: *Conflict … is already in use* — «имя уже занято». Остановленный
+контейнер тоже держит имя. **Исправление:** сначала `docker rm -f mehmon` (поэтому команды урока начинаются с
+`docker rm -f mehmon >/dev/null;`) или `--rm`.
+
+**4. Порт на хосте занят.** Первый `mehmon` ещё работает, второй контейнер тоже просит 8077:
+
+```console
+$ docker run -d --name mehmon2 -p 8077:8077 mehmon:kichik
+30896b1ecefe6c80c6ca596ae6a074b0bba68d60c7fe8d1d104f277459d6cd49
+docker: Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint mehmon2 (a5820599b823045ceac88629e37f633ff660211fc687d69d8f975203c27a8417): Bind for 0.0.0.0:8077 failed: port is already allocated
+
+Run 'docker run --help' for more information
+```
+
+*Bind for 0.0.0.0:8077 failed: port is already allocated* — «не удалось привязать порт 8077: порт занят». Контейнер
+создан (ID выведен), но не запущен: `docker ps -a` показывает его в состоянии `Created`, и он держит имя `mehmon2`.
+**Исправление:** другой порт хоста (`-p 8078:8077`) или остановите прежний контейнер. Потом `docker rm mehmon2`.
+
+**5. Зайти в `scratch` через shell.** Для отладки `docker run … sh` или `docker exec … sh`:
+
+```console
+$ docker run --rm mehmon:kichik sh
+docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "sh": executable file not found in $PATH
+
+Run 'docker run --help' for more information
+```
+
+*executable file not found in $PATH* — «исполняемый файл не найден в `$PATH`». В `scratch` нет shell: это не ошибка,
+это смысл такого образа. **Исправление:** читайте логи через `docker logs`. Если внутри нужен shell, соберите тот же
+бинарник на базе alpine (`boshqa/Dockerfile.alpine`).
+
+**6. Данные внутри контейнера (тихая ошибка).** Ошибки нет, но при пересоздании контейнера данные пропадают: счёт
+снова с 1 (раздел «Том»). **Исправление:** подключите том к папке данных: `-v daftar:/data`.
+
+**7. В стартовом скрипте нет `exec` (тихая ошибка).** При каждом деплое `docker stop` ждёт 10 секунд, сервер умирает
+от SIGKILL, начатые запросы обрываются, код 137 (раздел «Ловушка PID 1»). **Исправление:** последняя строка скрипта —
+`exec /server`.
+
+**8. `-p 8077:8077` на VPS (тихая угроза).** Порт открыт на всех адресах (`0.0.0.0`, `[::]`). Для сервиса, которым
+пользуется только Nginx или вы сами, это лишнее. **Исправление:** `-p 127.0.0.1:8077:8077`.
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Чем образ отличается от контейнера? Какая команда показывает список каждого?
+
+<details>
+<summary>Ответ</summary>
+
+Образ — неизменяемый пакет: файлы, слои и команда запуска. Контейнер — процесс, запущенный из образа, со своим
+записываемым слоем сверху. Из одного образа — несколько контейнеров. `docker image ls` — образы, `docker ps` —
+работающие контейнеры (`docker ps -a` — и остановленные).
+
+</details>
+
+**2.** Контейнер запущен с `-p 9000:8077`. Потом `curl -s localhost:9000` и `curl -sS localhost:8077`. Что выведется?
+
+**A)** оба `Salom!` · **B)** 9000 — `Salom!`, 8077 — ошибка подключения · **C)** 9000 — ошибка подключения, 8077 — `Salom!`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `-p ХОСТ:КОНТЕЙНЕР`: порт 9000 хоста связан с портом 8077 внутри контейнера. На порту 8077 хоста никого нет.
+
+```console
+$ docker run -d --name mehmon -p 9000:8077 mehmon:kichik >/dev/null; sleep 0.3; curl -s localhost:9000; curl -sS localhost:8077; docker rm -f mehmon >/dev/null
+Salom! Siz 1-mehmonsiz
+curl: (7) Failed to connect to localhost:8077 after 0 ms: Could not connect to server
+```
+
+Если вы выбрали «C», вы прочитали числа в обратном порядке: слева хост, справа контейнер.
+
+</details>
+
+**3.** `docker stop` ждал 10 секунд и вернул 137. Что это значит и какая причина самая частая?
+
+<details>
+<summary>Ответ</summary>
+
+137 = 128 + 9: процесс убит сигналом SIGKILL. Значит, сервер либо вообще не получил SIGTERM, либо не успел за
+10 секунд. Частая причина: сервер запущен через стартовый скрипт, а PID 1 — shell. Ядро доставляет PID 1 только те
+сигналы, которые он перехватывает, а shell SIGTERM не перехватывает и серверу не передаёт. Исправление: `exec /server`.
+
+</details>
+
+**4.** `exec /server: no such file or directory` — но `/server` в образе есть. Какого файла нет?
+
+<details>
+<summary>Ответ</summary>
+
+Динамического загрузчика `/lib64/ld-linux-x86-64.so.2` (и libc). Бинарник собран с включённым cgo, а в `scratch` их
+нет. Это показывает `ldd`. Исправление: `CGO_ENABLED=0`.
+
+</details>
+
+**5.** Из GO-1.01: что говорит `ldd` о статическом бинарнике?
+
+<details>
+<summary>Ответ</summary>
+
+`not a dynamic executable` — «не динамический исполняемый файл». Бинарник не запрашивает системных библиотек, поэтому
+работает и в `scratch`. Именно такой `/server` в `mehmon:kichik`, собранном с `CGO_ENABLED=0`.
+
+</details>
+
+## Домашнее задание
+
+Условия и ответы — в папке урока на GitHub:
+[lessons/sys-05-docker](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-05-docker).
+Ответы — в папке [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-05-docker/homework).
+Сначала попробуйте сами.
+
+- 🟢 **Легко:** запустите `mehmon:kichik` с `PORT=9000` (переменную окружения задаёт `-e`) и согласуйте с этим `-p`.
+- 🟡 **Средне:** вместо тома подключите свою папку (`-v "$PWD/papka:/data"`) и откройте файл на хосте. Кому
+  принадлежит файл?
+- 🟠 **Сложно:** запустите `mehmon-tuzoq` без `exec` с `--init` и остановите. Быстро ли он останавливается? Пишет ли
+  сервер «signal keldi»?
+- 🔴 **Гуру:** сервер должен работать не от root, а от пользователя `65532`, и при этом всё равно писать в том.
+
+Все ответы запускает один скрипт (сначала `./yigish.sh`; порты 8077, 8078 и 9000 должны быть свободны):
+
+```bash
+bash homework/javoblar.sh
+```
+
+<details>
+<summary>Ответ</summary>
+
+Вывод скрипта у нас (PID в `docker top` каждый раз другой):
+
+```console
+$ bash homework/javoblar.sh
+== Oson: PORT=9000 muhitdan, -p 9000:9000
+server: :9000 da tinglayapman
+Salom! Siz 1-mehmonsiz
+== Oʻrta: volume oʻrniga papka (bind mount), fayl egasi siz
+Salom! Siz 1-mehmonsiz
+Salom! Siz 2-mehmonsiz
+xostdagi fayl: homework/papka/mehmonlar.txt, qatorlar: 2
+== Qiyin: exec'siz image + --init
+start.sh: tayyorlanyapman
+server: :8077 da tinglayapman
+docker stop: 0.1 s, chiqish kodi: 143
+== Guru: USER 65532 (root emas) + volume
+-- oddiy image'ga --user 65532 bersak:
+open /data/mehmonlar.txt: permission denied
+-- homework/guru/Dockerfile bilan:
+Salom! Siz 1-mehmonsiz
+Salom! Siz 2-mehmonsiz
+USER                PID                 COMMAND
+65532               40431               server
+```
+
+🟢 `docker run -d -e PORT=9000 -p 9000:9000 mehmon:kichik`. Сервер берёт порт из окружения (`main.go`, строка 11,
+SYS-0.02). Второе число в `-p` должно совпадать с портом внутри контейнера: теперь это 9000.
+
+🟡 `-v "$PWD/papka:/data"` — не том, а **bind mount**: обычная папка хоста подключается напрямую. Файл появляется в
+папке на хосте. Без `--user "$(id -u):$(id -g)"` сервер внутри контейнера работает от root, файл на хосте тоже
+принадлежит root, и обычный пользователь не сможет его удалить. В ответе `--user` есть: файл ваш.
+
+🟠 `./toxtat.sh --init mehmon-tuzoq` → 0,1 с, но код **143** и «signal keldi» **нет**. `--init` ставит PID 1
+`docker-init` (tini). Он передаёт SIGTERM только непосредственному потомку — shell. Shell теперь не PID 1, поэтому
+SIGTERM его убивает (128 + 15 = 143). Init завершается, а ядро убивает оставшиеся процессы пространства имён, включая
+сервер, сигналом SIGKILL (`pid_namespaces(7)`). Быстро, но не аккуратно: решение всё равно `exec`.
+
+🔴 Если просто передать `--user 65532:65532`, получите `open /data/mehmonlar.txt: permission denied` — папка нового
+тома принадлежит root. Решение — `homework/guru/Dockerfile`:
+
+```dockerfile filename="homework/guru/Dockerfile" showLineNumbers
+# Guru javobi: server root emas, 65532 foydalanuvchisi nomidan ishlaydi.
+# Kontekst: dars papkasi (docker build -f homework/guru/Dockerfile .)
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+# scratch'da mkdir yoʻq: papkani shu bosqichda yaratamiz
+RUN mkdir /data
+
+FROM scratch
+COPY --from=build /server /server
+# /data egasi 65532: yangi (boʻsh) volume ulanganda shu egalikni oladi
+COPY --from=build --chown=65532:65532 /data /data
+ENV DATA=/data
+USER 65532:65532
+EXPOSE 8077
+CMD ["/server"]
+```
+
+Строка 9 создаёт пустую `/data` на этапе сборки (в `scratch` нет `mkdir`). Строка 14 копирует её с владельцем 65532.
+Строка 16 запускает сервер от этого пользователя. Когда пустой том подключается впервые, Docker копирует в него
+содержимое папки из образа вместе с владельцем: счёт 1, 2, в `docker top` — `USER 65532`. В `scratch` нет
+`/etc/passwd`, поэтому указывается не имя пользователя, а его номер (UID).
+
+</details>
+
+## Источники
+
+- Docker: [What is a container?](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/) ·
+  [Dockerfile reference](https://docs.docker.com/reference/dockerfile/) (exec- и shell-форма, `EXPOSE`, `CMD`) ·
+  [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/) ·
+  [Base images: scratch](https://docs.docker.com/build/building/base-images/) ·
+  [Port publishing](https://docs.docker.com/engine/network/port-publishing/) ·
+  [Storage](https://docs.docker.com/engine/storage/) · [Volumes](https://docs.docker.com/engine/storage/volumes/) ·
+  [docker stop](https://docs.docker.com/reference/cli/docker/container/stop/) ·
+  [docker run (`--init`)](https://docs.docker.com/reference/cli/docker/container/run/) ·
+  [docker ps](https://docs.docker.com/reference/cli/docker/container/ls/) ·
+  [Format output (Go templates)](https://docs.docker.com/engine/cli/formatting/) ·
+  [Best practices: ENTRYPOINT и exec, USER](https://docs.docker.com/build/building/best-practices/) ·
+  [Docker Desktop: Linux VM](https://docs.docker.com/desktop/features/vmm/) ·
+  [Docker Engine 29](https://www.docker.com/blog/docker-engine-version-29/)
+- Образ `golang`: [hub.docker.com/_/golang](https://hub.docker.com/_/golang) ·
+  distroless: [состав static](https://github.com/GoogleContainerTools/distroless/blob/main/base/README.md) ·
+  [tini](https://github.com/krallin/tini) (`--init`)
+- Go: [cmd/cgo](https://pkg.go.dev/cmd/cgo) · [net: Name Resolution](https://pkg.go.dev/net#hdr-Name_Resolution) ·
+  [os/signal](https://pkg.go.dev/os/signal) · [net/http Server.Shutdown](https://pkg.go.dev/net/http#Server.Shutdown)
+- Linux: [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html) ·
+  [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html) ·
+  [proc_pid_status(5)](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html) (`NSpid`) ·
+  [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) (`ENOENT`: ELF interpreter) ·
+  [bash(1)](https://man7.org/linux/man-pages/man1/bash.1.html) (`exec`)
+- Папка курса и README: [lessons/sys-05-docker](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-05-docker)
+- Все результаты получены повторным запуском 2026-11-26 на Docker Engine 29.8.1 (overlay2), `golang:1.26.8`
+  (Go 1.26.8 linux/amd64, Debian 13, gcc 14.2.0), `alpine:3.24`, `gcr.io/distroless/static-debian13`, Linux 6.18. От
+  записи видео (2026-11-25) отличаются только PID и адреса в выводе `ldd`.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-05-docker)
+
+---
+
+← Предыдущий урок: [SYS-0.02](/lab/youtube/sys/sys-0-02/ru) · Следующий урок: [SYS-0.06](/lab/youtube/sys#sys-0-06) → · [Все уроки](/lab/youtube/sys)
+
+</div>
