@@ -1,0 +1,1276 @@
+---
+title: "Why a database and not a JSON file? Two Go processes break one file"
+date: "2026/11/26"
+description: "We measure how two Go processes break a JSON file, kill -9 and the lost update, then do the same job in PostgreSQL with INSERT and WAL."
+tag: "youtube, databases, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/databases/db-1-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/databases/db-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/databases/db-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/databases/db-1-01) · [Русский](/lab/youtube/databases/db-1-01/ru) · **English**  
+Lesson DB-1.01 · [Maʼlumotlar bazasi: 0 → Guru](/lab/youtube/databases#db-1-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+What happens when two programs write to one file at the same time? In this lesson two Go programs write orders to
+one JSON file. Each should write 1000 orders. The result: the file is no longer JSON. At the start there are a few
+hundred whole orders, and after them a ~70-byte "tail" of an old write. Go's `sync.Mutex` does not help here: these
+are two separate processes.
+
+**One idea:** a file only stores bytes. Protection against concurrent writes, against crashes, and for queries has to
+be written by someone. A database does this work inside itself: the change runs inside the database and is written to
+a log first.
+
+By the end of the lesson you will:
+
+- be able to show on your own computer how two processes break one JSON file and how `kill -9` leaves it empty;
+- know what `rename` and `flock` fix and what they don't;
+- recognise the **lost update** bug in code: the "read, append, write" cycle loses orders in Postgres too;
+- explain why `INSERT` in Postgres keeps 2000 out of 2000 and how the database recovers after a crash with the
+  **WAL**.
+
+Today's three core new words:
+
+| Word | Plain meaning | Term |
+|---|---|---|
+| lost update | two processes read the same old state; the one that writes later silently erases the change of the one that wrote earlier | lost update |
+| atomic | cannot be split in half: another process sees either the old or the new state, never anything in between | atomic |
+| write-ahead log | the database first appends each change to the end of a log and updates the table files later | write-ahead log (WAL) |
+
+Helper words are explained in one sentence where they appear: **crash** (a process dies unexpectedly), **lock**
+(`flock`), **fsync**, **transaction** and **commit**.
+
+## Before you start
+
+This is the first lesson of the Databases track. It builds on:
+
+- [SYS-0.02 · Jarayon va muhit: ps, kill, $PATH va env oʻzgaruvchilar](/lab/youtube/sys/sys-0-02/en): what a **process** is,
+  running in the background with `&`, `$!`, `wait`, `kill -9`, and the fact that SIGKILL cannot be caught.
+- [SYS-0.05 · Docker: «mening kompyuterimda ishlaydi» muammosiga yechim](/lab/youtube/sys/sys-0-05/en): the container; the
+  `mehmon` ("guest") server wrote guests to a file and protected the file with `sync.Mutex`.
+- [SYS-0.06 · docker compose: Postgres va Go ilovasi bitta buyruq bilan](/lab/youtube/sys/sys-0-06/en): `compose.yaml`, the
+  password in `.env`, the healthcheck, connecting with `pgx` through `DATABASE_URL`. Today we use the same Postgres
+  setup.
+- Go basics: [GO-1.05 · for](/lab/youtube/go/go-1-05/en), [GO-1.06 · functions, two return values](/lab/youtube/go/go-1-06/en),
+  [GO-1.08 · slices and append](/lab/youtube/go/go-1-08/en), [GO-1.09 · map](/lab/youtube/go/go-1-09/en),
+  [GO-1.10 · struct](/lab/youtube/go/go-1-10/en), [GO-1.14 · errors are values, errors.Is](/lab/youtube/go/go-1-14/en).
+  Reading and writing JSON ([GO-1.20](/lab/youtube/go#go-1-20)) and `sync.Mutex` ([GO-1.22](/lab/youtube/go#go-1-22)) are not covered
+  yet: today it is enough to know what they do, which is said below in one sentence.
+
+**How to run the code.** go.dev/play does not work for this lesson: the programs write to disk, `kill` each other
+and connect to Postgres in Docker. You need: Linux (it also compiles on macOS, but we did not measure there; on
+Windows the `fayl` program does not compile, the reason is in "Common mistakes"), Go 1.26, Docker and Compose. Get
+the course repository and go to the lesson folder (`cd` is the command that changes the folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/db-01-why-database
+```
+
+All commands run from this folder. The scripts (`poyga.sh` — "race"; `qulash.sh` — "crash"; `baza.sh` —
+"database") build the Go programs into the `bin/` folder themselves. Our computer has no C compiler, so we worked
+with `CGO_ENABLED=0`; the scripts set it themselves in the Postgres part. Clean-up at the end:
+
+```bash
+docker compose down -v; rm -rf bin buyurtmalar.json*
+```
+
+**The video's numbers and ours.** The tests in this lesson are races: the result changes on every run. The video
+shows a run recorded on 2026-11-26 (the table in the course README is from the same runs). All terminal output on
+this page was produced again in the evening of the same day (22:30–22:45) on the same laptop. The computer was busy
+with other work at the time (load average 1–1.7). So the exact numbers differ. What matters is **the ratio and the
+direction**: does the file break, what share of the orders is lost, is it zero. Those came out the same in both
+measurements. Next to each result you will find the video's number; the comparison table is in "All measurements in
+one table".
+
+A question from SYS-0.02. A process was sent `kill -9`. Does it manage to finish writing the file before it dies?
+
+**A)** yes, Go has time to run the functions deferred with `defer` · **B)** only if the program caught the signal
+with `signal.NotifyContext` · **C)** no: SIGKILL cannot be caught, the process stops immediately
+
+<details>
+<summary>Answer</summary>
+
+**C.** `kill -9` sends the process SIGKILL (signal 9). signal(7): *"The signals SIGKILL and SIGSTOP cannot be caught,
+blocked, or ignored."* The kernel stops the process at once: neither `defer` nor a signal handler runs. "B" is true
+only for SIGTERM (plain `kill`): that is how the clean shutdown in SYS-0.02 worked. Today we use exactly this property
+to simulate a crash: the program dies in the middle of a write, without finishing anything.
+
+</details>
+
+## Three problems: concurrent writes, crashes and queries
+
+In this track we will learn to write SQL, connect to Postgres from Go, and study indexes and transactions. At the end
+we will build a storage engine (the part of a database that keeps data on disk) in Go ourselves. But first the
+simplest question: why is a file not enough?
+
+Carnegie Mellon University's database course (CMU 15-445/645) asks exactly this question in its first lecture. In the
+slides the data lives in plain CSV files, and then the questions come: *"What if two threads try to write to the same
+file at the same time?"*, *"What if the machine crashes while our program is updating a record?"*. In the course
+these questions stay rhetorical. We will run them and count.
+
+Today we will see three problems with our own eyes:
+
+| # | Problem | Question | Today's test |
+|---|---|---|---|
+| 1 | concurrent writes | what if two processes write to one file? | `poyga.sh` |
+| 2 | crash | what if a process dies in the middle of a write? | `qulash.sh`, `qulash-baza.sh` |
+| 3 | query | how do we answer "who placed how many orders?" | a loop in Go and one SQL statement |
+
+This is our problem too. The `mehmon` server in SYS-0.05 wrote the guest count to a file. In Node
+`fs.writeFileSync('db.json', JSON.stringify(data))`, in Python `json.dump(data, open('db.json', 'w'))`, in PHP
+`file_put_contents('db.json', json_encode($data))` — in small projects we have all written a "database" like this.
+Today we measure its limits.
+
+## A "database" in a file: `fayl/main.go`
+
+The program keeps orders in one JSON file (`buyurtmalar.json`, "orders"). For each order it reads the file, appends
+one order to the end of the list and writes everything again. The code uses only Go basics. The full file:
+
+```go filename="fayl/main.go" showLineNumbers
+// fayl: buyurtmalarni bitta JSON faylda saqlaydigan "baza" (DB-1.01).
+// Har bir buyurtma: faylni oʻqi → roʻyxatga qoʻsh → faylni qayta yoz.
+//
+//	./bin/fayl -mijoz A -n 1000              A mijozdan 1000 ta buyurtma yozadi
+//	./bin/fayl -usul rename -mijoz A         vaqtinchalik fayl + rename bilan
+//	./bin/fayl -usul qulf -mijoz A           flock + rename bilan
+//	./bin/fayl -sana                         faylda nechta buyurtma borligini sanaydi
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"os"
+	"syscall"
+)
+
+type Buyurtma struct {
+	ID    int    `json:"id"`
+	Mijoz string `json:"mijoz"`
+	Summa int    `json:"summa"`
+}
+
+type Ombor struct {
+	Buyurtmalar []Buyurtma `json:"buyurtmalar"`
+}
+
+func oqi(fayl string) (Ombor, error) {
+	var o Ombor
+	b, err := os.ReadFile(fayl)
+	if errors.Is(err, fs.ErrNotExist) {
+		return o, nil // fayl yoʻq: ombor boʻsh
+	}
+	if err != nil {
+		return o, err
+	}
+	err = json.Unmarshal(b, &o)
+	return o, err
+}
+
+func yoz(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fayl, b, 0o644) // avval faylni boʻshatadi, keyin yozadi
+}
+
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
+// tashxis: buzuq faylning boshidagi butun JSON qismini topadi va ortida nima qolganini aytadi.
+func tashxis(fayl string) {
+	b, _ := os.ReadFile(fayl)
+	if len(b) == 0 {
+		fmt.Println("fayl 0 bayt: hamma buyurtma yoʻq")
+		return
+	}
+	var o Ombor
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if dec.Decode(&o) != nil {
+		fmt.Printf("fayl %d bayt, oxiri yozilmay qolgan\n", len(b))
+		return
+	}
+	qoldi := len(b) - int(dec.InputOffset())
+	fmt.Printf("boshida %d ta buyurtma, ortida yana %d bayt eski yozuv\n", len(o.Buyurtmalar), qoldi)
+}
+
+func main() {
+	fayl := flag.String("fayl", "buyurtmalar.json", "ombor fayli")
+	mijoz := flag.String("mijoz", "A", "kim buyurtma beryapti")
+	n := flag.Int("n", 1000, "nechta buyurtma (0 = toʻxtatilguncha)")
+	sana := flag.Bool("sana", false, "faqat sanash")
+	usul := flag.String("usul", "oddiy", "oddiy | rename | qulf")
+	flag.Parse()
+
+	if *sana {
+		o, err := oqi(*fayl)
+		if err != nil {
+			fmt.Println("fayl buzuq:", err)
+			tashxis(*fayl)
+			os.Exit(1)
+		}
+		jami := map[string]int{}
+		for _, b := range o.Buyurtmalar {
+			jami[b.Mijoz]++
+		}
+		fmt.Printf("faylda: %d ta buyurtma (A: %d, B: %d)\n", len(o.Buyurtmalar), jami["A"], jami["B"])
+		return
+	}
+
+	saqla := yoz
+	if *usul != "oddiy" {
+		saqla = yozRename
+	}
+	buzuq := 0
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+	fmt.Printf("%s: %d ta yozdim, %d marta buzuq faylni oʻqidim\n", *mijoz, *n, buzuq)
+}
+```
+
+Let's read it in parts. The identifiers are Uzbek: `Buyurtma` — order, `Ombor` — store, `mijoz` — customer, `summa` —
+amount, `oqi` — read, `yoz` — write.
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–7 | comment | what the program does and which flags it runs with |
+| 10–19 | `import (…)` | standard library packages; `syscall` gives Linux system calls (today for `flock`) |
+| 21–25 | `type Buyurtma struct` | one order: number, customer, amount (GO-1.10). `` `json:"id"` `` is a tag: the key name in JSON (GO-1.02) |
+| 27–29 | `type Ombor struct` | the list of all orders (a slice). The JSON in the file: `{"buyurtmalar": [ … ]}` |
+| 31–42 | `func oqi` | reads the whole file (`os.ReadFile`) and turns the JSON into a struct (`json.Unmarshal`; `&o` is the address of `o`, so the function can fill it, GO-1.11). Returns two values: the store and an error (GO-1.06) |
+| 34–36 | `errors.Is(err, fs.ErrNotExist)` | if the file does not exist yet, that is not an error: the store is empty (GO-1.14) |
+| 44–50 | `func yoz` | turns the struct into pretty JSON text (`json.MarshalIndent`, 2 spaces per level) and writes it with `os.WriteFile`. `0o644` is the new file's permissions (`rw-r--r--`) |
+| 52–64 | `func yozRename` | the first fix (its own section below) |
+| 66–73 | `func qulfla` | the second fix, a lock (below) |
+| 75–90 | `func tashxis` | "diagnosis": finds the whole JSON part at the start of a broken file and says how many bytes are left after it ("Going deeper" section) |
+| 93–98 | `flag.String`, `flag.Int`, `flag.Bool` | command-line flags (like `argparse` in Python): `-fayl`, `-mijoz A`, `-n 1000`, `-sana`, `-usul`. They return pointers, so the value is read as `*mijoz` |
+| 100–113 | `if *sana` | "count": reads the file and counts orders per customer with a `map` (GO-1.09). If the file is broken: `tashxis` and exit code 1 |
+| 115–118 | `saqla := yoz` | "save": chooses which write function to use. A function is a value too (GO-1.06) |
+| 120 | `for i := 0; *n == 0 \|\| i < *n; {` | the main loop. With `-n 0` it runs until stopped. `i` grows only after a successful write (line 145) |
+| 121–128 | `var q *os.File` … | takes the lock only with `-usul qulf` (below) |
+| 129–138 | `o, err := oqi(*fayl)` | **read**. If the file is broken, it increments the `buzuq` ("broken") counter and tries again. After 100,000 tries it gives up: "fayl tiklanmadi" ("the file did not recover") |
+| 139 | `append(… Buyurtma{ID: len(…) + 1, …})` | **append**. The new number = list length + 1 |
+| 140–143 | `saqla(*fayl, o)` | **write**: the whole list is written to the file again |
+| 144 | `q.Close()` | releases the lock. Safe even when `q` is nil: `Close` returns an error, not a panic |
+| 147 | `fmt.Printf` | "wrote 1000, read a broken file N times" |
+
+The most important line is 49. The Go documentation says it openly about `os.WriteFile`: *"otherwise WriteFile
+truncates it before writing"* and *"Since WriteFile requires multiple system calls to complete, a failure mid-operation
+can leave the file in a partially written state."* So `os.WriteFile` is not one operation but several **system
+calls** (a program's request to the Linux kernel):
+
+| Step | System call | File state |
+|---|---|---|
+| 1 | `open(…, O_TRUNC)` | the file is opened and **emptied**: 0 bytes |
+| 2 | `write(…)` | the new JSON is being written: from 0 to N bytes |
+| 3 | `close(…)` | done |
+
+Node's `fs.writeFileSync` (default flag `'w'`), Python's `open(path, 'w')` and PHP's `file_put_contents` also empty
+the file first and then write. The problem is not in Go; it is in the "rewrite the file in place" approach.
+
+## Two processes, one file
+
+`poyga.sh` starts two processes at the same time. Its heart is one line:
+
+```bash
+./bin/fayl -usul "$usul" -mijoz A & ./bin/fayl -usul "$usul" -mijoz B & wait
+```
+
+`&` starts a program in the background and moves on to the next command (SYS-0.02). So A and B start at almost the
+same moment. `wait` waits until both finish. Then the script counts the file with `./bin/fayl -sana`. Each process
+writes 1000 orders, so there should be 2000 in total. Predict before running:
+
+**A)** 2000 orders in the file · **B)** the file is intact, but there are fewer orders · **C)** the file breaks and
+is no longer JSON
+
+<details>
+<summary>Answer</summary>
+
+**C.** Both processes empty the file and write from the start. One lands on top of the other's unfinished write, and
+two JSON documents stick together in the file. The next `oqi` cannot read it; the program retries again and again and
+finally gives up. "B" is what the version fixed with rename gives (below). "A" is what we expected, but a plain file
+does not give it.
+
+</details>
+
+```console
+$ ./poyga.sh
+B: fayl tiklanmadi: invalid character '{' after top-level value
+A: fayl tiklanmadi: invalid character '{' after top-level value
+fayl buzuq: invalid character '{' after top-level value
+boshida 504 ta buyurtma, ortida yana 71 bayt eski yozuv
+```
+
+Both processes stopped with "fayl tiklanmadi": in 100,000 read attempts they never saw whole JSON. The file is broken
+for good, not temporarily. The last two lines come from `-sana`: the `encoding/json` error *invalid character '\{'
+after top-level value* and the `tashxis` result ("504 orders at the start, then another 71 bytes of an old write").
+We got 504 whole orders at the start and a 71-byte tail. The video: 67 and 70 bytes. The number differs every time;
+the picture is the same.
+
+Why does `sync.Mutex` not help? A mutex is an object in the memory of one process. It queues the goroutines of that
+process (separate pieces of work that run at the same time inside a process, GO-1.21). The server in SYS-0.05 was one
+process, and the requests were its goroutines. A and B are two separate processes: each has its own memory and its
+own mutex. They do not see each other's locks.
+
+## Why exactly `}{`: the tail of the longer write
+
+Let's look at the end of the file (`tail -n 9` — the last 9 lines):
+
+```console
+$ tail -n 9 buyurtmalar.json
+    }
+  ]
+}{
+      "id": 505,
+      "mijoz": "B",
+      "summa": 25000
+    }
+  ]
+}
+```
+
+Right after the closing `}` comes a new `{`. Here is what happened:
+
+```text
+time  process A                          process B                          file
+ 1    open(O_TRUNC)                                                         0 bytes
+ 2                                       open(O_TRUNC)                      0 bytes
+ 3    write: 505 orders (longer)                                            [ 505 orders ........... ]}
+ 4                                       write: 504 (71 bytes shorter)     [ 504 orders .......]}{"id": 505 …]}
+                                         from byte 0 of the file, on top    └── B ──────────────┘└ A's tail ┘
+```
+
+Both processes opened and emptied the file at almost the same time (`O_TRUNC`, open(2)). Then both wrote from the
+start of the file. One wrote a longer JSON, the other a shorter JSON on top of it. After the point where the short
+write ended, the tail of the long one stayed in place. The tail is one order long: in `MarshalIndent` format one order
+with a two-digit number takes 70 bytes, with a three-digit number 71 bytes (we computed this ourselves). The reason:
+the two processes are usually one order apart.
+
+Just bad luck once? Let's repeat it twenty times:
+
+```console
+$ ./poyga.sh oddiy 20
+20 urinish (oddiy): fayl buzildi 20 marta, butun qoldi 0 marta
+buzilganda faylning butun boshida 2–558 ta buyurtma bor edi (2000 dan)
+```
+
+The file broke in 20 of 20 attempts. When it broke, the start of the file held from 2 to 558 whole orders. The video
+also shows 20/20, with a range of 1–289: sometimes it breaks at the very first order. The course research has more
+series too: in total the file broke in 53 of 53 attempts.
+
+## `kill -9` in the middle of a write
+
+Now we remove the rival: only one process writes to the file. This time the danger is a **crash**, an unexpected
+death of the process (the computer keeps running; only the program dies). `qulash.sh` does this 100 times:
+
+```bash
+./bin/fayl -usul "$usul" -n 0 >/dev/null &
+sleep "0.$((RANDOM % 9 + 1))"                     # 0.1–0.9 s yozsin
+kill -9 $! ; wait $! 2>/dev/null
+```
+
+Line 1 starts the program in the background, writing without stopping (`-n 0`). Line 2 waits a random 0.1–0.9
+seconds (`$RANDOM` is bash's random number; the comment says "let it write for 0.1–0.9 s"). Line 3 sends SIGKILL to
+the last background process (`$!`) and waits for it to end. Then the script checks the file: intact, completely empty
+(0 bytes) or half written. If the process died before its first write (no file yet), the attempt does not count and
+is repeated.
+
+Predict: how many of 100 kills break the file? **A)** none — with one writer there is no danger · **B)** a few ·
+**C)** all of them
+
+<details>
+<summary>Answer</summary>
+
+**B.** The kill comes at a random moment. Most often the program dies when one file has been written and the next
+has not started yet: the file is intact. But sometimes the kill falls between `open(O_TRUNC)` and `write` — the file
+is 0 bytes. Rarely it falls in the middle of `write` — half a file. If you chose "A", you thought the danger was only
+in concurrent writes: for a crash one writer is enough.
+
+</details>
+
+```console
+$ ./qulash.sh oddiy 100
+100 marta kill -9 (oddiy): fayl butun 93, boʻm-boʻsh 6, yarim yozilgan 1
+```
+
+We got 7 broken out of 100: 6 times the file was left at 0 bytes, meaning every order was lost, and once it was half
+written. The video: 10 (9 empty, 1 half). Other series of 100 in the course README: from 2 to 19. The empty file is
+the most common case because the moment between step 1 (emptying) and step 2 (writing) is long: the write copies more
+than 70 KB of JSON.
+
+Note: we killed only the **process**. The written bytes stay in Linux's in-memory copy (the page cache), and while
+the computer keeps running they still reach the disk. A power cut is a different, harsher test: we cover it in module
+DB-6 ([DB-6.01](/lab/youtube/databases#db-6-01)).
+
+## First fix: a temporary file and `rename`
+
+The idea: we do not change the file in place. The new JSON is first written to a temporary file next to it, then
+`rename` puts it in place of the old file:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+```
+
+| Line | What it does |
+|---|---|
+| `tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())` | the temporary file name: `buyurtmalar.json.12345.tmp`. The number in the middle is the process ID (PID), so the temporary files of A and B are different |
+| `os.WriteFile(tmp, b, 0o644)` | the new JSON goes to the temporary file. If a crash happens here, only the `.tmp` file is left unfinished; the main file is untouched |
+| `os.Rename(tmp, fayl)` | moves the temporary file to the main name, replacing the old one |
+
+On Linux rename is **atomic**. rename(2): *"If newpath already exists, it will be atomically replaced, so that there
+is no point at which another process attempting to access newpath will find it missing."* Another process that opens
+`buyurtmalar.json` sees either the old file or the new one. It never sees half a file. Go's `os.Rename` documentation
+warns: *"on non-Unix platforms Rename is not an atomic operation"*. That is why we say "on Linux". In Python the same
+thing is `os.replace(tmp, path)`, in Node `fs.renameSync(tmp, path)`.
+
+Now 100 kills:
+
+```console
+$ ./qulash.sh rename 100
+100 marta kill -9 (rename): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+```
+
+100 out of 100 intact — in the video too. Wherever the kill lands, the main file holds whole JSON: either the old or
+the new one.
+
+## The file is intact, the orders are gone: lost update
+
+With rename we race the two processes again. Predict how many orders the file will hold.
+
+**A)** 2000 — the file no longer breaks · **B)** ~1000 · **C)** the file breaks again
+
+<details>
+<summary>Answer</summary>
+
+**B.** Rename makes only *the file swap* atomic, not the "read → append → write" cycle. The two processes read the
+same old file, each puts its own version in place, and the later one erases the earlier one. Each process's cycle
+overlaps the other's almost completely, so roughly every second order is lost. If you chose "A", you took "no broken
+file" for "no bug".
+
+</details>
+
+```console
+$ ./poyga.sh rename
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 1001 ta buyurtma (A: 39, B: 962)
+```
+
+Both processes say "wrote 1000, read a broken file 0 times". No error. But let's count: the file has only 1001
+orders. The video had 1013. For us B won more (962 to 39), in the video A did (701 to 312): who wins is random.
+Twenty attempts:
+
+```console
+$ ./poyga.sh rename 20
+20 urinish (rename): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 997, eng kami 986, eng koʻpi 1009 (2000 dan)
+```
+
+The file never broke. But every attempt lost on average 997 of 2000 orders (the video: 983, range 964–999). One
+attempt lost 1009, so the file kept 991. That is fewer than one process writing alone would leave: the last `rename`
+wins, and the file keeps only the state the last writer read plus its one order.
+
+This bug is called a **lost update** (the term is from chapter 7 of M. Kleppmann's *Designing Data-Intensive
+Applications*). Step by step:
+
+| Step | A | B | Orders in the file |
+|---|---|---|---|
+| 1 | read the file: 100 | | 100 |
+| 2 | | read the same file: 100 | 100 |
+| 3 | appended its own, wrote 101 (+A) | | 101 (+A) |
+| 4 | | appended its own, wrote *its* 101 (+B) | 101 (+B, **A's order is gone**) |
+
+The file is intact, there is no error, but an order is missing. This is more dangerous than a broken file: a program
+notices a broken file at once, but nobody notices a lost order. Not until the customer calls to ask "where is my
+order?".
+
+## Second fix: the `flock` lock
+
+To stop the lost update, the "read → append → write" cycle must run in only one process at a time. For this all
+processes take one shared **lock**. On Linux this is `flock(2)`:
+
+```go
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+```
+
+`os.OpenFile` opens the file next to it, `buyurtmalar.json.lock` (and creates it if it does not exist).
+`syscall.Flock(…, LOCK_EX)` puts an exclusive lock on that file: if another process already holds the lock, the call
+**waits** until it is released. `int(f.Fd())` is the file descriptor, the number of the open file inside the process.
+The lock holds a separate `.lock` file, not the store file: the store file is replaced by rename every time, while the
+lock has to stay in one place.
+
+In the main loop the lock is used like this:
+
+```go
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+```
+
+The lock is taken on line 124. Reading (129), appending (139) and writing (140) run inside the lock. It is released on
+line 144. Writing still goes through rename (lines 115–118: `qulf` also picks `yozRename`). In PHP this is
+`flock($fp, LOCK_EX)`, in Python `fcntl.flock(f, fcntl.LOCK_EX)`. The same system call is underneath.
+
+```console
+$ ./poyga.sh qulf 20
+20 urinish (qulf): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+20 attempts, zero lost — in the video too. The price: the processes now write in turn. 20 attempts took us 47
+seconds, while rename without the lock took 16 seconds (we timed the command separately).
+
+## The lock worked, but this is only the beginning
+
+File + rename + flock worked correctly. But let's list what else a real project needs:
+
+| Problem | What happens |
+|---|---|
+| `flock` is an advisory lock | flock(2): *"flock() places advisory locks only; given suitable permissions on a file, a process is free to ignore the use of flock()"*. A program that does not take the lock (a manual edit, an old script) writes to the file freely |
+| power cut | the new renamed file may still be in memory, not on disk. You have to **fsync** both the file and the folder (fsync tells Linux "wait until the data reaches the disk"). fsync(2): the folder entry needs its own fsync |
+| the whole file for every order | at 1000 orders the file is ~71 KB. For 2000 orders ~142 MB are rewritten in total (we computed this) |
+| finding one order | to find `id = 1500` you have to read the whole file and parse the JSON |
+| several files | if "order + stock left in the store" live in two files, there is no way to change both together atomically |
+
+If you solve all of this, you will have written a database yourself. The "Atomic Commit" page in the SQLite
+documentation explains in detail how a database makes a write atomic and safe against a power cut.
+
+## Question: what if we put the JSON in a Postgres column?
+
+Now let's try the simple fix. We take the JSON out of the file and put it in one column of a Postgres table. The Go
+code is the same: read, append, write. Only, instead of a file, one row of a table:
+
+```go
+// jsonUsul: fayldagi kod bilan bir xil, faqat fayl oʻrnida jadvaldagi bitta qator.
+func jsonUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	return 0, jsonYoz(ctx, db, mijoz)
+}
+
+func jsonYoz(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	var b []byte
+	if err := db.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	b, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b)
+	return err
+}
+```
+
+| Code | What it does |
+|---|---|
+| `db.QueryRow` + `SELECT doc FROM ombor WHERE id = 1` + `.Scan(&b)` | **read**: gets the `doc` column (JSON) of row 1 of the `ombor` table as bytes (`pgx`, SYS-0.06). `ctx` is the context (`context.Background()`), covered in GO-1.23; you can ignore it today |
+| `json.Unmarshal`, `append`, `json.Marshal` | **append**: the same as with the file, in Go |
+| `db.Exec` + `UPDATE ombor SET doc = $1 WHERE id = 1` | **write**: rewrites the whole JSON. `$1` is a parameter; `b` takes its place |
+
+The tables are created by `baza -tayyorla` ("prepare"): the `doc` column has type `jsonb` (Postgres's binary JSON
+type):
+
+```go
+const sxema = `
+CREATE TABLE IF NOT EXISTS ombor (id int PRIMARY KEY, doc jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS buyurtmalar (
+	id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	mijoz text   NOT NULL,
+	summa bigint NOT NULL
+);
+TRUNCATE ombor, buyurtmalar RESTART IDENTITY;
+INSERT INTO ombor VALUES (1, '{"buyurtmalar": []}');`
+```
+
+We start Postgres with compose as in SYS-0.06. The difference: this time the Go processes run not in a container but
+on the host (our own computer). That is why the port is open only on `127.0.0.1:5440`:
+
+```bash
+cp .env.example .env          # keyin .env dagi DB_PASSWORD= qatoriga oʻz parolingizni yozing
+docker compose up -d --wait   # Postgres 18 healthy boʻlguncha kutadi
+```
+
+(The code comments say: "then write your password on the DB_PASSWORD= line in .env" and "waits until Postgres 18 is
+healthy".) The video asks you to pause here. Predict: will Postgres keep two thousand orders?
+
+**A)** yes, 2000: the database orders concurrent writes by itself · **B)** no, ~1000: just like the file ·
+**C)** the second process gets an error
+
+<details>
+<summary>Answer</summary>
+
+**B.** `SELECT` and `UPDATE` are two separate statements. Each runs in its own automatic **transaction** (a group of
+statements the database runs as "all or nothing"). The default isolation level in Postgres is Read Committed: each
+statement sees the data committed when it starts. The gap between the read and the write stays in your Go code: the
+database does not see it. A and B read the same old JSON, then the later writer erases the earlier one — the same lost
+update as with the file. "A" is the most common misconception: a database protects only *the operation it is given*.
+"C" does not happen: both `UPDATE`s are legal, and Postgres runs them one after the other.
+
+</details>
+
+```console
+$ ./baza.sh json
+A: 1000 ta yozdim
+B: 1000 ta yozdim
+json ustunida: 1000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+```
+
+`json ustunida` ("in the json column") holds only 1000 of 2000 (the video: 1002). Twenty attempts:
+
+```console
+$ ./baza.sh json 20
+20 urinish (json): yoʻqolgan buyurtma oʻrtacha 1000, eng kami 1000, eng koʻpi 1000 (2000 dan)
+```
+
+For us every attempt lost exactly 1000. The video: 999 on average, range 994–1000. The conclusion is the same in both:
+**the database is not magic**. It protects only the operation it is given. We told Postgres "here is the new JSON,
+replace the old one", and it did exactly that.
+
+## The right way: one `INSERT` per order
+
+The right way: we give the change to the database itself. Each order is one `INSERT`, that is, one new row in the
+`buyurtmalar` table. Nothing is read beforehand:
+
+```go
+// insertUsul: oʻqish yoʻq — oʻzgarishni bazaning oʻziga beramiz. Baza yangi qatorning id'sini qaytaradi.
+func insertUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	var id int64
+	err := db.QueryRow(ctx, `INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000) RETURNING id`, mijoz).Scan(&id)
+	return id, err
+}
+```
+
+`INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000)` adds a new row. The database assigns the `id` itself
+(`GENERATED ALWAYS AS IDENTITY` in the schema: an automatically increasing number). `RETURNING id` asks the database
+to return the new row's number, and `.Scan(&id)` takes it. Go reads and appends nothing, so there is no gap between
+"read" and "write" either.
+
+```console
+$ ./baza.sh insert 20
+20 urinish (insert): yoʻqolgan buyurtma oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+Twenty attempts, two thousand every time, zero lost — in the video too.
+
+The third problem is the **query**. "Who placed how many orders, and for what total?" In the file program we read the
+whole file and wrote a loop in Go for this (`fayl/main.go`, lines 107–111: a `map` and `for range`). In Postgres one
+SQL statement is enough. `docker compose exec db` runs a command inside the `db` service's container; `psql` is
+Postgres's terminal client:
+
+```console
+$ docker compose exec db psql -U ombor -c 'SELECT mijoz, count(*), sum(summa) FROM buyurtmalar GROUP BY mijoz ORDER BY mijoz'
+ mijoz | count |   sum    
+-------+-------+----------
+ A     |  1000 | 25000000
+ B     |  1000 | 25000000
+(2 rows)
+```
+
+`GROUP BY mijoz` groups the rows by customer, `count(*)` counts the rows in each group, `sum(summa)` adds up the
+amounts, `ORDER BY` sorts. A and B have 1000 each, 25,000,000 each. We will study SQL line by line in the next
+lessons.
+
+## Crash test: we `kill -9` Postgres
+
+Now we run the crash test from the file part against the database. A and B `INSERT` without stopping, and we kill the
+Postgres container with `kill -9` (`docker compose kill db` sends SIGKILL to the container's main process). The key
+lines of `qulash-baza.sh`:
+
+```bash
+./bin/baza -mijoz A -n 0 -tasdiq bin/A.ids >bin/A.log & ./bin/baza -mijoz B -n 0 -tasdiq bin/B.ids >bin/B.log &
+sleep "1.$((RANDOM % 9))"
+docker compose kill db >/dev/null 2>&1
+```
+
+The check is not by count but **by each number**. The client writes the new `id` to a file only after `INSERT`
+returned without an error, that is, after the database said "done" (`-tasdiq` — "acknowledgement"):
+
+```go
+	i := 0
+	for ; *n == 0 || i < *n; i++ {
+		id, err := yoz(ctx, db, *mijoz)
+		if err != nil {
+			fmt.Printf("%s: %d ta tasdiqlandi, keyin xato: %v\n", *mijoz, i, err)
+			if idlar != nil {
+				idlar.Flush() // os.Exit defer'larni bajarmaydi
+			}
+			os.Exit(1)
+		}
+		if idlar != nil {
+			fmt.Fprintln(idlar, id) // faqat baza "tayyor" degandan keyin
+		}
+	}
+```
+
+`idlar` ("ids") is a `bufio.Writer` that writes to the file through a buffer (GO-1.20). `fmt.Fprintln(idlar, id)`
+runs only after `yoz` returned without an error. On an error the program first calls `Flush` (writes the buffer out to
+the file), because `os.Exit` does not run `defer`s (GO-1.15).
+
+After the database is back up, `baza -tekshir A.ids B.ids` ("check") checks whether every acknowledged `id` is in the
+table. Predict: how many acknowledged orders are lost after the kill?
+
+**A)** the last few: they were still in memory · **B)** none · **C)** all of them: the database files broke
+
+<details>
+<summary>Answer</summary>
+
+**B.** Postgres returns the reply to a commit (the success reply) only after the change has reached the log on disk.
+So every order the client got an acknowledgement for is recovered from the log after the crash. "A" was true for the
+file program: there "I wrote it" ≠ "it is saved". In the next section we look at how the WAL works.
+
+</details>
+
+```console
+$ ./qulash-baza.sh
+A: 363 ta tasdiqlandi, keyin xato: unexpected EOF
+B: 364 ta tasdiqlandi, keyin xato: unexpected EOF
+database system was not properly shut down; automatic recovery in progress
+redo starts
+redo done
+database system is ready to accept connections
+tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0
+```
+
+Let's read the result:
+
+| Line | Meaning |
+|---|---|
+| `A: 363 ta tasdiqlandi, keyin xato: unexpected EOF` | A got 363 acknowledgements, then the connection broke (*unexpected EOF* — an unexpected end of the stream: the server vanished in the middle of a reply) |
+| `database system was not properly shut down; automatic recovery in progress` | the log of the restarted Postgres |
+| `redo starts` / `redo done` | **redo**: the changes from the log are being applied to the table again / finished |
+| `database system is ready to accept connections` | the database accepts connections |
+| `tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0` | "acknowledged: 727 · in the database: 728 · acknowledged and lost: 0": all 363 + 364 = 727 acknowledged `id`s are there; the table has 728 rows |
+
+The video had 569 + 570 = 1139 acknowledged and 1140 rows. We have fewer: the kill comes after a random 1.0–1.8
+seconds, and the computer was busy. The important part is the same: acknowledged and lost — 0.
+
+The one extra row in the database is an order that was committed, but whose reply did not reach the program. The
+database kept it, while the client thought there was an error. Because each process has only one `INSERT` in flight at
+a time, there can be 0, 1 or 2 extra rows. Twenty times:
+
+```console
+$ ./qulash-baza.sh 20 | tail -1
+20 marta kill -9: 20 marta tasdiqlangan har bir id joyida (yoʻqolgan jami 0), tasdiqsiz ortiqcha qator jami 17
+```
+
+In 20 of 20 attempts every acknowledged `id` is there. Unacknowledged extra rows: 17 in total — the same number as in
+the video (a coincidence: the attempts are different). If the client sends such an "errored" order again, a duplicate
+appears; that is the topic of idempotency, in later modules.
+
+## WAL: first to the log, then to the table
+
+The database was saved by the **write-ahead log**, **WAL** for short. The PostgreSQL 18 documentation (28.3):
+*"changes to data files (where tables and indexes reside) must be written only after those changes have been logged,
+that is, after WAL records describing the changes have been flushed to permanent storage."* The order:
+
+| Step | What happens | Where |
+|---|---|---|
+| 1 | an `INSERT` arrives | Postgres memory |
+| 2 | a record of the change is appended to the end of the log | WAL file |
+| 3 | `COMMIT`: waits until the log reaches the disk (`synchronous_commit = on`, the default) | disk |
+| 4 | only then the "done" reply goes to the client | network |
+| 5 | the table files are updated later, without hurry | disk |
+| crash | the database reads the log and redoes the changes that had not reached the table — the `redo` in the log | WAL → table |
+
+The documentation: *"any changes that have not been applied to the data pages can be redone from the WAL records.
+(This is roll-forward recovery, also known as REDO.)"* Writing to the log is cheap: it only appends a small record to
+the end. There is no need to rewrite the whole table every time. Our file program did the opposite: for every order
+it rewrote the whole file in place.
+
+Remember: we killed only the **process**. What happens in a power cut, and fsync, we cover in depth in module DB-6
+([DB-6.01](/lab/youtube/databases#db-6-01)). The cost of fsync was measured in SYS-1.01:
+[SYS-1.01 · the latency table](/lab/youtube/sys/sys-1-01/en).
+
+## When a file, when SQLite, when Postgres
+
+So is a file never needed? It is, but in its place:
+
+| Situation | What is enough |
+|---|---|
+| a settings file that only one program writes | JSON + rename + fsync |
+| an app on one computer, one writer at a time | SQLite |
+| many writers, many clients over the network | a server database such as Postgres |
+
+SQLite's own site compares it not with server databases but with the plain file-opening function: *"SQLite does not
+compete with client/server databases. SQLite competes with fopen()."* (`fopen` is C's function for opening a file.) The
+same page: SQLite *"will only allow one writer at any instant in time"*. With many writers and many clients on the
+network you need a server database. In this track we work with Postgres.
+
+In the next lesson: the relational model, and why a table is really a set
+([DB-1.02 · Relyatsion model: jadval — bu toʻplam](/lab/youtube/databases#db-1-02)).
+
+## All measurements in one table
+
+| Test | In the video (README) | Ours (evening) | What matters |
+|---|---|---|---|
+| `./poyga.sh` | broken: 67 orders + 70 bytes | broken: 504 orders + 71 bytes | the file breaks, the tail = 1 order |
+| `./poyga.sh oddiy 20` | 20/20 broken, 1–289 | 20/20 broken, 2–558 | breaks every time |
+| `./qulash.sh oddiy 100` | 10 broken (9 empty, 1 half) | 7 broken (6 empty, 1 half) | even one writer loses the file in a crash |
+| `./qulash.sh rename 100` | 100/100 intact | 100/100 intact | rename stops the breakage |
+| `./poyga.sh rename` | 1013 (A 701, B 312) | 1001 (A 39, B 962) | ~half is lost |
+| `./poyga.sh rename 20` | 983 lost on average | 997 lost on average | lost update, no error |
+| `./poyga.sh qulf 20` | 0 lost | 0 lost | the lock fixes it |
+| `./baza.sh json` | 1002 | 1000 | the database is not magic |
+| `./baza.sh json 20` | 999 on average | 1000 on average | ~half |
+| `./baza.sh insert 20` | 0 lost | 0 lost | the change runs inside the database |
+| `./qulash-baza.sh` | 1139 acked, 1140 rows, 0 lost | 727 acked, 728 rows, 0 lost | nothing acknowledged is lost |
+| `./qulash-baza.sh 20` | 20/20, 17 extra | 20/20, 17 extra | WAL |
+
+## Going deeper (optional): `tashxis`, why half is lost, and SIGKILL for Postgres
+
+**How the tail is measured.** `tashxis` (lines 75–90) reads one JSON value from the start of the file with
+`json.Decoder`. `Decode` stops at the first closing `}` and does not look further. `dec.InputOffset()` tells how far it
+read. Subtract that from the file length and you get the number of bytes left over. `json.Unmarshal`, on the other
+hand, expects the whole file to be one value, so it fails on the extra `{`. The course author also checked the result
+with Python's `json.JSONDecoder.raw_decode` (course research).
+
+**Why exactly half is lost.** Each cycle reads the whole file, parses the JSON, builds a new one and writes it. At 1000
+orders that is ~71 KB. The cycles of A and B overlap almost entirely. If two processes read the same state and both
+write, one of the two orders survives. That is why the result is ~1000. This explanation is from the course research;
+it was not measured separately.
+
+**When the file is 0 bytes and when it is half.** `os.WriteFile` = `open(O_WRONLY|O_CREATE|O_TRUNC)` + `write` +
+`close`. If the kill falls between `open` and `write`: 0 bytes. In the middle of a large `write`: half a file (course
+research: on a fatal signal the kernel stops a buffered write at a page boundary).
+
+**SIGKILL for Postgres.** `docker compose kill db` sends SIGKILL to the container's process 1 (the postmaster). The
+PostgreSQL documentation ("Server Shutdown") advises against stopping a real server with SIGKILL: child processes and
+shared memory are left uncleaned. We did it on purpose to simulate a crash. The proper "fast" stop is SIGQUIT
+(immediate shutdown): according to the documentation it also *"will lead to recovery (by replaying the WAL log) upon
+next start-up"*.
+
+**Why `jsonb_set` fixes it.** In the medium homework task, "read, append, write" moves inside one `UPDATE`. Postgres
+locks the row being updated. The second `UPDATE` waits, then under Read Committed re-reads the *new* version of the
+row and appends on top of it (PostgreSQL 13.2.1). This is the *atomic write operation* from DDIA.
+
+## Common mistakes
+
+**1. "There is a database, so orders cannot be lost."** The most common misconception, often written in blog posts
+too. There is no error message; the result is silently wrong. In "Question: what if we put the JSON in a Postgres
+column?" we saw it: with the JSON in a `jsonb` column and Go reading, appending and writing, Postgres lost ~1000 of
+2000. The cause: the read and the write are two separate statements, and the gap is in Go code. The fix: give the
+change to the database — one `INSERT` per order, or one `UPDATE … jsonb_set`, or `SELECT … FOR UPDATE` inside a
+transaction (homework).
+
+**2. "`sync.Mutex` protects the file."** In one process, yes (the SYS-0.05 server). In two processes, no: each
+process has its own memory and its own mutex, and there is no error message either. If the server runs as two copies
+(two containers, or the moment an old version is replaced by a new one), the file breaks. The fix: a lock between
+processes (`flock`) or a database.
+
+**3. "I used rename, so the file is safe."** Rename only stops the breakage. Two things remain: the lost update
+(concurrent writers, section "The file is intact, the orders are gone") and a power cut (without fsync the new file
+may not be on disk). The fix: a lock + fsync of the temporary file + fsync of the folder after rename (Guru task).
+
+**4. "There is a `.lock` file, so the lock is taken."** Some scripts check a lock by asking "does a lock file
+exist?". If the process died from `kill -9`, the file stays, and everybody waits forever. `flock`, however, is not
+the existence of a file but a lock tied to an open descriptor: when the process dies, the kernel closes its files and
+the lock is released by itself. Our `.lock` file also stays on disk — that is normal; it is only the place the lock
+is put on.
+
+**5. On Windows `fayl` does not compile.** Let's build for another system (`GOOS=windows` tells Go "build for
+Windows"):
+
+```console
+$ GOOS=windows go build ./fayl
+# github.com/abdurahmon27/go-backend-uz/lessons/db-01-why-database/fayl
+fayl/main.go:72:20: undefined: syscall.Flock
+fayl/main.go:72:47: undefined: syscall.LOCK_EX
+```
+
+Reading it: `fayl/main.go:72:20` — the file, line 72, character 20. *undefined: syscall.Flock* — "`syscall.Flock` is
+not defined". The `syscall` package is different on every system: `Flock` exists only on Unix systems (Linux, macOS).
+The fix: do the lesson on Linux or inside WSL on Windows. On Windows Go's `os.Rename` is not atomic either (Go
+documentation).
+
+**6. No password in `.env`.** If you ran `cp .env.example .env` and forgot to write the password:
+
+```console
+$ cp .env.example .env
+$ docker compose up -d --wait
+error while interpolating services.db.environment.POSTGRES_PASSWORD: required variable DB_PASSWORD is missing a value: .env faylida DB_PASSWORD yoʻq
+```
+
+This output was produced in a copy of the lesson folder (so the real `.env` was not touched); the files are the same.
+Reading it: *error while interpolating services.db.environment.POSTGRES_PASSWORD* — "error while putting a value into
+`services → db → environment → POSTGRES_PASSWORD`". *required variable DB_PASSWORD is missing a value* — "the required
+variable `DB_PASSWORD` has no value". The last part is the guard's own message from `${DB_PASSWORD:?…}` in
+`compose.yaml` (SYS-0.06): ".env has no DB_PASSWORD". Compose started nothing. The fix: write a password after
+`DB_PASSWORD=` in `.env`.
+
+**7. "`kill -9` = a power cut."** Today's crashes are process crashes: the written bytes stay in Linux's memory and,
+while the computer runs, reach the disk. In a power cut, data that was not fsynced can be lost too. Today's results do
+not show that "file + rename survives a power cut". We will test that in module DB-6.
+
+## Check yourself
+
+**1.** Why can the `sync.Mutex` from SYS-0.05 not put processes A and B in order?
+
+<details>
+<summary>Answer</summary>
+
+A mutex is an object in one process's memory; it queues the goroutines of that process. A and B are two separate
+processes, each with its own mutex. They do not see each other's locks. If you need a lock between processes, use
+`flock` (a lock at the kernel level) or a database.
+
+</details>
+
+**2.** What did rename fix, and what did it not fix?
+
+<details>
+<summary>Answer</summary>
+
+It fixed: the file is never seen half written or with two JSON documents stuck together (`qulash.sh rename 100` —
+100/100 intact, 0 breakages in the race). It did not fix: the lost update — two processes read the same old file and
+the later one erases the earlier one (~1000 of 2000 lost). It gives no protection against a power cut either: that
+needs fsync.
+
+</details>
+
+**3.** What does `./poyga.sh qulf` (one attempt) print? Predict, then open the answer.
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ ./poyga.sh qulf
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 2000 ta buyurtma (A: 1000, B: 1000)
+```
+
+Each process wrote 1000, there were no broken reads, and the file holds 2000: 1000 each for A and B. The lock put the
+"read, append, write" cycle in a queue, and rename kept the file whole. The order of the first two lines can change
+from run to run: the processes took turns.
+
+</details>
+
+**4.** When does Postgres send the client the "committed" reply? Where did the extra row in the database come from?
+
+<details>
+<summary>Answer</summary>
+
+After the change is written to the WAL and the log has reached the disk (`synchronous_commit = on`, the default). The
+table files are updated later, and after a crash the changes are redone from the log (`redo`). The extra row is an
+order whose commit happened in the database but whose reply did not reach the client: the database kept it, while the
+client got an error and did not add it to the acknowledged list.
+
+</details>
+
+**5.** From SYS-0.02: what number does `sleep 9 & kill -9 $!; wait $!; echo $?` print, and why?
+
+<details>
+<summary>Answer</summary>
+
+`137`. The exit code of a process killed by a signal = 128 + the signal number; SIGKILL is 9, so 128 + 9 = 137. This
+command was run in SYS-0.02. Today's `qulash.sh` also does `kill -9 $!; wait $!`, but does not show the exit code
+(`2>/dev/null`).
+
+</details>
+
+## Homework
+
+Tasks and answers are in the lesson folder on GitHub:
+[lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database).
+The answer code is in
+[homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database/homework); `bash
+homework/javoblar.sh` runs all of it (you need `.env` and `docker compose up -d --wait`). Try it yourself first.
+
+- 🟢 **Easy:** `./qulash.sh qulf 100` — does the file stay intact? Why? If a process dies while holding the lock,
+  does the second process wait forever?
+- 🟡 **Medium:** fix the Postgres `-usul json` with one `UPDATE`, without reading in Go (`jsonb_set`, `||`,
+  `jsonb_array_length`).
+- 🟠 **Hard:** fix it without changing the Go "read-append-write" code: put the read and the write in one transaction
+  and lock the row with `SELECT … FOR UPDATE`.
+- 🔴 **Guru:** add an `fsync` of the temporary file and an `fsync` of the folder after rename to the `rename` method.
+  How much slower did it get? Why the folder too?
+
+<details>
+<summary>Answer</summary>
+
+Our run:
+
+```console
+$ bash homework/javoblar.sh
+== Oson: qulf usulini 100 marta kill -9
+100 marta kill -9 (qulf): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+== Oʻrta: Postgres, usul sql
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Qiyin: Postgres, usul forupdate
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Guru: qulf (fsync'siz) va qulf + fsync, ikki jarayon × 1000
+fayl: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 2443 ms
+fsync: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 9777 ms
+```
+
+🟢 100/100 intact. The `qulf` method also writes with rename (lines 115–118), so wherever the kill lands, a whole
+file sits in place: either the old or the new one. Nobody waits forever: `flock` is tied to the process's open file;
+when the process dies, the kernel closes its descriptors and the lock is released by itself. In a "does a lock file
+exist?" scheme the lock would be left behind.
+
+🟡 Reading, appending and writing happen inside one `UPDATE`; Go reads nothing (from `homework/baza-tuzat/main.go`):
+
+```go
+// sqlUsul: Go hech narsani oʻqimaydi. Oʻqish, qoʻshish va yozish bitta UPDATE ichida:
+// Postgres qatorni yangilash paytida qulflaydi, ikkinchi UPDATE birinchisi tugashini kutadi
+// va yangi qiymatning ustiga qoʻshadi (Read Committed, PostgreSQL docs 13.2.1).
+func sqlUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE ombor
+		SET doc = jsonb_set(doc, '{buyurtmalar}', doc->'buyurtmalar' || jsonb_build_object(
+			'id', jsonb_array_length(doc->'buyurtmalar') + 1, 'mijoz', $1::text, 'summa', 25000))
+		WHERE id = 1`, mijoz)
+	return err
+}
+```
+
+`doc->'buyurtmalar'` is the array inside the JSON, `||` appends the new object to it, `jsonb_array_length(…) + 1` is
+the new number, and `jsonb_set` puts the updated array back into `doc`. Postgres locks the row being updated: the
+second `UPDATE` waits and appends on top of the row's new version. Result: `json ustunida: 2000 ta`.
+
+🟠 The Go code is the same, but inside one transaction: `Begin` starts it, `Commit` confirms it:
+
+```go
+// forUpdateUsul: Go kodi oʻzgarmaydi, lekin oʻqish va yozish bitta transaction'da,
+// SELECT … FOR UPDATE esa qatorni commit'gacha qulflaydi — ikkinchi jarayon kutadi.
+func forUpdateUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // commit'dan keyin hech narsa qilmaydi
+	var b []byte
+	if err := tx.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1 FOR UPDATE`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	if b, err = json.Marshal(o); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+`FOR UPDATE` locks the row it read until the commit. The second process's `SELECT … FOR UPDATE` waits until the first
+one commits, then reads the *new* JSON → 2000. `defer tx.Rollback(ctx)` cancels the transaction on an error and does
+nothing after a commit. This is *explicit locking* from DDIA. The lost update and its four fixes:
+[DB-5.02](/lab/youtube/databases#db-5-02).
+
+🔴 `homework/fsync/main.go` is a copy of `fayl/main.go`; only `yozRename` differs:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil { // 1) maʼlumot diskda
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, fayl); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(fayl)) // 2) yangi nom ham diskda: papkani fsync qilamiz
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+```
+
+`f.Sync()`: the temporary file's data is on disk. `d.Sync()`: the folder itself — a file name lives in the folder's
+entry, and rename changes exactly that entry. fsync(2): *"Calling fsync() does not necessarily ensure that the entry
+in the directory containing the file has also reached disk. For that an explicit fsync() on a file descriptor for the
+directory is also needed."* If the power goes out without a folder fsync, the rename can be lost.
+
+The price: for us 2.4 s → 9.8 s (~4 times). The course README has two measurements: 6.1 → 15.4 s and 7.0 → 13.6 s
+(~2–2.5 times). The exact number depends on the disk and the computer's load, but the direction is the same: two
+fsyncs per order make it several times slower. For comparison: Postgres wrote 2000 `INSERT`s, with a WAL flush on
+every commit, in 1.9 s (course research). This is not a like-for-like comparison: the file rewrites the whole file and
+does two fsyncs each time, Postgres appends a small record to the log. The reason was not measured separately.
+
+</details>
+
+## Sources
+
+- CMU 15-445/645 Fall 2024, Lecture 01 (A. Pavlo), slides 10–14 "Flat file strawman":
+  [01-relationalmodel.pdf](https://15445.courses.cs.cmu.edu/fall2024/slides/01-relationalmodel.pdf)
+- M. Kleppmann, *Designing Data-Intensive Applications*, chapter 7 "Transactions", "Preventing Lost Updates":
+  [dataintensive.net](https://dataintensive.net/)
+- Go: [os.WriteFile (go1.26.8, file.go:927–931)](https://github.com/golang/go/blob/go1.26.8/src/os/file.go#L927-L931) ·
+  [os.Rename](https://pkg.go.dev/os#Rename) · [syscall.Flock](https://pkg.go.dev/syscall#Flock)
+- Linux: [open(2) O_TRUNC](https://man7.org/linux/man-pages/man2/open.2.html) ·
+  [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) ·
+  [flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html) ·
+  [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html) ·
+  [signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html)
+- PostgreSQL 18: [WAL Introduction](https://www.postgresql.org/docs/18/wal-intro.html) ·
+  [synchronous_commit](https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT) ·
+  [Server Shutdown](https://www.postgresql.org/docs/18/server-shutdown.html) ·
+  [Transaction Isolation (Read Committed)](https://www.postgresql.org/docs/18/transaction-iso.html) ·
+  [INSERT](https://www.postgresql.org/docs/18/sql-insert.html) ·
+  [SELECT … FOR UPDATE](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE) ·
+  [jsonb_set](https://www.postgresql.org/docs/18/functions-json.html)
+- SQLite: [Appropriate Uses For SQLite](https://www.sqlite.org/whentouse.html) ·
+  [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html)
+- In other languages: [Node fs flags](https://nodejs.org/api/fs.html#file-system-flags) ·
+  [Python open](https://docs.python.org/3/library/functions.html#open) ·
+  [Python os.replace](https://docs.python.org/3/library/os.html#os.replace) ·
+  [Python fcntl.flock](https://docs.python.org/3/library/fcntl.html#fcntl.flock) ·
+  [PHP file_put_contents](https://www.php.net/manual/en/function.file-put-contents.php) ·
+  [PHP flock](https://www.php.net/manual/en/function.flock.php)
+- pgx: [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)
+- Course folder and README (all measurements):
+  [lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+- Results from `go1.26.8 linux/amd64` (`CGO_ENABLED=0`), Linux 6.18 (NixOS), ext4 NVMe, Intel Core i5-12450H, Docker
+  Engine 29.8.1, Compose 5.4.0, `postgres:18-alpine` (PostgreSQL 18.7), pgx v5.13.0, 2026-11-26. The video's results
+  are from the course README (same day, quoted, not re-run). The terminal output on this page: the same day,
+  22:30–22:45, load average 1–1.7. "One order is 70/71 bytes" and "~142 MB in total" are our own calculation;
+  Postgres's 1.9 s and the "why half is lost" explanation are from the course research, not re-measured.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+---
+
+Next lesson: [DB-1.02](/lab/youtube/databases#db-1-02) → · [All lessons](/lab/youtube/databases)
+
+</div>

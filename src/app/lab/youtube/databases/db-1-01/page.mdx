@@ -1,0 +1,1264 @@
+---
+title: "Nega JSON fayl emas, baza? Ikki Go jarayoni bitta faylni buzadi"
+date: "2026/11/26"
+description: "Ikki Go jarayoni JSON faylni qanday buzishi, kill -9 va lost update'ni oʻlchaymiz, keyin xuddi shu ishni PostgreSQL'da INSERT va WAL bilan koʻramiz."
+tag: "youtube, databases, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/databases/db-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/databases/db-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/databases/db-1-01/ru) · [English](/lab/youtube/databases/db-1-01/en)  
+Dars DB-1.01 · [Maʼlumotlar bazasi: 0 → Guru](/lab/youtube/databases#db-1-01) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Ikki dastur bitta faylga bir vaqtda yozsa nima boʻladi? Bu darsda ikki Go dasturi bitta JSON faylga buyurtma yozadi.
+Har biri 1000 tadan yozishi kerak. Natija: fayl endi JSON emas. Boshida bir necha yuz butun buyurtma, ortida esa eski
+yozuvning ~70 baytlik dumi. Go'dagi `sync.Mutex` bu yerda yordam bermaydi: ular ikki alohida jarayon.
+
+**Bitta gʻoya:** fayl faqat baytlarni saqlaydi. Bir vaqtda yozish, crash va soʻrovdan himoyani kimdir yozishi kerak.
+Maʼlumotlar bazasi shu ishni oʻz ichida bajaradi: oʻzgarish bazaning ichida bajariladi va avval jurnalga yoziladi.
+
+Dars oxirida siz:
+
+- ikki jarayon bitta JSON faylni qanday buzishini va `kill -9` uni qanday boʻshatib qoʻyishini oʻz kompyuteringizda
+  koʻrsata olasiz;
+- `rename` va `flock` nimani tuzatishini, nimani tuzatmasligini bilasiz;
+- **lost update** (yoʻqolgan yangilanish) xatosini koddan taniysiz: «oʻqi, qoʻsh, yoz» sikli Postgres'da ham
+  buyurtma yoʻqotadi;
+- Postgres'dagi `INSERT` nega 2000 dan 2000 ni saqlashini va crash'dan keyin **WAL** bilan qanday tiklanishini
+  tushuntirasiz.
+
+Bugungi uchta asosiy yangi soʻz:
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| yoʻqolgan yangilanish | ikki jarayon bir xil eski holatni oʻqiydi; keyin yozgani oldin yozganining oʻzgarishini jimgina oʻchiradi | lost update |
+| atomik | yarmida boʻlinmaydi: boshqa jarayon yo eski, yo yangi holatni koʻradi, oraligʻini hech qachon | atomic |
+| oldindan yoziladigan jurnal | baza har oʻzgarishni avval jurnal oxiriga yozadi, jadval fayllarini keyinroq yangilaydi | write-ahead log (WAL) |
+
+Yordamchi soʻzlar paydo boʻlgan joyida bir gapda tushuntiriladi: **crash** (jarayon kutilmaganda oʻladi), **qulf**
+(lock, `flock`), **fsync**, **transaction** va **commit**.
+
+## Oldin bilish kerak
+
+Bu maʼlumotlar bazasi trekining birinchi darsi. U quyidagilarga tayanadi:
+
+- [SYS-0.02 · Jarayon va muhit: ps, kill, $PATH va env oʻzgaruvchilar](/lab/youtube/sys/sys-0-02): **jarayon** (process)
+  nima, `&` bilan fonda ishga tushirish, `$!`, `wait`, `kill -9` va SIGKILL'ni ushlab boʻlmasligi.
+- [SYS-0.05 · Docker: «mening kompyuterimda ishlaydi» muammosiga yechim](/lab/youtube/sys/sys-0-05): container; `mehmon`
+  serveri mehmonlarni faylga yozardi va faylni `sync.Mutex` bilan himoya qilardi.
+- [SYS-0.06 · docker compose: Postgres va Go ilovasi bitta buyruq bilan](/lab/youtube/sys/sys-0-06): `compose.yaml`, `.env`
+  dagi parol, healthcheck, `pgx` bilan `DATABASE_URL` orqali ulanish. Bugun xuddi shu Postgres sozlamasi.
+- Go asoslari: [GO-1.05 · for](/lab/youtube/go/go-1-05), [GO-1.06 · funksiyalar, ikki qiymat qaytarish](/lab/youtube/go/go-1-06),
+  [GO-1.08 · slice va append](/lab/youtube/go/go-1-08), [GO-1.09 · map](/lab/youtube/go/go-1-09),
+  [GO-1.10 · struct](/lab/youtube/go/go-1-10), [GO-1.14 · xato ham qiymat, errors.Is](/lab/youtube/go/go-1-14).
+  JSON'ni oʻqish-yozish ([GO-1.20](/lab/youtube/go#go-1-20)) va `sync.Mutex` ([GO-1.22](/lab/youtube/go#go-1-22)) hali oʻtilmagan:
+  bugun ulardan faqat nima qilishini bilish kifoya, pastda bir gapda aytiladi.
+
+**Kodni qanday ishga tushirish.** go.dev/play bu darsga yaramaydi: dasturlar diskka yozadi, bir-birini `kill` qiladi
+va Docker'dagi Postgres'ga ulanadi. Kerak boʻladi: Linux (macOS'da ham kompilyatsiya boʻladi, lekin biz oʻlchamadik;
+Windows'da `fayl` dasturi kompilyatsiya boʻlmaydi, sababi «Koʻp uchraydigan xatolar» boʻlimida), Go 1.26, Docker va
+Compose. Kurs repository'sini oling va dars papkasiga oʻting (`cd` — papkaga oʻtish buyrugʻi):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/db-01-why-database
+```
+
+Hamma buyruqlar shu papkadan ishga tushadi. Skriptlar (`poyga.sh` — «poyga», race; `qulash.sh` — «qulash», crash;
+`baza.sh` — «baza», database) Go dasturlarini oʻzi `bin/` papkasiga yigʻadi. Bizning kompyuterda C kompilyatori yoʻq,
+shuning uchun `CGO_ENABLED=0` bilan ishladik; skriptlar Postgres qismida buni oʻzi qoʻyadi. Oxirida tozalash:
+
+```bash
+docker compose down -v; rm -rf bin buyurtmalar.json*
+```
+
+**Videodagi va bizning raqamlar.** Bu darsdagi sinovlar poyga: natija har ishga tushirishda boshqacha. Video
+2026-11-26 kuni yozib olingan ishga tushirishni koʻrsatadi (kurs README'sidagi jadval ham oʻsha). Bu sahifadagi hamma
+terminal natijalari esa oʻsha kuni kechqurun (22:30–22:45) xuddi shu noutbukda qayta ishga tushirilgan. Kompyuter
+oʻshanda boshqa ishlar bilan ham band edi (load average 1–1,7). Shuning uchun aniq sonlar boshqacha. Muhimi —
+**nisbat va yoʻnalish**: fayl buziladimi, buyurtmalarning qancha qismi yoʻqoladi, nol boʻladimi. Ular ikkala
+oʻlchovda bir xil chiqdi. Har bir natija yonida videodagi son ham turadi; ikkalasini solishtiruvchi jadval
+«Hamma oʻlchovlar bitta jadvalda» boʻlimida.
+
+SYS-0.02 dan bitta savol. Jarayonga `kill -9` yuborildi. U oʻlishdan oldin faylni yozib tugatishga ulguradimi?
+
+**A)** ha, Go `defer` qilingan funksiyalarni bajarib ulguradi · **B)** faqat dastur signalni `signal.NotifyContext`
+bilan ushlagan boʻlsa · **C)** yoʻq: SIGKILL'ni ushlab boʻlmaydi, jarayon shu zahoti toʻxtaydi
+
+<details>
+<summary>Javob</summary>
+
+**C.** `kill -9` jarayonga SIGKILL (9-signal) yuboradi. signal(7): *"The signals SIGKILL and SIGSTOP cannot be caught,
+blocked, or ignored."* Yadro jarayonni shu zahoti toʻxtatadi: `defer` ham, signal ushlovchi ham ishlamaydi. «B» faqat
+SIGTERM (oddiy `kill`) uchun toʻgʻri: SYS-0.02 dagi toza toʻxtash shunday ishlardi. Bugun aynan shu xususiyat bilan
+crash'ni taqlid qilamiz: dastur yozish oʻrtasida, hech narsani tugatmay oʻladi.
+
+</details>
+
+## Uch muammo: bir vaqtda yozish, crash va soʻrov
+
+Bu trekda SQL yozishni, Go'dan Postgres'ga ulanishni, index va transaction'larni oʻrganamiz. Oxirida esa storage
+engine'ni (bazaning maʼlumotni diskda saqlaydigan qismini) Go'da oʻzimiz quramiz. Lekin avval eng oddiy savol: fayl
+nega yetmaydi?
+
+Karnegi Mellon universitetining maʼlumotlar bazasi kursi (CMU 15-445/645) ham birinchi maʼruzasida aynan shu savolni
+beradi. Slaydlarda maʼlumot oddiy CSV fayllarda saqlanadi, keyin savollar keladi: *"What if two threads try to write
+to the same file at the same time?"*, *"What if the machine crashes while our program is updating a record?"*. Kursda
+bu savollar ritorik qoladi. Biz ularni ishga tushirib, sanab koʻramiz.
+
+Bugun uch muammoni oʻz koʻzimiz bilan koʻramiz:
+
+| # | Muammo | Savol | Bugungi sinov |
+|---|---|---|---|
+| 1 | bir vaqtda yozish | ikki jarayon bitta faylga yozsa-chi? | `poyga.sh` |
+| 2 | crash | yozish oʻrtasida jarayon oʻlsa-chi? | `qulash.sh`, `qulash-baza.sh` |
+| 3 | soʻrov (query) | «kim nechta buyurtma berdi?» degan savolga qanday javob olamiz? | Go'dagi sikl va bitta SQL |
+
+Bu bizning muammomiz ham. SYS-0.05 dagi `mehmon` serveri mehmonlar sonini faylga yozardi. Node'da
+`fs.writeFileSync('db.json', JSON.stringify(data))`, Python'da `json.dump(data, open('db.json', 'w'))`, PHP'da
+`file_put_contents('db.json', json_encode($data))` — kichik loyihalarda hammamiz shunday «baza» yozganmiz. Bugun
+uning chegarasini oʻlchaymiz.
+
+## Fayldagi «baza»: `fayl/main.go`
+
+Dastur buyurtmalarni bitta JSON faylda (`buyurtmalar.json`) saqlaydi. Har bir buyurtma uchun u faylni oʻqiydi,
+roʻyxat oxiriga bitta buyurtma qoʻshadi va hammasini qayta yozadi. Kod faqat Go asoslaridan iborat. Toʻliq fayl:
+
+```go filename="fayl/main.go" showLineNumbers
+// fayl: buyurtmalarni bitta JSON faylda saqlaydigan "baza" (DB-1.01).
+// Har bir buyurtma: faylni oʻqi → roʻyxatga qoʻsh → faylni qayta yoz.
+//
+//	./bin/fayl -mijoz A -n 1000              A mijozdan 1000 ta buyurtma yozadi
+//	./bin/fayl -usul rename -mijoz A         vaqtinchalik fayl + rename bilan
+//	./bin/fayl -usul qulf -mijoz A           flock + rename bilan
+//	./bin/fayl -sana                         faylda nechta buyurtma borligini sanaydi
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"os"
+	"syscall"
+)
+
+type Buyurtma struct {
+	ID    int    `json:"id"`
+	Mijoz string `json:"mijoz"`
+	Summa int    `json:"summa"`
+}
+
+type Ombor struct {
+	Buyurtmalar []Buyurtma `json:"buyurtmalar"`
+}
+
+func oqi(fayl string) (Ombor, error) {
+	var o Ombor
+	b, err := os.ReadFile(fayl)
+	if errors.Is(err, fs.ErrNotExist) {
+		return o, nil // fayl yoʻq: ombor boʻsh
+	}
+	if err != nil {
+		return o, err
+	}
+	err = json.Unmarshal(b, &o)
+	return o, err
+}
+
+func yoz(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fayl, b, 0o644) // avval faylni boʻshatadi, keyin yozadi
+}
+
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
+// tashxis: buzuq faylning boshidagi butun JSON qismini topadi va ortida nima qolganini aytadi.
+func tashxis(fayl string) {
+	b, _ := os.ReadFile(fayl)
+	if len(b) == 0 {
+		fmt.Println("fayl 0 bayt: hamma buyurtma yoʻq")
+		return
+	}
+	var o Ombor
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if dec.Decode(&o) != nil {
+		fmt.Printf("fayl %d bayt, oxiri yozilmay qolgan\n", len(b))
+		return
+	}
+	qoldi := len(b) - int(dec.InputOffset())
+	fmt.Printf("boshida %d ta buyurtma, ortida yana %d bayt eski yozuv\n", len(o.Buyurtmalar), qoldi)
+}
+
+func main() {
+	fayl := flag.String("fayl", "buyurtmalar.json", "ombor fayli")
+	mijoz := flag.String("mijoz", "A", "kim buyurtma beryapti")
+	n := flag.Int("n", 1000, "nechta buyurtma (0 = toʻxtatilguncha)")
+	sana := flag.Bool("sana", false, "faqat sanash")
+	usul := flag.String("usul", "oddiy", "oddiy | rename | qulf")
+	flag.Parse()
+
+	if *sana {
+		o, err := oqi(*fayl)
+		if err != nil {
+			fmt.Println("fayl buzuq:", err)
+			tashxis(*fayl)
+			os.Exit(1)
+		}
+		jami := map[string]int{}
+		for _, b := range o.Buyurtmalar {
+			jami[b.Mijoz]++
+		}
+		fmt.Printf("faylda: %d ta buyurtma (A: %d, B: %d)\n", len(o.Buyurtmalar), jami["A"], jami["B"])
+		return
+	}
+
+	saqla := yoz
+	if *usul != "oddiy" {
+		saqla = yozRename
+	}
+	buzuq := 0
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+	fmt.Printf("%s: %d ta yozdim, %d marta buzuq faylni oʻqidim\n", *mijoz, *n, buzuq)
+}
+```
+
+Boʻlaklab oʻqiymiz. Identifikatorlar oʻzbekcha: `Buyurtma` — order, `Ombor` — store, `mijoz` — customer, `summa` —
+amount, `oqi` — read, `yoz` — write.
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1–7 | izoh | dastur nima qilishi va qanday flag'lar bilan ishga tushishi |
+| 10–19 | `import (…)` | standart kutubxonadan paketlar; `syscall` — Linux tizim chaqiruvlari (bugun `flock` uchun) |
+| 21–25 | `type Buyurtma struct` | bitta buyurtma: raqam, mijoz, summa (GO-1.10). `` `json:"id"` `` — teg: JSON'dagi kalit nomi (GO-1.02) |
+| 27–29 | `type Ombor struct` | hamma buyurtmalar roʻyxati (slice). Fayldagi JSON: `{"buyurtmalar": [ … ]}` |
+| 31–42 | `func oqi` | faylni toʻliq oʻqiydi (`os.ReadFile`) va JSON'ni struct'ga aylantiradi (`json.Unmarshal`, `&o` — `o` ning manzili, funksiya uni toʻldirishi uchun, GO-1.11). Ikki qiymat qaytaradi: ombor va xato (GO-1.06) |
+| 34–36 | `errors.Is(err, fs.ErrNotExist)` | fayl hali yoʻq boʻlsa — bu xato emas, ombor boʻsh (GO-1.14) |
+| 44–50 | `func yoz` | struct'ni chiroyli JSON matniga aylantiradi (`json.MarshalIndent`, har daraja 2 boʻshliq) va `os.WriteFile` bilan yozadi. `0o644` — yangi faylning ruxsatlari (`rw-r--r--`) |
+| 52–64 | `func yozRename` | birinchi tuzatish (pastda alohida boʻlim) |
+| 66–73 | `func qulfla` | ikkinchi tuzatish, qulf (pastda) |
+| 75–90 | `func tashxis` | «tashxis» — diagnosis: buzuq faylning boshidagi butun JSON qismini topadi va ortida necha bayt qolganini aytadi (Chuqurroq boʻlimida) |
+| 93–98 | `flag.String`, `flag.Int`, `flag.Bool` | buyruq qatori flag'lari (Python'dagi `argparse` kabi): `-fayl`, `-mijoz A`, `-n 1000`, `-sana`, `-usul`. Ular pointer qaytaradi, shuning uchun qiymat `*mijoz` deb oʻqiladi |
+| 100–113 | `if *sana` | «sana» — count: faylni oʻqiydi va buyurtmalarni mijoz boʻyicha `map` bilan sanaydi (GO-1.09). Fayl buzuq boʻlsa — `tashxis` va chiqish kodi 1 |
+| 115–118 | `saqla := yoz` | «saqla» — save: qaysi yozish funksiyasi ishlatilishini tanlaydi. Funksiya ham qiymat (GO-1.06) |
+| 120 | `for i := 0; *n == 0 \|\| i < *n; {` | asosiy sikl. `-n 0` boʻlsa — toʻxtatilguncha. `i` faqat muvaffaqiyatli yozishdan keyin oshadi (145-qator) |
+| 121–128 | `var q *os.File` … | faqat `-usul qulf` da qulf oladi (pastda) |
+| 129–138 | `o, err := oqi(*fayl)` | **oʻqi**. Fayl buzuq boʻlsa, `buzuq` («broken») sanagichini oshiradi va qayta urinadi. 100 000 urinishdan keyin taslim boʻladi: «fayl tiklanmadi» |
+| 139 | `append(… Buyurtma{ID: len(…) + 1, …})` | **qoʻsh**. Yangi raqam = roʻyxat uzunligi + 1 |
+| 140–143 | `saqla(*fayl, o)` | **yoz**: butun roʻyxat faylga qayta yoziladi |
+| 144 | `q.Close()` | qulfni boʻshatadi. `q` nil boʻlsa ham xavfsiz: `Close` xato qaytaradi, panic bermaydi |
+| 147 | `fmt.Printf` | «1000 ta yozdim, N marta buzuq faylni oʻqidim» |
+
+Eng muhim qator — 49. Go hujjati `os.WriteFile` haqida ochiq yozadi: *"otherwise WriteFile truncates it before
+writing"* va *"Since WriteFile requires multiple system calls to complete, a failure mid-operation can leave the file in
+a partially written state."* Yaʼni `os.WriteFile` — bitta amal emas, bir nechta **tizim chaqiruvi** (system call,
+dasturning Linux yadrosiga murojaati):
+
+| Qadam | Tizim chaqiruvi | Fayl holati |
+|---|---|---|
+| 1 | `open(…, O_TRUNC)` | fayl ochildi va **boʻshatildi**: 0 bayt |
+| 2 | `write(…)` | yangi JSON yozilmoqda: 0 dan N baytgacha |
+| 3 | `close(…)` | tayyor |
+
+Node'dagi `fs.writeFileSync` (standart flag `'w'`), Python'dagi `open(path, 'w')` va PHP'dagi `file_put_contents`
+ham avval faylni boʻshatadi, keyin yozadi. Muammo Go'da emas, «faylni joyida qayta yozish» usulida.
+
+## Ikki jarayon, bitta fayl
+
+`poyga.sh` ikki jarayonni bir vaqtda ishga tushiradi. Uning yuragi — bitta qator:
+
+```bash
+./bin/fayl -usul "$usul" -mijoz A & ./bin/fayl -usul "$usul" -mijoz B & wait
+```
+
+`&` dasturni fonda ishga tushiradi va keyingi buyruqqa oʻtadi (SYS-0.02). Shunday qilib A va B deyarli bir paytda
+boshlanadi. `wait` ikkalasi tugashini kutadi. Keyin skript `./bin/fayl -sana` bilan faylni sanaydi. Har bir jarayon
+1000 tadan yozadi, jami 2000 boʻlishi kerak. Ishga tushirishdan oldin taxmin qiling:
+
+**A)** faylda 2000 ta buyurtma · **B)** fayl butun, lekin buyurtmalar kamroq · **C)** fayl buziladi, JSON boʻlmay
+qoladi
+
+<details>
+<summary>Javob</summary>
+
+**C.** Ikkala jarayon ham faylni boʻshatib, boshidan yozadi. Biri ikkinchisining yarim yozuvi ustiga tushadi va
+faylda ikki JSON yopishib qoladi. Keyingi `oqi` uni oʻqiy olmaydi, dastur qayta-qayta urinadi va oxiri taslim
+boʻladi. «B» rename bilan tuzatilgan versiyada chiqadi (pastda). «A» — biz kutgan, lekin oddiy fayl bermaydigan
+natija.
+
+</details>
+
+```console
+$ ./poyga.sh
+B: fayl tiklanmadi: invalid character '{' after top-level value
+A: fayl tiklanmadi: invalid character '{' after top-level value
+fayl buzuq: invalid character '{' after top-level value
+boshida 504 ta buyurtma, ortida yana 71 bayt eski yozuv
+```
+
+Ikkala jarayon ham «fayl tiklanmadi» deb toʻxtadi: 100 000 marta oʻqishga urinib, butun JSON koʻrmadi. Fayl doimiy
+buzilgan, vaqtincha emas. Oxirgi ikki qatorni `-sana` chiqardi: `encoding/json` xatosi *invalid character '\{' after
+top-level value* («yuqori darajadagi qiymatdan keyin notoʻgʻri belgi `{`») va `tashxis` natijasi. Bizda boshida 504
+ta butun buyurtma va ortida 71 bayt qoldi. Videoda: 67 ta va 70 bayt. Raqam har safar boshqa, manzara bir xil.
+
+Nega `sync.Mutex` yordam bermaydi? Mutex — bitta jarayon xotirasidagi obyekt. U shu jarayonning goroutine'larini
+(jarayon ichida bir vaqtda ishlaydigan alohida ishlar, GO-1.21) navbatga qoʻyadi (SYS-0.05 dagi server bitta jarayon edi, soʻrovlar esa uning goroutine'lari). A va B esa ikki
+alohida jarayon: har birining oʻz xotirasi, oʻz Mutex'i bor. Ular bir-birining qulfini koʻrmaydi.
+
+## Nega aynan `}{`: uzun yozuvning dumi
+
+Fayl oxiriga qaraymiz (`tail -n 9` — oxirgi 9 qator):
+
+```console
+$ tail -n 9 buyurtmalar.json
+    }
+  ]
+}{
+      "id": 505,
+      "mijoz": "B",
+      "summa": 25000
+    }
+  ]
+}
+```
+
+Yopuvchi `}` dan keyin darhol yangi `{` keladi. Mana nima boʻldi:
+
+```text
+vaqt  A jarayoni                         B jarayoni                         fayl
+ 1    open(O_TRUNC)                                                         0 bayt
+ 2                                       open(O_TRUNC)                      0 bayt
+ 3    write: 505 ta buyurtma (uzunroq)                                      [ 505 ta ............... ]}
+ 4                                       write: 504 ta (71 bayt qisqa)     [ 504 ta ...........]}{"id": 505 …]}
+                                         faylning 0-baytidan, ustiga        └── B ──────────────┘└ A dumi ┘
+```
+
+Ikkala jarayon faylni deyarli bir vaqtda ochdi va boʻshatdi (`O_TRUNC`, open(2)). Keyin ikkalasi ham faylning
+boshidan yozdi. Biri uzunroq JSON'ni yozdi, ikkinchisi qisqaroq JSON'ni uning ustiga. Qisqa yozuv tugagan joydan
+keyin uzun yozuvning dumi joyida qoldi. Dumi bitta buyurtma uzunligida: `MarshalIndent` formatida bir buyurtma
+ikki xonali raqam bilan 70 bayt, uch xonali bilan 71 bayt (biz hisoblab chiqdik). Sababi: ikki jarayon odatda
+bir-biridan bitta buyurtma farq qiladi.
+
+Bir marta omad kelmadimi? Yigirma marta takrorlaymiz:
+
+```console
+$ ./poyga.sh oddiy 20
+20 urinish (oddiy): fayl buzildi 20 marta, butun qoldi 0 marta
+buzilganda faylning butun boshida 2–558 ta buyurtma bor edi (2000 dan)
+```
+
+Fayl 20 urinishning 20 tasida buzildi. Buzilganda faylning boshida 2 tadan 558 tagacha butun buyurtma bor edi.
+Videoda ham 20/20, oraliq 1–289: baʼzan birinchi buyurtmadayoq buziladi. Kurs tadqiqotida boshqa seriyalar ham
+bor: jami 53 urinishning 53 tasida buzilgan.
+
+## `kill -9` yozish oʻrtasida
+
+Endi raqibni olib tashlaymiz: faylga faqat bitta jarayon yozadi. Bu safar xavf — **crash**, yaʼni jarayonning
+kutilmagan oʻlimi (kompyuter ishlab turadi, faqat dastur oʻladi). `qulash.sh` buni 100 marta qiladi:
+
+```bash
+./bin/fayl -usul "$usul" -n 0 >/dev/null &
+sleep "0.$((RANDOM % 9 + 1))"                     # 0.1–0.9 s yozsin
+kill -9 $! ; wait $! 2>/dev/null
+```
+
+1-qator dasturni toʻxtovsiz yozishga (`-n 0`) fonda ishga tushiradi. 2-qator tasodifiy 0,1–0,9 soniya kutadi
+(`$RANDOM` — bash'ning tasodifiy soni). 3-qator oxirgi fon jarayoniga (`$!`) SIGKILL yuboradi va uning tugashini
+kutadi. Keyin skript faylni tekshiradi: butunmi, boʻm-boʻshmi (0 bayt) yoki yarim yozilganmi. Jarayon birinchi
+yozuvgacha oʻlsa (fayl hali yoʻq), bu urinish hisobga olinmaydi va qaytariladi.
+
+Taxmin qiling: 100 ta kill'dan nechtasi faylni buzadi? **A)** hech biri — bitta yozuvchi boʻlsa, xavf yoʻq ·
+**B)** bir nechtasi · **C)** hammasi
+
+<details>
+<summary>Javob</summary>
+
+**B.** Kill tasodifiy paytda keladi. Koʻpincha dastur fayl yozilib boʻlgan va keyingisi hali boshlanmagan paytda oʻladi:
+fayl butun. Lekin baʼzan kill `open(O_TRUNC)` va `write` orasiga tushadi — fayl 0 bayt. Kamdan-kam `write` ning
+oʻrtasiga — yarim fayl. «A» ni tanlagan boʻlsangiz, xavfni faqat bir vaqtda yozishda deb oʻylagansiz: crash'ga bitta
+yozuvchi ham yetadi.
+
+</details>
+
+```console
+$ ./qulash.sh oddiy 100
+100 marta kill -9 (oddiy): fayl butun 93, boʻm-boʻsh 6, yarim yozilgan 1
+```
+
+Bizda 100 tadan 7 tasi buzildi: 6 marta fayl 0 baytli boʻlib qoldi, yaʼni hamma buyurtma yoʻqoldi, 1 marta yarim
+yozildi. Videoda: 10 ta (9 boʻm-boʻsh, 1 yarim). Kurs README'sidagi boshqa yuztalik seriyalarda 2 tadan 19 tagacha.
+Boʻm-boʻsh fayl eng koʻp uchraydi, chunki 1-qadam (boʻshatish) va 2-qadam (yozish) orasidagi lahza uzun: yozish
+70 KB dan ortiq JSON'ni koʻchiradi.
+
+Diqqat: biz faqat **jarayonni** oʻldirdik. Yozilgan baytlar Linux'ning xotiradagi nusxasida (page cache) qoladi va
+kompyuter ishlab tursa, diskka baribir tushadi. Elektr oʻchishi boshqa, qattiqroq sinov: uni DB-6 modulida
+([DB-6.01](/lab/youtube/databases#db-6-01)) koʻramiz.
+
+## Birinchi tuzatish: vaqtinchalik fayl va `rename`
+
+Gʻoya: faylni joyida oʻzgartirmaymiz. Yangi JSON avval yonidagi vaqtinchalik faylga yoziladi, keyin `rename` uni
+eski faylning oʻrniga qoʻyadi:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| `tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())` | vaqtinchalik fayl nomi: `buyurtmalar.json.12345.tmp`. Oʻrtadagi son — jarayon raqami (PID), shuning uchun A va B ning vaqtinchalik fayllari har xil |
+| `os.WriteFile(tmp, b, 0o644)` | yangi JSON vaqtinchalik faylga yoziladi. Bu yerda crash boʻlsa, faqat `.tmp` fayl chala qoladi, asosiy fayl tegilmagan |
+| `os.Rename(tmp, fayl)` | vaqtinchalik faylni asosiy nomga koʻchiradi, eskisini almashtiradi |
+
+Linux'da rename **atomik**. rename(2): *"If newpath already exists, it will be atomically replaced, so that there is
+no point at which another process attempting to access newpath will find it missing."* Boshqa jarayon `buyurtmalar.json`
+ni ochsa, yo eski faylni, yo yangisini koʻradi. Yarim faylni hech qachon koʻrmaydi. Go'ning `os.Rename` hujjati
+ogohlantiradi: *"on non-Unix platforms Rename is not an atomic operation"*. Shuning uchun «Linux'da» deymiz. Python'da
+xuddi shu narsa — `os.replace(tmp, path)`, Node'da `fs.renameSync(tmp, path)`.
+
+Endi 100 marta kill:
+
+```console
+$ ./qulash.sh rename 100
+100 marta kill -9 (rename): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+```
+
+100 tadan 100 tasi butun — videoda ham. Kill qayerga tushmasin, asosiy faylda yo eski, yo yangi butun JSON turadi.
+
+## Fayl butun, buyurtmalar yoʻq: lost update
+
+Rename bilan ikki jarayonni yana poygaga qoʻyamiz. Taxmin qiling, faylda nechta buyurtma boʻladi?
+
+**A)** 2000 — fayl endi buzilmaydi · **B)** ~1000 · **C)** fayl yana buziladi
+
+<details>
+<summary>Javob</summary>
+
+**B.** Rename faqat *fayl almashinuvini* atomik qiladi, «oʻqi → qoʻsh → yoz» siklini emas. Ikki jarayon bir xil eski
+faylni oʻqiydi, har biri oʻz versiyasini qoʻyadi, keyingisi oldingisini oʻchiradi. Har bir jarayonning sikli
+ikkinchisinikini deyarli butunlay qoplaydi, shuning uchun taxminan har ikkinchi buyurtma yoʻqoladi. «A» ni tanlagan
+boʻlsangiz, buzilish yoʻqligini xato yoʻqligi deb oʻylagansiz.
+
+</details>
+
+```console
+$ ./poyga.sh rename
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 1001 ta buyurtma (A: 39, B: 962)
+```
+
+Ikkala jarayon ham «1000 ta yozdim, 0 marta buzuq faylni oʻqidim» deydi. Xato yoʻq. Lekin sanaymiz: faylda bor-yoʻgʻi
+1001 ta buyurtma. Videoda 1013 ta edi. Bizda B koʻproq yutgan (962 ga 39), videoda A (701 ga 312): kim yutishi
+tasodif. Yigirma urinish:
+
+```console
+$ ./poyga.sh rename 20
+20 urinish (rename): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 997, eng kami 986, eng koʻpi 1009 (2000 dan)
+```
+
+Fayl bir marta ham buzilmadi. Lekin har urinishda 2000 dan oʻrtacha 997 ta buyurtma yoʻqoldi (videoda 983, oraliq
+964–999). Bir urinishda 1009 ta yoʻqoldi, yaʼni faylda 991 ta qoldi. Bu bitta jarayon yolgʻiz yozganidan ham kam:
+oxirgi `rename` gʻolib, faylda faqat oxirgi yozuvchi oʻqigan holat va uning bitta buyurtmasi qoladi.
+
+Bu xatoning nomi **lost update**, yaʼni yoʻqolgan yangilanish (atama M. Kleppmann'ning *Designing Data-Intensive
+Applications* kitobi, 7-bobdan). Qadamma-qadam:
+
+| Qadam | A | B | Fayldagi buyurtmalar |
+|---|---|---|---|
+| 1 | faylni oʻqidi: 100 ta | | 100 |
+| 2 | | xuddi oʻsha faylni oʻqidi: 100 ta | 100 |
+| 3 | oʻzinikini qoʻshib, 101 tani yozdi (+A) | | 101 (+A) |
+| 4 | | oʻzinikini qoʻshib, *oʻzining* 101 tasini yozdi (+B) | 101 (+B, **A'niki yoʻq**) |
+
+Fayl butun, xato yoʻq, lekin buyurtma yoʻq. Bu buzilgan fayldan ham xavfliroq: buzilgan faylni dastur darhol
+sezadi, yoʻqolgan buyurtmani esa hech kim sezmaydi. Mijoz «buyurtmam qani?» deb qoʻngʻiroq qilmaguncha.
+
+## Ikkinchi tuzatish: `flock` qulfi
+
+Lost update'ni toʻxtatish uchun «oʻqi → qoʻsh → yoz» sikli bir vaqtda faqat bitta jarayonda bajarilishi kerak.
+Buning uchun hamma jarayon bitta umumiy **qulf** (lock) oladi. Linux'da bu — `flock(2)`:
+
+```go
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+```
+
+`os.OpenFile` yonidagi `buyurtmalar.json.lock` faylini ochadi (yoʻq boʻlsa yaratadi). `syscall.Flock(…, LOCK_EX)`
+shu faylga eksklyuziv qulf qoʻyadi: boshqa jarayon allaqachon qulflagan boʻlsa, u boʻshaguncha **kutadi**.
+`int(f.Fd())` — faylning deskriptori, yaʼni jarayondagi ochiq fayl raqami. Qulf ombor faylini emas, alohida `.lock`
+faylini ushlaydi: ombor fayli har safar rename bilan almashtiriladi, qulf esa bir joyda turishi kerak.
+
+Asosiy siklda qulf shunday ishlatiladi:
+
+```go
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+```
+
+Qulf 124-qatorda olinadi. Oʻqish (129), qoʻshish (139) va yozish (140) qulf ichida bajariladi. Qulf 144-qatorda
+boʻshaydi. Yozish baribir rename bilan (115–118-qatorlar: `qulf` ham `yozRename` ni tanlaydi). PHP'da bu — `flock($fp,
+LOCK_EX)`, Python'da `fcntl.flock(f, fcntl.LOCK_EX)`. Ichida oʻsha tizim chaqiruvi.
+
+```console
+$ ./poyga.sh qulf 20
+20 urinish (qulf): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+20 urinish, yoʻqotish nol — videoda ham. Narxi: jarayonlar endi navbat bilan yozadi. 20 urinish bizda 47 soniya oldi,
+qulfsiz rename esa 16 soniya (buyruq atrofida vaqtni alohida oʻlchadik).
+
+## Qulf ishladi, lekin bu hali boshlanishi
+
+Fayl + rename + flock toʻgʻri ishladi. Lekin real loyihada yana nimalar kerakligini sanaymiz:
+
+| Muammo | Nima boʻladi |
+|---|---|
+| `flock` — maslahat qulfi (advisory lock) | flock(2): *"flock() places advisory locks only; given suitable permissions on a file, a process is free to ignore the use of flock()"*. Qulfni ishlatmaydigan dastur (qoʻlda tahrir, eski skript) faylga bemalol yozaveradi |
+| elektr oʻchishi | rename qilingan yangi fayl hali diskda emas, xotirada boʻlishi mumkin. Faylni ham, papkani ham **fsync** qilish kerak (fsync — Linux'ga «maʼlumot diskka yetib borguncha kut» deyish). fsync(2): papka yozuvi uchun alohida fsync kerak |
+| har buyurtmada butun fayl | 1000 ta buyurtmada fayl ~71 KB. 2000 ta buyurtma uchun jami ~142 MB qayta yoziladi (biz hisobladik) |
+| bitta buyurtmani topish | `id = 1500` ni topish uchun butun faylni oʻqib, JSON'ni ochish kerak |
+| bir nechta fayl | «buyurtma + ombordagi qoldiq» ikki faylda boʻlsa, ikkalasini birga atomik oʻzgartirish yoʻli yoʻq |
+
+Shularning hammasini hal qilsangiz, oʻzingiz maʼlumotlar bazasi yozgan boʻlasiz. SQLite hujjatidagi «Atomic Commit»
+sahifasi baza yozishni qanday qilib atomik va elektr oʻchishiga chidamli qilishini batafsil tushuntiradi.
+
+## Savol: JSON'ni Postgres ustuniga qoʻysak-chi?
+
+Endi oddiy yechimni sinaymiz. JSON'ni fayldan olib, Postgres jadvalidagi bitta ustunga qoʻyamiz. Go kodi xuddi oʻsha:
+oʻqi, qoʻsh, yoz. Faqat fayl oʻrnida jadvaldagi bitta qator:
+
+```go
+// jsonUsul: fayldagi kod bilan bir xil, faqat fayl oʻrnida jadvaldagi bitta qator.
+func jsonUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	return 0, jsonYoz(ctx, db, mijoz)
+}
+
+func jsonYoz(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	var b []byte
+	if err := db.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	b, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b)
+	return err
+}
+```
+
+| Kod | Nima qiladi |
+|---|---|
+| `db.QueryRow` + `SELECT doc FROM ombor WHERE id = 1` + `.Scan(&b)` | **oʻqi**: `ombor` jadvalining 1-qatoridagi `doc` ustunini (JSON) baytlarga oladi (`pgx`, SYS-0.06). `ctx` — kontekst (`context.Background()`), GO-1.23 da; bugun unga eʼtibor bermasa ham boʻladi |
+| `json.Unmarshal`, `append`, `json.Marshal` | **qoʻsh**: fayldagi bilan bir xil, Go'da |
+| `db.Exec` + `UPDATE ombor SET doc = $1 WHERE id = 1` | **yoz**: butun JSON'ni qayta yozadi. `$1` — parametr, uning oʻrniga `b` keladi |
+
+Jadvallarni `baza -tayyorla` yaratadi («tayyorla» — prepare): `doc` ustuni `jsonb` turida (Postgres'ning ikkilik JSON
+turi):
+
+```go
+const sxema = `
+CREATE TABLE IF NOT EXISTS ombor (id int PRIMARY KEY, doc jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS buyurtmalar (
+	id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	mijoz text   NOT NULL,
+	summa bigint NOT NULL
+);
+TRUNCATE ombor, buyurtmalar RESTART IDENTITY;
+INSERT INTO ombor VALUES (1, '{"buyurtmalar": []}');`
+```
+
+Postgres'ni SYS-0.06 dagidek compose bilan koʻtaramiz. Farqi: bu safar Go jarayonlari container ichida emas, xostda
+(oʻz kompyuterimizda) ishlaydi. Shuning uchun port faqat `127.0.0.1:5440` da ochiq:
+
+```bash
+cp .env.example .env          # keyin .env dagi DB_PASSWORD= qatoriga oʻz parolingizni yozing
+docker compose up -d --wait   # Postgres 18 healthy boʻlguncha kutadi
+```
+
+Videoni shu yerda pauza qilish soʻralgan. Taxmin qiling: Postgres ikki ming buyurtmani saqlab qoladimi?
+
+**A)** ha, 2000 ta: baza bir vaqtdagi yozishlarni oʻzi tartibga soladi · **B)** yoʻq, ~1000 ta: xuddi fayldagidek ·
+**C)** ikkinchi jarayon xato oladi
+
+<details>
+<summary>Javob</summary>
+
+**B.** `SELECT` va `UPDATE` — ikki alohida buyruq. Har biri oʻz avtomatik **transaction**'ida bajariladi
+(transaction — bazada «hammasi yoki hech biri» qilib bajariladigan buyruqlar guruhi). Postgres'da standart
+izolyatsiya darajasi — Read Committed: har bir buyruq boshlanish paytida commit boʻlgan maʼlumotni koʻradi. Oʻqish bilan yozish orasidagi oraliq Go kodingizda qoladi: baza uni
+koʻrmaydi. A va B bir xil eski JSON'ni oʻqiydi, keyin yozgani oldingisini oʻchiradi — fayldagi lost update'ning
+oʻzi. «A» — eng keng tarqalgan notoʻgʻri fikr: baza faqat *oʻziga berilgan* amalni himoya qiladi. «C» boʻlmaydi:
+ikkala `UPDATE` ham qonuniy, Postgres ularni birin-ketin bajaradi.
+
+</details>
+
+```console
+$ ./baza.sh json
+A: 1000 ta yozdim
+B: 1000 ta yozdim
+json ustunida: 1000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+```
+
+`json ustunida` 2000 dan bor-yoʻgʻi 1000 ta (videoda 1002). Yigirma urinish:
+
+```console
+$ ./baza.sh json 20
+20 urinish (json): yoʻqolgan buyurtma oʻrtacha 1000, eng kami 1000, eng koʻpi 1000 (2000 dan)
+```
+
+Bizda har bir urinishda roppa-rosa 1000 ta yoʻqoldi. Videoda oʻrtacha 999, oraliq 994–1000. Xulosa ikkalasida bir
+xil: **baza sehrli emas**. U faqat oʻziga berilgan amalni himoya qiladi. Postgres'ga «mana yangi JSON, eskisini
+almashtir» dedik, u aynan shuni qildi.
+
+## Toʻgʻri yoʻl: har buyurtma — bitta `INSERT`
+
+Toʻgʻri yoʻl: oʻzgarishni bazaning oʻziga beramiz. Har bir buyurtma — bitta `INSERT`, yaʼni `buyurtmalar` jadvalida
+bitta yangi qator. Oldindan hech narsa oʻqilmaydi:
+
+```go
+// insertUsul: oʻqish yoʻq — oʻzgarishni bazaning oʻziga beramiz. Baza yangi qatorning id'sini qaytaradi.
+func insertUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	var id int64
+	err := db.QueryRow(ctx, `INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000) RETURNING id`, mijoz).Scan(&id)
+	return id, err
+}
+```
+
+`INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000)` yangi qator qoʻshadi. `id` ni baza oʻzi beradi
+(`GENERATED ALWAYS AS IDENTITY` — avtomatik oshadigan raqam, sxemada). `RETURNING id` bazaga yangi qatorning
+raqamini qaytarishni aytadi, `.Scan(&id)` uni oladi. Go hech narsani oʻqib-qoʻshmaydi, shuning uchun «oʻqi» va «yoz»
+orasida oraliq ham yoʻq.
+
+```console
+$ ./baza.sh insert 20
+20 urinish (insert): yoʻqolgan buyurtma oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+Yigirma urinish, har safar ikki ming, yoʻqotish nol — videoda ham.
+
+Uchinchi muammo — **soʻrov** (query). «Kim nechta buyurtma berdi va qancha summaga?» Fayl dasturida buning uchun
+butun faylni oʻqib, Go'da sikl yozganmiz (`fayl/main.go`, 107–111-qatorlar: `map` va `for range`). Postgres'da bitta
+SQL buyrugʻi yetadi. `docker compose exec db` buyruqni `db` servisining container'i ichida ishga tushiradi, `psql` —
+Postgres'ning terminal mijozi:
+
+```console
+$ docker compose exec db psql -U ombor -c 'SELECT mijoz, count(*), sum(summa) FROM buyurtmalar GROUP BY mijoz ORDER BY mijoz'
+ mijoz | count |   sum    
+-------+-------+----------
+ A     |  1000 | 25000000
+ B     |  1000 | 25000000
+(2 rows)
+```
+
+`GROUP BY mijoz` qatorlarni mijoz boʻyicha guruhlaydi, `count(*)` har guruhdagi qatorlarni sanaydi, `sum(summa)`
+summalarni qoʻshadi, `ORDER BY` tartiblaydi. A ham, B ham 1000 tadan, har biri 25 000 000. SQL'ni keyingi darslarda
+qatorma-qator oʻrganamiz.
+
+## Crash sinovi: Postgres'ni `kill -9` qilamiz
+
+Endi faylda qilgan crash sinovini bazaga qilamiz. A va B toʻxtovsiz `INSERT` qiladi, biz esa Postgres container'ini
+`kill -9` bilan oʻldiramiz (`docker compose kill db` — container'ning asosiy jarayoniga SIGKILL). `qulash-baza.sh`
+ning asosiy qatorlari:
+
+```bash
+./bin/baza -mijoz A -n 0 -tasdiq bin/A.ids >bin/A.log & ./bin/baza -mijoz B -n 0 -tasdiq bin/B.ids >bin/B.log &
+sleep "1.$((RANDOM % 9))"
+docker compose kill db >/dev/null 2>&1
+```
+
+Tekshiruv sanash bilan emas, **har bir raqam bilan** bajariladi. Mijoz `INSERT` xatosiz qaytgandan keyingina, yaʼni
+baza «tayyor» degandan keyin, yangi `id` ni faylga yozadi (`-tasdiq` — «tasdiq», acknowledgement):
+
+```go
+	i := 0
+	for ; *n == 0 || i < *n; i++ {
+		id, err := yoz(ctx, db, *mijoz)
+		if err != nil {
+			fmt.Printf("%s: %d ta tasdiqlandi, keyin xato: %v\n", *mijoz, i, err)
+			if idlar != nil {
+				idlar.Flush() // os.Exit defer'larni bajarmaydi
+			}
+			os.Exit(1)
+		}
+		if idlar != nil {
+			fmt.Fprintln(idlar, id) // faqat baza "tayyor" degandan keyin
+		}
+	}
+```
+
+`idlar` — faylga buferlab yozadigan `bufio.Writer` (GO-1.20). `fmt.Fprintln(idlar, id)` faqat `yoz` xatosiz
+qaytgandan keyin ishlaydi. Xato boʻlsa, dastur avval `Flush` qiladi (buferdagini faylga tushiradi), chunki
+`os.Exit` `defer`larni bajarmaydi (GO-1.15).
+
+Bazani qayta koʻtargach, `baza -tekshir A.ids B.ids` («tekshir» — check) har bir tasdiqlangan `id` jadvalda bormi,
+tekshiradi. Taxmin qiling: kill'dan keyin tasdiqlangan buyurtmalardan nechtasi yoʻqoladi?
+
+**A)** oxirgi bir nechtasi: ular hali xotirada edi · **B)** hech biri · **C)** hammasi: baza fayllari buzildi
+
+<details>
+<summary>Javob</summary>
+
+**B.** Postgres commit javobini (muvaffaqiyat haqidagi javobni) faqat oʻzgarish jurnalda diskka tushgandan keyin
+qaytaradi. Shuning uchun mijoz tasdiq olgan har bir buyurtma crash'dan keyin jurnaldan tiklanadi. «A» — fayl
+dasturida toʻgʻri edi: unda «yozdim» ≠ «saqlandi». Keyingi boʻlimda WAL qanday ishlashini koʻramiz.
+
+</details>
+
+```console
+$ ./qulash-baza.sh
+A: 363 ta tasdiqlandi, keyin xato: unexpected EOF
+B: 364 ta tasdiqlandi, keyin xato: unexpected EOF
+database system was not properly shut down; automatic recovery in progress
+redo starts
+redo done
+database system is ready to accept connections
+tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0
+```
+
+Natijani oʻqiymiz:
+
+| Qator | Maʼnosi |
+|---|---|
+| `A: 363 ta tasdiqlandi, keyin xato: unexpected EOF` | A 363 ta tasdiq oldi, keyin ulanish uzildi (*unexpected EOF* — «kutilmagan oqim oxiri»: server javob oʻrtasida yoʻqoldi) |
+| `database system was not properly shut down; automatic recovery in progress` | qayta ishga tushgan Postgres logi: «baza toʻgʻri yopilmagan; avtomatik tiklash boshlandi» |
+| `redo starts` / `redo done` | **redo**, yaʼni qayta bajarish: jurnaldagi oʻzgarishlar jadvalga qayta qoʻllanmoqda / tugadi |
+| `database system is ready to accept connections` | baza ulanishlarni qabul qilyapti |
+| `tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0` | 363 + 364 = 727 ta tasdiqlangan `id` ning hammasi joyida; jadvalda esa 728 ta qator |
+
+Videoda 569 + 570 = 1139 ta tasdiqlangan va 1140 ta qator edi. Bizda kamroq: kill tasodifiy 1,0–1,8 soniyada keladi va
+kompyuter band edi. Muhimi bir xil: tasdiqlanib yoʻqolgan — 0.
+
+Bazadagi bitta ortiqcha qator — commit boʻlgan, lekin javobi dasturga yetib bormagan buyurtma. Baza uni saqladi,
+mijoz esa «xato» deb oʻyladi. Har jarayonda bir paytda faqat bitta `INSERT` boʻlgani uchun ortiqcha qator 0, 1 yoki 2
+boʻlishi mumkin. Yigirma marta:
+
+```console
+$ ./qulash-baza.sh 20 | tail -1
+20 marta kill -9: 20 marta tasdiqlangan har bir id joyida (yoʻqolgan jami 0), tasdiqsiz ortiqcha qator jami 17
+```
+
+20 urinishning 20 tasida tasdiqlangan har bir `id` joyida. Tasdiqsiz ortiqcha qator jami 17 ta — videodagi bilan bir
+xil son (tasodif: urinishlar boshqa). Mijoz bunday «xato» buyurtmani qayta yuborsa, dublikat paydo boʻladi; bu
+idempotentlik mavzusi, keyingi modullarda.
+
+## WAL: avval jurnalga, keyin jadvalga
+
+Bazani **write-ahead log**, qisqasi **WAL** qutqardi. Oʻzbekchasiga — «oldindan yoziladigan jurnal». PostgreSQL 18 hujjati
+(28.3): *"changes to data files (where tables and indexes reside) must be written only after those changes have been
+logged, that is, after WAL records describing the changes have been flushed to permanent storage."* Tartib:
+
+| Qadam | Nima boʻladi | Qayerda |
+|---|---|---|
+| 1 | `INSERT` keldi | Postgres xotirasi |
+| 2 | oʻzgarish yozuvi jurnal oxiriga qoʻshiladi | WAL fayli |
+| 3 | `COMMIT`: jurnal diskka tushishini kutadi (`synchronous_commit = on`, standart) | disk |
+| 4 | shundan keyingina mijozga «tayyor» javobi | tarmoq |
+| 5 | jadval fayllari keyinroq, shoshilmasdan yangilanadi | disk |
+| crash | jurnalni oʻqiydi va jadvalga yetib bormagan oʻzgarishlarni qayta bajaradi — logdagi `redo` | WAL → jadval |
+
+Hujjat: *"any changes that have not been applied to the data pages can be redone from the WAL records. (This is
+roll-forward recovery, also known as REDO.)"* Jurnalga yozish arzon: u faqat oxiriga kichik yozuv qoʻshadi. Butun
+jadvalni har safar qayta yozish kerak emas. Bizning fayl dasturimiz esa aksini qilardi: har buyurtmada butun faylni
+joyida qayta yozardi.
+
+Esda tuting: biz faqat **jarayonni** oʻldirdik. Elektr oʻchishida nima boʻlishini va fsync'ni DB-6 modulida
+([DB-6.01](/lab/youtube/databases#db-6-01)) chuqur koʻramiz. fsync narxi SYS-1.01 da oʻlchangan:
+[SYS-1.01 · Latency jadvali](/lab/youtube/sys/sys-1-01).
+
+## Qachon fayl, qachon SQLite, qachon Postgres
+
+Demak, fayl hech qachon kerak emasmi? Kerak, lekin oʻz joyida:
+
+| Holat | Nima yetadi |
+|---|---|
+| sozlama fayli, uni faqat bitta dastur yozadi | JSON + rename + fsync |
+| bitta kompyuterdagi ilova, bir paytda bitta yozuvchi | SQLite |
+| koʻp yozuvchi, tarmoq orqali koʻp mijoz | Postgres kabi server bazasi |
+
+SQLite'ning oʻz sayti uni server bazalari bilan emas, oddiy fayl ochish funksiyasi bilan solishtiradi: *"SQLite does
+not compete with client/server databases. SQLite competes with fopen()."* (`fopen` — C tilida faylni ochish
+funksiyasi.) Oʻsha sahifa: SQLite *"will only allow one writer at any instant in time"*. Koʻp yozuvchi va tarmoqdagi koʻp
+mijoz boʻlsa, server bazasi kerak. Bu trekda Postgres bilan ishlaymiz.
+
+Keyingi darsda — relyatsion model: jadval nega aslida toʻplam
+([DB-1.02 · Relyatsion model: jadval — bu toʻplam](/lab/youtube/databases#db-1-02)).
+
+## Hamma oʻlchovlar bitta jadvalda
+
+| Sinov | Videoda (README) | Bizda (kechqurun) | Nima muhim |
+|---|---|---|---|
+| `./poyga.sh` | buzildi: 67 ta + 70 bayt | buzildi: 504 ta + 71 bayt | fayl buziladi, dumi = 1 buyurtma |
+| `./poyga.sh oddiy 20` | 20/20 buzildi, 1–289 | 20/20 buzildi, 2–558 | har safar buziladi |
+| `./qulash.sh oddiy 100` | 10 buzildi (9 boʻsh, 1 yarim) | 7 buzildi (6 boʻsh, 1 yarim) | bitta yozuvchi ham crash'da faylni yoʻqotadi |
+| `./qulash.sh rename 100` | 100/100 butun | 100/100 butun | rename buzilishni toʻxtatadi |
+| `./poyga.sh rename` | 1013 ta (A 701, B 312) | 1001 ta (A 39, B 962) | ~yarmi yoʻqoladi |
+| `./poyga.sh rename 20` | oʻrtacha 983 yoʻqoldi | oʻrtacha 997 yoʻqoldi | lost update, xatosiz |
+| `./poyga.sh qulf 20` | 0 yoʻqoldi | 0 yoʻqoldi | qulf tuzatadi |
+| `./baza.sh json` | 1002 ta | 1000 ta | baza sehrli emas |
+| `./baza.sh json 20` | oʻrtacha 999 | oʻrtacha 1000 | ~yarmi |
+| `./baza.sh insert 20` | 0 yoʻqoldi | 0 yoʻqoldi | oʻzgarish bazaning ichida |
+| `./qulash-baza.sh` | 1139 tasdiq, 1140 qator, 0 yoʻqoldi | 727 tasdiq, 728 qator, 0 yoʻqoldi | tasdiqlangan yoʻqolmaydi |
+| `./qulash-baza.sh 20` | 20/20, ortiqcha 17 | 20/20, ortiqcha 17 | WAL |
+
+## Chuqurroq (ixtiyoriy): `tashxis`, yarmi nega yoʻqoladi va Postgres'ni SIGKILL qilish
+
+**Dumi qanday oʻlchanadi.** `tashxis` (75–90-qatorlar) `json.Decoder` bilan faylning boshidan bitta JSON qiymatni
+oʻqiydi. `Decode` birinchi `}` da toʻxtaydi va qolganiga qaramaydi. `dec.InputOffset()` — qayergacha oʻqiganini aytadi.
+Fayl uzunligidan shuni ayirsak, ortida qolgan baytlar soni chiqadi. `json.Unmarshal` esa butun faylni bitta qiymat deb
+kutadi, shuning uchun ortiqcha `{` da xato beradi. Kurs muallifi natijani Python'ning `json.JSONDecoder.raw_decode`
+bilan ham tekshirgan (kurs tadqiqoti).
+
+**Nega aynan yarmi yoʻqoladi.** Har bir sikl butun faylni oʻqiydi, JSON'ni ochadi, yangisini yasaydi va yozadi. 1000 ta
+buyurtmada bu ~71 KB. A va B siklining deyarli hammasi bir-birini qoplaydi. Ikki jarayon bir xil holatni oʻqib, ikkalasi
+ham yozsa, ikki buyurtmadan bittasi qoladi. Shuning uchun natija ~1000. Bu kurs tadqiqotidagi tushuntirish, alohida
+oʻlchanmagan.
+
+**Fayl qachon 0 bayt, qachon yarim.** `os.WriteFile` = `open(O_WRONLY|O_CREATE|O_TRUNC)` + `write` + `close`. Kill
+`open` va `write` orasiga tushsa — 0 bayt. Katta `write` ning oʻrtasiga tushsa — yarim fayl (kurs tadqiqoti: yadro
+oʻldiruvchi signalda buferli yozishni sahifa chegarasida toʻxtatadi).
+
+**Postgres'ni SIGKILL qilish.** `docker compose kill db` container'ning 1-jarayoniga (postmaster) SIGKILL yuboradi.
+PostgreSQL hujjati («Server Shutdown») real serverni SIGKILL bilan toʻxtatmaslikni maslahat beradi: bola jarayonlar
+va umumiy xotira tozalanmay qoladi. Biz crash'ni taqlid qilish uchun ataylab shunday qildik. Toʻgʻri «tez» toʻxtatish
+— SIGQUIT (immediate shutdown): hujjatga koʻra u ham *"will lead to recovery (by replaying the WAL log) upon next
+start-up"*.
+
+**Nega `jsonb_set` bilan tuzalsa boʻladi.** Uy vazifasining Oʻrta darajasida «oʻqi, qoʻsh, yoz» bitta `UPDATE` ichiga
+koʻchadi. Postgres yangilanayotgan qatorni qulflaydi. Ikkinchi `UPDATE` kutadi, keyin Read Committed'da qatorning
+*yangi* versiyasini qayta oʻqib, uning ustiga qoʻshadi (PostgreSQL 13.2.1). Bu DDIA'dagi *atomic write operation*.
+
+## Koʻp uchraydigan xatolar
+
+**1. «Baza bor — demak buyurtma yoʻqolmaydi».** Eng keng tarqalgan notoʻgʻri fikr: bloglarda ham koʻp yoziladi. Xato
+xabari yoʻq, natija jimgina notoʻgʻri. «Savol: JSON'ni Postgres ustuniga qoʻysak-chi?» boʻlimida koʻrdik: JSON
+`jsonb` ustunida, Go'da oʻqib-qoʻshib-yozilsa, Postgres 2000 dan ~1000 ni yoʻqotdi. Sabab: oʻqish va yozish ikki
+alohida buyruq, oraliq Go kodida. Tuzatish: oʻzgarishni bazaga bering — har buyurtma bitta `INSERT`, yoki bitta
+`UPDATE … jsonb_set`, yoki transaction ichida `SELECT … FOR UPDATE` (uy vazifasi).
+
+**2. «`sync.Mutex` faylni himoya qiladi».** Bitta jarayonda — ha (SYS-0.05 dagi server). Ikki jarayonda — yoʻq: har
+jarayonning oʻz xotirasi va oʻz Mutex'i bor, xato xabari ham chiqmaydi. Server ikki nusxada ishga tushsa (ikki
+container, yoki eski va yangi versiya almashayotgan paytda), fayl buziladi. Tuzatish: jarayonlar orasidagi qulf
+(`flock`) yoki baza.
+
+**3. «Rename qildim — fayl xavfsiz».** Rename faqat buzilishni toʻxtatadi. Ikki narsa qoladi: lost update (bir
+vaqtda yozuvchilar, «Fayl butun, buyurtmalar yoʻq» boʻlimi) va elektr oʻchishi (fsync'siz yangi fayl diskda boʻlmasligi
+mumkin). Tuzatish: qulf + vaqtinchalik faylni fsync + rename'dan keyin papkani fsync (Guru vazifasi).
+
+**4. «`.lock` fayli bor — demak qulf band».** Baʼzi skriptlar qulfni «lock fayli bormi?» deb tekshiradi. Jarayon
+`kill -9` bilan oʻlsa, fayl qoladi va hamma abadiy kutadi. `flock` esa faylning borligi emas, ochiq deskriptorga
+bogʻlangan qulf: jarayon oʻlganda yadro uning fayllarini yopadi va qulf oʻzi boʻshaydi. Bizning `.lock` fayli ham
+diskda qoladi — bu normal, u faqat qulf qoʻyiladigan joy.
+
+**5. Windows'da `fayl` kompilyatsiya boʻlmaydi.** Boshqa tizim uchun yigʻib koʻramiz (`GOOS=windows` — Go'ga
+«Windows uchun yigʻ» deyish):
+
+```console
+$ GOOS=windows go build ./fayl
+# github.com/abdurahmon27/go-backend-uz/lessons/db-01-why-database/fayl
+fayl/main.go:72:20: undefined: syscall.Flock
+fayl/main.go:72:47: undefined: syscall.LOCK_EX
+```
+
+Oʻqiymiz: `fayl/main.go:72:20` — fayl, 72-qator, 20-belgi. *undefined: syscall.Flock* — «`syscall.Flock` aniqlanmagan».
+`syscall` paketi har tizimda har xil: `Flock` faqat Unix tizimlarida bor (Linux, macOS). Tuzatish: darsni Linux'da
+yoki Windows'dagi WSL ichida bajaring. Windows'da Go `os.Rename` ham atomik emas (Go hujjati).
+
+**6. `.env` da parol yoʻq.** `cp .env.example .env` qilib, parolni yozishni unutsangiz:
+
+```console
+$ cp .env.example .env
+$ docker compose up -d --wait
+error while interpolating services.db.environment.POSTGRES_PASSWORD: required variable DB_PASSWORD is missing a value: .env faylida DB_PASSWORD yoʻq
+```
+
+Bu natija dars papkasining nusxasida olingan (asl `.env` ga tegmaslik uchun), fayllar bir xil. Oʻqiymiz: *error while
+interpolating services.db.environment.POSTGRES_PASSWORD* — «`services → db → environment → POSTGRES_PASSWORD` ga
+qiymat qoʻyishda xato». *required variable DB_PASSWORD is missing a value* — «majburiy `DB_PASSWORD` oʻzgaruvchisining
+qiymati yoʻq». Oxirgi qism — `compose.yaml` dagi `${DB_PASSWORD:?…}` qoʻriqchisining oʻz xabari (SYS-0.06). Compose
+hech narsani ishga tushirmadi. Tuzatish: `.env` dagi `DB_PASSWORD=` dan keyin parol yozing.
+
+**7. «`kill -9` = elektr oʻchishi».** Bugungi crash'lar — jarayon crash'i: yozilgan baytlar Linux xotirasida qoladi
+va kompyuter ishlasa diskka tushadi. Elektr oʻchsa, fsync qilinmagan maʼlumot ham yoʻqolishi mumkin. Bugungi
+natijalardan «fayl + rename elektr oʻchishiga chidaydi» degan xulosa chiqmaydi. Buni DB-6 modulida sinaymiz.
+
+## Oʻzingizni tekshiring
+
+**1.** Nega SYS-0.05 dagi `sync.Mutex` A va B jarayonlarini tartibga sola olmaydi?
+
+<details>
+<summary>Javob</summary>
+
+Mutex — bitta jarayon xotirasidagi obyekt, u shu jarayonning goroutine'larini navbatga qoʻyadi. A va B — ikki alohida
+jarayon, har birida oʻz Mutex'i. Ular bir-birining qulfini koʻrmaydi. Jarayonlar orasida qulf kerak boʻlsa — `flock`
+(yadro darajasidagi qulf) yoki baza.
+
+</details>
+
+**2.** Rename nimani tuzatdi va nimani tuzatmadi?
+
+<details>
+<summary>Javob</summary>
+
+Tuzatdi: fayl endi hech qachon yarim yoki ikki JSON yopishgan holda koʻrinmaydi (`qulash.sh rename 100` — 100/100
+butun, poygada 0 marta buzildi). Tuzatmadi: lost update — ikki jarayon bir xil eski faylni oʻqib, keyingisi
+oldingisini oʻchiradi (2000 dan ~1000 yoʻqoldi). Elektr oʻchishiga qarshi himoya ham bermaydi: buning uchun fsync kerak.
+
+</details>
+
+**3.** `./poyga.sh qulf` (bitta urinish) nima chiqaradi? Taxmin qiling, keyin javobni oching.
+
+<details>
+<summary>Javob</summary>
+
+```console
+$ ./poyga.sh qulf
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 2000 ta buyurtma (A: 1000, B: 1000)
+```
+
+Har jarayon 1000 tadan yozdi, buzuq oʻqish yoʻq, faylda 2000 ta: A va B 1000 tadan. Qulf «oʻqi, qoʻsh, yoz» siklini
+navbatga qoʻydi, rename esa faylni butun saqladi. Jarayonlar navbat bilan ishlagani uchun ikkala qatorning tartibi
+har safar boshqacha boʻlishi mumkin.
+
+</details>
+
+**4.** Postgres mijozga «commit boʻldi» javobini qachon qaytaradi? Bazadagi ortiqcha qator qayerdan keldi?
+
+<details>
+<summary>Javob</summary>
+
+Oʻzgarish WAL'ga yozilib, jurnal diskka tushgandan keyin (`synchronous_commit = on`, standart). Jadval fayllari
+keyinroq yangilanadi, crash'dan keyin esa jurnaldan qayta bajariladi (`redo`). Ortiqcha qator — commit bazada boʻlgan,
+lekin javob mijozga yetib bormagan buyurtma: baza uni saqladi, mijoz esa xato oldi va uni tasdiqlanganlar roʻyxatiga
+yozmadi.
+
+</details>
+
+**5.** SYS-0.02 dan: `sleep 9 & kill -9 $!; wait $!; echo $?` qaysi sonni chiqaradi va nega?
+
+<details>
+<summary>Javob</summary>
+
+`137`. Signal bilan oʻldirilgan jarayonning chiqish kodi = 128 + signal raqami; SIGKILL — 9, demak 128 + 9 = 137.
+SYS-0.02 da shu buyruq ishga tushirilgan. Bugungi `qulash.sh` ham `kill -9 $!; wait $!` qiladi, faqat chiqish kodini
+koʻrsatmaydi (`2>/dev/null`).
+
+</details>
+
+## Uy vazifasi
+
+Shartlar va javoblar GitHub'dagi dars papkasida:
+[lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database).
+Javob kodlari —
+[homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database/homework), hammasini
+`bash homework/javoblar.sh` ishga tushiradi (`.env` va `docker compose up -d --wait` kerak). Avval oʻzingiz urinib
+koʻring.
+
+- 🟢 **Oson:** `./qulash.sh qulf 100` — fayl butun qoladimi? Nega? Jarayon qulfni ushlab turganida oʻlsa, ikkinchi
+  jarayon abadiy kutib qoladimi?
+- 🟡 **Oʻrta:** Postgres `-usul json` ni Go'da oʻqimasdan, bitta `UPDATE` bilan tuzating (`jsonb_set`, `||`,
+  `jsonb_array_length`).
+- 🟠 **Qiyin:** Go'dagi oʻqi-qoʻsh-yoz kodini oʻzgartirmasdan tuzating: oʻqish va yozishni bitta transaction'ga oling
+  va qatorni `SELECT … FOR UPDATE` bilan qulflang.
+- 🔴 **Guru:** `rename` usuliga vaqtinchalik fayl uchun `fsync` va rename'dan keyin papka uchun `fsync` qoʻshing.
+  Qancha sekinlashdi? Nega papkani ham?
+
+<details>
+<summary>Javob</summary>
+
+Bizning ishga tushirish:
+
+```console
+$ bash homework/javoblar.sh
+== Oson: qulf usulini 100 marta kill -9
+100 marta kill -9 (qulf): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+== Oʻrta: Postgres, usul sql
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Qiyin: Postgres, usul forupdate
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Guru: qulf (fsync'siz) va qulf + fsync, ikki jarayon × 1000
+fayl: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 2443 ms
+fsync: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 9777 ms
+```
+
+🟢 100/100 butun. `qulf` usuli ham rename bilan yozadi (115–118-qatorlar), shuning uchun kill qayerga tushmasin,
+joyida yo eski, yo yangi butun fayl turadi. Hech kim abadiy kutmaydi: `flock` jarayonning ochiq fayliga bogʻlangan,
+jarayon oʻlganda yadro uning deskriptorlarini yopadi va qulf oʻzi boʻshaydi. «Lock fayli bormi?» sxemasida esa qulf
+qolib ketardi.
+
+🟡 Oʻqish, qoʻshish va yozish bitta `UPDATE` ichida, Go hech narsani oʻqimaydi (`homework/baza-tuzat/main.go` dan):
+
+```go
+// sqlUsul: Go hech narsani oʻqimaydi. Oʻqish, qoʻshish va yozish bitta UPDATE ichida:
+// Postgres qatorni yangilash paytida qulflaydi, ikkinchi UPDATE birinchisi tugashini kutadi
+// va yangi qiymatning ustiga qoʻshadi (Read Committed, PostgreSQL docs 13.2.1).
+func sqlUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE ombor
+		SET doc = jsonb_set(doc, '{buyurtmalar}', doc->'buyurtmalar' || jsonb_build_object(
+			'id', jsonb_array_length(doc->'buyurtmalar') + 1, 'mijoz', $1::text, 'summa', 25000))
+		WHERE id = 1`, mijoz)
+	return err
+}
+```
+
+`doc->'buyurtmalar'` — JSON ichidagi massiv, `||` unga yangi obyektni qoʻshadi, `jsonb_array_length(…) + 1` — yangi
+raqam, `jsonb_set` yangilangan massivni `doc` ga qaytarib qoʻyadi. Postgres yangilanayotgan qatorni qulflaydi:
+ikkinchi `UPDATE` kutadi va qatorning yangi versiyasi ustiga qoʻshadi. Natija: `json ustunida: 2000 ta`.
+
+🟠 Go kodi oʻsha, lekin bitta transaction ichida: `Begin` uni boshlaydi, `Commit` tasdiqlaydi:
+
+```go
+// forUpdateUsul: Go kodi oʻzgarmaydi, lekin oʻqish va yozish bitta transaction'da,
+// SELECT … FOR UPDATE esa qatorni commit'gacha qulflaydi — ikkinchi jarayon kutadi.
+func forUpdateUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // commit'dan keyin hech narsa qilmaydi
+	var b []byte
+	if err := tx.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1 FOR UPDATE`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	if b, err = json.Marshal(o); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+`FOR UPDATE` oʻqilgan qatorni commit'gacha qulflaydi. Ikkinchi jarayonning `SELECT … FOR UPDATE` i birinchisi commit
+qilguncha kutadi, keyin *yangi* JSON'ni oʻqiydi → 2000. `defer tx.Rollback(ctx)` — xato boʻlsa transaction bekor
+qilinadi, commit'dan keyin esa hech narsa qilmaydi. Bu DDIA'dagi *explicit locking*. Lost update va uning toʻrt
+yechimi: [DB-5.02](/lab/youtube/databases#db-5-02).
+
+🔴 `homework/fsync/main.go` — `fayl/main.go` ning nusxasi, faqat `yozRename` boshqacha:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil { // 1) maʼlumot diskda
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, fayl); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(fayl)) // 2) yangi nom ham diskda: papkani fsync qilamiz
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+```
+
+`f.Sync()` — vaqtinchalik faylning maʼlumoti diskda. `d.Sync()` — papkaning oʻzi: fayl nomi papka yozuvida saqlanadi,
+rename aynan shu yozuvni oʻzgartiradi. fsync(2): *"Calling fsync() does not necessarily ensure that the entry in the
+directory containing the file has also reached disk. For that an explicit fsync() on a file descriptor for the
+directory is also needed."* Papka fsync'siz elektr oʻchsa, rename yoʻqolishi mumkin.
+
+Narxi: bizda 2,4 s → 9,8 s (~4 barobar). Kurs README'sida ikki oʻlchov: 6,1 → 15,4 s va 7,0 → 13,6 s (~2–2,5
+barobar). Aniq son diskka va kompyuter yuklamasiga bogʻliq, lekin yoʻnalish bir xil: har buyurtmaga ikki fsync bir
+necha barobar sekinlashtiradi. Taqqoslash uchun: Postgres 2000 ta `INSERT` ni, har commit'da WAL flush bilan, 1,9 s da
+yozgan (kurs tadqiqoti). Bu teng sharoitdagi taqqoslash emas: faylda har safar butun fayl va ikki fsync, Postgres'da
+esa jurnalga kichik yozuv. Sababi alohida oʻlchanmagan.
+
+</details>
+
+## Manbalar
+
+- CMU 15-445/645 Fall 2024, Lecture 01 (A. Pavlo), slaydlar 10–14 «Flat file strawman»:
+  [01-relationalmodel.pdf](https://15445.courses.cs.cmu.edu/fall2024/slides/01-relationalmodel.pdf)
+- M. Kleppmann, *Designing Data-Intensive Applications*, 7-bob «Transactions», «Preventing Lost Updates»:
+  [dataintensive.net](https://dataintensive.net/)
+- Go: [os.WriteFile (go1.26.8, file.go:927–931)](https://github.com/golang/go/blob/go1.26.8/src/os/file.go#L927-L931) ·
+  [os.Rename](https://pkg.go.dev/os#Rename) · [syscall.Flock](https://pkg.go.dev/syscall#Flock)
+- Linux: [open(2) O_TRUNC](https://man7.org/linux/man-pages/man2/open.2.html) ·
+  [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) ·
+  [flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html) ·
+  [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html) ·
+  [signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html)
+- PostgreSQL 18: [WAL Introduction](https://www.postgresql.org/docs/18/wal-intro.html) ·
+  [synchronous_commit](https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT) ·
+  [Server Shutdown](https://www.postgresql.org/docs/18/server-shutdown.html) ·
+  [Transaction Isolation (Read Committed)](https://www.postgresql.org/docs/18/transaction-iso.html) ·
+  [INSERT](https://www.postgresql.org/docs/18/sql-insert.html) ·
+  [SELECT … FOR UPDATE](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE) ·
+  [jsonb_set](https://www.postgresql.org/docs/18/functions-json.html)
+- SQLite: [Appropriate Uses For SQLite](https://www.sqlite.org/whentouse.html) ·
+  [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html)
+- Boshqa tillarda: [Node fs flags](https://nodejs.org/api/fs.html#file-system-flags) ·
+  [Python open](https://docs.python.org/3/library/functions.html#open) ·
+  [Python os.replace](https://docs.python.org/3/library/os.html#os.replace) ·
+  [Python fcntl.flock](https://docs.python.org/3/library/fcntl.html#fcntl.flock) ·
+  [PHP file_put_contents](https://www.php.net/manual/en/function.file-put-contents.php) ·
+  [PHP flock](https://www.php.net/manual/en/function.flock.php)
+- pgx: [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)
+- Kurs papkasi va README (hamma oʻlchovlar):
+  [lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+- Natijalar `go1.26.8 linux/amd64` (`CGO_ENABLED=0`), Linux 6.18 (NixOS), ext4 NVMe, Intel Core i5-12450H, Docker
+  Engine 29.8.1, Compose 5.4.0, `postgres:18-alpine` (PostgreSQL 18.7), pgx v5.13.0, 2026-11-26. Video natijalari kurs
+  README'sidan (oʻsha kuni, iqtibos, qayta ishga tushirilmagan). Bu sahifadagi terminal natijalari: oʻsha kuni
+  22:30–22:45, load average 1–1,7. «Bitta buyurtma 70/71 bayt» va «jami ~142 MB» — bizning hisob-kitob; Postgres'ning
+  1,9 s va «nega yarmi yoʻqoladi» tushuntirishi — kurs tadqiqotidan, qayta oʻlchanmagan.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+---
+
+Keyingi dars: [DB-1.02](/lab/youtube/databases#db-1-02) → · [Barcha darslar](/lab/youtube/databases)
+
+</div>
