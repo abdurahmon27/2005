@@ -1,0 +1,1929 @@
+---
+title: "defer, panic, recover: what cannot be recovered"
+date: "2026/11/26"
+description: "The order of defer and when its arguments are evaluated, the defer-in-a-loop trap, turning a panic into an error with recover, and fatal errors recover cannot catch."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-15/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-15"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-15/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-15/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-15"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-15) · [Русский](/lab/youtube/go/go-1-15/ru) · **English**  
+Lesson GO-1.15 · [Go: 0 → Guru](/lab/youtube/go#go-1-15) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/015-defer-panic-recover)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+A function opens 2000 log files one by one and closes each with `defer f.Close()`. With an open-file limit of
+1024 it stops after 1019 files with `too many open files`. So the "closed" files are still open. When does
+`defer` really run? At the end of the lesson we also run errors that even `recover` cannot save you from.
+
+**One idea:** `defer` is bound to the **function**, not to a block: the call runs when the function ends (by
+`return` or by a panic), in reverse order, and its arguments are evaluated on the `defer` line itself. `recover`
+catches a panic only inside such a `defer` and only in its own goroutine. On a fatal error and on `os.Exit`,
+`defer` does not run at all.
+
+After this lesson you will be able to:
+
+- say in advance in which order `defer` calls run and when their arguments are evaluated;
+- recognise the defer-in-a-loop trap and fix it with a separate function;
+- turn a panic into an ordinary `error` with `recover` and a named result, and know where this makes sense;
+- know what `recover` does not catch: a panic in another goroutine, a fatal error (deadlock, stack overflow, out
+  of memory), `os.Exit` and `log.Fatal`.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| defer | delays a call until the surrounding function ends; like `finally` in JS/PHP, but at function level | defer |
+| panic | an emergency stop raised by the runtime or by code: normal work stops, `defer` calls run, then the program crashes | panic |
+| recover | inside a deferred function, stops the panic and returns its value; the closest thing to `catch` | recover |
+
+Two helper words appear along the way: **LIFO** (*Last In, First Out*: the last one added runs first) and
+**named result** (`n` and `err` in `func f() (n int, err error)`). We explain both where they are needed.
+
+## Before you start
+
+- [GO-1.14 · Errors are values too: %w, errors.Is, AsType and Join](/lab/youtube/go/go-1-14/en): an expected error is a
+  returned `error` value; wrapping with `%w`, `errors.Is`, `errors.Join`.
+- [GO-1.06 · Functions: two return values, closures and variadic](/lab/youtube/go/go-1-06/en): returning `(value, error)`,
+  anonymous functions and closures (a closure captures the variable itself, not a copy).
+- [GO-1.09 · Maps: why the order is random and why recover does not save you](/lab/youtube/go/go-1-09/en): writing to a nil
+  map → panic, the first look at `defer` + `recover`, concurrent map writes → `fatal error: concurrent map writes`.
+- [GO-1.08 · Slices: the append trap and the outdated 1024 rule](/lab/youtube/go/go-1-08/en): the `index out of range` panic
+  and how to read its message.
+- [GO-1.12 · Methods: value receiver or pointer receiver?](/lab/youtube/go/go-1-12/en): `defer b.Chiqar()` from the homework
+  is today's "the argument is evaluated immediately" rule.
+- [GO-1.07 · Don't guess, measure: the first test and benchmark](/lab/youtube/go/go-1-07/en): `go test -v` (for the
+  "Medium" homework).
+- [GO-X.03 · No try/catch: the error value and defer](/lab/youtube/go#go-x-03): why Go has no exceptions.
+- Short programs run on [go.dev/play](https://go.dev/play). But `sikl/` and `sikltuzat/` (files and `ulimit`),
+  `server/` (network) and `fatal/xotira` (`ulimit -v`) need Go on your computer. Open a terminal in the course
+  folder (`lessons/015-defer-panic-recover`): every command runs from there.
+- Commands with `ulimit` are wrapped in `bash -c '…'`: in zsh `ulimit -n` behaves differently and the demo does
+  not reproduce (the reason is in "Going deeper"). If your machine has no C compiler, run `go vet` and `server/`
+  with `CGO_ENABLED=0` (then the `net` package builds without cgo).
+
+First, a question about the previous lesson. What does this program print?
+
+```go
+var ErrDisk = errors.New("disk toʻla")
+
+func main() {
+	fmt.Println(errors.Join(nil, nil) == nil)
+	err := errors.Join(ErrDisk, nil)
+	fmt.Println(err == nil, err == ErrDisk, errors.Is(err, ErrDisk))
+	fmt.Println(err)
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+`errors.Join` drops `nil` values. If all of them are `nil`, it returns `nil`. Even when only one error is left,
+it wraps it in a **new** value: with `==` it is not equal to `ErrDisk` ("disk full"), but `errors.Is` finds it.
+The "Medium" homework needs exactly this property: `errors.Join(err, f.Close())` gives `nil` when both errors are
+`nil`. The full program (not in the course folder, run separately):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrDisk = errors.New("disk toʻla")
+
+func main() {
+	fmt.Println(errors.Join(nil, nil) == nil)
+	err := errors.Join(ErrDisk, nil)
+	fmt.Println(err == nil, err == ErrDisk, errors.Is(err, ErrDisk))
+	fmt.Println(err)
+}
+```
+
+```console
+$ go run -trimpath eslash/main.go
+true
+false false true
+disk toʻla
+```
+
+</details>
+
+## 2000 files, 1019 opened
+
+`sikl/main.go` from the course folder. The function `sana` ("count") opens the files and hands the closing of
+each one to `defer`:
+
+```go filename="sikl/main.go" showLineNumbers
+// Ataylab xato: sikl ichidagi defer fayllarni funksiya tugaguncha yopmaydi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func sana(nomlar []string) (int, error) {
+	ochildi := 0
+	for _, nom := range nomlar {
+		f, err := os.Open(nom)
+		if err != nil {
+			return ochildi, err
+		}
+		defer f.Close() // XATO: sikl oxirida emas, sana tugaganda yopiladi
+		ochildi++
+	}
+	return ochildi, nil
+}
+
+func main() {
+	dir, nomlar := loglar(2000)
+	defer os.RemoveAll(dir)
+
+	n, err := sana(nomlar)
+	fmt.Println("ochildi:", n, "ta fayl")
+	if err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+
+// loglar vaqtinchalik papkada n ta bo'sh fayl yaratadi va o'sha papkaga o'tadi.
+func loglar(n int) (string, []string) {
+	dir, err := os.MkdirTemp("", "loglar")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		panic(err)
+	}
+	nomlar := make([]string, n)
+	for i := range nomlar {
+		nomlar[i] = fmt.Sprintf("log-%04d.txt", i+1)
+		if err := os.WriteFile(nomlar[i], nil, 0o644); err != nil {
+			panic(err)
+		}
+	}
+	return dir, nomlar
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 9 | `func sana(nomlar []string) (int, error)` | takes a slice of file names (`nomlar` = "names"), returns how many files were opened (`ochildi` = "opened") and an error |
+| 12 | `f, err := os.Open(nom)` | opens the file for reading; `f` is a `*os.File` |
+| 13–15 | `if err != nil { return ochildi, err }` | if it fails, returns the count so far and the error |
+| 16 | `defer f.Close()` | **delays** the call `f.Close()`; until when is the question of this lesson |
+| 17 | `ochildi++` | adds one to the counter |
+| 23 | `dir, nomlar := loglar(2000)` | creates 2000 empty files in a temporary folder |
+| 24 | `defer os.RemoveAll(dir)` | removes the folder when `main` ends |
+| 26–30 | `n, err := sana(nomlar)` … | prints the result and the error |
+| 34–50 | `func loglar(n int) …` | helper: creates a folder with `os.MkdirTemp`, moves into it with `os.Chdir`, writes empty files `log-0001.txt` … `log-2000.txt` (`%04d` = 4 digits with leading zeros; `0o644` = file permissions in octal). On an error, `panic(err)`: the emergency stop we look at today; good enough for a demo |
+
+Each process may have only a limited number of open files. `ulimit -n 1024` lowers this limit to 1024. On Linux,
+every open file takes one **file descriptor** (a small number) in the process. `bash -c '…'` runs the command
+inside bash (in zsh `ulimit -n` behaves differently):
+
+```console
+$ bash -c 'ulimit -n 1024; go run ./sikl'
+ochildi: 1019 ta fayl
+xato: open log-1020.txt: too many open files
+```
+
+*too many open files*. File 1020 did not open: the limit is 1024, and 5 descriptors are busy from the start of
+the program. 3 of them are stdin, stdout and stderr; 2 belong to the Go runtime's mechanism for waiting on network
+and files (`eventpoll` and `eventfd`). 1024 − 5 = 1019. So 1019 files are **still open**, even though each one
+has a `defer f.Close()`. The next two sections explain why.
+
+## defer: when the function ends, in reverse order
+
+A file, a database connection, a mutex lock: a resource you acquire must be given back. JS and PHP have
+`try … finally` for this, Python has `with`. Go has **`defer`**: it delays a call until the surrounding function
+ends. You write the release with `defer` right after you acquire the resource, and the release is not lost.
+`tartib/main.go` from the course folder only prints that the resources are acquired:
+
+```go filename="tartib/main.go" showLineNumbers
+// defer tartibi: oxirgi qo'yilgan defer birinchi ishlaydi (LIFO).
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("baza ochildi")
+	defer fmt.Println("baza yopildi")
+
+	fmt.Println("fayl ochildi")
+	defer fmt.Println("fayl yopildi")
+
+	fmt.Println("lock olindi")
+	defer fmt.Println("lock qaytarildi")
+
+	fmt.Println("ish bajarildi")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7, 10, 13 | `fmt.Println("… ochildi")` | prints right away that a resource was acquired (`baza` = "database", `fayl` = "file", `ochildi` / `olindi` = "opened" / "acquired") |
+| 8, 11, 14 | `defer fmt.Println("… yopildi")` | delays the closing call (`yopildi` = "closed", `qaytarildi` = "released") until `main` ends |
+| 16 | `fmt.Println("ish bajarildi")` | the main work ("work done") |
+
+Before running it, think: in which order are the "yopildi" lines printed?
+
+**A)** each right after its own "ochildi" line · **B)** at the end, in opening order: database, file, lock ·
+**C)** at the end, in reverse order: lock, file, database
+
+<details>
+<summary>Answer</summary>
+
+**C.** `defer` does not run the call; it puts it on a list. The list runs when `main` ends, starting from the last
+entry: the last one added runs first. If you chose "A", you thought `defer` runs after the next line. If you
+chose "B", you thought the list works like a queue: it works like a stack.
+
+</details>
+
+```console
+$ go run ./tartib
+baza ochildi
+fayl ochildi
+lock olindi
+ish bajarildi
+lock qaytarildi
+fayl yopildi
+baza yopildi
+```
+
+This order is called **LIFO** (*Last In, First Out*). The logic is simple: the lock was taken after the file was
+opened, and the file after the database. The last resource acquired is released first, because it may depend on
+the earlier ones. The `defer` list after each line:
+
+| Line | Printed | `defer` list (top = runs first) |
+|---|---|---|
+| 7–8 | `baza ochildi` | `baza yopildi` |
+| 10–11 | `fayl ochildi` | `fayl yopildi`, `baza yopildi` |
+| 13–14 | `lock olindi` | `lock qaytarildi`, `fayl yopildi`, `baza yopildi` |
+| 16 | `ish bajarildi` | unchanged |
+| 17 (`}`) | `lock qaytarildi`, `fayl yopildi`, `baza yopildi` | empty |
+
+The Go spec says: *"deferred functions are invoked immediately before the surrounding function returns, in the
+reverse order they were deferred"*. Whether the function ends with `return`, reaches the last `}`, or ends with a
+panic, the `defer` calls run.
+
+The same program in JS, Python and PHP (these files are not in the course folder, run separately: Node.js 24,
+Python 3.13, PHP 8.4):
+
+```js
+console.log("baza ochildi");
+try {
+  console.log("fayl ochildi");
+  try {
+    console.log("ish bajarildi");
+  } finally {
+    console.log("fayl yopildi");
+  }
+} finally {
+  console.log("baza yopildi");
+}
+```
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def resurs(nom):
+    print(nom, "ochildi")
+    yield
+    print(nom, "yopildi")
+
+with resurs("baza"), resurs("fayl"):
+    print("ish bajarildi")
+```
+
+```php
+<?php
+echo "baza ochildi\n";
+try {
+    echo "fayl ochildi\n";
+    try {
+        echo "ish bajarildi\n";
+    } finally {
+        echo "fayl yopildi\n";
+    }
+} finally {
+    echo "baza yopildi\n";
+}
+```
+
+```console
+$ node tartib.js
+baza ochildi
+fayl ochildi
+ish bajarildi
+fayl yopildi
+baza yopildi
+$ python3 tartib.py
+baza ochildi
+fayl ochildi
+ish bajarildi
+fayl yopildi
+baza yopildi
+$ php tartib.php
+baza ochildi
+fayl ochildi
+ish bajarildi
+fayl yopildi
+baza yopildi
+```
+
+The order is the same: reversed. The difference is in the shape and in the boundary:
+
+| | JS / PHP `try … finally` | Python `with` | Go `defer` |
+|---|---|---|---|
+| Each resource | a new nested block | one more item in `with`, or a nested block | one flat line, next to the acquisition |
+| When it runs | when the **block** ends | when the **block** ends | when the **function** ends |
+| Reverse order | follows from the nesting | the same | the `defer` list: LIFO |
+
+Why Go chose this: acquire and release stand side by side, and nested blocks do not grow. The price is the word
+"function" in the last column. The bug at the start comes exactly from this.
+
+## The argument is evaluated on the defer line
+
+The second rule of `defer`. `vaqt/main.go` from the course folder measures with `defer`, in two ways, how long a
+function ran:
+
+```go filename="vaqt/main.go" showLineNumbers
+// defer argumentlari defer qatorida hisoblanadi, closure ichidagisi esa oxirida.
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func ish() {
+	start := time.Now()
+	defer fmt.Println("argument:", time.Since(start).Round(time.Millisecond))
+	defer func() {
+		fmt.Println("closure: ", time.Since(start).Round(time.Millisecond))
+	}()
+
+	time.Sleep(100 * time.Millisecond) // og'ir ish
+}
+
+func main() {
+	ish()
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `start := time.Now()` | the start time |
+| 11 | `defer fmt.Println("argument:", time.Since(start)…)` | `time.Since(start)` = time passed since `start`; `.Round(time.Millisecond)` rounds to milliseconds. Here it is an **argument** of `Println` |
+| 12–14 | `defer func() { … }()` | an anonymous function (closure, [GO-1.06](/lab/youtube/go/go-1-06/en)); the `()` at the end calls it, and `defer` delays that call. `time.Since` is **inside** the closure |
+| 16 | `time.Sleep(100 * time.Millisecond)` | waits 100 ms in place of "heavy work" |
+
+Think: which two lines does the program print, and in which order?
+
+**A)** `argument: 100ms`, then `closure:  100ms` · **B)** `closure:  100ms`, then `argument: 0s` ·
+**C)** `argument: 0s`, then `closure:  100ms`
+
+<details>
+<summary>Answer</summary>
+
+**B.** Two rules work together. The first is order: the `defer` on line 12 was added last, so it runs first
+(LIFO). The second is argument time: `time.Since(start)` on line 11 was evaluated **on the `defer` line itself**,
+when 0 had passed; `Println` later prints that saved `0s`. The code inside the closure runs when the function ends
+and sees 100 ms. If you chose "A", you thought `defer` delays the whole line. If you chose "C", you found the
+argument rule but forgot LIFO.
+
+</details>
+
+```console
+$ go run ./vaqt
+closure:  100ms
+argument: 0s
+```
+
+The spec: *"Each time a "defer" statement executes, the function value and parameters to the call are evaluated
+as usual and saved anew but the actual function is not invoked."* The timeline:
+
+| Time | What happens | What is saved |
+|---|---|---|
+| 0 ms, line 11 | `time.Since(start)` is evaluated → `0s` | `Println("argument:", 0s)` |
+| 0 ms, line 12 | the closure is created, its code does not run yet | `func(){…}` (it holds `start`) |
+| 0 → 100 ms | `time.Sleep` | — |
+| 100 ms, `}` | the closure runs: `time.Since(start)` is evaluated now → `100ms` | — |
+| 100 ms | `Println("argument:", 0s)` prints the saved `0s` | — |
+
+`go vet` recognises this mistake:
+
+```console
+$ go vet ./vaqt
+vaqt/main.go:11:33: call to time.Since is not deferred
+```
+
+Line 11, column 33: *call to time.Since is not deferred*. This is the `defers` check of `go vet`; it looks for
+exactly `time.Since` in a defer argument. For other functions (`defer log.Println(len(buf))`) it is silent, but
+the rule is the same. The same rule applies to method values: in `defer b.Chiqar()` from the
+[GO-1.12](/lab/youtube/go/go-1-12/en) homework, `b` with a value receiver is copied on the `defer` line.
+
+**Fix:** put whatever must be evaluated later inside a closure (lines 12–14).
+
+## The defer-in-a-loop trap
+
+Back to `sikl/main.go` from the start. `defer` runs not when a **loop iteration** ends, but when the **whole
+function** (`sana`) ends. Each step adds one more `f.Close()` to the list, and the file stays open:
+
+| Step (`nom`) | Open files | `defer` list |
+|---|---|---|
+| 1 (`log-0001.txt`) | 1 | `f1.Close()` |
+| 2 (`log-0002.txt`) | 2 | `f2.Close()`, `f1.Close()` |
+| … | … | … |
+| 1019 (`log-1019.txt`) | 1019 (+5 busy = 1024) | 1019 `Close` calls |
+| 1020 (`log-1020.txt`) | `os.Open` → `too many open files` | `return` → only now do the 1019 `Close` calls run |
+
+Without a limit, 2000 files would be open after 2000 iterations. The files are closed only when `sana` ends. On a
+real server the limit is higher, but in a long or infinite loop (for example, a worker reading from a queue) open
+files still pile up.
+
+Both the compiler and `go vet` are silent here:
+
+```console
+$ go vet ./sikl
+```
+
+The command printed nothing: for `go vet` this is correct code. staticcheck's SA9001 check is about this topic:
+*"Deferred calls run when the surrounding function returns, not at the end of each loop iteration."* But it
+mostly checks `range` loops over a channel; do not rely on it to find our file loop.
+
+In Python the same loop is written with `with`, and there is no problem, because `with` closes the file when the
+**block** ends (the file is not in the course folder, run separately):
+
+```python
+import os
+import tempfile
+
+os.chdir(tempfile.mkdtemp())
+ochildi = 0
+for i in range(1, 2001):
+    nom = f"log-{i:04d}.txt"
+    open(nom, "w").close()
+    with open(nom) as f:  # with bloki tugashi bilan yopiladi
+        ochildi += 1
+print("ochildi:", ochildi, "ta fayl")
+```
+
+```console
+$ bash -c 'ulimit -n 1024; python3 sikl.py'
+ochildi: 2000 ta fayl
+```
+
+`try … finally` in JS or PHP also runs on every iteration inside a loop: it is bound to a block too. Go's `defer`
+is bound to the function. This is exactly where the hand of a JS/Python/PHP developer slips.
+
+There is one more cost. According to the Go 1.14 release notes, an ordinary `defer` became *"almost zero
+overhead"*. But this speed-up (open-coded defers) does not apply to a `defer` inside a loop: the compiler turns it
+off for the whole function (the source is in "Going deeper").
+
+## The fix: the loop body in its own function
+
+The fix is simple: move the loop body into its own function. Now `defer` runs as soon as that small function
+ends. `sikltuzat/main.go` from the course folder:
+
+```go filename="sikltuzat/main.go" showLineNumbers
+// Tuzatish: har bir fayl alohida funksiyada ochiladi, defer o'sha funksiya tugaganda ishlaydi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func bittasi(nom string) error {
+	f, err := os.Open(nom)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // bittasi tugashi bilan yopiladi
+	return nil
+}
+
+func sana(nomlar []string) (int, error) {
+	ochildi := 0
+	for _, nom := range nomlar {
+		if err := bittasi(nom); err != nil {
+			return ochildi, err
+		}
+		ochildi++
+	}
+	return ochildi, nil
+}
+
+func main() {
+	dir, nomlar := loglar(2000)
+	defer os.RemoveAll(dir)
+
+	n, err := sana(nomlar)
+	fmt.Println("ochildi:", n, "ta fayl")
+	if err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+
+// loglar vaqtinchalik papkada n ta bo'sh fayl yaratadi va o'sha papkaga o'tadi.
+func loglar(n int) (string, []string) {
+	dir, err := os.MkdirTemp("", "loglar")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		panic(err)
+	}
+	nomlar := make([]string, n)
+	for i := range nomlar {
+		nomlar[i] = fmt.Sprintf("log-%04d.txt", i+1)
+		if err := os.WriteFile(nomlar[i], nil, 0o644); err != nil {
+			panic(err)
+		}
+	}
+	return dir, nomlar
+}
+```
+
+The changed lines:
+
+| Line | Code | What it does |
+|---|---|---|
+| 9–16 | `func bittasi(nom string) error` | opens and closes one file (`bittasi` = "one of them") |
+| 14 | `defer f.Close()` | now runs when `bittasi` ends, that is, separately for each file |
+| 21 | `if err := bittasi(nom); err != nil {` | the loop body is now one call |
+
+`main` and `loglar` are unchanged. With the same limit:
+
+```console
+$ bash -c 'ulimit -n 1024; go run ./sikltuzat'
+ochildi: 2000 ta fayl
+```
+
+All 2000 files were opened and closed: at most one file is open at a time. Another way you often see at work is
+to call `f.Close()` by hand, without `defer`. But then you must not forget `Close` on any `return` or panic path;
+the separate function gives this job back to `defer`.
+
+## panic: normal work stops, defer calls run
+
+We said `defer` also runs in a function that ends with a panic. Let us check. When an index is outside a slice,
+the Go runtime raises a **panic** (we saw this in [GO-1.08](/lab/youtube/go/go-1-08/en)). `panik/main.go` from the course
+folder:
+
+```go filename="panik/main.go" showLineNumbers
+// panic: oddiy ish to'xtaydi, lekin defer'lar baribir ishlaydi.
+package main
+
+import "fmt"
+
+func main() {
+	defer fmt.Println("defer: baza yopildi")
+
+	narxlar := []int{1200, 3400, 560}
+	i := 5
+	fmt.Println("narx:", narxlar[i])
+	fmt.Println("bu qator chiqmaydi")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7 | `defer fmt.Println("defer: baza yopildi")` | delays the "database closed" call |
+| 9 | `narxlar := []int{1200, 3400, 560}` | a slice of three elements (`narxlar` = "prices"): indices 0, 1, 2 |
+| 10–11 | `i := 5`, `narxlar[i]` | there is no index 5 → panic |
+| 12 | `fmt.Println("bu qator chiqmaydi")` | we check what the string says ("this line is not printed") |
+
+Think: what appears on the screen?
+
+**A)** only the panic message: the program crashed, so `defer` does not run · **B)** first
+`defer: baza yopildi`, then the panic message · **C)** the panic message, then `bu qator chiqmaydi`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The panic stops normal work at that point: line 12 never gets its turn. But before the function ends, its
+`defer` calls still run, and only then does the runtime print the message and the stack trace and stop the
+program. If you chose "A", you thought of a panic as an instant kill like `os.Exit` (that exists too, see below).
+If you chose "C", you thought of a panic as a warning.
+
+</details>
+
+`-trimpath` only shortens the file path in the message ([GO-1.11](/lab/youtube/go/go-1-11/en)):
+
+```console
+$ go run -trimpath ./panik
+defer: baza yopildi
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.main()
+	github.com/abdurahmon27/go-backend-uz/lessons/015-defer-panic-recover/panik/main.go:11 +0x52
+exit status 2
+```
+
+Reading the message:
+
+- `defer: baza yopildi` is the first line: `defer` ran **after** the panic but **before** the message.
+- *runtime error: index out of range [5] with length 3*: index 5 is outside a slice of length 3.
+- The lines after `goroutine 1 [running]:` are the **stack trace** (the chain of calls): which function was at
+  which line during the panic. `main.main()`, `panik/main.go:11` is line 11.
+- *exit status 2*: the program ended with **exit code** 2. A panic and a fatal error always give 2; `0` means
+  success.
+- `bu qator chiqmaydi` was not printed at all.
+
+The closest thing in JS and Python is an uncaught exception. And `finally` behaves just like `defer` (the files
+are not in the course folder, run separately; in JS going past the end of an array is not an error but
+`undefined`, so the error comes from `undefined.toFixed()`):
+
+```js
+function main() {
+  try {
+    const narxlar = [1200, 3400, 560];
+    narxlar.at(5).toFixed(); // undefined.toFixed()
+    console.log("bu qator chiqmaydi");
+  } finally {
+    console.log("finally: baza yopildi");
+  }
+}
+main();
+```
+
+```python
+def main():
+    try:
+        narxlar = [1200, 3400, 560]
+        print("narx:", narxlar[5])
+        print("bu qator chiqmaydi")
+    finally:
+        print("finally: baza yopildi")
+
+main()
+```
+
+The stack trace contains full file paths, so `grep` keeps only the lines we need. `2>/dev/null` hides the error
+stream (stderr), and `echo "exit: $?"` prints the exit code:
+
+```console
+$ node panik.js 2>&1 | grep -E '^(finally|TypeError)'
+finally: baza yopildi
+TypeError: Cannot read properties of undefined (reading 'toFixed')
+$ python3 panik.py 2>&1 | grep -E '^(finally|IndexError)'
+finally: baza yopildi
+IndexError: list index out of range
+$ node panik.js 2>/dev/null; echo "exit: $?"
+finally: baza yopildi
+exit: 1
+$ python3 panik.py 2>/dev/null; echo "exit: $?"
+finally: baza yopildi
+exit: 1
+```
+
+The mechanism is the same: the error travels up the stack, the `finally` / `defer` blocks on the way run, and if
+nobody catches it, the process crashes. The difference is where it is used. In JS/Python an exception is the
+normal way to handle errors. In Go the normal way is to return an `error` ([GO-1.14](/lab/youtube/go/go-1-14/en)); a panic is
+for a programmer's bug or a state in which the program cannot continue.
+
+## recover: turning a panic into an ordinary error
+
+The closest thing to `catch` is **`recover`**. It stops the panic and returns the panic value. But there is one
+condition: it works only when it is called by **the deferred function itself**. Anywhere else it returns `nil`
+and does nothing. `qutqar/main.go` from the course folder:
+
+```go filename="qutqar/main.go" showLineNumbers
+// recover: panic'ni ushlab, oddiy xatoga aylantirish (nomlangan natija orqali).
+package main
+
+import "fmt"
+
+func narx(narxlar []int, i int) (n int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("narx(%d): %v", i, r)
+		}
+	}()
+	return narxlar[i], nil
+}
+
+func main() {
+	narxlar := []int{1200, 3400, 560}
+	for _, i := range []int{1, 5, 2} {
+		n, err := narx(narxlar, i)
+		fmt.Println(n, err)
+	}
+	fmt.Println("dastur davom etdi")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `func narx(…) (n int, err error)` | both results have names: `n` and `err` (`narx` = "price"). This is a **named result**: an ordinary variable inside the function, starting at its zero value (`0`, `nil`) |
+| 7–11 | `defer func() { … }()` | a closure that runs even on a panic |
+| 8 | `if r := recover(); r != nil {` | `recover()` is `nil` if there is no panic, otherwise the panic value (`r`) |
+| 9 | `err = fmt.Errorf("narx(%d): %v", i, r)` | writes the panic into the `err` result as an ordinary error |
+| 12 | `return narxlar[i], nil` | if `i` is in range, the price and `nil`; if not, a panic here |
+| 17 | `for _, i := range []int{1, 5, 2}` | tries three indices: 5 is out of range |
+
+Can the closure change the named result of the outer function? The spec: *"if the deferred function is a
+function literal and the surrounding function has named result parameters that are in scope within the literal,
+the deferred function may access and modify the result parameters before they are returned"*. With unnamed
+results (`(int, error)`) the closure would have no name to reach `err`.
+
+Think: what does the line for `narx(narxlar, 5)` print?
+
+**A)** the program crashes as in `panik` · **B)** `0 narx(5): runtime error: index out of range [5] with length 3`,
+and the program goes on · **C)** `0 <nil>`: the panic is silently swallowed
+
+<details>
+<summary>Answer</summary>
+
+**B.** Line 12 panicked, normal work stopped, the closure in `defer` ran. `recover` stopped the panic and returned
+its value (`runtime error: …`), and the closure wrote it to `err`. `narx` returned like an ordinary function: `n`
+is still `0` (nothing was written to it), and `err` is the new error. For `main` this is an ordinary
+`(value, error)`. If you chose "A", you forgot `recover`. If you chose "C", you thought `recover` returns the
+error by itself: the closure writes it to `err` (line 9).
+
+</details>
+
+```console
+$ go run ./qutqar
+3400 <nil>
+0 narx(5): runtime error: index out of range [5] with length 3
+560 <nil>
+dastur davom etdi
+```
+
+| `i` | Line 12 | Closure in `defer` | `narx` returns |
+|---|---|---|---|
+| 1 | `return 3400, nil` | `recover()` → `nil`, does nothing | `3400, nil` |
+| 5 | panic: `index out of range [5]` | `recover()` → panic value; `err = narx(5): …` | `0, narx(5): …` |
+| 2 | `return 560, nil` | `recover()` → `nil` | `560, nil` |
+
+The difference from `try { … } catch (e) { … }` in JS/Python: `catch` can stand anywhere in the block, and the
+program continues from the line after `catch`. `recover` works only inside `defer`, and the function returns not
+from the panic point but **from the function itself**. The only way to change the result is a named result.
+
+But this is not the everyday path. For an expected error (missing price, wrong amount) return an `error`: we saw
+that in the previous lesson. Effective Go: *"recover is only useful inside deferred functions"*, and it names a
+server as the place to use it: *"shut down a failing goroutine inside a server without killing the other
+executing goroutines"*. `recover` belongs **at a boundary**: an HTTP handler, the start of a background
+goroutine, the public API of a library. `fmt` does the same: it catches a panic in an `Error()` or `String()`
+method and prints `%!v(PANIC=…)` (the "Guru" homework of [GO-1.14](/lab/youtube/go/go-1-14/en)).
+
+## Pause: does recover in main save another goroutine?
+
+We need one new keyword: `go f()` starts a function in a new **goroutine**, a separate thread of execution that
+runs alongside `main`. Goroutines are covered in detail in [GO-1.21](/lab/youtube/go#go-1-21). `goroutine/main.go` from the
+course folder:
+
+```go filename="goroutine/main.go" showLineNumbers
+// main'dagi recover boshqa goroutine'dagi panic'ni ushlay olmaydi.
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("qutqarildi:", r)
+		}
+	}()
+
+	go func() {
+		var narxlar map[string]int
+		narxlar["olma"] = 1200 // nil map'ga yozish: panic
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("main tugadi")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10–14 | `defer func() { if r := recover(); … }()` | the same guard in `main` as in `qutqar` (`qutqarildi` = "recovered") |
+| 16–19 | `go func() { … }()` | starts the anonymous function in a new goroutine |
+| 17–18 | `var narxlar map[string]int`, `narxlar["olma"] = 1200` | writing to a nil map (`olma` = "apple") → panic ([GO-1.09](/lab/youtube/go/go-1-09/en)) |
+| 21 | `time.Sleep(100 * time.Millisecond)` | the `main` goroutine waits 100 ms so the other one has time to run (`main tugadi` = "main finished") |
+
+Before running it, think: does the `recover` in `main` save the program?
+
+**A)** yes: `qutqarildi: assignment to entry in nil map`, then `main tugadi` · **B)** no: the program crashes,
+nothing from `main` is printed · **C)** the panic stops only that goroutine, `main tugadi` is printed
+
+<details>
+<summary>Answer</summary>
+
+**B.** A panic travels up only through the calls of **its own goroutine** and never moves to another one. The
+`defer` of `main` is not on the other goroutine's stack, so its `recover` never gets a turn. When the panic
+reaches the top of that goroutine, by the spec the **whole program** stops: *"the program is terminated and the
+error condition is reported"*. If you chose "A", you thought of `recover` as a `try/catch` around the whole
+program. If you chose "C", you thought it works like Python threads (we compare below).
+
+</details>
+
+```console
+$ go run -trimpath ./goroutine
+panic: assignment to entry in nil map
+
+goroutine 7 [running]:
+main.main.func2()
+	github.com/abdurahmon27/go-backend-uz/lessons/015-defer-panic-recover/goroutine/main.go:18 +0x28
+created by main.main in goroutine 1
+	github.com/abdurahmon27/go-backend-uz/lessons/015-defer-panic-recover/goroutine/main.go:16 +0x3b
+exit status 2
+```
+
+Neither `qutqarildi` nor `main tugadi` is on the screen. The stack trace tells why: the panic is in
+`goroutine 7` (the number may differ between runs), `main.main.func2()` is the second anonymous function inside
+`main`, line 18. *created by main.main in goroutine 1*: `main.main` in goroutine 1 created it, at line 16. `main`
+itself runs in `goroutine 1`:
+
+```text
+goroutine 1 (main)                    goroutine 7
+┌───────────────────────────┐         ┌──────────────────────────────┐
+│ main()                    │  go …   │ main.func2()                 │
+│   defer: recover() ───┐   │ ──────► │   narxlar["olma"] = 1200     │
+│   time.Sleep(100ms)   │   │         │   panic ▲ travels up         │
+└───────────────────────│───┘         └────────│─────────────────────┘
+                        │                      │ reached the top of the goroutine,
+     no panic on this stack                    │ no recover
+                                               ▼
+                                  whole program: exit status 2
+```
+
+How do other languages behave? In Node, neither an error in a `setTimeout` callback inside `try`, nor an error in
+an `async` function called without `await` (an unhandled rejection), reaches the outer `catch`. In Python, an
+exception inside a thread stops only that thread (the files are not in the course folder, run separately):
+
+```js
+try {
+  setTimeout(() => {
+    throw new Error("fondagi xato");
+  }, 10);
+} catch (e) {
+  console.log("qutqarildi:", e.message);
+}
+setTimeout(() => console.log("main tugadi"), 100);
+```
+
+```js
+async function fon() {
+  throw new Error("fondagi xato");
+}
+
+try {
+  fon(); // await yo'q
+} catch (e) {
+  console.log("qutqarildi:", e.message);
+}
+setTimeout(() => console.log("main tugadi"), 100);
+```
+
+```python
+import threading
+import time
+
+def fon():
+    narxlar = {}
+    narxlar["olma"] += 1200  # KeyError
+
+try:
+    threading.Thread(target=fon).start()
+except Exception as e:
+    print("qutqarildi:", e)
+time.sleep(0.1)
+print("main tugadi")
+```
+
+```console
+$ node fon.js 2>&1 | grep -E '^(qutqarildi|Error|main)'
+Error: fondagi xato
+$ node fon.js 2>/dev/null; echo "exit: $?"
+exit: 1
+$ node rad.js 2>&1 | grep -E '^(qutqarildi|Error|main)'
+Error: fondagi xato
+$ node rad.js 2>/dev/null; echo "exit: $?"
+exit: 1
+$ python3 fon.py 2>&1 | grep -E '^(qutqarildi|Exception|KeyError|main)'
+Exception in thread Thread-1 (fon):
+KeyError: 'olma'
+main tugadi
+$ python3 fon.py 2>/dev/null; echo "exit: $?"
+main tugadi
+exit: 0
+```
+
+(`fon.js` is the first JS program, `rad.js` the second.) Node is like Go: in both cases `catch` did not run and
+the process crashed with code 1. Python wrote the error to stderr, stopped the thread and let `main` continue. Go
+follows Node: an uncaught panic in any goroutine brings down the whole process. **Rule:** `recover` must be
+**inside** the goroutine where the panic can happen.
+
+## net/http: a panic in the handler and a panic in the background
+
+In a backend this difference matters a lot. The `net/http` server starts a separate goroutine for each connection
+and catches a handler's panic itself. Its documentation says: *"If ServeHTTP panics, the server (the caller of
+ServeHTTP) assumes that the effect of the panic was isolated to the active request. It recovers the panic, logs a
+stack trace to the server error log, and either closes the network connection or sends an HTTP/2 RST_STREAM"*. A
+goroutine that the handler starts itself is outside this protection. `server/main.go` from the course folder is a
+server and a client that sends it requests, in one program:
+
+```go filename="server/main.go" showLineNumbers
+// net/http handler'dagi panic'ni ushlaydi, handler ochgan goroutine'dagisini esa yo'q.
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	http.HandleFunc("/narx", func(w http.ResponseWriter, r *http.Request) {
+		narxlar := []int{1200, 3400, 560}
+		fmt.Fprintln(w, narxlar[5]) // panic: server uni ushlaydi
+	})
+	http.HandleFunc("/salom", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "server tirik")
+	})
+	http.HandleFunc("/fon", func(w http.ResponseWriter, r *http.Request) {
+		go func() {
+			time.Sleep(50 * time.Millisecond) // fondagi ish
+			var hisob map[string]int
+			hisob["fon"]++ // panic boshqa goroutine'da: hech kim ushlamaydi
+		}()
+		fmt.Fprintln(w, "fonda ishlayapti")
+	})
+
+	srv := &http.Server{Addr: "127.0.0.1:8015", ErrorLog: log.New(os.Stdout, "", 0)}
+	go srv.ListenAndServe()
+	time.Sleep(100 * time.Millisecond)
+
+	for _, yol := range []string{"/narx", "/salom", "/fon", "/salom"} {
+		so(yol)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func so(yol string) {
+	res, err := http.Get("http://127.0.0.1:8015" + yol)
+	if err != nil {
+		fmt.Println("javob", yol+":", "xato,", err)
+		return
+	}
+	defer res.Body.Close()
+	fmt.Println("javob", yol+":", res.Status)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 13–16 | the `/narx` handler | `http.HandleFunc(path, func(w, r))` binds a handler to a path: `r` is the request, `fmt.Fprintln(w, …)` writes to the response. Here `narxlar[5]` → panic **in the handler's goroutine** |
+| 17–19 | the `/salom` handler | answers `server tirik` ("the server is alive"): we check whether the server still works |
+| 20–27 | the `/fon` handler | `go func() { … }()` starts background work (`fon` = "background") and answers right away; 50 ms later, writing to a nil map in the background goroutine → panic |
+| 29 | `srv := &http.Server{…, ErrorLog: log.New(os.Stdout, "", 0)}` | a server on port 8015; the error log goes to stdout, without dates |
+| 30 | `go srv.ListenAndServe()` | starts the server in the background, and `main` becomes the client |
+| 33–36 | `for _, yol := range …` | four requests in a row (`yol` = "path"): `/narx`, `/salom`, `/fon`, `/salom` |
+| 39–47 | `func so(yol string)` | sends a request (`so` from *soʻra*, "ask"), prints the response status (`javob` = "response") or the error; `defer res.Body.Close()` closes the response body |
+
+`server/demo.sh` runs the program and keeps only the main lines, without stack traces:
+
+```bash filename="server/demo.sh"
+#!/usr/bin/env bash
+# Serverni ishga tushiradi va stack trace'siz, faqat asosiy qatorlarni ko'rsatadi.
+# CGO_ENABLED=0: net paketi bu mashinada C kompilyatorisiz yig'ilishi uchun.
+cd "$(dirname "$0")/.." && CGO_ENABLED=0 go run ./server 2>&1 | grep -E '^(javob|http: panic|panic:|exit status)'
+```
+
+Think: which of the four requests get an answer?
+
+**A)** none: the first panic brings the server down · **B)** `/narx` gets an error, `/salom` and `/fon` get
+`200 OK`, the last `/salom` never runs · **C)** `/narx` gets an error, the other three get `200 OK`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The server catches the panic in `/narx`: it logs it and closes only that connection. The server is alive,
+`/salom` gets an answer. `/fon` returns `200 OK` right away, but 50 ms later nobody catches the panic in the
+background goroutine, and the whole process crashes: the last `/salom` never runs. If you chose "A", you did not
+know about the `recover` inside `net/http`. If you chose "C", you thought the server's protection also covers
+goroutines started by the handler.
+
+</details>
+
+```console
+$ bash ./server/demo.sh
+http: panic serving 127.0.0.1:47592: runtime error: index out of range [5] with length 3
+javob /narx: xato, Get "http://127.0.0.1:8015/narx": EOF
+javob /salom: 200 OK
+javob /fon: 200 OK
+panic: assignment to entry in nil map
+exit status 2
+```
+
+Line by line:
+
+| Line | Who wrote it | Meaning |
+|---|---|---|
+| `http: panic serving 127.0.0.1:47592: …` | the server, error log | "panic while serving 127.0.0.1:47592" (the client's port, different every time): the server caught it |
+| `javob /narx: xato, … EOF` | the client | *EOF*: the connection was closed without an answer; the server closed only this connection |
+| `javob /salom: 200 OK` | the client | the server is alive |
+| `javob /fon: 200 OK` | the client | the handler managed to answer |
+| `panic: assignment to entry in nil map` | the runtime | the panic in the background goroutine: nobody caught it |
+| `exit status 2` | `go run` | the whole process crashed; there is no last `/salom` |
+
+One bug in one background job killed **all** requests and all connections of the server. That is why every
+background goroutine needs its own `recover` (the `safelyDo` example in Effective Go; the "Hard" homework).
+
+## Fatal error: errors that recover cannot touch
+
+Now the errors that `recover` cannot catch at all. The `main` function of each of the three programs in the
+course folder has a `recover`, and it should print `qutqarildi:` every time:
+
+```go filename="fatal/deadlock/main.go" showLineNumbers
+// Hamma goroutine uxlab qoldi: fatal error, recover ishlamaydi.
+package main
+
+import "fmt"
+
+func main() {
+	defer func() {
+		r := recover()
+		fmt.Println("qutqarildi:", r)
+	}()
+
+	natija := make(chan int)
+	<-natija // hech kim yozmaydi
+}
+```
+
+```go filename="fatal/stack/main.go" showLineNumbers
+// Cheksiz rekursiya: stack bir milliard baytdan oshadi, fatal error.
+package main
+
+import "fmt"
+
+func sana(n int) int {
+	return sana(n+1) + 1
+}
+
+func main() {
+	defer func() {
+		r := recover()
+		fmt.Println("qutqarildi:", r)
+	}()
+
+	fmt.Println(sana(0))
+}
+```
+
+```go filename="fatal/xotira/main.go" showLineNumbers
+// Xotira tugadi: fatal error, recover ishlamaydi.
+// Demo uchun: ulimit -v 1000000 (taxminan 1 GB virtual xotira).
+package main
+
+import "fmt"
+
+func main() {
+	defer func() {
+		r := recover()
+		fmt.Println("qutqarildi:", r)
+	}()
+
+	buf := make([]byte, 2<<30) // 2 GiB
+	fmt.Println(len(buf))
+}
+```
+
+| Program | Line | What it does |
+|---|---|---|
+| all | `defer func() { r := recover(); fmt.Println("qutqarildi:", r) }()` | if `defer` runs, the `qutqarildi:` line is **always** printed (even when `r` is `nil`) |
+| `deadlock` | `natija := make(chan int)`, `<-natija` | a channel is a pipe that passes values between goroutines (from [GO-1.21](/lab/youtube/go#go-1-21) on). `<-natija` waits for a value from it (`natija` = "result"), and nobody writes to it: `main` hangs forever |
+| `stack` | `return sana(n+1) + 1` | endless recursion: every call takes new space on the stack |
+| `xotira` | `make([]byte, 2<<30)` | `2<<30` = 2 shifted left by 30 bits = 2 147 483 648 bytes (2 GiB); `xotira` = "memory" |
+
+The `2>&1 | grep -E '^(…)'` at the end of each command merges stderr into stdout and keeps only the lines that
+start with these words: it hides the long stack traces. If `qutqarildi` were printed, `grep` would show it too:
+
+```console
+$ go run ./fatal/deadlock 2>&1 | grep -E '^(fatal|qutqarildi|exit)'
+fatal error: all goroutines are asleep - deadlock!
+exit status 2
+```
+
+*all goroutines are asleep - deadlock!*: the runtime saw that no goroutine can continue. This is a **deadlock**.
+
+The second one (runs for ≈ 4 seconds):
+
+```console
+$ go run ./fatal/stack 2>&1 | grep -E '^(runtime: goroutine|fatal|qutqarildi|exit)'
+runtime: goroutine stack exceeds 1000000000-byte limit
+fatal error: stack overflow
+exit status 2
+```
+
+*goroutine stack exceeds 1000000000-byte limit*: the goroutine's stack grew past 1 000 000 000 bytes. On a 64-bit
+system one goroutine stack is at most 1 GB.
+
+The third one. `ulimit -v 1000000` limits the process's virtual memory to ≈ 1 GB (the value is in KB), so getting
+2 GiB is impossible. The parentheses `( … )` set the limit for this command only, in a separate shell:
+
+```console
+$ (ulimit -v 1000000; go run ./fatal/xotira) 2>&1 | grep -E '^(runtime: out|fatal|qutqarildi|exit)'
+runtime: out of memory: cannot allocate 2147483648-byte block (8060928 in use)
+fatal error: out of memory
+exit status 2
+```
+
+*cannot allocate 2147483648-byte block (8060928 in use)*: a block of 2 147 483 648 bytes could not be allocated
+(8 060 928 bytes in use); the in-use part differs a little every time.
+
+All three printed `fatal error`, and none printed `qutqarildi`: `defer` did not run at all.
+
+For people coming from JS and Python, the biggest surprise is stack overflow. There it is an ordinary exception
+you can catch (the files are not in the course folder, run separately):
+
+```js
+function sana(n) {
+  return sana(n + 1) + 1;
+}
+
+try {
+  sana(0);
+} catch (e) {
+  console.log("qutqarildi:", e.message);
+}
+```
+
+```python
+def sana(n):
+    return sana(n + 1) + 1
+
+try:
+    sana(0)
+except RecursionError as e:
+    print("qutqarildi:", e)
+```
+
+```console
+$ node stack.js
+qutqarildi: Maximum call stack size exceeded
+$ python3 stack.py
+qutqarildi: maximum recursion depth exceeded
+```
+
+V8 and CPython limit the depth in advance and throw `RangeError` / `RecursionError`. In Go a goroutine stack grows
+as needed (up to 1 GB), and going past the limit is a fatal error that cannot be caught.
+
+## Why recover is powerless: throw and fatal are not panics
+
+Because these are not panics. In these cases the runtime calls not `panic` but the function `throw` or `fatal`.
+Their comments (`runtime/panic.go`, go1.26.8, abridged: function bodies and extra comments removed):
+
+```go
+// throw triggers a fatal error that dumps a stack trace and exits.
+//
+// throw should be used for runtime-internal fatal errors where Go itself,
+// rather than user code, may be at fault for the failure.
+func throw(s string)
+
+// fatal is equivalent to throw, but is used when user code is expected to be
+// at fault for the failure, such as racing map writes.
+func fatal(s string)
+
+// fatalthrow implements an unrecoverable runtime throw. It freezes the
+// system, prints stack traces starting from its caller, and terminates the
+// process.
+func fatalthrow(t throwType)
+```
+
+| Function | What the comment says | Where it is used |
+|---|---|---|
+| `throw` | triggers a fatal error, dumps a stack trace and exits; Go itself, not user code, may be at fault | stack overflow (`throw("stack overflow")`), out of memory (`throw("out of memory")`) |
+| `fatal` | the same as `throw`, but used when user code is expected to be at fault, such as racing map writes | deadlock (`fatal("all goroutines are asleep - deadlock!")`), `concurrent map writes` |
+| `fatalthrow` | an unrecoverable throw: freezes the system, prints stack traces and terminates the process | both end up here → `exit(2)` |
+
+`concurrent map writes` from [GO-1.09](/lab/youtube/go/go-1-09/en) also came from this `fatal`. Both print the message and stop
+the process immediately. There is no travelling up the stack as with a panic: `defer` calls do not run, and
+`recover` never gets a turn.
+
+| | panic | fatal error (`throw` / `fatal`) |
+|---|---|---|
+| Examples | index out of range, writing to a nil map, nil pointer, `panic(x)` | deadlock, stack overflow, out of memory, concurrent map writes |
+| Do `defer` calls run | yes, up the stack | no |
+| `recover` | catches it in the same goroutine | cannot catch it |
+| Result | if uncaught: `panic: …`, exit status 2 | always `fatal error: …`, exit status 2 |
+
+## os.Exit and log.Fatal: you skip defer yourself
+
+There is one more way to skip `defer`, and it is in your hands. `os.Exit` stops the program immediately. The
+documentation says it plainly: *"The program terminates immediately; deferred functions are not run."*
+`log.Fatal` also calls `os.Exit` inside: *"Fatal is equivalent to Print followed by a call to os.Exit(1)."*
+`exit/main.go` from the course folder:
+
+```go filename="exit/main.go" showLineNumbers
+// log.Fatal ichida os.Exit bor: defer'lar ishlamaydi.
+package main
+
+import (
+	"fmt"
+	"log"
+)
+
+func main() {
+	defer fmt.Println("defer: buferdagi loglar yozildi")
+
+	if err := sozla(); err != nil {
+		log.Fatal("sozlash: ", err)
+	}
+}
+
+func sozla() error {
+	return fmt.Errorf("PORT berilmagan")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `defer fmt.Println("defer: buferdagi loglar yozildi")` | in a real program this is where the log buffer is flushed to disk ("buffered logs written") or a connection is closed |
+| 12–14 | `log.Fatal("sozlash: ", err)` | prints the message with date and time and calls `os.Exit(1)` |
+| 17–19 | `func sozla() error` | imitates configuration (`sozla` = "configure"): always returns the error "PORT berilmagan" ("PORT not set") |
+
+Think: is the `defer:` line printed? **A)** yes, before the log message · **B)** yes, after the log message ·
+**C)** no
+
+<details>
+<summary>Answer</summary>
+
+**C.** `log.Fatal` prints the message and calls `os.Exit(1)`. `os.Exit` stops the process on the spot: `main`
+does not return, and its `defer` calls do not run. If you chose "B", you thought `log.Fatal` behaves like a
+panic: with a panic, `defer` would run.
+
+</details>
+
+```console
+$ go run ./exit
+2026/11/26 16:42:27 sozlash: PORT berilmagan
+exit status 1
+```
+
+The log message is there (the date and time differ each run), the `defer:` line is not. On a real server that
+means buffered logs, an unclosed transaction or a temporary file that was not removed.
+
+**The fix:** move the main work into a `run` function that returns an `error`. After its `defer` calls have run,
+`main` calls `os.Exit`. `exit/tuzat/main.go` from the course folder:
+
+```go filename="exit/tuzat/main.go" showLineNumbers
+// Tuzatish: ish run() ichida, uning defer'lari ishlab bo'lgach main chiqadi.
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	defer fmt.Println("defer: buferdagi loglar yozildi")
+
+	if err := sozla(); err != nil {
+		return fmt.Errorf("sozlash: %w", err)
+	}
+	return nil
+}
+
+func sozla() error {
+	return fmt.Errorf("PORT berilmagan")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10–13 | `if err := run(); err != nil { log.Print(err); os.Exit(1) }` | `main` only logs the error and sets the exit code; it has no `defer` of its own |
+| 16–23 | `func run() error` | all the work is here; the error comes back with `return` (with `%w` from [GO-1.14](/lab/youtube/go/go-1-14/en)) |
+| 17 | `defer fmt.Println(…)` | runs when `run` returns, **before** `os.Exit` |
+
+```console
+$ go run ./exit/tuzat
+defer: buferdagi loglar yozildi
+2026/11/26 16:42:27 sozlash: PORT berilmagan
+exit status 1
+```
+
+First the `defer:` line, then the log, then exit code 1. Other languages have the same trap (the files are not in
+the course folder, run separately):
+
+```js
+try {
+  console.log("sozlash: PORT berilmagan");
+  process.exit(1);
+} finally {
+  console.log("finally: buferdagi loglar yozildi");
+}
+```
+
+```php
+<?php
+try {
+    echo "sozlash: PORT berilmagan\n";
+    exit(1);
+} finally {
+    echo "finally: buferdagi loglar yozildi\n";
+}
+```
+
+```python
+import os
+import sys
+
+try:
+    print("sys.exit:", flush=True)
+    sys.exit(1)
+finally:
+    print("  finally ishladi", flush=True)
+    try:
+        print("os._exit:", flush=True)
+        os._exit(1)
+    finally:
+        print("  finally ishladi", flush=True)
+```
+
+```console
+$ node exit.js; echo "exit: $?"
+sozlash: PORT berilmagan
+exit: 1
+$ php exit.php; echo "exit: $?"
+sozlash: PORT berilmagan
+exit: 1
+$ python3 exit.py; echo "exit: $?"
+sys.exit:
+  finally ishladi
+os._exit:
+exit: 1
+```
+
+Node's `process.exit` and PHP's `exit` skip `finally`, just like `os.Exit`. In Python, `sys.exit` actually raises
+a `SystemExit` exception, so `finally` runs; `os._exit` exits without `finally`. Go's `os.Exit` matches Python's
+`os._exit`, not `sys.exit`.
+
+## Summary: the rules of defer, panic, recover
+
+- Release a resource with `defer` right after you acquire it; `defer` calls run when the function ends, in
+  reverse order (LIFO), on `return` and on a panic.
+- The argument on a `defer` line is evaluated immediately; the code inside a closure runs at the end.
+- If you need `defer` inside a loop, move the loop body into its own function.
+- `recover` catches a panic only in the deferred function itself and only in its own goroutine; it belongs at a
+  boundary (handler, goroutine start), and for expected errors you return an `error`.
+- On a fatal error (deadlock, stack overflow, out of memory, concurrent map writes) and on `os.Exit` /
+  `log.Fatal`, `defer` does not run and `recover` does not help.
+
+## Going deeper (optional): why exactly 1019, and the cost of defer
+
+**Why 1019, and why `bash -c`.** When a program starts, descriptors 0, 1 and 2 (stdin, stdout, stderr) are busy.
+The Go runtime opens two more: `eventpoll` (epoll) and `eventfd`, for its mechanism of waiting on network and
+files. This was checked during the lesson's research with `ls -l /proc/<pid>/fd`. The limit has two parts: soft
+and hard. At startup Go raises the soft limit to one below the hard limit (`syscall/rlimit.go`:
+`nlim.Cur = nlim.Max - 1`). `ulimit -n 1024` in bash sets both to 1024, so Go cannot raise it. In zsh,
+`ulimit -n` changes only the soft limit: Go raises it again and all 2000 files open. That is why the demo is
+written with `bash -c`.
+
+**Open-coded defers.** Since Go 1.14 the compiler places ordinary `defer` calls at the end of the function as
+direct calls (*open-coded defers*, [design document](https://github.com/golang/proposal/blob/master/design/34481-opencoded-defers.md)):
+according to the release notes this is *"almost zero overhead compared to calling the deferred function
+directly"*. But the number of `defer` calls in a loop is not known in advance. The compiler code
+(`cmd/compile/internal/walk/stmt.go`, go1.26.8):
+
+```console
+$ sed -n 116,120p $(go env GOROOT)/src/cmd/compile/internal/walk/stmt.go
+		if n.Esc() != ir.EscNever {
+			// If n.Esc is not EscNever, then this defer occurs in a loop,
+			// so open-coded defers cannot be used in this function.
+			ir.CurFunc.SetOpenCodedDeferDisallowed(true)
+		}
+```
+
+*"If n.Esc is not EscNever, then this defer occurs in a loop, so open-coded defers cannot be used in this
+function."* Note: the whole **function** moves to the slow path, not only the `defer` in the loop. The internals
+(the `_defer` and `_panic` records) are in [GO-4.15](/lab/youtube/go#go-4-15).
+
+**`panic(nil)`.** Since Go 1.21 (when the module's `go` line is 1.21 or newer), `panic(nil)` also gives a value
+you can catch: `recover()` returns not `nil` but a `*runtime.PanicNilError`. So the check
+`if r := recover(); r != nil` never misses a panic (the program is not in the course folder, run separately):
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	defer func() {
+		r := recover()
+		fmt.Printf("%T: %v\n", r, r)
+	}()
+	panic(nil)
+}
+```
+
+```console
+$ go run -trimpath nilpanic/main.go
+*runtime.PanicNilError: panic called with nil argument
+```
+
+(`%T` prints the type of a value.)
+
+**A deadlock is not always detected.** The runtime detects a deadlock only when **all** goroutines are stuck. If
+one goroutine on a server waits forever, the others (for example, `ListenAndServe`) keep running, and the runtime
+says nothing: this is a silent goroutine leak.
+
+## Common mistakes
+
+**1. `defer` inside a loop.** The most common mistake of this topic is to think `defer` runs at the end of a loop
+iteration. There is no error message, the compiler and `go vet` are silent; under load you run out of files or
+connections and get `too many open files`. We saw it in "2000 files, 1019 opened" and "The defer-in-a-loop
+trap". **Fix:** move the loop body into its own function (`sikltuzat/`).
+
+**2. Putting a value that must be computed later into an argument.** `defer fmt.Println(time.Since(start))`
+always prints `0s` (section "The argument is evaluated on the defer line"). `go vet` finds this only for
+`time.Since`: `call to time.Since is not deferred`. **Fix:** `defer func() { fmt.Println(time.Since(start)) }()`.
+
+**3. `defer f.Close` without parentheses.** `defer` needs a call, not the function itself (this example is not
+in the course folder, run separately):
+
+```go
+package main
+
+import "os"
+
+func main() {
+	f, err := os.Open("go.mod")
+	if err != nil {
+		return
+	}
+	defer f.Close
+}
+```
+
+```console
+$ go run -trimpath qavssiz/main.go
+# command-line-arguments
+qavssiz/main.go:10:8: expression in defer must be function call
+```
+
+Line 10, column 8: *expression in defer must be function call*. **Fix:** `defer f.Close()`.
+
+**4. Calling `recover` without `defer`.** If you call `recover` plainly at the start of a function, it returns
+`nil`: there is no panic yet at that moment. The compiler and `go vet` are silent (this example is not in the
+course folder, run separately):
+
+```go
+package main
+
+import "fmt"
+
+func narx(narxlar []int, i int) (n int, err error) {
+	if r := recover(); r != nil { // XATO: defer'siz
+		err = fmt.Errorf("narx(%d): %v", i, r)
+	}
+	return narxlar[i], nil
+}
+
+func main() {
+	fmt.Println(narx([]int{1200, 3400, 560}, 5))
+	fmt.Println("dastur davom etdi")
+}
+```
+
+```console
+$ go run -trimpath togridan/main.go
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.narx({0x17c1e0acee8, 0x3, 0x17c1e07a6f8?}, 0x5)
+	./main.go:9 +0xe8
+main.main()
+	./main.go:13 +0x49
+exit status 2
+```
+
+The numbers in `main.narx(…)` are how the arguments look in memory (the slice address, length 3, …, `i = 5`); the
+address differs every run. The panic is on line 9, while `recover` already returned `nil` on line 6. In the same
+way, `defer recover()` and a `recover` called from **another** function inside the deferred one do not work (the
+"Guru" homework). **Fix:** call `recover` directly inside the deferred function, as in `qutqar/main.go`.
+
+**5. Thinking that `recover` in `main` catches everything.** A panic in a background goroutine brings down the
+whole process (sections "Pause" and "net/http"). **Fix:** a `recover` in the first `defer` of every `go func()`
+(the "Hard" homework).
+
+**6. `log.Fatal` or `os.Exit` in a function with `defer`.** A silent problem: the `defer` calls do not run, and
+the buffer never reaches the disk (section "os.Exit and log.Fatal"). **Fix:** do not use `log.Fatal` outside
+`main`; move the work into `run() error` and call `os.Exit` only in `main`, after `run` returns.
+
+**7. Losing the error of `defer f.Close()` on a file opened for writing.** For a file opened for reading this is
+harmless. When writing to a full disk, though, the error may appear exactly in `Close`, and a plain
+`defer f.Close()` loses it. **Fix:** a named result + `defer func() { err = errors.Join(err, f.Close()) }()` (the
+"Medium" homework).
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** What is the difference between `defer fmt.Println(x)` and `defer func() { fmt.Println(x) }()`?
+
+<details>
+<summary>Answer</summary>
+
+In the first, `x` is evaluated and saved on the `defer` line itself: later changes are not visible. In the second,
+`defer` saves the closure, and `x` is read inside it when the function ends, so it sees the last value. Both run
+when the function ends, in LIFO order.
+
+</details>
+
+**2.** What does this program print? **A)** `3` · **B)** `6` · **C)** `0`
+
+```go
+func ikki() (n int) {
+	defer func() { n *= 2 }()
+	return 3
+}
+
+func main() {
+	fmt.Println(ikki())
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+**B: `6`.** `return 3` first writes to the named result (`n = 3`), then the `defer` calls run, then the function
+returns. The closure doubles `n`: `6`. If you chose "A", you thought `return` takes the value away immediately. If
+you chose "C", you thought `defer` sees the initial `0`. The full program (not in the course folder, run
+separately):
+
+```go
+package main
+
+import "fmt"
+
+func ikki() (n int) {
+	defer func() { n *= 2 }()
+	return 3
+}
+
+func main() {
+	fmt.Println(ikki())
+}
+```
+
+```console
+$ go run -trimpath natija/main.go
+6
+```
+
+</details>
+
+**3.** `main` has a `recover`, and the panic happens inside `go func() { … }()`. Is the program saved? Where should
+the `recover` have been?
+
+<details>
+<summary>Answer</summary>
+
+No. A panic travels up only through the calls of its own goroutine; when it reaches the top of that goroutine, the
+whole program stops with `exit status 2`. The `recover` must be **inside** that goroutine, in its first `defer`
+(`xavfsizGo` in the homework).
+
+</details>
+
+**4.** In which of these cases do `defer` calls run: `return`, a panic, `os.Exit(1)`, `log.Fatal(err)`,
+`fatal error: all goroutines are asleep - deadlock!`?
+
+<details>
+<summary>Answer</summary>
+
+Only on `return` and on a panic. `os.Exit` and `log.Fatal` (`Print` + `os.Exit(1)`) stop the process at once. A
+fatal error is not a panic: the runtime goes `fatal` / `throw` → `fatalthrow` → `exit(2)`, with no travelling up
+the stack.
+
+</details>
+
+**5.** From [GO-1.09](/lab/youtube/go/go-1-09/en): writing to a nil map, and two goroutines writing to the same map at the
+same time. Which one can `recover` catch, and why?
+
+<details>
+<summary>Answer</summary>
+
+It catches the nil map write: that is an ordinary panic (`assignment to entry in nil map`). Concurrent writes are
+`fatal("concurrent map writes")`: the runtime treats this as a bug in user code and stops the process without
+running `defer` calls, so `recover` never gets a turn.
+
+</details>
+
+## Homework
+
+Tasks at four levels. All files are in the lesson folder on GitHub:
+[lessons/015-defer-panic-recover](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/015-defer-panic-recover).
+Answers: the [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/015-defer-panic-recover/homework)
+folder. Try it yourself first.
+
+🟢 **Easy:** what does `homework/oson/main.go` print? Write it down on paper first, then run it.
+
+```go filename="homework/oson/main.go" showLineNumbers
+// Oson: avval natijani qog'ozda yozing, keyin ishga tushiring.
+package main
+
+import "fmt"
+
+func main() {
+	x := 1
+	defer fmt.Println("A:", x)
+	for i := range 3 {
+		defer fmt.Println("i =", i)
+	}
+	defer func() { fmt.Println("B:", x) }()
+	x = 2
+}
+```
+
+(`for i := range 3` gives `i` = 0, 1, 2, [GO-1.05](/lab/youtube/go/go-1-05/en).)
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ go run ./homework/oson
+B: 2
+i = 2
+i = 1
+i = 0
+A: 1
+```
+
+The `defer` calls run in reverse order: the last one added is `B`. `B` is a closure, so it sees the last value of
+`x` (`2`). The argument (`i`) of the three `defer` calls in the loop was evaluated at each iteration: `2`, `1`,
+`0`. The argument of `A` was evaluated on its `defer` line (`x = 1`).
+
+</details>
+
+🟡 **Medium:** write a function `Saqla(nom, data)` ("save") that writes to a file: the error returned by
+`f.Close()` must not be lost.
+
+<details>
+<summary>Answer</summary>
+
+`homework/orta/saqla.go`:
+
+```go filename="homework/orta/saqla.go" showLineNumbers
+// O'rta: Close xatosini yo'qotmaydigan saqla.
+package orta
+
+import (
+	"errors"
+	"os"
+)
+
+// saqlaXato: defer f.Close() Close qaytargan xatoni tashlab yuboradi.
+func saqlaXato(nom string, data []byte) error {
+	f, err := os.Create(nom)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(data)
+	return err
+}
+
+// Saqla: nomlangan natija + defer closure, Close xatosi ham qaytadi.
+func Saqla(nom string, data []byte) (err error) {
+	f, err := os.Create(nom)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
+	_, err = f.Write(data)
+	return err
+}
+```
+
+The plain `defer f.Close()` in `saqlaXato` throws the `Close` error away. `Saqla` has the named result `err` and a
+closure in `defer`: `errors.Join(err, f.Close())` keeps both the write error and the `Close` error, and gives
+`nil` when both are `nil` (the question in "Before you start"). The test writes to `/dev/full`: this special
+Linux file answers every write with "disk full".
+
+```console
+$ go test -v ./homework/orta
+=== RUN   TestSaqla
+--- PASS: TestSaqla (0.00s)
+=== RUN   TestToliqDisk
+    saqla_test.go:31: Saqla: write /dev/full: no space left on device
+--- PASS: TestToliqDisk (0.00s)
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/015-defer-panic-recover/homework/orta	0.002s
+```
+
+</details>
+
+🟠 **Hard:** write `xavfsizGo(nom, f)` ("safe go"): it starts `f` in a new goroutine, and a panic there must not
+bring down the server.
+
+<details>
+<summary>Answer</summary>
+
+`homework/qiyin/main.go`:
+
+```go filename="homework/qiyin/main.go" showLineNumbers
+// Qiyin: fondagi goroutine'dagi panic butun serverni yiqitmasin.
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+)
+
+var logger = log.New(os.Stdout, "", 0)
+
+// xavfsizGo f'ni yangi goroutine'da ishga tushiradi va uning panic'ini o'sha goroutine ichida ushlaydi.
+func xavfsizGo(nom string, f func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Printf("%s: panic ushlandi: %v", nom, r)
+			}
+		}()
+		f()
+	}()
+}
+
+func main() {
+	xavfsizGo("fon", func() {
+		var hisob map[string]int
+		hisob["fon"]++
+	})
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("server tirik")
+}
+```
+
+The `recover` is **inside** the new goroutine, in its first `defer` (lines 16–20). `f` runs in that same goroutine
+(line 21), so its panic travels up to that `defer`.
+
+```console
+$ go run ./homework/qiyin
+fon: panic ushlandi: assignment to entry in nil map
+server tirik
+```
+
+</details>
+
+🔴 **Guru:** which of the four variants (`a`, `b`, `c`, `d`) in `homework/guru/main.go` catch the panic? Why?
+
+```go filename="homework/guru/main.go" showLineNumbers
+// Guru: to'rtta variantdan qaysi birida recover panic'ni ushlaydi?
+package main
+
+import "fmt"
+
+func qutqar() {
+	if r := recover(); r != nil {
+		fmt.Println("  ushlandi:", r)
+	}
+}
+
+func a() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("  ushlandi:", r)
+		}
+	}()
+	panic("a")
+}
+
+func b() {
+	defer qutqar()
+	panic("b")
+}
+
+func c() {
+	defer func() { qutqar() }()
+	panic("c")
+}
+
+func d() {
+	defer recover()
+	panic("d")
+}
+
+func sina(nom string, f func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("  ushlanmadi, tashqariga chiqdi:", r)
+		}
+	}()
+	fmt.Println(nom + ":")
+	f()
+}
+
+func main() {
+	sina("a", a)
+	sina("b", b)
+	sina("c", c)
+	sina("d", d)
+}
+```
+
+(`sina` = "test": it runs each variant with its own `recover`; a panic the variant did not catch comes out here.
+`ushlanmadi, tashqariga chiqdi` means "not caught, escaped", `ushlandi` means "caught".)
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ go run ./homework/guru
+a:
+  ushlandi: a
+b:
+  ushlandi: b
+c:
+  ushlanmadi, tashqariga chiqdi: c
+d:
+  ushlanmadi, tashqariga chiqdi: d
+```
+
+Only `a` and `b`. In `a`, the deferred anonymous function calls `recover` directly. In `b`, `qutqar` itself is
+deferred, and it calls `recover` directly. In `c`, `recover` is called from **another** function (`qutqar`) inside
+the deferred one → `nil`. In `d` (`defer recover()`), `recover` itself is deferred; no deferred function called
+it → `nil`. The spec: *"The return value of recover is nil when the goroutine is not panicking or recover was not
+called directly by a deferred function."*
+
+</details>
+
+## Sources
+
+- Go spec: [Defer statements](https://go.dev/ref/spec#Defer_statements),
+  [Handling panics](https://go.dev/ref/spec#Handling_panics), [Run-time panics](https://go.dev/ref/spec#Run_time_panics),
+  [Go statements](https://go.dev/ref/spec#Go_statements)
+- Andrew Gerrand, [Defer, Panic, and Recover](https://go.dev/blog/defer-panic-and-recover) (Go blog, 2010)
+- [Effective Go: Recover](https://go.dev/doc/effective_go#recover); [Go FAQ: Why does Go not have
+  exceptions?](https://go.dev/doc/faq#exceptions)
+- Release notes: [Go 1.14](https://go.dev/doc/go1.14) (defer *"almost zero overhead"*),
+  [Go 1.21](https://go.dev/doc/go1.21) (`PanicNilError`)
+- Package docs: [net/http.Handler](https://pkg.go.dev/net/http#Handler), [os.Exit](https://pkg.go.dev/os#Exit),
+  [log.Fatal](https://pkg.go.dev/log#Fatal), go vet [defers](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/defers)
+- Go source code (go1.26.8): [runtime/panic.go](https://github.com/golang/go/blob/go1.26.8/src/runtime/panic.go#L1199-L1241)
+  (`throw`, `fatal`), [runtime/stack.go](https://github.com/golang/go/blob/go1.26.8/src/runtime/stack.go#L1200-L1208)
+  (stack overflow), [runtime/proc.go](https://github.com/golang/go/blob/go1.26.8/src/runtime/proc.go#L6468)
+  (deadlock), [cmd/compile/internal/walk/stmt.go](https://github.com/golang/go/blob/go1.26.8/src/cmd/compile/internal/walk/stmt.go#L116-L120)
+  (defer in a loop)
+- [staticcheck SA9001](https://staticcheck.dev/docs/checks/#SA9001)
+- Other languages: [MDN: try...catch (finally)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/try...catch),
+  [Node.js: process.exit()](https://nodejs.org/api/process.html#processexitcode),
+  [Node.js: --unhandled-rejections](https://nodejs.org/api/cli.html#--unhandled-rejectionsmode),
+  [Python: contextlib.contextmanager](https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager),
+  [Python: threading.excepthook](https://docs.python.org/3/library/threading.html#threading.excepthook),
+  [Python: sys.exit](https://docs.python.org/3/library/sys.html#sys.exit),
+  [Python: os._exit](https://docs.python.org/3/library/os.html#os._exit),
+  [PHP: exit](https://www.php.net/manual/en/function.exit.php)
+- All Go results were produced with `go1.26.8 linux/amd64` (Intel i5-12450H) on 2026-11-26. For comparison:
+  Node.js v24.10.0, Python 3.13.15, PHP 8.4.26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/015-defer-panic-recover)
+
+---
+
+← Previous lesson: [GO-1.14](/lab/youtube/go/go-1-14/en) · Next lesson: [GO-1.16](/lab/youtube/go/go-1-16/en) → · [All lessons](/lab/youtube/go)
+
+</div>

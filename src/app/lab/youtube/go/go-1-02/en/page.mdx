@@ -1,0 +1,1040 @@
+---
+title: "Types and overflow: Go refuses, but x++ silently wraps around"
+date: "2026/11/26"
+description: "The same +1: Python is exact, JS rounds, Go gives a negative number. int8 … int64, two's complement, overflow and why constants are rejected."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-02/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-02"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-02"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-02) · [Русский](/lab/youtube/go/go-1-02/ru) · **English**  
+Lesson GO-1.02 · [Go: 0 → Guru](/lab/youtube/go#go-1-02) · ▶️ [Watch the video on YouTube](https://youtu.be/Z-XfLk7vJlM) · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/002-types-overflow)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+We add one to a large identifier, `9223372036854775807`, in three languages. Python gives the exact answer:
+`9223372036854775808`. JavaScript rounds the last digits and prints `9223372036854776000`. In Go this number sits in
+an `int64` variable, and `id++` gives a **negative number** with no error: `-9223372036854775808`. Where does this
+negative number come from, and when does Go refuse to compile it at all?
+
+**One idea:** in Go, the type you choose sets the limit of an integer (`int8` = −128 … 127). When a value in a
+variable crosses the limit, it silently wraps around by two's complement (Python has no limit, JS loses precision).
+A constant expression is evaluated exactly: if the final value does not fit the type, Go rejects it at compile time.
+
+By the end of the lesson you will be able to:
+
+- name the limits of `int8`, `int16`, `int32`, `int64` and `int` from the type name, and compare them with Python
+  `int` and JS `number`;
+- show in bits why `127 + 1` in `int8` is exactly `−128`;
+- say, without running the code, which line is a compile error and which one silently wraps;
+- find and fix the bug in an `int8` like counter, and send a large `int64` ID to the frontend intact with
+  `json:"id,string"`.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| `int8` … `int64`, `int` | integer types with a fixed size: the number in the name is the number of bits | sized integer types |
+| overflow | a value crosses the type's limit and comes back from the other end: in `int8`, 127 + 1 → −128 | overflow |
+| constant | an expression whose value is known at compile time (`128`, `math.MaxInt64 + 1`): evaluated exactly, checked when it is put into a type | constant |
+
+Two helper words also appear: **two's complement** (the way a negative number is written in bits) and
+**`math.MaxInt64`** (the largest number that fits in an `int64` variable). We explain both where they are needed.
+
+## Before you start
+
+- [GO-X.01 · A 20-line HTTP API: the first Go service and one binary](/lab/youtube/go#go-x-01): `go run`, reading a compiler
+  error in `file:line:column` order.
+- [GO-X.02 · Types exist at runtime too: "2" + 2 is 22 in JS, a compile error in Go](/lab/youtube/go#go-x-02): static types
+  are checked at compile time; `var x T`, `:=` picks `int` for an integer; the **zero value**; `for`.
+- [GO-X.03 · No try/catch: the error value and defer](/lab/youtube/go#go-x-03): the `error` value. You need it only in the
+  🟡 homework.
+- [GO-1.01 · Why does Go exist? What is inside go build](/lab/youtube/go/go-1-01/en): a byte = 8 bits, `go build` and the runtime.
+- You can copy the Go programs to [go.dev/play](https://go.dev/play) and run them there. For the `python3` and `node`
+  commands you need them on your computer. If you downloaded the course code, open a terminal in the lesson folder
+  (`lessons/002-types-overflow`): every command works from there.
+- The folders `sigmaydi/`, `const64/` and `constover/` do not compile on purpose. That is why `go vet ./...` reports
+  errors for them: run each folder on its own.
+
+First, one question from the lesson about types and the zero value. In JavaScript, `let layk; layk + 1` → `NaN`. In
+Go we give no value:
+
+```go
+var layk int
+fmt.Println(layk + 1)
+```
+
+What does it print? **A)** something like `NaN` · **B)** `1` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `1`.** Go has no `undefined`: a variable without a value gets the **zero value** of its type, and for `int`
+that is `0`. If you chose "something like `NaN`", you carried over the JS rule. If you chose "a compile error", you
+thought Go rejects a `var` without a value: it does not, the declaration is valid.
+
+```go filename="eslash/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var layk int
+	fmt.Println(layk + 1)
+}
+```
+
+```console
+$ node -p 'let layk; layk + 1'
+NaN
+$ go run eslash/main.go
+1
+```
+
+`layk` means "like". Today's like counter also starts from this zero.
+
+</details>
+
+## The same +1, three different answers
+
+The three commands from the start of the lesson. For Python and Node the code is inside the command; for Go it is in
+`hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"math"
+)
+
+func main() {
+	var id int64 = math.MaxInt64 // 9223372036854775807
+	id++
+	fmt.Println(id)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( "fmt" "math" )` | imports the `fmt` (output) and `math` packages |
+| 9 | `var id int64 = math.MaxInt64` | `id` is a variable of type `int64`. `math.MaxInt64` is a constant in the `math` package: the largest number that fits in `int64` |
+| 10 | `id++` | adds one to `id`, like `id++` in JS |
+| 11 | `fmt.Println(id)` | prints the result |
+
+```console
+$ python3 -c 'print(9223372036854775807 + 1)'
+9223372036854775808
+$ node -p '9223372036854775807 + 1'
+9223372036854776000
+$ go run hook/main.go
+-9223372036854775808
+```
+
+Three languages, three answers. Only Go's is negative, and Go gave no error and no warning.
+
+## Each language puts the integer limit in a different place
+
+Why are the answers different? Because each language stores "an integer" in its own way:
+
+| Language | Integer | Limit | `9223372036854775807 + 1` |
+|---|---|---|---|
+| Python | `int` | none: "Integers have unlimited precision" | `9223372036854775808`, exact |
+| JavaScript | `number` = float64 (a floating-point format) | precision is lost after 2⁵³; for exact integers, `BigInt` | `9223372036854776000`, rounded |
+| Go | `int8`, `int16`, `int32`, `int64`, `int` | the type you choose | in `int64`, `-9223372036854775808` |
+
+See the JavaScript limit yourself. These commands are not files in the course folder; the code is inside the
+command:
+
+```console
+$ node -p 'Number.MAX_SAFE_INTEGER'
+9007199254740991
+$ node -p '2**53 + 1'
+9007199254740992
+$ node -p '9223372036854775807n + 1n'
+9223372036854775808n
+```
+
+`Number.MAX_SAFE_INTEGER` = 2⁵³ − 1. After it, float64 cannot store every integer: instead of `2**53 + 1` we got
+the neighbour `2**53`. A `BigInt`, written with the `n` suffix, computes exactly, like Python.
+
+In Go, the type sets the limit. The types are in the next section.
+
+## The number in the type name is the number of bits: `int8` … `int64`
+
+In Go, the number in an integer type's name is the number of bits: `int8` is 8 bits, that is 1 byte; `int64` is 64
+bits, 8 bytes. `sizes/main.go` prints the sizes and limits:
+
+```go filename="sizes/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"math"
+	"unsafe"
+)
+
+func main() {
+	fmt.Println("int8 ", unsafe.Sizeof(int8(0)), "bayt:", math.MinInt8, "...", math.MaxInt8)
+	fmt.Println("int16", unsafe.Sizeof(int16(0)), "bayt:", math.MinInt16, "...", math.MaxInt16)
+	fmt.Println("int32", unsafe.Sizeof(int32(0)), "bayt:", math.MinInt32, "...", math.MaxInt32)
+	fmt.Println("int64", unsafe.Sizeof(int64(0)), "bayt:", math.MinInt64, "...", math.MaxInt64)
+	fmt.Println("uint8", unsafe.Sizeof(uint8(0)), "bayt:", 0, "...", math.MaxUint8)
+	fmt.Println("int  ", unsafe.Sizeof(int(0)), "bayt (bu kompyuterda)")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–7 | `import (…)` | imports the `fmt`, `math` and `unsafe` packages |
+| 10–15 | `unsafe.Sizeof(int8(0))` | `int8(0)` is a zero of type `int8`; `unsafe.Sizeof` says how many bytes a value of that type takes in memory. The `unsafe` package holds tools that bypass Go's type safety; here it is used only to measure |
+| 10–13 | `math.MinInt8`, `math.MaxInt8`, … | constants in the `math` package: the smallest and largest value of each type |
+| 14 | `uint8` | `u` means unsigned: no negative numbers, 0 … 255. We do not use it today; `byte` is exactly this type |
+| 15 | `int(0)` | the size of plain `int` |
+
+The output words are Uzbek: `bayt` means "byte", `bu kompyuterda` means "on this computer".
+
+```console
+$ go run sizes/main.go
+int8  1 bayt: -128 ... 127
+int16 2 bayt: -32768 ... 32767
+int32 4 bayt: -2147483648 ... 2147483647
+int64 8 bayt: -9223372036854775808 ... 9223372036854775807
+uint8 1 bayt: 0 ... 255
+int   8 bayt (bu kompyuterda)
+```
+
+The main rule: the `int8` type holds only **−128 to 127**, 256 numbers in total. Plain `int` on this computer has
+the same size as `int64`. By Go's official rules (the Go spec), `int` is 32 or 64 bits. (The video trims the
+`uint8` line; this is the full output.)
+
+`:=` always picks `int` for an integer (GO-X.02). So when you need `int8`, you write the type with `var`:
+`var x int8 = 127`.
+
+## `127 + 1` in `int8`
+
+The `int8` version of the first example, `aylanish/main.go`. We start from the largest value:
+
+```go filename="aylanish/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var x int8 = 127
+	x++
+	fmt.Println(x)
+}
+```
+
+On line 6, `x` is an `int8` variable with the value 127. Line 7 adds one to it, line 8 prints it.
+
+What does it print? **A)** `128` · **B)** `-128` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `-128`**, the smallest number of `int8`. 128 does not fit in `int8`, so the value comes back from the other end
+of the range. If you chose "`128`", you thought of an unlimited number, as in Python. If you chose "a compile error",
+you thought Go checks this in advance. `x` is a variable, and its value is computed while the program runs. We see
+when Go really refuses in the section "When Go refuses".
+
+</details>
+
+```console
+$ go run aylanish/main.go
+-128
+```
+
+In memory:
+
+| After line | `x` (`int8`) | On screen |
+|---|---|---|
+| 6 | 127 | |
+| 7 | −128 (127 + 1) | |
+| 8 | −128 | `-128` |
+
+This is not a strange choice by Go. JavaScript also has an 8-bit integer: `Int8Array`. There, too, 127 plus one gives
+−128:
+
+```console
+$ node -p 'const a = new Int8Array([127]); a[0]++; a[0]'
+-128
+```
+
+This is simply how eight bits work. Why exactly −128 is the next section.
+
+## Why exactly −128: bits and two's complement
+
+In eight bits, 127 is `0111 1111`: a zero and seven ones. Add one: the ones on the right become zeros, and a one
+carries to the left: `1000 0000`. The question: which number is this?
+
+Go stores negative numbers in **two's complement**: the leftmost bit has a negative weight, in `int8` it is **−128**.
+The other bits are positive, as usual:
+
+```text
+bit weight:   −128   64   32   16    8    4    2    1
+  127  =         0    1    1    1    1    1    1    1    = 64+32+16+8+4+2+1
+  + 1
+ −128  =         1    0    0    0    0    0    0    0    = −128
+   −1  =         1    1    1    1    1    1    1    1    = −128 + 127
+
+number circle:    … 126 → 127 → −128 → −127 …
+```
+
+Go's official rules require integers to be stored exactly like this: "represented using two's complement
+arithmetic". Almost all processors store negative numbers this way too. `binary/main.go` prints the bits:
+
+```go filename="binary/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var x int8 = 127
+	fmt.Printf("%4d = %08b\n", x, uint8(x))
+	x++
+	fmt.Printf("%4d = %08b\n", x, uint8(x))
+	x = -1
+	fmt.Printf("%4d = %08b\n", x, uint8(x))
+}
+```
+
+- **Line 7:** `Printf` prints by a template: `%4d` is a number in a field 4 characters wide; `%08b` is the binary
+  form, padded with zeros to 8 digits; `\n` is a new line. `uint8(x)` reads the same bits as an unsigned number:
+  `%b` would print a negative number with a minus sign, and we want the bits themselves. Conversion is covered in
+  "Going deeper".
+- **Lines 8–9:** add one and print again.
+- **Lines 10–11:** `x = -1` and its bits.
+
+```console
+$ go run binary/main.go
+ 127 = 01111111
+-128 = 10000000
+  -1 = 11111111
+```
+
+The same three rows as in the table, now from Go itself.
+
+## Overflow: not an error, but no check either
+
+Crossing the type's limit and wrapping around is called **overflow**. By Go's official rules it is not an error:
+
+> For signed integers, the operations `+`, `-`, `*`, `/`, and `<<` may legally overflow and the resulting value exists and is
+> deterministically defined by the signed integer representation, the operation, and its operands. Overflow does not
+> cause a run-time panic.
+
+In other words, for signed integers `+`, `-`, `*`, `/` and `<<` may legally overflow. The result is well defined,
+and the program does not stop (no panic).
+
+| Line | `x` (`int8`) | What happened |
+|---|---|---|
+| `var x int8 = 127` | 127 | |
+| `x++` | −128 | 127 + 1 → −128 |
+| next line | −128 | no error, the program goes on |
+
+But Go does not check overflow for you either. Where a value can reach the limit, you write the check yourself: you
+do that with `safeAdd` in the 🟡 homework.
+
+## When Go refuses: a constant
+
+Now we do not add; we write 128 directly. `sigmaydi/main.go`:
+
+```go filename="sigmaydi/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var x int8 = 128
+	fmt.Println(x)
+}
+```
+
+Remember from GO-X.02 when Go catches type errors. What does this program do?
+**A)** prints `-128` · **B)** prints `128` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**C: a compile error.** `128` is a **constant**: its value is known at compile time. When it is put into an `int8`
+variable, Go checks whether it fits and refuses. If you chose "`-128`", you carried the wrap from `x++` over to
+here. If you chose "`128`", you forgot the `int8` limit.
+
+</details>
+
+```console
+$ go run sigmaydi/main.go
+# command-line-arguments
+sigmaydi/main.go:6:15: cannot use 128 (untyped int constant) as int8 value in variable declaration (overflows)
+```
+
+Let us read the message. `# command-line-arguments` is the name of the package that `go run` built from the given
+file. Then `sigmaydi/main.go:6:15`: the file, line 6, column 15, which is where `128` stands. Then the reason:
+*cannot use 128 (untyped int constant) as int8 value in variable declaration (overflows)* — "128 (an untyped integer
+constant) cannot be used as an `int8` value in a variable declaration (it overflows)". The program did not even
+start.
+
+What the *untyped constant* in the message is, we open up in the next lesson, [GO-1.03](/lab/youtube/go/go-1-03/en). There we also see why the
+wait function `time.Sleep(2)` waits only 2 nanoseconds.
+
+## The rule: a constant expression is evaluated exactly
+
+The precise rule is this. **Constant expressions are evaluated exactly, with no limit.** The Go spec: "Constant
+expressions are always evaluated exactly; intermediate values and the constants themselves may require precision
+significantly larger than supported by any predeclared type". The error appears only when the result is put into a
+type like `int8` or `int64` and does not fit.
+
+That is why the first example, written with a constant, is rejected too. `const64/main.go`:
+
+```go filename="const64/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"math"
+)
+
+// Ataylab kompilyatsiya bo'lmaydi: konstanta int64 ga sig'maydi.
+func main() {
+	var id int64 = math.MaxInt64 + 1
+	fmt.Println(id)
+}
+```
+
+The comment on line 8: "Does not compile on purpose: the constant does not fit in int64".
+
+```console
+$ go run const64/main.go
+# command-line-arguments
+const64/main.go:10:17: cannot use math.MaxInt64 + 1 (untyped int constant 9223372036854775808) as int64 value in variable declaration (overflows)
+```
+
+Line 10, column 17: `math.MaxInt64 + 1`. Look at the message: Go computed the sum exactly, `9223372036854775808`,
+and nothing wrapped. Then it saw that this number does not fit in `int64` and refused. In `hook/main.go`, the same
+`+ 1` happened in a variable, at run time, and wrapped silently.
+
+TypeScript does not check such a line at all. `tsc 5.9.3` with `strict: true` compiled the file below with no errors
+(the file is not in the course folder; we checked it separately). The value is then rounded at run time, as in the
+Node example:
+
+```ts
+declare const console: { log(...a: unknown[]): void }
+const id: number = 9223372036854775807 + 1
+console.log(id)
+```
+
+Everything in one table:
+
+| Code | What it is | Result |
+|---|---|---|
+| `var x int8 = 128` | a constant, does not fit in `int8` | compile error 🛑 |
+| `var id int64 = math.MaxInt64 + 1` | a constant expression, does not fit in `int64` | compile error 🛑 |
+| `x++` (`x` = 127, `int8`) | a variable, at run time | −128, silently 🔄 |
+| TS: `const id: number = 2⁶³ − 1 + 1` | `tsc --strict` | no error, rounded |
+
+## Check: `100 + 50 - 60`
+
+Let us test the rule. `var a int8 = 100 + 50 - 60`. In between we get 150, which does not fit in `int8`.
+
+```go
+var a int8 = 100 + 50 - 60
+fmt.Println(a)
+```
+
+What is the result? **A)** `90` · **B)** a compile error · **C)** a negative number
+
+<details>
+<summary>Answer</summary>
+
+**A: `90`.** The program compiles. A constant expression is evaluated exactly, and the intermediate 150 is stored
+nowhere. Only the final 90 is put into the `int8` variable, and it fits. If you chose "a compile error", you thought
+Go checks every step: it checks only the final value. If you chose "a negative number", you thought 150 wraps in
+`int8`: there is no variable here, so nothing can wrap.
+
+</details>
+
+```go filename="ifoda/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	// Konstanta ifoda aniq hisoblanadi: oraliqdagi 150 hech qayerga saqlanmaydi,
+	// int8 ga faqat yakuniy 90 qo'yiladi.
+	var a int8 = 100 + 50 - 60
+	fmt.Println(a)
+}
+```
+
+The comment on lines 6–7: "A constant expression is evaluated exactly: the intermediate 150 is stored nowhere, only
+the final 90 is put into int8".
+
+```console
+$ go run ifoda/main.go
+90
+```
+
+## A real bug: the `int8` like counter
+
+To save space in the like counter of a post, we pick `int8`. The loop starts it at zero and increases it 200 times.
+`layk/main.go`:
+
+```go filename="layk/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var layk int8
+	for i := 1; i <= 200; i++ {
+		layk++
+	}
+	fmt.Println(layk)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `var layk int8` | `layk` ("like") is an `int8` counter, zero value 0 |
+| 7 | `for i := 1; i <= 200; i++ {` | the same as `for (let i = 1; i <= 200; i++)` in JS, only without parentheses: 200 times |
+| 8 | `layk++` | one like each time |
+| 10 | `fmt.Println(layk)` | the result after the loop |
+
+The post got 200 likes. What does it print?
+**A)** stops at `127` · **B)** stops at `-128` · **C)** `-56`
+
+<details>
+<summary>Answer</summary>
+
+**C: `-56`.** After the 127th like, `layk` = 127. At the 128th it turned into −128. The remaining 72 likes brought it
+to −56: −128 + 72 = −56. If you chose "stops at `127`", you thought Go holds the number at the limit (saturation):
+it does not. If you chose "stops at `-128`", you thought adding stops after the wrap: after −128 come −127, −126 and
+so on.
+
+</details>
+
+```console
+$ go run layk/main.go
+-56
+```
+
+| `i` | `layk` after the step |
+|---|---|
+| 1 | 1 |
+| 127 | 127 |
+| 128 | −128 |
+| 129 | −127 |
+| 200 | −56 |
+
+No error and no log. That is why such a bug is hard to notice without tests.
+
+**Fix:** `int` instead of `int8`. In `layk-int/main.go` only line 6 changed:
+
+```go filename="layk-int/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var layk int
+	for i := 1; i <= 200; i++ {
+		layk++
+	}
+	fmt.Println(layk)
+}
+```
+
+```console
+$ go run layk-int/main.go
+200
+```
+
+The Go Tour rule says the same: "you should use `int` unless you have a specific reason to use a sized or unsigned
+integer type". Picking a small type to save a few bytes is usually not worth it.
+
+## A large ID to the frontend: `json:"id,string"`
+
+There is a second limit for the frontend. If the backend sends an `int64` ID in JSON as a number, JavaScript reads it
+into a float64 and rounds it: a different ID comes out. `hook/id.js` shows this:
+
+```js filename="hook/id.js"
+// Backend JSON'da 64 bitlik ID yubordi, frontend uni JSON.parse bilan son qilib o'qidi.
+const body = '{"id":1234567890123456789}'
+console.log(body)
+console.log(JSON.parse(body).id)
+```
+
+The comment on line 1: "The backend sent a 64-bit ID in JSON, the frontend read it as a number with JSON.parse".
+
+```console
+$ node hook/id.js
+{"id":1234567890123456789}
+1234567890123456800
+```
+
+The last digits are not `789` but `800`. That ID may belong to a different post in the database, or to none at all.
+That is why the X API (formerly Twitter) returns IDs as strings. Its documentation says: "In JavaScript, integers are
+limited to 53 bits. This causes precision loss with large IDs" and "Always use string IDs in your code". Twitter
+added the `id_str` field in 2010 for this reason.
+
+In Go this is one tag on a struct field. `jsonid/main.go`:
+
+```go filename="jsonid/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// ",string" teg int64 ni JSON'da string qilib yozadi: JS uni yaxlitlamaydi.
+type Post struct {
+	ID int64 `json:"id,string"`
+}
+
+func main() {
+	b, _ := json.Marshal(Post{ID: 1234567890123456789})
+	fmt.Println(string(b))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 4 | `"encoding/json"` | the JSON package that ships with Go |
+| 8 | comment | "the ",string" tag writes an int64 into JSON as a string: JS will not round it" |
+| 9–11 | `type Post struct { … }` | `Post` is a set of fields (a struct), similar to `type Post = { id: … }` in TS. We cover structs in detail in [GO-1.10](/lab/youtube/go/go-1-10/en) |
+| 10 | `` ID int64 `json:"id,string"` `` | the `ID` field, of type `int64`. The text in backquotes is a **tag**: `encoding/json` reads it. `id` is the key name in JSON, `,string` means "write this number into JSON as a string" |
+| 14 | `b, _ := json.Marshal(…)` | turns the struct into JSON bytes. `json.Marshal` returns the bytes and an `error`; `_` throws the error away (in real code, check it, GO-X.03) |
+| 15 | `fmt.Println(string(b))` | prints the bytes as text |
+
+```console
+$ go run jsonid/main.go
+{"id":"1234567890123456789"}
+```
+
+Now the ID is in quotes: `JSON.parse` reads it as a string, and no digit changes. The frontend keeps it as a string
+and calls `BigInt(post.id)` when it needs arithmetic.
+
+## In real life: the Boeing 787
+
+This is not only a textbook example. In 2015 the US Federal Aviation Administration (FAA) issued a mandatory
+directive for the Boeing 787 (AD 2015-09-07). If the four generator control units (GCUs) were powered up at the same
+time and ran for **248 days** without a break, a software counter in them would overflow. The airplane could then
+lose all generator power and, in the directive's words, "loss of control of the airplane".
+
+Until the software was fixed, operators were ordered to power the airplane off and on regularly: "at intervals not to
+exceed 120 days", that is, at most every **120 days**. Later, AD 2018-20-15 required new GCU software. The FAA did
+not name the counter's type or how fast it grows.
+
+| Number | What it is |
+|---|---|
+| 248 days | after this much continuous power, the counter overflows |
+| 120 days | the power-off-and-on interval must not exceed this |
+
+## Going deeper (optional): the conversion `int8(big)`
+
+One more silent place: **conversion**, that is, turning a value of one integer type into another. `convert/main.go`:
+
+```go filename="convert/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	big := 300
+	small := int8(big)
+	fmt.Println(small)
+
+	other := 200
+	fmt.Println(int8(other))
+}
+```
+
+- **Line 6:** `big` is an `int` because of `:=`, with the value 300.
+- **Line 7:** `int8(big)` converts `big` to `int8`. 300 does not fit in `int8`.
+- **Lines 10–11:** the same with 200.
+
+```console
+$ go run convert/main.go
+44
+-56
+```
+
+Go takes the low 8 bits, throws the rest away and gives a result with no error:
+
+| Number | Bits | Low 8 bits | As `int8` |
+|---|---|---|---|
+| 300 | `1 0010 1100` | `0010 1100` | 32 + 8 + 4 = **44** |
+| 200 | `1100 1000` | `1100 1000` | −128 + 64 + 8 = **−56** |
+
+The Go spec (Conversions): the number is "truncated to fit in the result type's size", and "there is no indication of
+overflow". `Int8Array` in JavaScript also turns 300 into 44:
+
+```console
+$ node -p 'new Int8Array([300])[0]'
+44
+```
+
+Code that reads an `int64` from a database and converts it to `int32` can have the same bug. (When a floating-point
+number is converted to an integer and does not fit, the result depends on the Go implementation.)
+
+## Common mistakes
+
+**1. Thinking "Go reports an error on overflow".** This is the most classic misconception of this topic. Overflow in
+a variable gives no error, no panic and no log: the `int8` like counter printed `-56` instead of 200 likes. The full
+example is in the section "A real bug: the `int8` like counter". **Fix:** use `int` unless you have a specific reason.
+In calculations that can reach the limit (money, counters), write the check yourself, like `safeAdd` in the 🟡
+homework.
+
+**2. Putting a constant into a small type.** `var x int8 = 128` and `var id int64 = math.MaxInt64 + 1` do not
+compile: see the sections "When Go refuses" and "The rule". The same mistake happens with a typed constant, but the
+message is different. This is `constover/main.go` (from the first version of the lesson, in the course folder):
+
+```go filename="constover/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(int8(127) + 1)
+}
+```
+
+```console
+$ go run constover/main.go
+# command-line-arguments
+constover/main.go:6:14: int8(127) + 1 (constant 128 of type int8) overflows int8
+```
+
+Line 6, column 14: `int8(127) + 1`. *(constant 128 of type int8) overflows int8* means "the constant 128 of type
+`int8` goes beyond `int8`". `int8(127)` is a typed constant, so Go checks the sum as an `int8` too. Why the check is
+stricter in this case is in [GO-1.03](/lab/youtube/go/go-1-03/en). **Fix:** put the value into a type it fits in (`int`), or
+keep the constant within the `int8` limits.
+
+**3. Sending a large `int64` ID in JSON as a number.** There is no error message: the frontend gets
+`1234567890123456800` instead of `1234567890123456789`. The example is in the section "A large ID to the frontend".
+**Fix:** add the tag `json:"…,string"` to the field, and keep the ID on the frontend as a string or a `BigInt`.
+
+**4. Converting a number that does not fit.** `int8(300)` gives `44` with no error. The example is in "Going deeper".
+**Fix:** check the limits before converting: `if big < math.MinInt8 || big > math.MaxInt8 { … }`.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** What is printed after `x = 127; x++` for an `int8` variable?
+
+<details>
+<summary>Answer</summary>
+
+`-128`. This is overflow: the value crossed the limit and came back from the other end, silently. In bits:
+`0111 1111` + 1 = `1000 0000`, and the leftmost bit weighs −128.
+
+</details>
+
+**2.** Why is `var x int8 = 128` rejected, but `var a int8 = 100 + 50 - 60` is not?
+
+<details>
+<summary>Answer</summary>
+
+A constant expression is evaluated exactly, and Go checks only whether the final value fits the type: 128 does not
+fit ❌, 90 fits ✅. The intermediate 150 is stored nowhere.
+
+</details>
+
+**3.** How do you send a large `int64` ID to the frontend?
+
+<details>
+<summary>Answer</summary>
+
+As a string, with the tag `json:"id,string"`. The reason: in JavaScript a number is a float64, and integers larger
+than 2⁵³ are rounded. The frontend keeps the ID as a string or a `BigInt`.
+
+</details>
+
+**4.** What does `sinov/main.go` print? **A)** `150` · **B)** a compile error · **C)** `-106`
+
+```go filename="sinov/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var a int8 = 100
+	a = a + 50
+	fmt.Println(a)
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+**C: `-106`.** This time `a + 50` contains a variable, so the calculation happens at run time and wraps silently:
+150 − 256 = −106. That is the difference from `100 + 50 - 60`: there, everything was a constant.
+
+```console
+$ go run sinov/main.go
+-106
+```
+
+</details>
+
+**5.** From [GO-1.01](/lab/youtube/go/go-1-01/en): why is the binary of a seven-line Go program about 2 MB?
+
+<details>
+<summary>Answer</summary>
+
+The Go linker builds a static binary by default: every binary contains the Go runtime (the garbage collector, the
+scheduler and more). The program's own code is very small; most of the bytes are the runtime.
+
+</details>
+
+## Homework
+
+Starter files and answers are in the lesson folder on GitHub:
+[lessons/002-types-overflow](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/002-types-overflow)
+(the `uyga/` folder). The commands run from the lesson folder.
+
+🟢 **Easy** (`uyga/oson/main.go`, a follow-up to `jsonid` from the video): the post also has the author's ID,
+`AuthorID int64`. Send it so that the frontend does not break it.
+
+```go filename="uyga/oson/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// Vazifa: AuthorID ham frontend'da (JavaScript) buzilmasin.
+// Tekshirish: go run ./uyga/oson | node uyga/check.js
+type Post struct {
+	ID       int64 `json:"id,string"`
+	AuthorID int64 `json:"author_id"`
+}
+
+func main() {
+	b, _ := json.Marshal(Post{ID: 1234567890123456789, AuthorID: 9007199254740993})
+	fmt.Println(string(b))
+}
+```
+
+The comments on lines 8–9: "Task: AuthorID must not break on the frontend (JavaScript) either. Check: …".
+
+The check: the Go program's output goes through `|` (a pipe) into `uyga/check.js`. Like a frontend, it calls
+`JSON.parse` and prints the type and value of each field. Right now:
+
+```console
+$ go run ./uyga/oson | node uyga/check.js
+id string 1234567890123456789
+author_id number 9007199254740992
+```
+
+`author_id` must arrive as exactly `9007199254740993`, but right now it arrives as `9007199254740992` (2⁵³ + 1 was
+rounded).
+
+➕ **Extra** (`uyga/int16/main.go`): at which step does `int16` (−32768 … 32767) become negative? Inside the loop,
+print `i` and `son` with `if son < 0` and leave with `break`. (`son` means "number", the counter.)
+
+🟡 **Medium** (`uyga/orta/main.go`): write `safeAdd(a, b int64) (int64, error)`: if the sum does not fit in `int64`,
+return `ErrOverflow` instead of the result. The four calls in `main` must print what the `kutilgan:` ("expected:")
+comments say.
+
+```go filename="uyga/orta/main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+)
+
+var ErrOverflow = errors.New("int64 overflow")
+
+// Vazifa: a+b int64 ga sig'masa, natija o'rniga ErrOverflow qaytaring.
+// Ishora: overflow faqat ishorasi bir xil ikki son qo'shilganda bo'ladi
+// (musbat + musbat yoki manfiy + manfiy), va yig'indining ishorasi o'zgaradi.
+func safeAdd(a, b int64) (int64, error) {
+	return a + b, nil // hozir jim aylanadi
+}
+
+func main() {
+	fmt.Println(safeAdd(2, 3))                         // kutilgan: 5 <nil>
+	fmt.Println(safeAdd(math.MaxInt64, 1))             // kutilgan: 0 int64 overflow
+	fmt.Println(safeAdd(math.MinInt64, -1))            // kutilgan: 0 int64 overflow
+	fmt.Println(safeAdd(math.MaxInt64, math.MinInt64)) // kutilgan: -1 <nil>
+}
+```
+
+The comments on lines 11–13: "Task: if a+b does not fit in int64, return ErrOverflow instead of the result. Hint:
+overflow happens only when two numbers of the same sign are added (positive + positive or negative + negative), and
+the sign of the sum changes". On line 15: "right now it wraps silently".
+
+Right now it wraps silently:
+
+```console
+$ go run ./uyga/orta
+5 <nil>
+-9223372036854775808 <nil>
+9223372036854775807 <nil>
+-1 <nil>
+```
+
+The harder tasks are left over from the first version of the lesson
+([homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/002-types-overflow/homework)):
+
+- 🟢 **Easy:** overflow an `int16` and explain the result.
+- 🟡 **Medium:** if Unix time is stored in an `int32`, on which date does it overflow?
+- 🟠 **Hard:** a function that detects overflow when two `int64` values are added.
+- 🔴 **Guru:** what does `abs(int8(-128))` print, and why?
+
+Answers: the [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/002-types-overflow/uyga/javob)
+folder and [homework/README.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/002-types-overflow/homework/README.md).
+Try it yourself first.
+
+<details>
+<summary>Answer</summary>
+
+🟢 Add `,string` to `AuthorID` too:
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// Javob: AuthorID ga ham ",string" qo'shamiz.
+type Post struct {
+	ID       int64 `json:"id,string"`
+	AuthorID int64 `json:"author_id,string"`
+}
+
+func main() {
+	b, _ := json.Marshal(Post{ID: 1234567890123456789, AuthorID: 9007199254740993})
+	fmt.Println(string(b))
+}
+```
+
+```console
+$ go run ./uyga/javob/oson
+{"id":"1234567890123456789","author_id":"9007199254740993"}
+$ go run ./uyga/javob/oson | node uyga/check.js
+id string 1234567890123456789
+author_id string 9007199254740993
+```
+
+➕ At step 32768, `int16` wraps from 32767 to −32768:
+
+```console
+$ go run ./uyga/javob/int16
+32768 -32768
+```
+
+🟡 Overflow happens only when two numbers of the same sign are added: positive + positive gave a negative, or
+negative + negative gave a positive (or 0). In Go, `a + b` does not panic, so it is safe to add first and check the
+sign afterwards:
+
+```go filename="uyga/javob/orta/main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+)
+
+var ErrOverflow = errors.New("int64 overflow")
+
+// safeAdd a+b ni qaytaradi; int64 ga sig'masa ErrOverflow.
+// Go'da a+b panic bermaydi, jim aylanadi. Shuning uchun natijani hisoblab,
+// keyin ishorasini tekshiramiz: musbat+musbat manfiy chiqsa yoki
+// manfiy+manfiy musbat (yoki 0) chiqsa, overflow bo'lgan.
+func safeAdd(a, b int64) (int64, error) {
+	sum := a + b
+	if (a > 0 && b > 0 && sum < 0) || (a < 0 && b < 0 && sum >= 0) {
+		return 0, ErrOverflow
+	}
+	return sum, nil
+}
+
+func main() {
+	fmt.Println(safeAdd(2, 3))                         // 5 <nil>
+	fmt.Println(safeAdd(math.MaxInt64, 1))             // 0 int64 overflow
+	fmt.Println(safeAdd(math.MinInt64, -1))            // 0 int64 overflow
+	fmt.Println(safeAdd(math.MaxInt64, math.MinInt64)) // -1 <nil>
+}
+```
+
+```console
+$ go run ./uyga/javob/orta
+5 <nil>
+0 int64 overflow
+0 int64 overflow
+-1 <nil>
+```
+
+On line 17, `&&` means "and" and `||` means "or", as in JS. `MaxInt64 + MinInt64` adds two numbers of different
+signs, so there is no overflow: `-1`.
+
+The harder tasks (details in `homework/README.md`):
+
+- 🟢 In `int16`, `32767 + 1` → `-32768`: `0111 1111 1111 1111` + 1 = `1000 0000 0000 0000`, the same rule as in
+  `int8`, only on 16 bits.
+- 🟡 The largest `int32` value is 2 147 483 647 seconds, which is **19 January 2038, 03:14:07 UTC**. One second later
+  the number becomes negative and turns into 13 December 1901 (the "year 2038 problem"). The range of MySQL's
+  `TIMESTAMP` type ends at exactly the same point.
+- 🟠 The idea is the same as in 🟡: if numbers of the same sign are added and the sign of the result changes, it is
+  overflow.
+- 🔴 `abs8(math.MinInt8)` → `-128`: +128 does not fit in `int8`, so `-(-128)` turns into −128 again. The fix: return
+  the result in a larger type (`int16`), or check `math.MinInt8` separately.
+
+</details>
+
+## Sources
+
+- Go's official rules (the Go spec): [Numeric types](https://go.dev/ref/spec#Numeric_types) (sizes, two's
+  complement, `int` is 32 or 64 bits), [Integer overflow](https://go.dev/ref/spec#Integer_overflow),
+  [Constants](https://go.dev/ref/spec#Constants), [Constant expressions](https://go.dev/ref/spec#Constant_expressions),
+  [The zero value](https://go.dev/ref/spec#The_zero_value), [Conversions](https://go.dev/ref/spec#Conversions)
+- A Tour of Go, Basic types ("use int unless…"): https://go.dev/tour/basics/11
+- [`encoding/json`](https://pkg.go.dev/encoding/json#Marshal) (the `,string` option)
+- Python, Numeric types ("Integers have unlimited precision"):
+  https://docs.python.org/3/library/stdtypes.html#numeric-types-int-float-complex
+- MDN, [`Number.MAX_SAFE_INTEGER`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER)
+- ECMAScript, [ToInt8](https://tc39.es/ecma262/#sec-toint8) (`Int8Array` wraps modulo 2⁸)
+- X API, [X IDs](https://docs.x.com/fundamentals/x-ids) · Twitter API announcement, 2010-10-19:
+  [Snowflake and `id_str`](https://groups.google.com/g/twitter-api-announce/c/ahbvo3VTIYI)
+- FAA AD 2015-09-07, Boeing 787: https://www.govinfo.gov/content/pkg/FR-2015-05-01/html/2015-10066.htm ·
+  AD 2018-20-15: https://www.govinfo.gov/content/pkg/FR-2018-10-16/html/2018-22152.htm
+- CMU 15-213, [Bits, Bytes & Integers](https://www.cs.cmu.edu/~213/lectures/02-bits-bytes-ints.pdf)
+- Go FAQ, [Why is my trivial program such a large binary?](https://go.dev/doc/faq#Why_is_my_trivial_program_such_a_large_binary)
+- All results were produced on 2026-11-26 with `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15 and tsc 5.9.3.
+
+## Video and code
+
+<iframe src="https://www.youtube-nocookie.com/embed/Z-XfLk7vJlM" title="Types and overflow: Go refuses, but x++ silently wraps around" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen style={{width: "100%", aspectRatio: "16 / 9", border: 0, borderRadius: 8}} />
+
+▶️ [Watch the video on YouTube](https://youtu.be/Z-XfLk7vJlM)
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/002-types-overflow)
+
+---
+
+← Previous lesson: [GO-1.01](/lab/youtube/go/go-1-01/en) · Next lesson: [GO-1.03](/lab/youtube/go/go-1-03/en) → · [All lessons](/lab/youtube/go)
+
+</div>
