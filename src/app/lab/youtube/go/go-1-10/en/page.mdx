@@ -1,0 +1,1462 @@
+---
+title: "Structs and memory: the same fields, 24 and 16 bytes"
+date: "2026/11/26"
+description: "Structs and composite literals, embedding, then padding and alignment: how field order changes a struct's size, and when it matters."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-10/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-10"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-10/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-10/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-10"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-10) · [Русский](/lab/youtube/go/go-1-10/ru) · **English**  
+Lesson GO-1.10 · [Go: 0 → Guru](/lab/youtube/go#go-1-10) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/010-structs-memory)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+There are two order records. Both hold the same three values: is it paid (yes/no), the amount, and is it delivered
+(yes/no). Only the order differs. The first takes **24 bytes** of memory, the second **16 bytes**. The data itself
+is only 10 bytes. Where did the extra bytes come from? A few bytes like these once crashed one of GitLab's services.
+Today we look inside the record and count every byte.
+
+**One idea:** struct fields sit in memory one after another, but each field must start at an address that suits
+its type. So empty bytes (padding) can appear between fields: the order of fields changes the size of the struct.
+If you put the fields with the largest alignment first, the struct usually gets smaller, but do it based on
+measurements.
+
+By the end of the lesson you will:
+
+- declare your own struct type, create a value with a composite literal, and be able to read embedding;
+- draw every byte of a struct on paper with `unsafe.Sizeof`, `unsafe.Alignof` and `unsafe.Offsetof` and check the
+  result;
+- shrink a struct by reordering its fields, and know when that helps and when it does not;
+- explain why an `int64` counter causes a panic on a 32-bit system and how `atomic.Int64` fixes it.
+
+Today's three core new words:
+
+| Word | Plain meaning | Go term |
+|---|---|---|
+| struct (field) | a type with fields declared in advance: close to an object type in TS or a `dataclass` in Python | struct (field) |
+| padding (empty bytes) | bytes between fields or at the end that store nothing | padding |
+| alignment | which number a value's address must be a multiple of: an 8-byte number goes at an address that is a multiple of 8 | alignment |
+
+Two helper words also appear: **composite literal** (a struct value written directly in code in curly braces) and
+**embedding** (putting one struct inside another without a field name). We explain both where they are needed.
+
+## Before you start
+
+- [GO-1.02 · Types and overflow](/lab/youtube/go/go-1-02/en): the memory **cell** (the place where a value lives), the fact that
+  a number type also sets the cell size, `var`, and the zero value (the starting value of a variable that was not
+  given one: `0` for numbers, `false` for `bool`, `""` for a string).
+- [GO-1.01 · Why does Go exist? What is inside go build](/lab/youtube/go/go-1-01/en): the **byte** (8 bits) and the **runtime**
+  (helper code that Go adds to every program).
+- [GO-0.04 · if: the program makes a decision](/lab/youtube/go/go-0-04/en): the `bool` type and its two values `true`, `false`.
+- [GO-1.05 · Go has no while: one for and all its forms](/lab/youtube/go/go-1-05/en): `for`, `range`, `range 3` and the
+  **address**: `&x` is the address of `x` in memory.
+- [GO-1.06 · Functions: two return values, closure and variadic](/lab/youtube/go/go-1-06/en): your own functions, the anonymous
+  function `func() { … }` and the variadic function, which takes any number of arguments through `...`.
+- [GO-1.07 · Don't guess, measure: your first test and benchmark](/lab/youtube/go/go-1-07/en): the benchmark (a speed
+  measurement) and `for b.Loop()`. In that lesson we saw `[]struct{ … }` and promised to cover structs in lesson ten.
+  Today we keep that promise.
+- [GO-1.08 · Slices: the append trap and the outdated 1024 rule](/lab/youtube/go/go-1-08/en): the slice, the array (a row of
+  cells), `make` and measuring with `unsafe.Sizeof`.
+- [GO-1.09 · Maps: why the order is random and why recover does not save you](/lab/youtube/go/go-1-09/en): the previous lesson;
+  there we met the words **panic** (an emergency crash of the program) and **goroutine** (a piece of work that runs
+  at the same time as others).
+- You can copy most programs into [go.dev/play](https://go.dev/play) and run them with the **Run** button. Running
+  with `GOARCH=386`, the `fieldalignment` analyzer and the timing measurements need Go on your own computer.
+- If you downloaded the course code, open a terminal in the lesson folder (`lessons/010-structs-memory`). The
+  commands below run from there: `go run ./olcham` runs the program in the `olcham` folder.
+
+First, a recall question from the previous lesson. Let `narx := map[string]int{"non": 4000}`. What does
+`narx["olma"]` return? **A)** an error · **B)** a panic · **C)** `0`
+
+<details>
+<summary>Answer</summary>
+
+**C: `0`.** Reading a missing key from a map is not an error: you get the zero value of the value type, `0` for
+`int`. The zero value matters today too: fields you leave out of a struct also get the zero value.
+
+</details>
+
+## Struct: several fields, one type
+
+A shop needs to remember a customer: name, money on the account and delivery address. Three separate variables are
+awkward: they must always travel together. In JS/TS you would write an object (`{ name, balance }`) and its type; in
+Python, a `class` or a `dataclass`.
+
+Go has no `class`. Instead there is the **struct**: a type whose fields are declared in advance. Each named value is
+a **field**. The difference from a JS object: you cannot add a new field to a struct while the program runs; the
+fields and their types are fixed at compile time. We already saw a struct in [GO-1.07](/lab/youtube/go/go-1-07/en), in the
+table-driven test, as `[]struct{ … }`. Today we give it a name of its own.
+
+This is `literal/main.go` from the course folder:
+
+```go filename="literal/main.go" showLineNumbers
+// literal: struct e'lon qilish, composite literal, zero value va embedding.
+package main
+
+import "fmt"
+
+type Manzil struct {
+	Shahar string
+	Kocha  string
+}
+
+type Mijoz struct {
+	Ism    string
+	Balans int64 // tiyinda
+	Manzil       // embedding: tur nomi (Manzil) maydon nomi ham boʻladi
+}
+
+func main() {
+	// kalitli literal: maydon nomi bilan, tartib muhim emas; Manzil yozilmadi -> zero value
+	a := Mijoz{Ism: "Aziza", Balans: 50_000}
+	fmt.Printf("%+v\n", a)
+
+	// var: hamma maydon zero value oladi
+	var b Mijoz
+	fmt.Printf("%+v\n", b)
+
+	// embedding: Manzil'ning maydonlari Mijoz'ga "koʻtariladi"
+	a.Shahar = "Samarqand"
+	fmt.Println(a.Shahar, a.Manzil.Shahar)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `// literal: …` | a comment: what the program is about |
+| 6 | `type Manzil struct {` | `type` declares a new type. Its name is `Manzil` ("address": a postal address), and it is a struct |
+| 7–8 | `Shahar string`, `Kocha  string` | two fields: first the field name, then its type. `Shahar` ("city") and `Kocha` ("street") are strings |
+| 11 | `type Mijoz struct {` | another new type: `Mijoz` ("customer") |
+| 12 | `Ism    string` | the field `Ism` ("name"), a string |
+| 13 | `Balans int64 // tiyinda` | `Balans` ("balance"): `int64` is an 8-byte whole number. Money is stored in tiyin (1 so'm = 100 tiyin) |
+| 14 | `Manzil` | no field name, only a type name: this is **embedding**. We cover it separately below |
+| 19 | `a := Mijoz{Ism: "Aziza", Balans: 50_000}` | creates a `Mijoz` value. `50_000` is 50 000; the underscore is only for readability |
+| 20 | `fmt.Printf("%+v\n", a)` | `%v` prints the value in Go's default format, `+` adds the field names. `\n` is a new line |
+| 23 | `var b Mijoz` | a variable `b` of type `Mijoz`, not given a value |
+| 24 | `fmt.Printf("%+v\n", b)` | prints `b` with field names |
+| 27 | `a.Shahar = "Samarqand"` | writes a new value into the `Shahar` field of `a`. The dot `.` accesses a field |
+| 28 | `fmt.Println(a.Shahar, a.Manzil.Shahar)` | two ways to reach the same field: explained in the embedding section |
+
+Note: in this lesson the word "address" has two meanings. The type `Manzil` is the customer's postal address (city,
+street). The "memory address" below is where a value lives in memory (`&x` from [GO-1.05](/lab/youtube/go/go-1-05/en)).
+
+The expression `Mijoz{ … }` on line 19 is a **composite literal**: a struct value written directly in code, inside
+curly braces. It looks like an object literal in JS, but the type name comes first. Inside are `field: value` pairs.
+A literal that names its fields this way (the field names act as keys) is called a keyed literal, and the order of
+the fields does not matter: `Mijoz{Balans: 50_000, Ism: "Aziza"}` is exactly the same value. Here `Manzil` is not
+written at all. By Go's official rules, a field you leave out gets the zero value.
+
+Before running it, think: what does the second line (`var b Mijoz`) print?
+**A)** `{Ism: Balans:0 Manzil:{Shahar: Kocha:}}` · **B)** `<nil>` · **C)** a compile error: `b` was not given a
+value
+
+<details>
+<summary>Answer</summary>
+
+**A.** In a struct declared with `var`, **every** field gets the zero value: the strings are empty (nothing after
+`Ism:`), the number is `0`. The fields of the inner `Manzil` struct are empty strings too. There is no equivalent of
+JS's `undefined`. If you chose "B": a struct value is never `null`; it always exists with its fields. Not "C": as we
+saw in [GO-1.02](/lab/youtube/go/go-1-02/en), Go fills a variable without a value with the zero value and reports no error.
+
+</details>
+
+```console
+$ go run ./literal
+{Ism:Aziza Balans:50000 Manzil:{Shahar: Kocha:}}
+{Ism: Balans:0 Manzil:{Shahar: Kocha:}}
+Samarqand Samarqand
+```
+
+The first line has Aziza's name and balance; the address is empty. In the second line every field has its zero
+value. In memory the two values look like this:
+
+| Field | `a` (from the literal) | `b` (from `var`) |
+|---|---|---|
+| `Ism` | `"Aziza"` | `""` |
+| `Balans` | `50000` | `0` |
+| `Manzil.Shahar` | `""` | `""` |
+| `Manzil.Kocha` | `""` | `""` |
+
+## Embedding: inner struct fields are promoted to the outer struct
+
+On line 14 of `Mijoz` there is no field name, only the type `Manzil`. Such a field is called an **embedded field**,
+and the technique is **embedding**. The field still has a name: the type name itself becomes the field name. That is
+why `a.Manzil.Shahar` on line 28 works.
+
+You can predict the third line in advance. On line 27 we wrote to `a.Shahar`, yet `Mijoz` has no field called
+`Shahar`. What does line 28 print? **A)** `Samarqand` and a blank · **B)** `Samarqand Samarqand` · **C)** a compile
+error: `Mijoz` has no `Shahar`
+
+<details>
+<summary>Answer</summary>
+
+**B: `Samarqand Samarqand`** (output above, third line). The fields of the inner struct are "raised" into the outer
+struct (Go's official rules call them *promoted*): `a.Shahar` is short for `a.Manzil.Shahar`. They are the same
+cell, so you get `Samarqand` twice. If you chose "A", you thought they were two different fields. Not "C": a promoted
+field is used like a field of the outer struct itself.
+
+</details>
+
+```text
+a (Mijoz)
+├─ Ism      "Aziza"
+├─ Balans   50000
+└─ Manzil   (type Manzil)
+   ├─ Shahar   "Samarqand"   ← both a.Shahar and a.Manzil.Shahar are this cell
+   └─ Kocha    ""
+```
+
+This is not inheritance: it is not the same as `class Mijoz extends Manzil` in JS/TS or `class Mijoz(Manzil)` in
+Python. `Mijoz` does not become the type `Manzil`; only the fields of `Manzil` are promoted into it. Go's official
+guide (Effective Go) says the same: embedding differs in an important way from subclassing in other languages. In
+"Common mistakes" we will see this in an error message. Functions attached to a type (methods) are promoted in the
+same way. We cover that in [GO-1.12](/lab/youtube/go#go-1-12).
+
+## The opening puzzle: the same fields, 24 and 16 bytes
+
+Now let's look at how a struct sits in memory. This is `olcham/main.go`:
+
+```go filename="olcham/main.go" showLineNumbers
+// olcham: maydonlari bir xil ikki struct, lekin oʻlchami har xil.
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+// Buyurtma: maydonlar "mantiqiy" tartibda yozilgan.
+type Buyurtma struct {
+	Tolandi    bool  // toʻlandimi?
+	Summa      int64 // tiyinda
+	Yetkazildi bool  // yetkazildimi?
+}
+
+// Ixcham: xuddi shu uchta maydon, faqat tartibi boshqa.
+type Ixcham struct {
+	Summa      int64
+	Tolandi    bool
+	Yetkazildi bool
+}
+
+func main() {
+	fmt.Println("Buyurtma:", unsafe.Sizeof(Buyurtma{}), "bayt")
+	fmt.Println("Ixcham:  ", unsafe.Sizeof(Ixcham{}), "bayt")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 4–7 | `import ( "fmt" "unsafe" )` | two packages. `unsafe` is a low-level package that ships with Go; we use it only for measuring (as in [GO-1.08](/lab/youtube/go/go-1-08/en)) |
+| 10–14 | `type Buyurtma struct { … }` | `Buyurtma` ("order"): `Tolandi` ("paid", `bool`), `Summa` ("amount", `int64`, in tiyin), `Yetkazildi` ("delivered", `bool`) |
+| 17–21 | `type Ixcham struct { … }` | `Ixcham` ("compact"): the same three fields, only `Summa` comes first |
+| 24 | `unsafe.Sizeof(Buyurtma{})` | `Buyurtma{}` is a literal with every field at its zero value. `unsafe.Sizeof` returns its size in bytes |
+| 25 | `unsafe.Sizeof(Ixcham{})` | the same for `Ixcham`. The spaces in `"Ixcham:  "` line up the two output lines |
+
+Before running it, calculate. A `bool` is 1 byte, an `int64` is 8 bytes. How many bytes do the three fields take
+together?
+
+<details>
+<summary>Answer</summary>
+
+1 + 8 + 1 = **10 bytes**. That is what the fields themselves take. Now let's see what Go says.
+
+</details>
+
+```console
+$ go run ./olcham
+Buyurtma: 24 bayt
+Ixcham:   16 bayt
+```
+
+Not 10! `Buyurtma` is 24 bytes, `Ixcham` is 16 bytes. The fields are the same; only the order differs. So the extra
+14 and 6 bytes come not from the fields themselves but from their **layout**. To see which byte is where, we need
+measuring tools.
+
+## Measuring inside a struct: Sizeof, Alignof, Offsetof
+
+We take three functions from the `unsafe` package:
+
+```go
+var x Buyurtma
+
+unsafe.Sizeof(x)         // 24: jami, padding bilan
+unsafe.Alignof(x)        // 8: manzil 8 ga karrali
+unsafe.Offsetof(x.Summa) // 8: boshidan 8 bayt narida
+```
+
+- **`unsafe.Sizeof`** tells how many bytes a type takes, empty bytes included. Its documentation says: *"For a
+  struct, the size includes any padding introduced by field alignment."*
+- **`unsafe.Alignof`** tells which number the value's memory address must be a multiple of. "A multiple of 8" means
+  divisible by 8 with no remainder: 0, 8, 16, 24…
+- **`unsafe.Offsetof`** tells how many bytes a field is from the start of the struct. This number is called the
+  **offset**. The first field's offset is always 0.
+
+From these numbers you can draw a map of every byte. `xarita/main.go` does this:
+
+```go filename="xarita/main.go" showLineNumbers
+// xarita: har bir maydon struct ichida qayerda turadi (Offsetof) va
+// orada nechta boʻsh bayt (padding) bor.
+package main
+
+import (
+	"fmt"
+	"strings"
+	"unsafe"
+)
+
+type Buyurtma struct {
+	Tolandi    bool
+	Summa      int64
+	Yetkazildi bool
+}
+
+type Ixcham struct {
+	Summa      int64
+	Tolandi    bool
+	Yetkazildi bool
+}
+
+type maydon struct {
+	harf           string
+	offset, olcham uintptr
+}
+
+// chiz: har bir bayt uchun bitta belgi; maydon harfi yoki "·" (padding).
+func chiz(nom string, jami, align uintptr, mm ...maydon) {
+	b := []string{}
+	for range jami {
+		b = append(b, "·")
+	}
+	for _, m := range mm {
+		for i := m.offset; i < m.offset+m.olcham; i++ {
+			b[i] = m.harf
+		}
+	}
+	fmt.Printf("%-9s %2d bayt, align %d  [%s]\n", nom, jami, align, strings.Join(b, ""))
+}
+
+func main() {
+	var x Buyurtma
+	chiz("Buyurtma", unsafe.Sizeof(x), unsafe.Alignof(x),
+		maydon{"T", unsafe.Offsetof(x.Tolandi), unsafe.Sizeof(x.Tolandi)},
+		maydon{"S", unsafe.Offsetof(x.Summa), unsafe.Sizeof(x.Summa)},
+		maydon{"Y", unsafe.Offsetof(x.Yetkazildi), unsafe.Sizeof(x.Yetkazildi)})
+
+	var y Ixcham
+	chiz("Ixcham", unsafe.Sizeof(y), unsafe.Alignof(y),
+		maydon{"S", unsafe.Offsetof(y.Summa), unsafe.Sizeof(y.Summa)},
+		maydon{"T", unsafe.Offsetof(y.Tolandi), unsafe.Sizeof(y.Tolandi)},
+		maydon{"Y", unsafe.Offsetof(y.Yetkazildi), unsafe.Sizeof(y.Yetkazildi)})
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11–21 | `Buyurtma`, `Ixcham` | exactly the same two structs as in `olcham/` |
+| 23–26 | `type maydon struct { … }` | the data about one field for the map: `harf` ("letter" on the map), `offset` and `olcham` ("size"). `offset, olcham uintptr` declares two fields of the same type on one line. `uintptr` is an unsigned whole number the size of an address: the `unsafe` functions return this type |
+| 29 | `func chiz(nom string, jami, align uintptr, mm ...maydon)` | the function `chiz` ("draw"): the struct name, its total size, its alignment and any number of `maydon` values (the variadic `...` from [GO-1.06](/lab/youtube/go/go-1-06/en)) |
+| 30 | `b := []string{}` | an empty slice of strings: one character per byte is collected here |
+| 31–33 | `for range jami { b = append(b, "·") }` | repeats `jami` times (no loop variable is needed, hence `for range`) and adds `·` each time: for now every byte is "empty" |
+| 34 | `for _, m := range mm {` | goes over each field |
+| 35–37 | `for i := m.offset; i < m.offset+m.olcham; i++ { b[i] = m.harf }` | replaces the bytes the field occupies (starting at its offset, `olcham` of them) with its letter |
+| 39 | `fmt.Printf("%-9s %2d bayt, align %d  [%s]\n", …)` | `%-9s` writes a string in a 9-character slot, left-aligned; `%2d` writes a number in a 2-character slot; `strings.Join(b, "")` glues the slice's characters into one string with no separator |
+| 43 | `var x Buyurtma` | the value we measure, all fields at their zero value |
+| 44 | `chiz("Buyurtma", unsafe.Sizeof(x), unsafe.Alignof(x),` | the name, total size and alignment |
+| 45–47 | `maydon{"T", unsafe.Offsetof(x.Tolandi), unsafe.Sizeof(x.Tolandi)}` … | the letter, offset and size of each field. This is an **unkeyed** literal: the values are written without field names, in the order of the fields of `maydon` |
+| 49–53 | `var y Ixcham` … | the same for `Ixcham` |
+
+On the map each letter is the first letter of a field name and stands for one byte: `T` = `Tolandi`, `S` = `Summa`,
+`Y` = `Yetkazildi`. `·` is an empty byte.
+
+Predict: in the `Buyurtma` map, at which byte do the `S` letters start? **A)** at 1 (right after `T`) · **B)** at 8 ·
+**C)** at 16
+
+<details>
+<summary>Answer</summary>
+
+**B: at 8.** The alignment of `int64` is 8: it must start at an address that is a multiple of 8. `T` took byte 0,
+and 1 to 7 are not multiples of 8. The nearest multiple is 8. If you chose "A", you thought fields are always packed
+tightly. Not "C": 8 itself is a multiple of 8.
+
+</details>
+
+```console
+$ go run ./xarita
+Buyurtma  24 bayt, align 8  [T·······SSSSSSSSY·······]
+Ixcham    16 bayt, align 8  [SSSSSSSSTY······]
+```
+
+The same three fields, but different sizes. The dots are empty bytes. They store nothing; they only push the next
+field to the right place. Such bytes are called **empty bytes**, or **padding**.
+
+`Buyurtma` byte by byte:
+
+| Bytes | What is there | Why |
+|---|---|---|
+| 0 | `T` (`Tolandi`, `bool`) | first field, offset 0 |
+| 1–7 | padding, 7 bytes | `Summa` must start at an address that is a multiple of 8 |
+| 8–15 | `S` (`Summa`, `int64`) | offset 8 |
+| 16 | `Y` (`Yetkazildi`, `bool`) | offset 16 |
+| 17–23 | padding, 7 bytes | the total size must be a multiple of 8 (the reason is in the next section) |
+
+`Ixcham` byte by byte:
+
+| Bytes | What is there | Why |
+|---|---|---|
+| 0–7 | `S` (`Summa`, `int64`) | first field, offset 0, a multiple of 8 |
+| 8 | `T` (`Tolandi`) | the alignment of `bool` is 1: any address works |
+| 9 | `Y` (`Yetkazildi`) | offset 9 |
+| 10–15 | padding, 6 bytes | 10 is rounded up to a multiple of 8: 16 |
+
+In the compact version `int64` comes first and both `bool` fields follow it. Empty space remains only at the end,
+6 bytes.
+
+## Why the empty space is needed: the alignment rule
+
+The processor does not read memory one byte at a time but in **chunks**: words of 4 or 8 bytes (and even larger
+chunks for the cache). If an 8-byte number sits at an address that is a multiple of 8, it fits entirely in one chunk,
+and one read is enough. If it starts at byte 5, it is split across two chunks: the processor has to read both and
+assemble the number, and some processors cannot read it at all.
+
+A Carnegie Mellon University (CMU) course states the rule like this:
+
+- a primitive value of K bytes must sit at an address that is a multiple of K: an 8-byte value at a multiple of 8;
+- a 4-byte value at a multiple of 4.
+
+Then one value never crosses the boundary between two chunks. Placing values this way is called **alignment**. The
+slide says: *"Required on some machines; advised on IA32"* (IA32: 32-bit Intel processors). Intel processors can
+read unaligned values too. But Intel itself recommends alignment for performance (the CS:APP textbook, §3.9.3).
+
+Go's official rules (the spec) give a guarantee for structs: the alignment of a struct equals **the largest of its
+fields' alignments**. For `Buyurtma` that is `max(1, 8, 1) = 8`. The compiler then rounds the struct's size up to a
+multiple of this number. That is why `Buyurtma` has 7 more bytes at the end.
+
+Why are the bytes at the end needed? Recall an array of structs ([GO-1.08](/lab/youtube/go/go-1-08/en)): the elements sit one
+after another. If `Buyurtma` were 17 bytes instead of 24:
+
+| Element | Start (24 bytes) | `Summa` (24 bytes) | Start (if 17) | `Summa` (if 17) |
+|---|---|---|---|---|
+| `[0]` | 0 | 8 ✓ | 0 | 8 ✓ |
+| `[1]` | 24 | 32 ✓ | 17 | 25 ✗ |
+| `[2]` | 48 | 56 ✓ | 34 | 42 ✗ |
+
+In the 17-byte version the `int64` of the next element would land at an address that is not a multiple of 8. The
+padding at the end keeps every element of the array in the right place.
+
+One trap: it is not "the alignment of the largest field" but "the largest of the fields' alignments". Even a 16-byte
+field can have an alignment of 1. We check this in "Common mistakes".
+
+## Pause: bool, int32, bool
+
+Now work out an example yourself. `int32` is a 4-byte whole number; its alignment is 4.
+
+```go
+type Savol struct {
+	A bool
+	B int32
+	C bool
+}
+```
+
+How many bytes is this struct? How can you make it smaller? Draw the bytes on paper.
+
+<details>
+<summary>Answer</summary>
+
+**12 bytes.** `A` is at byte 0. `B` (`int32`) starts at a multiple of 4, so 3 empty bytes remain after `A`: `B` is
+at bytes 4–7. `C` is at byte 8. That makes 9, but the struct's alignment is 4 and the size must be a multiple of 4:
+3 more bytes are added at the end, **12**.
+
+If we put `int32` first: 4 + 1 + 1 = 6, the next multiple of 4 is **8**. The struct shrinks to 8 bytes.
+
+If you got 6, you forgot the padding. If you got 9, you forgot the rounding at the end.
+
+</details>
+
+`savol/main.go` checks the answer. It is almost the same as `xarita/main.go`:
+
+```go filename="savol/main.go" showLineNumbers
+// savol: pauzadagi savolning javobi. bool, int32, bool: necha bayt?
+package main
+
+import (
+	"fmt"
+	"strings"
+	"unsafe"
+)
+
+type Savol struct {
+	A bool
+	B int32
+	C bool
+}
+
+type Javob struct {
+	B int32
+	A bool
+	C bool
+}
+
+type maydon struct {
+	harf           string
+	offset, olcham uintptr
+}
+
+func chiz(nom string, jami, align uintptr, mm ...maydon) {
+	b := []string{}
+	for range jami {
+		b = append(b, "·")
+	}
+	for _, m := range mm {
+		for i := m.offset; i < m.offset+m.olcham; i++ {
+			b[i] = m.harf
+		}
+	}
+	fmt.Printf("%-6s %2d bayt, align %d  [%s]\n", nom, jami, align, strings.Join(b, ""))
+}
+
+func main() {
+	var x Savol
+	chiz("Savol", unsafe.Sizeof(x), unsafe.Alignof(x),
+		maydon{"A", unsafe.Offsetof(x.A), unsafe.Sizeof(x.A)},
+		maydon{"B", unsafe.Offsetof(x.B), unsafe.Sizeof(x.B)},
+		maydon{"C", unsafe.Offsetof(x.C), unsafe.Sizeof(x.C)})
+	var y Javob
+	chiz("Javob", unsafe.Sizeof(y), unsafe.Alignof(y),
+		maydon{"B", unsafe.Offsetof(y.B), unsafe.Sizeof(y.B)},
+		maydon{"A", unsafe.Offsetof(y.A), unsafe.Sizeof(y.A)},
+		maydon{"C", unsafe.Offsetof(y.C), unsafe.Sizeof(y.C)})
+}
+```
+
+Only the types differ: `Savol` ("question": `A`, `B`, `C`) and the reordered `Javob` ("answer": `B`, `A`, `C`). On
+line 37 the names are shorter, hence `%-6s`. The `chiz` function is the same as in `xarita/`.
+
+```console
+$ go run ./savol
+Savol  12 bayt, align 4  [A···BBBBC···]
+Javob   8 bayt, align 4  [BBBBAC··]
+```
+
+## When it matters: a million orders
+
+8 bytes looks like a tiny difference. Let's create a million orders. This is `million/main.go`:
+
+```go filename="million/main.go" showLineNumbers
+// million: bir million buyurtma xotirada qancha joy oladi?
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+type Buyurtma struct {
+	Tolandi    bool
+	Summa      int64
+	Yetkazildi bool
+}
+
+type Ixcham struct {
+	Summa      int64
+	Tolandi    bool
+	Yetkazildi bool
+}
+
+const n = 1_000_000
+
+// ajratildi: f ishlaganda heap'da necha bayt ajratildi.
+func ajratildi(f func()) uint64 {
+	var a, b runtime.MemStats
+	runtime.ReadMemStats(&a)
+	f()
+	runtime.ReadMemStats(&b)
+	return b.TotalAlloc - a.TotalAlloc
+}
+
+var (
+	s1 []Buyurtma
+	s2 []Ixcham
+)
+
+func main() {
+	mb := func(b uint64) float64 { return float64(b) / 1e6 }
+	fmt.Printf("[]Buyurtma: %.1f MB\n", mb(ajratildi(func() { s1 = make([]Buyurtma, n) })))
+	fmt.Printf("[]Ixcham:   %.1f MB\n", mb(ajratildi(func() { s2 = make([]Ixcham, n) })))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 21 | `const n = 1_000_000` | a constant: one million |
+| 24 | `func ajratildi(f func()) uint64 {` | the function `ajratildi` ("allocated") takes another function (`f`) and returns how much memory was allocated while `f` ran. `uint64` is an 8-byte unsigned whole number |
+| 25 | `var a, b runtime.MemStats` | `runtime.MemStats` is the runtime's memory report (a struct!). Two of them: before and after |
+| 26, 28 | `runtime.ReadMemStats(&a)` | writes the report into `a`. `&a` is the address of `a`: so the function writes the result into exactly this cell |
+| 27 | `f()` | does the work we measure |
+| 29 | `return b.TotalAlloc - a.TotalAlloc` | `TotalAlloc` is the bytes allocated on the heap since the program started. The difference is what `f` allocated |
+| 32–35 | `var ( s1 []Buyurtma; s2 []Ixcham )` | two slices outside any function: they live until the program ends |
+| 38 | `mb := func(b uint64) float64 { return float64(b) / 1e6 }` | an anonymous function: converts bytes to megabytes. `1e6` is 1 000 000 (10⁶) |
+| 39–40 | `make([]Buyurtma, n)` … | creates a slice of a million elements and prints the allocated memory with `%.1f` (one digit after the decimal point) |
+
+The **heap** is the shared memory that lives for the whole run of the program ([GO-1.08](/lab/youtube/go/go-1-08/en)); a large
+slice like this goes there.
+
+Predict: **A)** both 10 MB · **B)** 24 MB and 16 MB · **C)** both 24 MB
+
+<details>
+<summary>Answer</summary>
+
+**B.** The elements of a slice sit one after another in an array, and each takes its space including padding:
+24 × 1 000 000 = 24 000 000 bytes, 16 × 1 000 000 = 16 000 000 bytes. "A" is the count without padding. If you chose
+"C", you forgot that `Ixcham` is 16 bytes.
+
+</details>
+
+```console
+$ go run ./million
+[]Buyurtma: 24.0 MB
+[]Ixcham:   16.0 MB
+```
+
+The first slice took 24 megabytes, the compact one 16 megabytes. The data is the same; 8 megabytes are pure padding.
+
+We saved memory. What about speed? Let's sum the paid orders. This is `tezlik/main.go`:
+
+```go filename="tezlik/main.go" showLineNumbers
+// tezlik: n ta buyurtmaning toʻlangan summasi (standart: bir million). Ish bir xil,
+// faqat xotiradan oʻqiladigan baytlar soni har xil.
+// Ikkala variant navbatma-navbat 100 marta oʻlchanadi va eng yaxshi
+// natija olinadi: kompyuterda boshqa ish ketayotgan boʻlsa ham shovqin kam.
+package main
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+type Buyurtma struct {
+	Tolandi    bool
+	Summa      int64
+	Yetkazildi bool
+}
+
+type Ixcham struct {
+	Summa      int64
+	Tolandi    bool
+	Yetkazildi bool
+}
+
+var natija int64 // kompilyator hisobni oʻchirib tashlamasin
+
+func jami1(s []Buyurtma) (j int64) {
+	for i := range s {
+		if s[i].Tolandi {
+			j += s[i].Summa
+		}
+	}
+	return j
+}
+
+func jami2(s []Ixcham) (j int64) {
+	for i := range s {
+		if s[i].Tolandi {
+			j += s[i].Summa
+		}
+	}
+	return j
+}
+
+// vaqt: f ni bir marta ishlatib, ketgan vaqtni qaytaradi.
+func vaqt(f func()) time.Duration {
+	t := time.Now()
+	f()
+	return time.Since(t)
+}
+
+func main() {
+	n := 1_000_000 // go run ./tezlik 100000 — boshqa oʻlcham
+	if len(os.Args) > 1 {
+		n, _ = strconv.Atoi(os.Args[1])
+	}
+	s1 := make([]Buyurtma, n)
+	s2 := make([]Ixcham, n)
+	for i := range n {
+		s1[i] = Buyurtma{Tolandi: i%2 == 0, Summa: int64(i)}
+		s2[i] = Ixcham{Tolandi: i%2 == 0, Summa: int64(i)}
+	}
+	eng1, eng2 := time.Hour, time.Hour
+	for range 100 {
+		eng1 = min(eng1, vaqt(func() { natija += jami1(s1) }))
+		eng2 = min(eng2, vaqt(func() { natija += jami2(s2) }))
+	}
+	fmt.Printf("n = %d\n", n)
+	fmt.Printf("Buyurtma: %.1f µs\n", eng1.Seconds()*1e6)
+	fmt.Printf("Ixcham:   %.1f µs\n", eng2.Seconds()*1e6)
+	fmt.Printf("Ixcham / Buyurtma: %.2f\n", eng2.Seconds()/eng1.Seconds())
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 26 | `var natija int64` | we add the result here: otherwise the compiler could delete the unused calculation ([GO-1.07](/lab/youtube/go/go-1-07/en)) |
+| 28–35 | `func jami1(s []Buyurtma) (j int64) {` | `jami1` ("total"): adds up `Summa` of the paid (`Tolandi` = `true`) orders. `(j int64)` is a named result, 0 at the start; `return j` returns it |
+| 37–44 | `func jami2(s []Ixcham) …` | exactly the same work for the `Ixcham` slice |
+| 47–51 | `func vaqt(f func()) time.Duration {` | `vaqt` ("time"): `time.Now()` takes the current time, runs `f()`, and `time.Since(t)` returns the time passed since then |
+| 54–57 | `n := 1_000_000` … `strconv.Atoi(os.Args[1])` | the default size is one million. If you write a number after the command (`go run ./tezlik 100000`), `os.Args[1]` is that text and `strconv.Atoi` turns it into a number |
+| 58–63 | `make(…)`, `for i := range n { … }` | fills both slices with the same data: every second order is paid (`i%2 == 0`), its amount is `i` |
+| 64 | `eng1, eng2 := time.Hour, time.Hour` | the "best time", deliberately very large at the start: one hour |
+| 65–68 | `for range 100 { … min(…) … }` | measures both versions alternately, 100 times. `min` returns the smaller of two values: the fastest result stays |
+| 69–72 | `fmt.Printf(…)` | `µs` is a microsecond (a millionth of a second). The last line is the ratio, with `%.2f` (two digits after the decimal point) |
+
+Measuring alternately and keeping the best reduces noise even when other work is running on the computer. The work
+is the same in both versions.
+
+Predict: what will the ratio on the last line be? **A)** about 1: the work is the same · **B)** clearly below 1: the
+compact one is faster · **C)** about 0.33: three times faster
+
+<details>
+<summary>Answer</summary>
+
+**B.** On our computer the ratio was 0.72–0.85 every time: the compact version took roughly a fifth less time. If
+you chose "A", you thought the time goes only into computing: here the main work is reading from memory. Not "C":
+a third fewer bytes are read, but time is not exactly proportional to bytes.
+
+</details>
+
+```console
+$ go run ./tezlik
+n = 1000000
+Buyurtma: 1144.0 µs
+Ixcham:   917.4 µs
+Ixcham / Buyurtma: 0.80
+```
+
+The times change a little on every run; you will get different numbers. In the video it was 1426.5 and 1162.7 µs,
+ratio 0.82.
+
+Why is there a difference? Inside the processor there is a **cache**: much smaller than main memory, but very fast.
+On this computer its largest level (L3) is 12 MiB (12 × 1 048 576 bytes). Neither 24 MB nor 16 MB fits in it. So the
+processor has to read the data from main memory, and the work is limited by that reading. The compact slice reads a
+third fewer bytes.
+
+## When it does not matter: a hundred thousand orders
+
+Now the same calculation with a hundred thousand orders. This data (2.4 and 1.6 MB) fits in the cache.
+
+Predict: will the compact version again be about a fifth faster?
+
+<details>
+<summary>Answer</summary>
+
+No. The difference is much smaller, and sometimes the compact version is even **slower**. We saw a ratio of 1.1–1.2
+on an idle computer and 0.89–1.08 under load. For data that fits in the cache, the number of bytes is not decisive.
+
+</details>
+
+```console
+$ go run ./tezlik 100000
+n = 100000
+Buyurtma: 47.3 µs
+Ixcham:   53.8 µs
+Ixcham / Buyurtma: 1.14
+```
+
+This time the compact version was slower (1.14 in the video too: 65.8 and 74.7 µs). We cannot say for sure why. The
+probable cause given in the course README: the compiler generates different code for a 24-byte and a 16-byte step,
+and for data in the cache this matters more than the number of bytes. This processor has performance and efficiency
+cores, and the result also depends on which core the program ran on. So saving bytes does not always buy speed.
+
+## On a 32-bit system: GOARCH=386
+
+There is one more subtle point: these numbers depend on the architecture (the processor type) and on the compiler's
+rules. So far everything was measured on a 64-bit computer (`amd64`). On a 32-bit system the processor works with a
+4-byte number at a time.
+
+If you write `GOARCH=386` before a command, Go builds the program for 32-bit Intel processors (`386`) for that one
+command only. A 64-bit Linux can usually run such a program directly (if running 32-bit programs is enabled).
+
+Predict: how many bytes is `Buyurtma` with `GOARCH=386`? **A)** 24 again · **B)** 16 · **C)** 10
+
+<details>
+<summary>Answer</summary>
+
+**B: 16.** On `386`, Go considers an address that is a multiple of 4 enough for `int64`: its alignment is 4. Now 3
+empty bytes remain after `T`, `S` is at bytes 4–11, `Y` at byte 12, and 3 bytes at the end: 16. If you chose "A",
+you thought alignment is the same everywhere. Not "C": there is still padding, just less.
+
+</details>
+
+```console
+$ GOARCH=386 go run ./xarita
+Buyurtma  16 bayt, align 4  [T···SSSSSSSSY···]
+Ixcham    12 bayt, align 4  [SSSSSSSSTY··]
+```
+
+The first struct is now 16 bytes, the compact one 12 bytes. Same code, different architecture, different size.
+
+| | `amd64` (64-bit) | `386` (32-bit) |
+|---|---|---|
+| alignment of `int64` | 8 | 4 |
+| `Buyurtma` | 24 bytes | 16 bytes |
+| `Ixcham` | 16 bytes | 12 bytes |
+
+## When alignment crashes the program: the atomic operation
+
+This difference can even crash a program. First a new concept. An **atomic operation** is an operation that several
+goroutines can safely perform at the same time: nobody can interrupt it halfway. We cover goroutines and atomic
+operations in later lessons ([GO-1.21](/lab/youtube/go#go-1-21)). For now one rule is enough: to increment a 64-bit number
+atomically, Go has the `sync/atomic` package.
+
+This is `atom/main.go`:
+
+```go filename="atom/main.go" showLineNumbers
+// atom: 32-bitli tizimda int64 maydon 8 ga karrali manzilda turmasligi mumkin.
+// GOARCH=386 go run ./atom — ataylab xato (panic).
+package main
+
+import (
+	"fmt"
+	"sync/atomic"
+	"unsafe"
+)
+
+type Hisoblagich struct {
+	Yoniq bool
+	Soni  int64 // bir nechta goroutine atomik oshiradi
+}
+
+func main() {
+	h := &Hisoblagich{}
+	fmt.Println("Soni offset:", unsafe.Offsetof(h.Soni))
+	atomic.AddInt64(&h.Soni, 1)
+	fmt.Println("Soni:", h.Soni)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11–14 | `type Hisoblagich struct { Yoniq bool; Soni int64 }` | `Hisoblagich` ("counter"): first `Yoniq` ("switched on", `bool`), then `Soni` ("count", `int64`) |
+| 17 | `h := &Hisoblagich{}` | creates the struct and stores its address in `h` (`&`). You can still write `h.Soni` through the address; we explain this in [GO-1.11](/lab/youtube/go/go-1-11/en) |
+| 18 | `unsafe.Offsetof(h.Soni)` | how many bytes `Soni` is from the start of the struct |
+| 19 | `atomic.AddInt64(&h.Soni, 1)` | goes to the address of `Soni` and atomically adds 1 to it |
+| 20 | `fmt.Println("Soni:", h.Soni)` | prints the result |
+
+On a 64-bit computer this program prints `Soni offset: 8` and `Soni: 1`. What about 32-bit? In the command, `2>&1`
+merges the error output into the normal output, and `| head -2` shows only the first two lines (the rest is long
+technical detail).
+
+```console
+$ GOARCH=386 go run ./atom 2>&1 | head -2
+Soni offset: 4
+panic: unaligned 64-bit atomic operation
+```
+
+In the 32-bit program `Soni` is 4 bytes from the start of the struct. *unaligned 64-bit atomic operation* means the
+atomic operation was given a 64-bit value that is not aligned. This is not a processor fault: the Go runtime checks
+the address itself and panics if it is not a multiple of 8. The "Bugs" section of the `sync/atomic` documentation
+says: *"On ARM, 386, and 32-bit MIPS, it is the caller's responsibility to arrange for 64-bit alignment of 64-bit
+words accessed atomically"* (the caller here means the programmer).
+
+Go 1.19 added new types. One of them is `atomic.Int64`: it is aligned to 8 bytes on every system. This is
+`atomfix/main.go`:
+
+```go filename="atomfix/main.go" showLineNumbers
+// atomfix: atomic.Int64 (Go 1.19+) har qanday tizimda 8 baytga tekislanadi.
+package main
+
+import (
+	"fmt"
+	"sync/atomic"
+	"unsafe"
+)
+
+type Hisoblagich struct {
+	Yoniq bool
+	Soni  atomic.Int64
+}
+
+func main() {
+	h := &Hisoblagich{}
+	fmt.Println("Soni offset:", unsafe.Offsetof(h.Soni))
+	h.Soni.Add(1)
+	fmt.Println("Soni:", h.Soni.Load())
+}
+```
+
+- **Line 12:** `Soni atomic.Int64` is not a plain `int64` but a special type from the `sync/atomic` package.
+- **Line 18:** `h.Soni.Add(1)` atomically adds 1. `Add` is a function attached to this type (a method).
+- **Line 19:** `h.Soni.Load()` atomically reads the value.
+
+Predict: what is `Soni offset` with `GOARCH=386`? **A)** 4 · **B)** 8 · **C)** 1
+
+<details>
+<summary>Answer</summary>
+
+**B: 8.** The Go 1.19 release notes: *"Int64 and Uint64 are automatically aligned to 64-bit boundaries in structs
+and allocated data, even on 32-bit systems."* The compiler put 7 bytes of padding after `Yoniq`. "A" is the offset
+of a plain `int64` on 32-bit.
+
+</details>
+
+```console
+$ GOARCH=386 go run ./atomfix
+Soni offset: 8
+Soni: 1
+```
+
+## A real incident: GitLab, 2022
+
+This happened in a real project too. In December 2022, some users who upgraded their self-hosted GitLab to version
+15.7.0 ran into trouble. They ran it on Raspberry Pi computers with the 32-bit Raspberry Pi OS. Their Gitaly service
+crashed with exactly this panic: `panic: unaligned 64-bit atomic operation`. The first advice was to go back to
+version 15.6.3.
+
+| What happened | Details |
+|---|---|
+| Cause | a new field `ProtoFormat` was added to the `ObjectHash` struct: it grew from 64 to 72 bytes. An `int64` counter in the struct that contains it shifted and landed at an address that is not a multiple of 8 |
+| First idea | put the counter at the start of the struct. But the author of the fix wrote: *"Moving `outstandingRequests` first in the struct isn't enough"* |
+| Fix | the counters were moved into a separate struct, with a test that checks their alignment (MR !5223); a second place was fixed in MR !5226 |
+| `atomic.Int64` | the proposal to switch to it (gitaly#4702) was still open as of 2026-11-25 |
+
+Why was moving it first not enough? The `sync/atomic` documentation guarantees alignment only for the **first** word
+of an allocated struct, array or slice, and for a global or local variable. In an array of structs only the first
+element is guaranteed. Recall the `386` result above: `Ixcham` (with `int64` first) is 12 bytes.
+
+| Array element | Start | Is `Summa` a multiple of 8? |
+|---|---|---|
+| `[0]` | 0 | ✓ |
+| `[1]` | 12 | ✗ |
+| `[2]` | 24 | ✓ |
+| `[3]` | 36 | ✗ |
+
+The incident also brings us back to the lesson's topic: the problem began when one field was added and another
+field shifted.
+
+## Don't count bytes by hand: fieldalignment
+
+You don't need to count bytes by hand every time. The Go team has an analyzer called `fieldalignment` (a static
+analysis tool that checks code without running it, like a linter). First we install it:
+
+```console
+$ go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@v0.53.0
+```
+
+`go install` printed nothing: the installation succeeded. The program goes into the `$(go env GOPATH)/bin/` folder
+(like `staticcheck` in [GO-1.05](/lab/youtube/go/go-1-05/en)). We wrote version `v0.53.0`; the course README has `@latest`,
+which was also `v0.53.0` on 2026-11-25.
+
+Now we run it on our first program. The `2>&1 | sed "s|$PWD/||"` at the end of the command only shortens the long
+folder path in the message.
+
+```console
+$ $(go env GOPATH)/bin/fieldalignment ./olcham 2>&1 | sed "s|$PWD/||"
+olcham/main.go:10:15: Buyurtma has size 24 but the optimal size is 16 leading to a waste of 8 bytes (33%)
+```
+
+`olcham/main.go`, line 10, column 15 (the word `struct`): *Buyurtma has size 24 but the optimal size is 16 leading
+to a waste of 8 bytes (33%)*. About `Ixcham` it said nothing: it is already as compact as possible.
+
+But its documentation also has a warning: *"the diagnostics produced by fieldanalyzer very rarely indicate a
+significant problem, so the analyzer is not included in typical suites such as vet or gopls."*
+
+The `-fix` flag reorders the fields itself. We tried it on a copy of `olcham/main.go` (this experiment is not in the
+course folder: we copied the file into a separate folder with its own `go.mod` containing the line `go 1.26`):
+
+```console
+$ $(go env GOPATH)/bin/fieldalignment -fix .
+```
+
+It printed nothing. `sed -n 10,14p main.go` prints lines 10–14 of the file:
+
+```console
+$ sed -n 10,14p main.go
+type Buyurtma struct {
+	Summa      int64
+	Tolandi    bool
+	Yetkazildi bool
+}
+```
+
+The order is right, but the comments next to the fields (`// toʻlandimi?`, `// tiyinda`, `// yetkazildimi?`) are
+gone. If you use `-fix`, always review the file afterwards.
+
+## When to reorder fields
+
+So should you reorder every struct? In most cases, no.
+
+| Situation | What to do |
+|---|---|
+| one struct, an 8-byte difference | irrelevant: keep the order that is easy to read |
+| a struct kept in memory in millions of copies (large slices, cache entries) | measure, and reorder if needed |
+| first | write fields in the order that is easy to read |
+| then | measure, and change the order only if needed |
+
+Dave Cheney wrote the same in his 2015 article "Padding is hard": *"Do Go programmers need to care about this
+minutiae ? Probably not."*
+
+There is one more exception. The processor works with the cache not byte by byte but in 64-byte chunks called
+**cache lines** (64 on this computer). A compact order sometimes puts the variables of two goroutines into one cache
+line. When one goroutine writes to its variable, the copy of that line on the other core becomes stale. This is
+called **false sharing**, and it slows down both goroutines. The `fieldalignment` documentation warns about it too:
+*"the most compact order is not always the most efficient."* You will measure this in the Guru homework.
+
+## Going deeper (optional): what the spec promises
+
+This section is not in the video; it comes from the course README.
+
+- Go's official rules give only minimal guarantees: the sizes of the numeric types and the struct alignment (the
+  largest of the fields' alignments). Laying out fields in source order is the current behavior of the `gc`
+  compiler.
+- The spec does not promise a field order. Robert Griesemer of the Go team in
+  [golang/go#10014](https://github.com/golang/go/issues/10014): *"Currently, the spec does not specify how struct
+  fields are laid out in memory."* But having the compiler reorder the fields of existing structs was rejected.
+- If you need the same layout as C, Go 1.23 and later have the [`structs.HostLayout`](https://pkg.go.dev/structs#HostLayout)
+  marker.
+- On 32-bit Linux, C also used 4-byte alignment for the 8-byte `double` (a floating-point number) (CMU slide, IA32).
+  Go with `GOARCH=386` places `int64` the same way.
+
+The folder also has a benchmark for `go test`. This is `million/bench_test.go`:
+
+```go filename="million/bench_test.go" showLineNumbers
+package main
+
+import "testing"
+
+// Bir million buyurtmaning toʻlangan summasini hisoblaymiz.
+// Ish bir xil, faqat xotirada oʻqiladigan baytlar soni har xil.
+
+func BenchmarkBuyurtma(b *testing.B) {
+	s := make([]Buyurtma, n)
+	for i := range s {
+		s[i] = Buyurtma{Tolandi: i%2 == 0, Summa: int64(i)}
+	}
+	for b.Loop() {
+		var jami int64
+		for i := range s {
+			if s[i].Tolandi {
+				jami += s[i].Summa
+			}
+		}
+		_ = jami
+	}
+}
+
+func BenchmarkIxcham(b *testing.B) {
+	s := make([]Ixcham, n)
+	for i := range s {
+		s[i] = Ixcham{Tolandi: i%2 == 0, Summa: int64(i)}
+	}
+	for b.Loop() {
+		var jami int64
+		for i := range s {
+			if s[i].Tolandi {
+				jami += s[i].Summa
+			}
+		}
+		_ = jami
+	}
+}
+```
+
+This is the pattern from [GO-1.07](/lab/youtube/go/go-1-07/en): inside `for b.Loop()` the sum of paid orders out of a million is
+computed. `n`, `Buyurtma` and `Ixcham` come from `main.go` in the same folder.
+
+```console
+$ go test -bench . ./million
+goos: linux
+goarch: amd64
+pkg: github.com/abdurahmon27/go-backend-uz/lessons/010-structs-memory/million
+cpu: 12th Gen Intel(R) Core(TM) i5-12450H
+BenchmarkBuyurtma-12    	    1144	   1064696 ns/op
+BenchmarkIxcham-12      	    1434	    864912 ns/op
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/010-structs-memory/million	2.471s
+```
+
+Columns: name, how many times the loop ran, and the nanoseconds one calculation took. Our ratio came out at about
+0.8. According to the README, on an idle computer with `-count 10` the medians were ≈1.15 and ≈0.82 ms (ratio
+≈0.7). When other memory-heavy work was running, the `go test` results jumped around a lot and even swapped order.
+That is why the video uses `tezlik/`, which measures alternately.
+
+## Common mistakes
+
+**1. Thinking a struct's size is the sum of its fields' sizes.** The main trap of the lesson, shown in "The opening
+puzzle": `bool + int64 + bool` is not 10 but 24 bytes. There is no error message; memory is simply wasted.
+**Fix:** check the size with `unsafe.Sizeof` or run `fieldalignment`. If there are millions of copies, put the fields
+with the largest alignment first.
+
+**2. Thinking "a struct's alignment = the alignment of its largest field".** This example is not in the course
+folder; it was run separately:
+
+```go
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+type Katta struct {
+	A [16]byte
+	B int32
+}
+
+func main() {
+	var k Katta
+	fmt.Println("Sizeof:", unsafe.Sizeof(k), "Alignof:", unsafe.Alignof(k))
+}
+```
+
+`[16]byte` is a 16-byte array, the largest field in this struct.
+
+```console
+$ go run engkatta/main.go
+Sizeof: 20 Alignof: 4
+```
+
+The largest field is 16 bytes, but the alignment is 4. The alignment of `[16]byte` is 1 (it is made of bytes), that
+of `int32` is 4. The rule: **the largest** of the fields' alignments, `max(1, 4) = 4`. **Fix:** look at each field's
+alignment, not its size.
+
+**3. Leaving out a field in an unkeyed literal.** In a literal without field names, every field must be written, in
+order (not in the course folder):
+
+```go
+package main
+
+import "fmt"
+
+type Mijoz struct {
+	Ism    string
+	Balans int64
+	Shahar string
+}
+
+func main() {
+	a := Mijoz{"Aziza", 50_000}
+	fmt.Println(a)
+}
+```
+
+```console
+$ go run kalitsiz/main.go
+# command-line-arguments
+kalitsiz/main.go:12:28: too few values in struct literal of type Mijoz
+```
+
+Line 12, column 28: *too few values in struct literal of type Mijoz*. The struct has three fields, and we wrote two.
+An unkeyed literal breaks the same way when someone adds a new field to the struct. **Fix:** write a keyed literal:
+`Mijoz{Ism: "Aziza", Balans: 50_000}`. The omitted `Shahar` gets the zero value.
+
+**4. Writing a field the struct does not have.** (Not in the course folder.)
+
+```go
+package main
+
+import "fmt"
+
+type Mijoz struct {
+	Ism    string
+	Balans int64
+}
+
+func main() {
+	a := Mijoz{Ism: "Aziza", Yosh: 20}
+	fmt.Println(a)
+}
+```
+
+```console
+$ go run nomalum/main.go
+# command-line-arguments
+nomalum/main.go:11:27: unknown field Yosh in struct literal of type Mijoz
+```
+
+*unknown field Yosh in struct literal of type Mijoz*: the field `Yosh` ("age") is not declared in `Mijoz`. **Fix:**
+add the field to the struct type or correct the name.
+
+**5. Treating embedding as inheritance.** `Mijoz` contains a `Manzil`, but a `Mijoz` is not a `Manzil` (not in the
+course folder):
+
+```go
+package main
+
+import "fmt"
+
+type Manzil struct {
+	Shahar string
+}
+
+type Mijoz struct {
+	Ism string
+	Manzil
+}
+
+func chop(m Manzil) {
+	fmt.Println(m.Shahar)
+}
+
+func main() {
+	a := Mijoz{Ism: "Aziza", Manzil: Manzil{Shahar: "Buxoro"}}
+	chop(a)
+}
+```
+
+```console
+$ go run meros/main.go
+# command-line-arguments
+meros/main.go:20:7: cannot use a (variable of struct type Mijoz) as Manzil value in argument to chop
+```
+
+Line 20, column 7: *cannot use a (variable of struct type Mijoz) as Manzil value in argument to chop*. The fields are
+promoted, but the type does not change. **Fix:** pass the inner struct itself: `chop(a.Manzil)`.
+
+**6. Atomically incrementing a plain `int64` on a 32-bit system.** We saw this in "When alignment crashes the
+program": `atomic.AddInt64` on an `int64` after a `bool` panics with `GOARCH=386`. On a 64-bit computer there is no
+error, so the bug stays hidden. **Fix:** use the `atomic.Int64` type (Go 1.19+).
+
+**7. Not reviewing the file after `fieldalignment -fix`.** In our test it deleted the field comments (section "Don't
+count bytes by hand"). **Fix:** review the changes after `-fix`, or reorder the fields by hand.
+
+## Check yourself
+
+Answer first, then open the answer.
+
+**1.** Why is `Buyurtma` 24 bytes and `Ixcham` 16 bytes, even though the fields are the same?
+
+<details>
+<summary>Answer</summary>
+
+`int64` must start at an address that is a multiple of 8. In `Buyurtma` it comes after a `bool`: 7 bytes of padding
+in between and 7 more at the end (so the size is a multiple of 8). In `Ixcham` the `int64` comes first, both `bool`
+fields follow it, and the empty space is only at the end: 6 bytes.
+
+</details>
+
+**2.** What does this program print on a 64-bit computer? **A)** `13` · **B)** `16` · **C)** `24`
+
+```go
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+type T struct {
+	A int32
+	B bool
+	C int64
+}
+
+func main() {
+	fmt.Println(unsafe.Sizeof(T{}))
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+**B: `16`.** `A` is at bytes 0–3, `B` at byte 4, then 3 bytes of padding, `C` (`int64`) at bytes 8–15. 16 is already
+a multiple of 8, so no padding is needed at the end. "A" is the sum without padding. If you chose "C", you thought
+every field takes 8 bytes. (This program is not in the course folder; it was run separately.)
+
+```console
+$ go run savol1/main.go
+16
+```
+
+</details>
+
+**3.** What happens if you leave some fields out of a keyed composite literal?
+
+<details>
+<summary>Answer</summary>
+
+They get the zero value: `0` for a number, `""` for a string, `false` for a `bool`. In a keyed literal the order of
+the fields does not matter either.
+
+</details>
+
+**4.** Does making a struct compact always make the program faster?
+
+<details>
+<summary>Answer</summary>
+
+No. With a million orders (does not fit in the cache) the compact version was about a fifth faster. With a hundred
+thousand (fits in the cache) the difference is much smaller, and sometimes the compact one is even slower. Measure
+first.
+
+</details>
+
+**5.** On a 32-bit system, which type would you choose for a 64-bit counter that several goroutines increment, and
+why?
+
+<details>
+<summary>Answer</summary>
+
+`atomic.Int64`. It is aligned to 8 bytes on every system (Go 1.19+). A plain `int64` on `386` may end up at an
+address that is only a multiple of 4, and `atomic.AddInt64` panics at such an address.
+
+</details>
+
+**6.** From [GO-1.07](/lab/youtube/go/go-1-07/en): how is a benchmark function named, and how is the loop inside it written?
+
+<details>
+<summary>Answer</summary>
+
+Its name starts with `Benchmark` and it takes `b *testing.B`: `func BenchmarkIxcham(b *testing.B)`. The work being
+measured goes inside `for b.Loop() { … }`. The file name ends in `_test.go`; you run it with `go test -bench .`.
+Today's `million/bench_test.go` is built exactly like that.
+
+</details>
+
+## Homework
+
+Four levels of tasks. All files and answers are in the lesson folder on GitHub:
+[lessons/010-structs-memory](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/010-structs-memory).
+Answers: the [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/010-structs-memory/homework)
+folder. Try on your own first.
+
+🟢 **Easy:** how many bytes is `struct { A bool; B int64; C int32; D bool }`? Calculate on paper first, then check
+with `unsafe.Sizeof`.
+
+<details>
+<summary>Answer</summary>
+
+`homework/oson/main.go`. `A` at byte 0, 7 bytes of padding, `B` 8–15, `C` 16–19, `D` 20. That makes 21; the next
+multiple of 8 is **24**. The compact order `B, C, A, D`: 8 + 4 + 1 + 1 = 14 → **16**.
+
+```console
+$ go run ./homework/oson
+Oson:       24
+OsonIxcham: 16
+```
+
+</details>
+
+🟡 **Medium:** find the size and the most compact order for `struct { Faol bool; Ism string; Admin bool; Yosh int32 }`.
+
+<details>
+<summary>Answer</summary>
+
+`homework/orta/main.go`. A `string` holds two things: the address of its bytes (8 bytes) and its length (8 bytes).
+That is 16 bytes in total, alignment 8. `Faol` 0, 7 bytes of padding, `Ism` 8–23, `Admin` 24, 3 bytes of padding,
+`Yosh` 28–31 → **32**. Compact: `Ism, Yosh, Faol, Admin` = 16 + 4 + 1 + 1 = 22 → **24**. `fieldalignment` says the
+same.
+
+```console
+$ go run ./homework/orta
+string: 16 bayt, align 8
+Foydalanuvchi:       32
+FoydalanuvchiIxcham: 24
+```
+
+</details>
+
+🟠 **Hard:** the empty struct `struct{}` is 0 bytes. Why is `struct { A int64; B struct{} }` 16 bytes, but
+`struct { B struct{}; A int64 }` only 8?
+
+<details>
+<summary>Answer</summary>
+
+`homework/qiyin/main.go`. The address of a final zero-size field (`&x.B`) must not point to the byte right after the
+struct, that is, to another object. Otherwise the garbage collector might think that object is "alive" too. So the
+compiler adds 1 byte for a zero-size field at the end, and then rounds up to a multiple of 8: 9 → **16**
+(`cmd/compile/internal/types/size.go`, issue 9401). At the start, no extra byte is needed: **8**.
+
+```console
+$ go run ./homework/qiyin
+struct{}: 0
+Oxirida:  16
+Boshida:  8
+```
+
+</details>
+
+🔴 **Guru** (after you learn goroutines): two goroutines each increment their own `atomic.Int64` counter. Write a
+benchmark for counters placed side by side and for counters 64 bytes apart, and compare.
+
+<details>
+<summary>Answer</summary>
+
+`homework/guru/guru_test.go`: `Yonma` ("side by side": `A` and `B` next to each other) and `Ajratilgan`
+("separated": `_ [56]byte` between them, an unnamed 56-byte filler). When two counters share one 64-byte cache line,
+each write makes the copy on the other core stale: that is false sharing. You can find the cache line size with
+`getconf LEVEL1_DCACHE_LINESIZE`: 64 on this computer.
+
+```console
+$ go test -bench . -count 5 ./homework/guru
+goos: linux
+goarch: amd64
+pkg: github.com/abdurahmon27/go-backend-uz/lessons/010-structs-memory/homework/guru
+cpu: 12th Gen Intel(R) Core(TM) i5-12450H
+BenchmarkYonma-12         	      56	  19220549 ns/op
+BenchmarkYonma-12         	      55	  19112706 ns/op
+BenchmarkYonma-12         	      67	  19417688 ns/op
+BenchmarkYonma-12         	      64	  18150542 ns/op
+BenchmarkYonma-12         	      49	  22403467 ns/op
+BenchmarkAjratilgan-12    	     266	   4579355 ns/op
+BenchmarkAjratilgan-12    	     250	   4597480 ns/op
+BenchmarkAjratilgan-12    	     258	   4684210 ns/op
+BenchmarkAjratilgan-12    	     258	   4640125 ns/op
+BenchmarkAjratilgan-12    	     266	   4701269 ns/op
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/010-structs-memory/homework/guru	11.719s
+```
+
+On our machine `Ajratilgan` was about 4 times faster (the README says ≈5 times). Absolute times vary a lot between
+computers.
+
+</details>
+
+## Sources
+
+- Go's official rules (Go spec): [Struct types](https://go.dev/ref/spec#Struct_types),
+  [Composite literals](https://go.dev/ref/spec#Composite_literals),
+  [Size and alignment guarantees](https://go.dev/ref/spec#Size_and_alignment_guarantees)
+- [pkg.go.dev/unsafe](https://pkg.go.dev/unsafe): `Sizeof`, `Alignof`, `Offsetof`
+- [Effective Go: Embedding](https://go.dev/doc/effective_go#embedding)
+- [sync/atomic: Bugs](https://pkg.go.dev/sync/atomic#pkg-note-BUG),
+  [Go 1.19 Release Notes: atomic types](https://go.dev/doc/go1.19#atomic_types)
+- [GOARCH and other environment variables](https://go.dev/doc/install/source#environment)
+- [fieldalignment](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment) (v0.53.0)
+- [CMU 15-213: Machine-Level Programming IV: Data](https://www.cs.cmu.edu/afs/cs/academic/class/15213-s15/www/lectures/08-machine-data.pdf)
+  (the alignment rule); Bryant, O'Hallaron, *Computer Systems: A Programmer's Perspective* (CS:APP3e), §3.9.3
+- GitLab: [gitaly#4701](https://gitlab.com/gitlab-org/gitaly/-/issues/4701),
+  [MR !5223](https://gitlab.com/gitlab-org/gitaly/-/merge_requests/5223),
+  [MR !5226](https://gitlab.com/gitlab-org/gitaly/-/merge_requests/5226),
+  [gitaly#4702](https://gitlab.com/gitlab-org/gitaly/-/issues/4702); [golang/go#11891](https://github.com/golang/go/issues/11891)
+- Dave Cheney, [Padding is hard](https://dave.cheney.net/2015/10/09/padding-is-hard) (2015)
+- [golang/go#10014](https://github.com/golang/go/issues/10014), [structs.HostLayout](https://pkg.go.dev/structs#HostLayout)
+- Go source code: [cmd/compile/internal/types/size.go](https://github.com/golang/go/blob/go1.26.8/src/cmd/compile/internal/types/size.go)
+  (a zero-size field at the end, issue 9401)
+- All results from `go1.26.8 linux/amd64`, Intel i5-12450H (L3 cache 12 MiB), 2026-11-26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/010-structs-memory)
+
+---
+
+← Previous lesson: [GO-1.09](/lab/youtube/go/go-1-09/en) · Next lesson: [GO-1.11](/lab/youtube/go/go-1-11/en) → · [All lessons](/lab/youtube/go)
+
+</div>
