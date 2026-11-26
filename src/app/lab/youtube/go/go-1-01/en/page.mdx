@@ -1,0 +1,917 @@
+---
+title: "Why does Go exist? What is inside go build"
+date: "2026/11/26"
+description: "Open a Go binary like a bundle analyzer: the runtime's cost, linker tree-shaking and package init, the FROM scratch time-zone bug and time/tzdata."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-01) · [Русский](/lab/youtube/go/go-1-01/ru) · **English**  
+Lesson GO-1.01 · [Go: 0 → Guru](/lab/youtube/go#go-1-01) · ▶️ [Watch the video on YouTube](https://youtu.be/TaGL7BmLP3Y) · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The binary of the twenty-line HTTP API from GO-X.01 is 8,659,683 bytes, that is 8.66 MB. When you see an 8 MB bundle
+in a frontend project, you open a bundle analyzer straight away. What are these megabytes in a Go binary, and how
+many of them are our own code? Today we measure it.
+
+**The one idea:** most of a Go binary is not our code. Every program carries the runtime. From the imported packages
+the linker keeps only the functions that can be called, plus every package's `init` code. Data that lives on the
+system (the time-zone database) does not get into the binary at all: you add it on purpose with `import _`.
+
+By the end of the lesson you will be able to:
+
+- measure any Go binary by package with `go tool nm` and the 10-line `paketlar.sh` script;
+- explain why an empty Go program is 1.8 MB and which part of that cost can be removed;
+- say, through `init`, why a package imported for one function doubles the binary;
+- fix the `unknown time zone` error in a `FROM scratch` image with `import _ "time/tzdata"` or distroless.
+
+Today's three core new concepts:
+
+| Concept | Plain meaning | English term |
+|---|---|---|
+| the runtime's fixed cost | the GC, the scheduler and their tables are inside every Go binary: even an empty program is 1.8 MB | runtime (fixed cost) |
+| linker tree-shaking and `init` | the linker drops functions nobody calls, but packages' `init` code and global variables stay | dead-code elimination, package initialization |
+| `import _ "…"` | import a package without a name, only for its `init` (its side effect), like `import 'dotenv/config'` | blank import |
+
+There are also two helper tools: **`go tool nm`** (gives the size of every function in a binary) and
+**`-ldflags="-s -w"`** (a linker flag that removes debug information; only in the "Going deeper" section).
+
+## Before you start
+
+- [GO-X.01 · 20-line HTTP API: the first service in Go and one binary](/lab/youtube/go#go-x-01): `go build` makes one static
+  binary; the runtime (garbage collector and scheduler) takes the place of V8 and the event loop in Node; the
+  `FROM scratch` image; cgo and `CGO_ENABLED=0`. We don't explain these again here.
+- [GO-X.03 · No try/catch: error values and defer](/lab/youtube/go#go-x-03): checking an error with `if err != nil`.
+- go.dev/play is not enough for this lesson: the files, `paketlar.sh` and the `Dockerfile`s are in the course folder.
+  Download the course and open a terminal in the `lessons/001-why-go` folder. The commands work from there, moving into
+  subfolders with `cd`. You also need Docker (for the time-zone section).
+- This laptop has no C compiler (gcc). So programs that pull in the `net` package are built with `CGO_ENABLED=0`, the
+  recipe from GO-X.01. The error you get without it is in "Common mistakes".
+
+First, one question from GO-X.01. We built the API in the `golang` image and put it into a `scratch` image. `docker run`
+said `exec /api: no such file or directory`, although the file was in the image. What was the cause?
+**A)** wrong `GOARCH` · **B)** cgo stayed on: the binary looks for libc on the system · **C)** there is no Go in `scratch`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The `golang` image has gcc, so cgo stayed on. The binary looked for libc and its loader
+(`/lib64/ld-linux-x86-64.so.2`) on the system, and `scratch` has neither. The "file not found" message is really about
+the loader. A is wrong: a wrong architecture gives `exec format error`. C is wrong: a Go binary does not need Go
+installed, the runtime is inside the binary.
+
+Takeaway: what gets into a binary and what does not directly affects deployment. Today we measure the inside of a
+binary by package.
+
+</details>
+
+## A bundle analyzer for a Go binary
+
+Make a guess first. The GO-X.01 API is 8,659,683 bytes. How much of it are our twenty lines (the machine code of the
+`main` package)?
+
+**A)** ~1 MB · **B)** ~100 KB · **C)** less than 2 KB
+
+<details>
+<summary>Answer</summary>
+
+**C: 1,595 bytes**, 0.02 % of the file. If you chose A or B, you thought of the binary as a bundle that is "mostly our
+code". In a Go binary our code is the smallest part. Below we measure what the rest is.
+
+</details>
+
+Go has no ready-made bundle analyzer. But `go tool nm -size` prints every symbol in a binary (a function or a global
+variable) with its size. The `paketlar.sh` script in the lesson folder ("paketlar" = "packages") takes only the
+functions from that list and sums them by package:
+
+```bash filename="paketlar.sh" showLineNumbers
+#!/bin/sh
+# Go binary uchun "bundle analyzer": mashina kodi (funksiyalar) baytlarini paketlar bo'yicha qo'shadi.
+# Ishlatish: ./paketlar.sh <binary> [qator soni, standart 6]
+# Eslatma: -ldflags="-s" bilan build qilingan faylda simvollar jadvali yo'q, natija bo'sh bo'ladi.
+go tool nm -size "$1" | awk '
+  $3 == "T" || $3 == "t" {
+    size = $2
+    name = $0; sub(/^ *[0-9a-f]+ +[0-9]+ +[A-Za-z] +/, "", name)   # nomda bo`sh joy bo`lishi mumkin
+    sub(/^go:/, "", name); sub(/^type:\.(eq|hash)\./, "", name)     # kompilyator yasagan eq/hash funksiyalari
+    sub(/\[.*/, "", name)                                            # generic: Foo[...] -> Foo
+    slash = 0; for (i = 1; i <= length(name); i++) if (substr(name, i, 1) == "/") slash = i
+    rest = substr(name, slash + 1); dot = index(rest, ".")
+    pkg = (dot > 0) ? substr(name, 1, slash + dot - 1) : "runtime(asm)"   # paketsiz nom = runtime assembler kodi
+    sum[pkg] += size; total += size
+  }
+  END { for (p in sum) printf "%8d %5.1f%% %s\n", sum[p], 100 * sum[p] / total, p; printf "%8d 100.0%% JAMI\n", total }
+' | sort -rn | head -n "${2:-6}"
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `go tool nm -size "$1"` | for every symbol: address, size (bytes), type letter, name. `T`/`t` means machine code (a function) |
+| 6 | `$3 == "T" \|\| $3 == "t"` | takes only functions; global variables are not counted |
+| 8–10 | `sub(…)` | cleans the name: compiler-generated `type:.eq.`/`type:.hash.` (equality and hash functions) and the generic `[...]` part are removed |
+| 11–13 | `slash`, `dot`, `pkg` | extracts the package name: `net/http.StatusText` → `net/http`. A name without a package (assembler code) → `runtime(asm)` |
+| 14 | `sum[pkg] += size` | adds up the bytes per package |
+| 16–17 | `END …`, `sort -rn \| head` | prints with percentages, largest first (`JAMI` = "total"); the second argument is the number of lines |
+
+Now we build the GO-X.01 API and open it with this script (`cd` = change to another folder):
+
+```console
+$ cd ../0x-01-http-api && CGO_ENABLED=0 go build -o api . && ls -l api
+-rwxr-xr-x 1 haywan users 8659683 Nov 26 17:49 api
+$ ../001-why-go/paketlar.sh api 6
+ 2614648 100.0% JAMI
+  461510  17.7% runtime
+  244700   9.4% crypto/tls
+  231802   8.9% net/http
+  137266   5.2% net
+  100373   3.8% slices
+$ ../001-why-go/paketlar.sh api 400 | grep ' main$'
+    1595   0.1% main
+```
+
+The largest is `runtime`, then `crypto/tls` and `net/http`. Our `main` package is 1,595 bytes: we found it with `grep`
+in a 400-line list.
+
+Note: `JAMI` is machine code only, 2,614,648 bytes. That is 30 % of the 8.66 MB file. The rest is the function name
+table and debug information; we open them in the "Going deeper" section.
+
+| `api` file: 8,659,683 bytes | Bytes | Share | Where we look at it |
+|---|---|---|---|
+| machine code (what `paketlar.sh` counts) | 2,614,648 | 30 % | this section |
+| ↳ of which `runtime` | 461,510 | | this section |
+| ↳ of which our `main` | 1,595 | 0.02 % | this section |
+| name table, debug information and the rest | 6,045,035 | 70 % | "Going deeper" |
+
+## The runtime: the fixed cost of every Go program
+
+We measure the runtime's cost in the smallest program. The seven-line "Salom, dunyo" ("Hello, world"):
+
+```go filename="salom/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Salom, dunyo!")
+}
+```
+
+```console
+$ cd ../001-why-go/salom && go build main.go && ls -l
+total 2360
+-rwxr-xr-x 1 haywan users 2409990 Nov 26 17:49 main
+-rw-r--r-- 1 haywan users      74 Nov 26 12:25 main.go
+```
+
+`main.go` is 74 bytes; the `main` file that `go build` made is 2,409,990 bytes. Let's open it:
+
+```console
+$ ../paketlar.sh main 4
+  612609 100.0% JAMI
+  437293  71.4% runtime
+   29557   4.8% fmt
+   25634   4.2% reflect
+$ go tool nm -size main | grep ' main.main$'
+  49e140         83 T main.main
+```
+
+71.4 % of the machine code belongs to the `runtime` package. Our `main.main` function is 83 bytes. You know the runtime
+from GO-X.01: the garbage collector and the scheduler. What is new: it is in the API and in "Salom, dunyo" alike. It is
+the **fixed cost** of every Go program (Go FAQ: the runtime "is part of every Go program").
+
+The difference from Node: V8 and the event loop live in one `node` file, installed once per server. In Go every
+service carries its own runtime inside its own binary.
+
+Now we measure this cost on its own: we remove `fmt` too. No imports, an empty `func main`, the program does nothing
+(`bosh` = "empty"):
+
+```go filename="bosh/main.go" showLineNumbers
+package main
+
+func main() {
+}
+```
+
+What share of "Salom, dunyo" (2,409,990 bytes) will its binary be? Above, `fmt` was 4.8 % of the machine code.
+
+**A)** ~5 %: most of the size was `fmt` · **B)** ~75 %: `fmt` and the packages it pulls in are about a quarter ·
+**C)** ~100 %: `fmt` is negligible
+
+<details>
+<summary>Answer</summary>
+
+**B: 1,829,988 bytes, 75.9 %.** Even a program that does nothing is 1.8 MB. That is the runtime, its tables and debug
+information. If you chose A, you thought our code and `fmt` make the size: the runtime is there without them. If you
+chose C, you looked at `fmt` alone: it is small, but it pulls in packages like `reflect`. The difference from
+"Salom, dunyo" is 580,002 bytes.
+
+</details>
+
+```console
+$ cd ../bosh && go build main.go && ls -l main
+-rwxr-xr-x 1 haywan users 1829988 Nov 26 17:49 main
+```
+
+| Binary | Size, bytes | Inside |
+|---|---|---|
+| `bosh/main` (empty `func main`) | 1,829,988 | runtime + tables + debug information |
+| `salom/main` | 2,409,990 | + `fmt`, `reflect` and others (+580,002) |
+| GO-X.01 `api` | 8,659,683 | + `net/http`, `crypto/tls`, `net`, `encoding/json` … |
+
+Part of these 1.8 MB can be removed (the debug information); the rest is needed for the runtime to work. Which part:
+see "Going deeper".
+
+## Tree-shaking: the linker drops code nobody calls
+
+The frontend tree-shaking question. Vite or Rollup put only the functions you call from `lodash-es` into the bundle.
+In Go this is the **linker**'s job: the compiler turns each package into machine code separately, and the linker
+assembles them into one binary. While doing so it keeps the functions reachable from `main.main` and drops the rest
+(**dead-code elimination**).
+
+Let's test it. We import `net/http`, but call only one small function from it, `http.StatusText`. It returns the text
+for an HTTP status code: `Not Found` for 404.
+
+```go filename="statustext/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	fmt.Println(http.StatusText(404))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( "fmt" "net/http" )` | two packages: `fmt` and `net/http`, the HTTP server package from GO-X.01 |
+| 9 | `http.StatusText(404)` | the only call into `net/http`: 404 → `"Not Found"`. No server, no request |
+
+```console
+$ cd ../statustext && CGO_ENABLED=0 go run main.go
+Not Found
+```
+
+How big will the binary be? For comparison: "Salom, dunyo" is 2.4 MB, the GO-X.01 API is 8.7 MB.
+
+**A)** ~2.4 MB: the linker drops what is unused · **B)** ~5 MB: part of it stays · **C)** ~8.7 MB: the whole package
+goes in
+
+<details>
+<summary>Answer</summary>
+
+**B: 5,143,595 bytes**, twice the size of "Salom, dunyo". If you chose A, you thought tree-shaking drops all unused
+code: in the next section we see why it can't. If you chose C, you thought Go adds the whole package: the code of
+`net/http` itself really was dropped.
+
+</details>
+
+```console
+$ CGO_ENABLED=0 go build -o st main.go && ls -l st
+-rwxr-xr-x 1 haywan users 5143595 Nov 26 17:49 st
+$ ../paketlar.sh st 400 | grep ' net/http$'
+    5262   0.4% net/http
+```
+
+The code of `net/http` itself is 5,262 bytes. In the GO-X.01 API it was 231,802 bytes: 44 times smaller. The linker
+really dropped the functions nobody calls. So where do the 2.7 MB on top of "Salom, dunyo" come from?
+
+## `init`: code that runs before main stays
+
+In JavaScript the top-level code of a module runs on import: the code in `import './polyfill'` runs even if you call
+nothing from it. That is why a bundler cannot drop such a module. With `"sideEffects": false` in `package.json` you
+tell the bundler "these modules have no side effects, drop them freely".
+
+In Go the counterpart is **package initialization**. In every imported package two things run before `main`, always
+(Go spec, "Package initialization"):
+
+- initializing global variables: for example `var DefaultTransport = &Transport{…}` in `net/http`;
+- the package's `func init()` functions.
+
+The linker starts from two roots: `main.main` and the init tasks of all packages
+(`cmd/link/internal/ld/deadcode.go`). The init code and everything it calls stay in the binary. Go has no flag like
+`"sideEffects": false`.
+
+The largest packages in the `statustext` binary:
+
+```console
+$ ../paketlar.sh st 6
+ 1428465 100.0% JAMI
+  454858  31.8% runtime
+  121834   8.5% net
+   59328   4.2% math/big
+   51441   3.6% crypto/internal/fips140/nistec
+   48111   3.4% time
+$ go tool nm -size -sort size st | grep -E ' (net/http|net|crypto/x509)\.init$'
+  506ac0       3754 T crypto/x509.init
+  521a60       3092 T net/http.init
+  4df440       2867 T net.init
+$ ../paketlar.sh st 400 | grep -E ' crypto(/|$)' | wc -l
+47
+```
+
+We called neither `net` nor `crypto`. They came in through the init chain:
+
+| Step | What | Result |
+|---|---|---|
+| 1 | before `main`, the init task of every imported package (`main.inittasks`) | the linker does not drop them |
+| 2 | `net/http.init`: global variables, for example `DefaultTransport` | `Transport` and its dialer stay |
+| 3 | `DefaultTransport` → `net.(*Dialer).DialContext` | the `net` package: 121,834 bytes |
+| 4 | TLS and certificates (`crypto/x509.init` and others) | `math/big` and 47 `crypto` packages (`crypto` and `crypto/…`) |
+| 5 | all of it | the binary is 5,143,595 bytes, although `StatusText` is the only call |
+
+The course README has one more rule: the methods of a type stored in an interface also stay if an interface method
+with the same name is called somewhere (`math/big` comes in partly this way).
+
+The takeaway for work: an import in Go is not free. Before importing a big package for one helper function, measure
+its cost with `paketlar.sh`.
+
+## A production case: `FROM scratch` and the time zone
+
+Now something that does **not** get into the binary. A service shows the time in Tashkent (`vaqt` = "time"):
+
+```go filename="vaqt/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 9 | `loc, err := time.LoadLocation("Asia/Tashkent")` | loads a time zone by name: `loc` is the zone, `err` the error (two values, as in GO-X.03) |
+| 10–13 | `if err != nil { … return }` | if the zone is not found, prints the error (`xato` = "error") and stops |
+| 14 | `time.Now().In(loc).Hour()` | converts the current time to that zone and takes the hour (`Toshkent soati` = "Tashkent hour") |
+
+On the laptop the hour is right:
+
+```console
+$ cd ../vaqt && go build -o vaqt main.go && ./vaqt
+Toshkent soati: 17
+```
+
+We put it into the `FROM scratch` image from GO-X.01. `vaqt/Dockerfile`:
+
+```dockerfile filename="vaqt/Dockerfile"
+FROM scratch
+COPY vaqt /vaqt
+ENTRYPOINT ["/vaqt"]
+```
+
+```bash
+docker build -t vaqt .
+```
+
+What does `docker run` print? On the laptop it was `Toshkent soati: 17` (Tashkent is UTC+5).
+
+**A)** `Toshkent soati: 17` · **B)** the UTC hour: `12` · **C)** an error
+
+<details>
+<summary>Answer</summary>
+
+**C: `xato: unknown time zone Asia/Tashkent`.** The time-zone database is not inside the binary. `time.LoadLocation`
+reads it from the system, and `scratch` has no files at all. If you chose A, you thought the binary carries everything
+with it: code yes, system data no. B happens in another case: we see it below.
+
+</details>
+
+```console
+$ docker run --rm vaqt
+xato: unknown time zone Asia/Tashkent
+```
+
+The search order for the database, from `go doc time.LoadLocation`:
+
+| # | Where from | Laptop | `scratch` |
+|---|---|---|---|
+| 1 | the file named by the `$ZONEINFO` environment variable | — | — |
+| 2 | Unix system locations: `/usr/share/zoneinfo/` … `/etc/zoneinfo` | ✅ found | ❌ missing |
+| 3 | `$GOROOT/lib/time/zoneinfo.zip` (where Go is installed) | ✅ | ❌ no Go |
+| 4 | the `time/tzdata` package, if it is imported | — | ❌ not imported |
+
+At least this error is visible. Option B is quieter. A `time.Now()` without a zone uses the local zone (`time.Local`),
+and in `scratch` that silently becomes UTC. `vaqt-local/main.go`:
+
+```go filename="vaqt-local/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	// zona ko'rsatilmagan: time.Local (scratch'da jimgina UTC)
+	fmt.Println(time.Now().Format("15:04 MST"))
+}
+```
+
+Line 10: `Format("15:04 MST")` means hour:minute and the zone name. In Go a format layout is written with a fixed
+reference date: `15` is the hour, `04` the minute, `MST` the zone. (The comment on line 9: "no zone given: time.Local,
+silently UTC in scratch".)
+
+```console
+$ cd ../vaqt-local && go build -o vaqt main.go && ./vaqt
+17:49 +05
+```
+
+```bash
+docker build -t vaqt-local .
+```
+
+```console
+$ docker run --rm vaqt-local
+12:49 UTC
+```
+
+No error, no log: the service runs 5 hours behind.
+
+In Node this is rare. The ICU library that `Intl` uses carries its own time-zone database inside the `node` file
+(official Node binaries are built with full-icu):
+
+```console
+$ node -p process.versions.tz
+2025b
+```
+
+## The fix: `import _ "time/tzdata"`
+
+The `time/tzdata` package holds a copy of the time-zone database. We need no function from it, only its `init`: it
+registers the database with the `time` package. Like `import 'dotenv/config'` in JS: the module exports nothing you
+use, importing it is enough.
+
+First we try a plain import. This file is not in the course folder: we removed the `_` from `vaqt-tz/main.go` and
+tested it in a separate folder:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+	"time/tzdata"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+```console
+$ go build -o vaqt main.go
+# command-line-arguments
+./main.go:6:2: "time/tzdata" imported and not used
+```
+
+Reading the message: `./main.go:6:2` is the file, line 6, column 2. *"time/tzdata" imported and not used* means the
+package is imported but never used. Go treats an unused import as a compile error, not a warning. JS has no such rule,
+which is why JS needs no `_`.
+
+The solution is a **blank import**: `_` in place of the package name. It means "import the package, but I don't use its
+name, only its init" (Go spec, "Import declarations"). In `vaqt-tz/main.go` only line 6 is added:
+
+```go filename="vaqt-tz/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+	_ "time/tzdata"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+We rebuild and run it in `scratch`. `vaqt-tz/Dockerfile` is the same as `vaqt/Dockerfile`:
+
+```console
+$ cd ../vaqt-tz && go build -o vaqt main.go
+```
+
+`go build` printed nothing: the build succeeded.
+
+```bash
+docker build -t vaqt .
+```
+
+```console
+$ docker run --rm vaqt
+Toshkent soati: 17
+$ ls -l vaqt ../vaqt/vaqt
+-rwxr-xr-x 1 haywan users 2885090 Nov 26 17:49 vaqt
+-rwxr-xr-x 1 haywan users 2474690 Nov 26 17:49 ../vaqt/vaqt
+```
+
+The cost is 410,400 bytes (the docs say "about 450 KB"). Now step 4 of the search order works:
+
+| | `vaqt` | `vaqt-tz` |
+|---|---|---|
+| import | `"time"` | `"time"` + `_ "time/tzdata"` |
+| before `main` | — | `tzdata` init: registers the database with `time` |
+| in `scratch` | `unknown time zone` | `Toshkent soati: 17` |
+| size, bytes | 2,474,690 | 2,885,090 (+410,400) |
+
+The second way: a distroless static image instead of `scratch`. It contains the time-zone database, so even the
+unfixed `vaqt` works. This command is not in the course folder; we tested it separately (`-v` mounts the file into the
+container):
+
+```console
+$ cd ../vaqt && docker run --rm -v $PWD/vaqt:/vaqt:ro --entrypoint /vaqt gcr.io/distroless/static-debian13
+Toshkent soati: 17
+```
+
+The third way is `go build -tags timetzdata`, without touching the code. That is the 🟡 homework.
+
+## Going deeper (optional): binary sections, `-s -w` and 2007
+
+**File sections.** `paketlar.sh` counts only machine code. `size -A` shows the whole file by ELF section:
+
+```console
+$ cd ../salom && size -A main
+main  :
+section                 size      addr
+.note.go.buildid         100   4198264
+.note.gnu.build-id        36   4198364
+.text                 643537   4198400
+.rodata               222082   4845568
+.gopclntab            677386   5067656
+.typelink               2056   5745056
+.itablink                136   5747136
+.go.buildinfo            304   5750784
+.go.fipsinfo             120   5751104
+.go.module               592   5751232
+.noptrdata             19618   5751840
+.data                  22258   5771488
+.bss                  132312   5793760
+.noptrbss              87488   5926080
+.debug_abbrev            352         0
+.debug_line           163128         0
+.debug_frame           30664         0
+.debug_gdb_scripts        91         0
+.debug_info           296941         0
+.debug_loclists       113057         0
+.debug_rnglists        67861         0
+.debug_addr             4024         0
+Total                2484143
+```
+
+| Section | Bytes | Of the file | What |
+|---|---|---|---|
+| `.text` | 643,537 | 26.7 % | machine code |
+| `.gopclntab` | 677,386 | 28.1 % | the table of function names and line numbers: the runtime uses it for stack traces and the garbage collector |
+| `.debug_*` (8 sections) | 676,118 | 28.1 % | DWARF debug information: for debuggers, not needed to run the program |
+| `.rodata` | 222,082 | 9.2 % | type information, strings |
+
+`.bss` and `.noptrbss` take no space in the file: they are allocated in memory when the program starts.
+
+**`-ldflags="-s -w"`.** `-ldflags` passes flags to the linker. `-w` removes the DWARF debug information. `-s` also
+removes the symbol table that `go tool nm` reads, and since Go 1.22 it implies `-w` as well:
+
+```console
+$ go build -ldflags="-s -w" -o main-sw main.go && ls -l main-sw
+-rwxr-xr-x 1 haywan users 1601698 Nov 26 17:49 main-sw
+```
+
+2,409,990 → 1,601,698 bytes, −33.5 %. It is similar to a production build without source maps. With one difference:
+`.gopclntab`, which the runtime uses, stays, so the function names and line numbers in a panic stack trace do not
+change (🔍 homework). The price: a debugger (for example Delve) and `go tool nm` can no longer work with this file.
+
+**Go's import model and 2007.** In his 2012 article "Go at Google", Rob Pike recalls a C++ binary at Google. After the
+`#include`s were expanded, the compiler received "a blow-up of 2000 bytes for every C++ source byte". The build "took 45
+minutes using a precursor distributed build system". The Go compiler reads not the source of an imported package but
+its compiled object file: "the compiler reads the object file for B, not its source code". Pike calls the story that
+Go's idea was born during such a 45-minute wait "the origin myth for Go".
+
+## Common mistakes
+
+**1. Thinking "the linker tree-shakes, so imports are free".** This is the classic misconception of this topic. There
+is no error message: the binary grows silently. `net/http` was imported for `http.StatusText`, and the binary grew from
+2.4 MB to 5.1 MB. The cause is packages' init code and global variables (section "`init`: code that runs before main
+stays"). **Fix:** measure with `paketlar.sh` before and after an import. You may not need a big package for one small
+function.
+
+**2. `time.LoadLocation` in `FROM scratch`.** Works on the laptop, prints `xato: unknown time zone Asia/Tashkent` in the
+image. The full example is in "A production case". **Fix:** `import _ "time/tzdata"` in the `main` package, or
+`go build -tags timetzdata`, or a distroless image.
+
+**3. A zone-less `time.Now()` is silently UTC in `scratch`.** No error, only the hour is 5 hours off (`vaqt-local`,
+section "A production case"). **Fix:** load the zone explicitly with `time.LoadLocation` (and add the database as in
+mistake 2). Check the time in the same image as production, not on the laptop.
+
+**4. Importing `time/tzdata` without `_`.** `./main.go:6:2: "time/tzdata" imported and not used`. The example is in
+"The fix". **Fix:** write `_` in place of the package name.
+
+**5. A plain `go build` of a program that pulls in `net` on a machine without gcc.** This is what you get on this
+laptop:
+
+```console
+$ cd ../statustext && go build -o st main.go
+# runtime/cgo
+cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
+```
+
+Reading it: `# runtime/cgo` means the error came while building the `runtime/cgo` package. *C compiler "gcc" not
+found* means the C compiler gcc was not found. In Go cgo is on by default (`go env CGO_ENABLED` → `1`), and the `net`
+package wants to use the system library through cgo. **Fix:** `CGO_ENABLED=0 go build …`. It also makes the binary
+fit for `scratch` (GO-X.01).
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** Why is a Go program that does nothing 1.8 MB?
+
+<details>
+<summary>Answer</summary>
+
+Every Go binary carries its own runtime (garbage collector, scheduler and more), its tables (`.gopclntab`) and debug
+information (DWARF). That is the fixed cost. With `-ldflags="-s -w"` the debug information goes; the runtime and the
+tables stay.
+
+</details>
+
+**2.** If we import `net/http` for one `http.StatusText`, why does the binary double?
+
+<details>
+<summary>Answer</summary>
+
+The linker drops functions nobody calls (`net/http`'s own code shrank to 5,262 bytes). But every imported package's
+`init` code and global variables always run before `main`, so they stay together with everything they call:
+`DefaultTransport` → `net`, TLS, 47 `crypto` packages. Go has no `"sideEffects": false`.
+
+</details>
+
+**3.** A `scratch` image prints `unknown time zone`. What do you do?
+
+<details>
+<summary>Answer</summary>
+
+The time-zone database is read from the system, and `scratch` does not have it. Add `import _ "time/tzdata"` to the
+`main` package (+410 KB), or use `go build -tags timetzdata`, or take a distroless image. A zone-less `time.Now()`
+gives no error and silently shows UTC: check that too.
+
+</details>
+
+**4.** In the `salom/` folder, `main-sw` is built with `-ldflags="-s -w"`. What does `../paketlar.sh main-sw` print?
+**A)** the same table as for `main` · **B)** smaller numbers · **C)** an empty result
+
+<details>
+<summary>Answer</summary>
+
+**C.** `-s` removes the symbol table, and `go tool nm` reads exactly that table. The functions are in the binary; only
+the table with their names and sizes is gone. If you chose B, you thought `-s -w` shrinks the code: the machine code
+does not change.
+
+```console
+$ ../paketlar.sh main-sw
+reading main-sw: no symbol section
+reading main-sw: no symbols
+       0 100.0% JAMI
+```
+
+</details>
+
+**5.** From the start of the lesson: `scratch` prints `exec /api: no such file or directory`. What do you check first?
+
+<details>
+<summary>Answer</summary>
+
+Whether the binary was built with cgo: then it looks for libc and its loader on the system, and `scratch` has neither.
+Rebuild with `CGO_ENABLED=0`. It is the same "what does not get into the binary" question as the time-zone database.
+
+</details>
+
+## Homework
+
+Starter files and answers are in the lesson folder on GitHub:
+[lessons/001-why-go](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go) (the `uyga/` folder,
+"uyga" = "homework"; answers in
+[uyga/README.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/001-why-go/uyga/README.md)).
+Guess first, then measure, then open the answer. The commands in each answer start from the lesson folder
+(`lessons/001-why-go`).
+
+🟢 **Easy** (`statustext/`): replace `fmt.Println(http.StatusText(404))` with `fmt.Println("salom")` and change the
+import to `_ "net/http"`. Now nothing from `net/http` is called. Guess **before** building: does the binary drop to
+2.4 MB or stay at ~5.1 MB? Then look at the share of `net/http` with `paketlar.sh`.
+
+🟡 **Medium** (`uyga/orta/`, the broken version from the video plus a `Dockerfile`): make the `vaqt` service work in
+`scratch` without touching `main.go`; change only the build command. Hint: `go doc time/tzdata`.
+
+```go filename="uyga/orta/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+🔍 **Curiosity** (`uyga/qiziq/`): build it normally and with `-ldflags="-s -w"`, and compare the two panic outputs. Do
+the function names and line numbers disappear?
+
+```go filename="uyga/qiziq/main.go" showLineNumbers
+package main
+
+func boshla(n int) int {
+	s := []int{1, 2, 3}
+	return s[n]
+}
+
+func main() {
+	println(boshla(5))
+}
+```
+
+`boshla` ("start") reads index 5 from a slice with 3 elements: the program stops with a panic. `println` is a Go
+built-in function and needs no import.
+
+➕ **GO-X.01 review** (`uyga/qoshimcha/`): a program that does `http.Get("https://go.dev")` runs in `scratch`. What does
+it print and how do you fix it?
+
+<details>
+<summary>Answer</summary>
+
+🟢 This solution is not in the course folder: we copied `statustext/main.go` to a separate folder and changed it. The
+folder path is stored inside the binary, so the size differs by a few bytes from the one in `uyga/README.md`
+(5,139,103).
+
+```go
+package main
+
+import (
+	"fmt"
+	_ "net/http"
+)
+
+func main() {
+	fmt.Println("salom")
+}
+```
+
+```console
+$ CGO_ENABLED=0 go build -o st main.go && ls -l st
+-rwxr-xr-x 1 haywan users 5139127 Nov 26 17:50 st
+$ ../paketlar.sh st 300 | grep ' net/http$'
+    3729   0.3% net/http
+```
+
+Almost no change (5,143,595 → 5,139,127). `StatusText` itself was negligible. The size comes from the `init` code and
+global variables of `net/http` and its dependencies, and they run as soon as the package is imported. That is exactly
+what `import _` means: "for init only".
+
+🟡 `go doc time/tzdata`: "This package will be automatically imported if you build with -tags timetzdata".
+
+```console
+$ cd uyga/orta && go build -tags timetzdata -o vaqt main.go && ls -l vaqt
+-rwxr-xr-x 1 haywan users 2884802 Nov 26 17:50 vaqt
+```
+
+```bash
+docker build -t vaqt .
+```
+
+```console
+$ docker run --rm vaqt
+Toshkent soati: 17
+```
+
+The size is almost the same as with `import _ "time/tzdata"`. Which is better? `import _` lives in the code itself and
+can't be forgotten. `-tags` is handy for several binaries. The docs recommend that the `main` package, not a library,
+imports tzdata.
+
+🔍 We added `-trimpath` to both builds so that the panic output does not show the full folder path (it removes file
+paths from the binary). That is why the sizes are a bit smaller than in `uyga/README.md` (1,830,012 and 1,208,482).
+
+```console
+$ cd uyga/qiziq && go build -trimpath -o p main.go && ./p
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.boshla(...)
+	./main.go:5
+main.main()
+	./main.go:9 +0xa
+$ go build -trimpath -ldflags="-s -w" -o p2 main.go && ./p2
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.boshla(...)
+	./main.go:5
+main.main()
+	./main.go:9 +0xa
+$ ls -l p p2
+-rwxr-xr-x 1 haywan users 1821476 Nov 26 17:50 p
+-rwxr-xr-x 1 haywan users 1200290 Nov 26 17:50 p2
+```
+
+Nothing disappeared, and the file shrank by 34 %. The stack trace comes from the `.gopclntab` table: the runtime uses
+it and the linker does not drop it. `-w` removes only DWARF (for debuggers), `-s` the symbol table.
+
+➕ HTTPS root certificates are also read from the system (`crypto/x509/root_linux.go`), and `scratch` has none:
+
+```console
+$ cd uyga/qoshimcha && CGO_ENABLED=0 go build -o app main.go
+```
+
+```bash
+docker build -t https .
+```
+
+```console
+$ docker run --rm https
+xato: Get "https://go.dev": tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+The fix: copy the certificates into the image or take distroless (both give `200 OK`):
+
+```dockerfile
+FROM scratch
+COPY --from=alpine:3.24 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY app /app
+ENTRYPOINT ["/app"]
+```
+
+or `FROM gcr.io/distroless/static-debian13` (it has both the certificates and the time zones).
+
+</details>
+
+## Sources
+
+- Go FAQ: [runtime](https://go.dev/doc/faq#runtime) ("is part of every Go program") ·
+  [Why is my trivial program such a large binary?](https://go.dev/doc/faq#Why_is_my_trivial_program_such_a_large_binary)
+- Go spec: [Package initialization](https://go.dev/ref/spec#Package_initialization) ·
+  [Import declarations](https://go.dev/ref/spec#Import_declarations)
+- Linker: [cmd/link/internal/ld/deadcode.go](https://github.com/golang/go/blob/go1.26.8/src/cmd/link/internal/ld/deadcode.go) ·
+  [cmd/link](https://pkg.go.dev/cmd/link) (`-s`, `-w`)
+- [`net/http.StatusText`](https://pkg.go.dev/net/http#StatusText) · [`time.LoadLocation`](https://pkg.go.dev/time#LoadLocation) ·
+  [`time/tzdata`](https://pkg.go.dev/time/tzdata)
+- Docker, [the `scratch` image](https://docs.docker.com/build/building/base-images/#create-a-minimal-base-image-using-scratch) ·
+  [distroless](https://github.com/GoogleContainerTools/distroless)
+- Node.js, [Internationalization support](https://nodejs.org/api/intl.html) (full-icu)
+- Rob Pike, [Go at Google: Language Design in the Service of Software Engineering](https://go.dev/talks/2012/splash.article) (2012)
+- Course folder: [lessons/001-why-go](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go) ·
+  GO-X.01 API: [lessons/0x-01-http-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+- All results from `go1.26.8 linux/amd64`, Docker 29.8.1 and Node v24.10.0, taken on 2026-11-26. In another folder the
+  byte counts differ by a few bytes: file paths are stored inside the binary too.
+
+## Video and code
+
+<iframe src="https://www.youtube-nocookie.com/embed/TaGL7BmLP3Y" title="Why does Go exist? What is inside go build" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen style={{width: "100%", aspectRatio: "16 / 9", border: 0, borderRadius: 8}} />
+
+▶️ [Watch the video on YouTube](https://youtu.be/TaGL7BmLP3Y)
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go)
+
+---
+
+← Previous lesson: [GO-X.04](/lab/youtube/go#go-x-04) · Next lesson: [GO-1.02](/lab/youtube/go/go-1-02/en) → · [All lessons](/lab/youtube/go)
+
+</div>

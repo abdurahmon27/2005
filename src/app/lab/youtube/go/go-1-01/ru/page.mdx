@@ -1,0 +1,911 @@
+---
+title: "Зачем нужен Go? Что внутри go build"
+date: "2026/11/26"
+description: "Открываем Go-бинарник как bundle analyzer: цена runtime, tree-shaking в linker и init пакетов, ошибка часового пояса во FROM scratch и time/tzdata."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-01) · **Русский** · [English](/lab/youtube/go/go-1-01/en)  
+Урок GO-1.01 · [Go: 0 → Guru](/lab/youtube/go#go-1-01) · ▶️ [Смотреть видео на YouTube](https://youtu.be/TaGL7BmLP3Y) · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Бинарник двадцатистрочного HTTP API из GO-X.01 весит 8 659 683 байта, то есть 8,66 МБ. Увидев бандл на 8 МБ во
+фронтенде, вы сразу открываете bundle analyzer. Что это за мегабайты в Go-бинарнике и сколько из них — наш код?
+Сегодня это измерим.
+
+**Одна идея:** бо́льшая часть Go-бинарника — не наш код. В каждой программе есть runtime. Из импортированных пакетов
+linker оставляет только функции, которые могут быть вызваны, и init-код каждого пакета. А данные системы (база
+часовых поясов) в бинарник не попадают вовсе: их добавляют осознанно, через `import _`.
+
+К концу урока вы сможете:
+
+- измерить любой Go-бинарник по пакетам с помощью `go tool nm` и 10-строчного скрипта `paketlar.sh`;
+- объяснить, почему пустая Go-программа весит 1,8 МБ и какую часть этой цены можно убрать;
+- через `init` объяснить, почему пакет, импортированный ради одной функции, удваивает бинарник;
+- исправить ошибку `unknown time zone` в образе `FROM scratch` с помощью `import _ "time/tzdata"` или distroless.
+
+Три главных новых понятия:
+
+| Понятие | Простыми словами | По-английски |
+|---|---|---|
+| постоянная цена runtime | GC, планировщик и их таблицы есть в каждом Go-бинарнике: даже пустая программа весит 1,8 МБ | runtime (fixed cost) |
+| tree-shaking в linker и `init` | linker выбрасывает функции, которые никто не вызывает, но init-код пакетов и их глобальные переменные остаются | dead-code elimination, package initialization |
+| `import _ "…"` | подключить пакет без имени, только ради его `init` (побочного эффекта), как `import 'dotenv/config'` | blank import |
+
+Есть ещё два вспомогательных инструмента: **`go tool nm`** (показывает размер каждой функции в бинарнике) и
+**`-ldflags="-s -w"`** (флаг для linker, убирает отладочную информацию; только в разделе «Глубже»).
+
+## Что нужно знать заранее
+
+- [GO-X.01 · HTTP API в 20 строк: первый сервис на Go и один бинарник](/lab/youtube/go#go-x-01): `go build` собирает один
+  статический бинарник; runtime (garbage collector и планировщик) заменяет V8 и event loop из Node; образ
+  `FROM scratch`; cgo и `CGO_ENABLED=0`. Здесь мы это заново не объясняем.
+- [GO-X.03 · Нет try/catch: ошибка как значение и defer](/lab/youtube/go#go-x-03): проверка ошибки через `if err != nil`.
+- go.dev/play для этого урока не хватит: файлы, `paketlar.sh` и `Dockerfile`ы лежат в папке курса. Скачайте курс и
+  откройте терминал в папке `lessons/001-why-go`. Команды работают оттуда, в подпапки переходим через `cd`. Ещё нужен
+  Docker (для раздела о часовом поясе).
+- На этом ноутбуке нет компилятора C (gcc). Поэтому программы, которые тянут пакет `net`, собираются с
+  `CGO_ENABLED=0`, как в рецепте из GO-X.01. Ошибка без него — в разделе «Частые ошибки».
+
+Сначала один вопрос из GO-X.01. Мы собрали API в образе `golang` и положили в образ `scratch`. `docker run` ответил
+`exec /api: no such file or directory`, хотя файл в образе был. В чём была причина?
+**A)** неверный `GOARCH` · **B)** cgo остался включён: бинарник ищет libc в системе · **C)** в `scratch` нет Go
+
+<details>
+<summary>Ответ</summary>
+
+**B.** В образе `golang` есть gcc, поэтому cgo остался включён. Бинарник искал в системе libc и её загрузчик
+(`/lib64/ld-linux-x86-64.so.2`), а в `scratch` их нет. Сообщение «файл не найден» на самом деле про загрузчик. A
+неверно: при неверной архитектуре будет `exec format error`. C неверно: Go-бинарнику не нужен установленный Go,
+runtime внутри бинарника.
+
+Вывод: что попадает в бинарник, а что нет, напрямую влияет на деплой. Сегодня измерим содержимое бинарника по пакетам.
+
+</details>
+
+## Bundle analyzer для Go-бинарника
+
+Сначала угадайте. API из GO-X.01 весит 8 659 683 байта. Сколько из них — наши двадцать строк (машинный код пакета
+`main`)?
+
+**A)** ~1 МБ · **B)** ~100 КБ · **C)** меньше 2 КБ
+
+<details>
+<summary>Ответ</summary>
+
+**C: 1 595 байт**, 0,02 % файла. Если вы выбрали A или B, вы представили бинарник как бандл, который «в основном наш
+код». В Go-бинарнике наш код — самая маленькая часть. Из чего остальное, измерим ниже.
+
+</details>
+
+Готового bundle analyzer в Go нет. Но `go tool nm -size` выводит каждый символ бинарника (функцию или глобальную
+переменную) с его размером. Скрипт `paketlar.sh` («пакеты») из папки урока берёт из этого списка только функции и
+суммирует их по пакетам:
+
+```bash filename="paketlar.sh" showLineNumbers
+#!/bin/sh
+# Go binary uchun "bundle analyzer": mashina kodi (funksiyalar) baytlarini paketlar bo'yicha qo'shadi.
+# Ishlatish: ./paketlar.sh <binary> [qator soni, standart 6]
+# Eslatma: -ldflags="-s" bilan build qilingan faylda simvollar jadvali yo'q, natija bo'sh bo'ladi.
+go tool nm -size "$1" | awk '
+  $3 == "T" || $3 == "t" {
+    size = $2
+    name = $0; sub(/^ *[0-9a-f]+ +[0-9]+ +[A-Za-z] +/, "", name)   # nomda bo`sh joy bo`lishi mumkin
+    sub(/^go:/, "", name); sub(/^type:\.(eq|hash)\./, "", name)     # kompilyator yasagan eq/hash funksiyalari
+    sub(/\[.*/, "", name)                                            # generic: Foo[...] -> Foo
+    slash = 0; for (i = 1; i <= length(name); i++) if (substr(name, i, 1) == "/") slash = i
+    rest = substr(name, slash + 1); dot = index(rest, ".")
+    pkg = (dot > 0) ? substr(name, 1, slash + dot - 1) : "runtime(asm)"   # paketsiz nom = runtime assembler kodi
+    sum[pkg] += size; total += size
+  }
+  END { for (p in sum) printf "%8d %5.1f%% %s\n", sum[p], 100 * sum[p] / total, p; printf "%8d 100.0%% JAMI\n", total }
+' | sort -rn | head -n "${2:-6}"
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 5 | `go tool nm -size "$1"` | для каждого символа: адрес, размер (байты), буква типа, имя. `T`/`t` — машинный код (функция) |
+| 6 | `$3 == "T" \|\| $3 == "t"` | берёт только функции; глобальные переменные не считаются |
+| 8–10 | `sub(…)` | чистит имя: убирает сгенерированные компилятором `type:.eq.`/`type:.hash.` (функции сравнения и хеш-функции) и generic-часть `[...]` |
+| 11–13 | `slash`, `dot`, `pkg` | выделяет имя пакета: `net/http.StatusText` → `net/http`. Имя без пакета (ассемблерный код) → `runtime(asm)` |
+| 14 | `sum[pkg] += size` | суммирует байты по пакетам |
+| 16–17 | `END …`, `sort -rn \| head` | выводит с процентами, от большего к меньшему (`JAMI` — «итого»); второй аргумент — сколько строк |
+
+Теперь соберём API из GO-X.01 и откроем его этим скриптом (`cd` — перейти в другую папку):
+
+```console
+$ cd ../0x-01-http-api && CGO_ENABLED=0 go build -o api . && ls -l api
+-rwxr-xr-x 1 haywan users 8659683 Nov 26 17:49 api
+$ ../001-why-go/paketlar.sh api 6
+ 2614648 100.0% JAMI
+  461510  17.7% runtime
+  244700   9.4% crypto/tls
+  231802   8.9% net/http
+  137266   5.2% net
+  100373   3.8% slices
+$ ../001-why-go/paketlar.sh api 400 | grep ' main$'
+    1595   0.1% main
+```
+
+Самый большой — `runtime`, за ним `crypto/tls` и `net/http`. А наш пакет `main` — 1 595 байт: мы нашли его через
+`grep` в списке из 400 строк.
+
+Обратите внимание: `JAMI` — это только машинный код, 2 614 648 байт. Это 30 % файла в 8,66 МБ. Остальное — таблица имён
+функций и отладочная информация, их откроем в разделе «Глубже».
+
+| Файл `api`: 8 659 683 байта | Байты | Доля | Где смотрим |
+|---|---|---|---|
+| машинный код (его и считает `paketlar.sh`) | 2 614 648 | 30 % | этот раздел |
+| ↳ из него `runtime` | 461 510 | | этот раздел |
+| ↳ из него наш `main` | 1 595 | 0,02 % | этот раздел |
+| таблица имён, отладочная информация и прочее | 6 045 035 | 70 % | «Глубже» |
+
+## Runtime: постоянная цена каждой Go-программы
+
+Цену runtime измерим на самой маленькой программе. Семистрочная «Salom, dunyo» («Привет, мир»):
+
+```go filename="salom/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Salom, dunyo!")
+}
+```
+
+```console
+$ cd ../001-why-go/salom && go build main.go && ls -l
+total 2360
+-rwxr-xr-x 1 haywan users 2409990 Nov 26 17:49 main
+-rw-r--r-- 1 haywan users      74 Nov 26 12:25 main.go
+```
+
+`main.go` — 74 байта, а собранный `go build` файл `main` — 2 409 990 байт. Откроем его:
+
+```console
+$ ../paketlar.sh main 4
+  612609 100.0% JAMI
+  437293  71.4% runtime
+   29557   4.8% fmt
+   25634   4.2% reflect
+$ go tool nm -size main | grep ' main.main$'
+  49e140         83 T main.main
+```
+
+71,4 % машинного кода принадлежит пакету `runtime`. Наша функция `main.main` — 83 байта. Runtime вы знаете по
+GO-X.01: garbage collector и планировщик (scheduler). Новое здесь вот что: он есть и в API, и в «Salom, dunyo». Это
+**постоянная цена** каждой Go-программы (Go FAQ: runtime «is part of every Go program»).
+
+Отличие от Node: V8 и event loop живут в одном файле `node`, который ставится на сервер один раз. В Go каждый сервис
+носит свой runtime внутри своего бинарника.
+
+Теперь измерим эту цену в чистом виде: уберём и `fmt`. Импортов нет, `func main` пустая, программа ничего не делает
+(`bosh` — «пустой»):
+
+```go filename="bosh/main.go" showLineNumbers
+package main
+
+func main() {
+}
+```
+
+Какую долю от «Salom, dunyo» (2 409 990 байт) составит её бинарник? Выше `fmt` занимал 4,8 % машинного кода.
+
+**A)** ~5 %: бо́льшая часть размера была `fmt` · **B)** ~75 %: `fmt` и подтянутые им пакеты — около четверти ·
+**C)** ~100 %: `fmt` ничтожен
+
+<details>
+<summary>Ответ</summary>
+
+**B: 1 829 988 байт, 75,9 %.** Даже программа, которая ничего не делает, весит 1,8 МБ. Это runtime, его таблицы и
+отладочная информация. Если вы выбрали A, вы думали, что размер дают наш код и `fmt`: runtime есть и без них. Если
+выбрали C, вы смотрели только на сам `fmt`: он маленький, но тянет пакеты вроде `reflect`. Разница с «Salom, dunyo» —
+580 002 байта.
+
+</details>
+
+```console
+$ cd ../bosh && go build main.go && ls -l main
+-rwxr-xr-x 1 haywan users 1829988 Nov 26 17:49 main
+```
+
+| Бинарник | Размер, байты | Внутри |
+|---|---|---|
+| `bosh/main` (пустая `func main`) | 1 829 988 | runtime + таблицы + отладочная информация |
+| `salom/main` | 2 409 990 | + `fmt`, `reflect` и другие (+580 002) |
+| `api` из GO-X.01 | 8 659 683 | + `net/http`, `crypto/tls`, `net`, `encoding/json` … |
+
+Часть этих 1,8 МБ можно убрать (отладочную информацию), остальное нужно для работы runtime. Какую именно — в разделе
+«Глубже».
+
+## Tree-shaking: linker выбрасывает код, который никто не вызывает
+
+Вопрос из фронтенда про tree-shaking. Vite или Rollup кладут в бандл только те функции из `lodash-es`, которые вы
+вызываете. В Go это работа **linker** (компоновщика): компилятор превращает каждый пакет в машинный код отдельно, а
+linker собирает их в один бинарник. При сборке он оставляет функции, достижимые из `main.main`, а остальное
+выбрасывает (**dead-code elimination**).
+
+Проверим. Импортируем `net/http`, но вызовем из него одну маленькую функцию — `http.StatusText`. Она возвращает текст
+HTTP-кода статуса: для 404 — `Not Found`.
+
+```go filename="statustext/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	fmt.Println(http.StatusText(404))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 3–6 | `import ( "fmt" "net/http" )` | два пакета: `fmt` и `net/http` — пакет HTTP-сервера из GO-X.01 |
+| 9 | `http.StatusText(404)` | единственный вызов из `net/http`: 404 → `"Not Found"`. Ни сервера, ни запроса |
+
+```console
+$ cd ../statustext && CGO_ENABLED=0 go run main.go
+Not Found
+```
+
+Какого размера будет бинарник? Для сравнения: «Salom, dunyo» — 2,4 МБ, API из GO-X.01 — 8,7 МБ.
+
+**A)** ~2,4 МБ: linker выбрасывает неиспользуемое · **B)** ~5 МБ: часть остаётся · **C)** ~8,7 МБ: пакет входит
+целиком
+
+<details>
+<summary>Ответ</summary>
+
+**B: 5 143 595 байт**, вдвое больше «Salom, dunyo». Если вы выбрали A, вы думали, что tree-shaking выбрасывает весь
+неиспользуемый код: в следующем разделе увидим, почему он не может. Если выбрали C, вы думали, что Go добавляет пакет
+целиком: собственный код `net/http` действительно выброшен.
+
+</details>
+
+```console
+$ CGO_ENABLED=0 go build -o st main.go && ls -l st
+-rwxr-xr-x 1 haywan users 5143595 Nov 26 17:49 st
+$ ../paketlar.sh st 400 | grep ' net/http$'
+    5262   0.4% net/http
+```
+
+Собственный код `net/http` — 5 262 байта. В API из GO-X.01 было 231 802 байта, то есть в 44 раза меньше. Linker
+действительно выбросил функции, которые никто не вызывает. Тогда откуда лишние 2,7 МБ сверх «Salom, dunyo»?
+
+## `init`: код, который выполняется до main, остаётся
+
+В JavaScript код верхнего уровня модуля выполняется при импорте: код из `import './polyfill'` выполнится, даже если вы
+ничего из него не вызываете. Поэтому бандлер не может выбросить такой модуль. Через `"sideEffects": false` в
+`package.json` вы говорите бандлеру: «в этих модулях нет побочных эффектов, выбрасывай смело».
+
+В Go этому соответствует **инициализация пакета**. В каждом импортированном пакете две вещи выполняются до `main`,
+всегда (Go spec, «Package initialization»):
+
+- инициализация глобальных переменных: например, `var DefaultTransport = &Transport{…}` в `net/http`;
+- функции `func init()` пакета.
+
+У linker две стартовые точки: `main.main` и init-задачи всех пакетов (`cmd/link/internal/ld/deadcode.go`). Init-код и
+всё, что он вызывает, остаются в бинарнике. Флага вроде `"sideEffects": false` в Go нет.
+
+Самые большие пакеты в бинарнике `statustext`:
+
+```console
+$ ../paketlar.sh st 6
+ 1428465 100.0% JAMI
+  454858  31.8% runtime
+  121834   8.5% net
+   59328   4.2% math/big
+   51441   3.6% crypto/internal/fips140/nistec
+   48111   3.4% time
+$ go tool nm -size -sort size st | grep -E ' (net/http|net|crypto/x509)\.init$'
+  506ac0       3754 T crypto/x509.init
+  521a60       3092 T net/http.init
+  4df440       2867 T net.init
+$ ../paketlar.sh st 400 | grep -E ' crypto(/|$)' | wc -l
+47
+```
+
+Мы не вызывали ни `net`, ни `crypto`. Они вошли по цепочке init:
+
+| Шаг | Что | Результат |
+|---|---|---|
+| 1 | до `main` — init-задача каждого импортированного пакета (`main.inittasks`) | linker их не выбрасывает |
+| 2 | `net/http.init`: глобальные переменные, например `DefaultTransport` | остаются `Transport` и его dialer |
+| 3 | `DefaultTransport` → `net.(*Dialer).DialContext` | пакет `net`: 121 834 байта |
+| 4 | TLS и сертификаты (`crypto/x509.init` и другие) | `math/big` и 47 пакетов `crypto` (`crypto` и `crypto/…`) |
+| 5 | всё вместе | бинарник 5 143 595 байт, хотя вызван только `StatusText` |
+
+В README курса есть ещё одно правило: методы типа, сохранённого в интерфейс, тоже остаются, если где-то вызывается
+метод интерфейса с тем же именем (`math/big` частично попадает так).
+
+Вывод для работы: импорт в Go не бесплатен. Прежде чем импортировать большой пакет ради одной вспомогательной
+функции, измерьте его цену через `paketlar.sh`.
+
+## Случай из продакшена: `FROM scratch` и часовой пояс
+
+Теперь то, что в бинарник **не** попадает. Сервис показывает время в Ташкенте (`vaqt` — «время»):
+
+```go filename="vaqt/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 9 | `loc, err := time.LoadLocation("Asia/Tashkent")` | загружает часовой пояс по имени: `loc` — пояс, `err` — ошибка (два значения, как в GO-X.03) |
+| 10–13 | `if err != nil { … return }` | если пояс не найден, выводит ошибку (`xato` — «ошибка») и выходит |
+| 14 | `time.Now().In(loc).Hour()` | переводит текущее время в этот пояс и берёт час (`Toshkent soati` — «час в Ташкенте») |
+
+На ноутбуке час правильный:
+
+```console
+$ cd ../vaqt && go build -o vaqt main.go && ./vaqt
+Toshkent soati: 17
+```
+
+Кладём его в образ `FROM scratch` из GO-X.01. `vaqt/Dockerfile`:
+
+```dockerfile filename="vaqt/Dockerfile"
+FROM scratch
+COPY vaqt /vaqt
+ENTRYPOINT ["/vaqt"]
+```
+
+```bash
+docker build -t vaqt .
+```
+
+Что выведет `docker run`? На ноутбуке было `Toshkent soati: 17` (Ташкент — UTC+5).
+
+**A)** `Toshkent soati: 17` · **B)** час по UTC: `12` · **C)** ошибку
+
+<details>
+<summary>Ответ</summary>
+
+**C: `xato: unknown time zone Asia/Tashkent`.** Базы часовых поясов нет внутри бинарника. `time.LoadLocation` читает её
+из системы, а в `scratch` вообще нет файлов. Если вы выбрали A, вы думали, что бинарник несёт с собой всё: код — да,
+данные системы — нет. B получается в другом случае: увидим ниже.
+
+</details>
+
+```console
+$ docker run --rm vaqt
+xato: unknown time zone Asia/Tashkent
+```
+
+Порядок поиска базы по `go doc time.LoadLocation`:
+
+| # | Откуда | Ноутбук | `scratch` |
+|---|---|---|---|
+| 1 | файл из переменной окружения `$ZONEINFO` | — | — |
+| 2 | системные пути Unix: `/usr/share/zoneinfo/` … `/etc/zoneinfo` | ✅ находит | ❌ нет |
+| 3 | `$GOROOT/lib/time/zoneinfo.zip` (где установлен Go) | ✅ | ❌ нет Go |
+| 4 | пакет `time/tzdata`, если он импортирован | — | ❌ не импортирован |
+
+Эта ошибка хотя бы видна. Вариант B тише. `time.Now()` без пояса использует локальный пояс (`time.Local`), а в
+`scratch` он молча становится UTC. `vaqt-local/main.go`:
+
+```go filename="vaqt-local/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	// zona ko'rsatilmagan: time.Local (scratch'da jimgina UTC)
+	fmt.Println(time.Now().Format("15:04 MST"))
+}
+```
+
+Строка 10: `Format("15:04 MST")` — часы:минуты и имя пояса. В Go шаблон формата пишется через конкретную эталонную
+дату: `15` — час, `04` — минуты, `MST` — пояс. (Комментарий в строке 9: «пояс не указан: time.Local, в scratch молча
+UTC».)
+
+```console
+$ cd ../vaqt-local && go build -o vaqt main.go && ./vaqt
+17:49 +05
+```
+
+```bash
+docker build -t vaqt-local .
+```
+
+```console
+$ docker run --rm vaqt-local
+12:49 UTC
+```
+
+Ни ошибки, ни лога: сервис отстаёт на 5 часов.
+
+В Node такое встречается редко. Библиотека ICU, которую использует `Intl`, носит свою базу часовых поясов внутри файла
+`node` (официальные сборки Node собираются с full-icu):
+
+```console
+$ node -p process.versions.tz
+2025b
+```
+
+## Исправление: `import _ "time/tzdata"`
+
+В пакете `time/tzdata` лежит копия базы часовых поясов. Никакие функции из него нам не нужны, только его `init`: он
+регистрирует базу в пакете `time`. Как `import 'dotenv/config'` в JS: модуль ничего нужного не экспортирует, достаточно
+его импортировать.
+
+Сначала попробуем обычный импорт. Этого файла нет в папке курса: мы убрали `_` из `vaqt-tz/main.go` и проверили в
+отдельной папке:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+	"time/tzdata"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+```console
+$ go build -o vaqt main.go
+# command-line-arguments
+./main.go:6:2: "time/tzdata" imported and not used
+```
+
+Читаем сообщение: `./main.go:6:2` — файл, строка 6, столбец 2. *"time/tzdata" imported and not used* — «импортирован, но
+не используется». Неиспользуемый импорт в Go — не предупреждение, а ошибка компиляции. В JS такого правила нет, поэтому
+там `_` не нужен.
+
+Решение — **blank import** (пустой импорт): `_` вместо имени пакета. Это значит «подключаю пакет, но его имя не
+использую, только ради init» (Go spec, «Import declarations»). В `vaqt-tz/main.go` добавлена только строка 6:
+
+```go filename="vaqt-tz/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+	_ "time/tzdata"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+Пересобираем и запускаем в `scratch`. `vaqt-tz/Dockerfile` такой же, как `vaqt/Dockerfile`:
+
+```console
+$ cd ../vaqt-tz && go build -o vaqt main.go
+```
+
+`go build` ничего не вывел: сборка прошла успешно.
+
+```bash
+docker build -t vaqt .
+```
+
+```console
+$ docker run --rm vaqt
+Toshkent soati: 17
+$ ls -l vaqt ../vaqt/vaqt
+-rwxr-xr-x 1 haywan users 2885090 Nov 26 17:49 vaqt
+-rwxr-xr-x 1 haywan users 2474690 Nov 26 17:49 ../vaqt/vaqt
+```
+
+Цена — 410 400 байт (в документации «about 450 KB»). Теперь работает шаг 4 порядка поиска:
+
+| | `vaqt` | `vaqt-tz` |
+|---|---|---|
+| импорт | `"time"` | `"time"` + `_ "time/tzdata"` |
+| до `main` | — | init `tzdata`: регистрирует базу в `time` |
+| в `scratch` | `unknown time zone` | `Toshkent soati: 17` |
+| размер, байты | 2 474 690 | 2 885 090 (+410 400) |
+
+Второй путь: образ distroless static вместо `scratch`. В нём есть база часовых поясов, поэтому работает даже
+неисправленный `vaqt`. Этой команды нет в папке курса, мы проверили её отдельно (`-v` подключает файл в контейнер):
+
+```console
+$ cd ../vaqt && docker run --rm -v $PWD/vaqt:/vaqt:ro --entrypoint /vaqt gcr.io/distroless/static-debian13
+Toshkent soati: 17
+```
+
+Третий путь — `go build -tags timetzdata`, не трогая код. Это 🟡 домашнее задание.
+
+## Глубже (необязательно): секции бинарника, `-s -w` и 2007 год
+
+**Секции файла.** `paketlar.sh` считает только машинный код. Весь файл по секциям ELF показывает `size -A`:
+
+```console
+$ cd ../salom && size -A main
+main  :
+section                 size      addr
+.note.go.buildid         100   4198264
+.note.gnu.build-id        36   4198364
+.text                 643537   4198400
+.rodata               222082   4845568
+.gopclntab            677386   5067656
+.typelink               2056   5745056
+.itablink                136   5747136
+.go.buildinfo            304   5750784
+.go.fipsinfo             120   5751104
+.go.module               592   5751232
+.noptrdata             19618   5751840
+.data                  22258   5771488
+.bss                  132312   5793760
+.noptrbss              87488   5926080
+.debug_abbrev            352         0
+.debug_line           163128         0
+.debug_frame           30664         0
+.debug_gdb_scripts        91         0
+.debug_info           296941         0
+.debug_loclists       113057         0
+.debug_rnglists        67861         0
+.debug_addr             4024         0
+Total                2484143
+```
+
+| Секция | Байты | Доля файла | Что |
+|---|---|---|---|
+| `.text` | 643 537 | 26,7 % | машинный код |
+| `.gopclntab` | 677 386 | 28,1 % | таблица имён функций и номеров строк: runtime использует её для stack trace и garbage collector |
+| `.debug_*` (8 секций) | 676 118 | 28,1 % | отладочная информация DWARF: для отладчика, для работы программы не нужна |
+| `.rodata` | 222 082 | 9,2 % | информация о типах, строки |
+
+`.bss` и `.noptrbss` места в файле не занимают: память под них выделяется при запуске программы.
+
+**`-ldflags="-s -w"`.** `-ldflags` передаёт флаги linker. `-w` убирает отладочную информацию DWARF. `-s` убирает ещё и
+таблицу символов, которую читает `go tool nm`, а начиная с Go 1.22 подразумевает и `-w`:
+
+```console
+$ go build -ldflags="-s -w" -o main-sw main.go && ls -l main-sw
+-rwxr-xr-x 1 haywan users 1601698 Nov 26 17:49 main-sw
+```
+
+2 409 990 → 1 601 698 байт, −33,5 %. Похоже на продакшен-сборку без source map'ов. Но с отличием: `.gopclntab`, которую
+использует runtime, остаётся, поэтому имена функций и номера строк в stack trace паники (panic) не меняются (🔍
+домашнее задание). Цена: отладчик (например, Delve) и `go tool nm` больше не могут работать с этим файлом.
+
+**Модель импорта Go и 2007 год.** В статье 2012 года «Go at Google» Роб Пайк вспоминает C++-бинарник в Google. После
+раскрытия `#include` компилятор получал «a blow-up of 2000 bytes for every C++ source byte»: 2000 байт на каждый байт
+исходника. А сборка «took 45 minutes using a precursor distributed build system». Компилятор Go читает не исходник
+импортированного пакета, а готовый объектный файл: «the compiler reads the object file for B, not its source code».
+Историю о том, что идея Go родилась во время такого 45-минутного ожидания, Пайк называет «the origin myth for Go».
+
+## Частые ошибки
+
+**1. Думать «linker делает tree-shaking, значит импорт бесплатный».** Это классическое заблуждение по этой теме.
+Сообщения об ошибке нет: бинарник молча растёт. `net/http` импортировали ради `http.StatusText`, и бинарник вырос с
+2,4 МБ до 5,1 МБ. Причина — init-код и глобальные переменные пакетов (раздел «`init`: код, который выполняется до main,
+остаётся»). **Исправление:** измеряйте через `paketlar.sh` до и после импорта. Ради одной маленькой функции большой
+пакет может быть не нужен.
+
+**2. `time.LoadLocation` во `FROM scratch`.** На ноутбуке работает, в образе — `xato: unknown time zone Asia/Tashkent`.
+Полный пример — в разделе «Случай из продакшена». **Исправление:** `import _ "time/tzdata"` в пакете `main`, или
+`go build -tags timetzdata`, или образ distroless.
+
+**3. `time.Now()` без пояса молча становится UTC в `scratch`.** Ошибки нет, просто час сдвинут на 5 часов
+(`vaqt-local`, раздел «Случай из продакшена»). **Исправление:** загружайте пояс явно через `time.LoadLocation` (и
+добавьте базу, как в ошибке 2). Проверяйте время в том же образе, что и в продакшене, а не на ноутбуке.
+
+**4. Импорт `time/tzdata` без `_`.** `./main.go:6:2: "time/tzdata" imported and not used`. Пример — в разделе
+«Исправление». **Исправление:** напишите `_` вместо имени пакета.
+
+**5. Обычный `go build` программы, которая тянет `net`, на машине без gcc.** На этом ноутбуке выходит так:
+
+```console
+$ cd ../statustext && go build -o st main.go
+# runtime/cgo
+cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
+```
+
+Читаем: `# runtime/cgo` — ошибка возникла при сборке пакета `runtime/cgo`. *C compiler "gcc" not found* — «компилятор C
+gcc не найден». В Go cgo по умолчанию включён (`go env CGO_ENABLED` → `1`), а пакет `net` хочет использовать системную
+библиотеку через cgo. **Исправление:** `CGO_ENABLED=0 go build …`. Так бинарник заодно подходит и для `scratch`
+(GO-X.01).
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Почему Go-программа, которая ничего не делает, весит 1,8 МБ?
+
+<details>
+<summary>Ответ</summary>
+
+Каждый Go-бинарник несёт свой runtime (garbage collector, планировщик и другое), его таблицы (`.gopclntab`) и
+отладочную информацию (DWARF). Это постоянная цена. С `-ldflags="-s -w"` уходит отладочная информация, runtime и
+таблицы остаются.
+
+</details>
+
+**2.** Если импортировать `net/http` ради одного `http.StatusText`, почему бинарник удваивается?
+
+<details>
+<summary>Ответ</summary>
+
+Linker выбрасывает функции, которые никто не вызывает (собственный код `net/http` сократился до 5 262 байт). Но init-код
+и глобальные переменные каждого импортированного пакета всегда выполняются до `main`, поэтому они остаются вместе со
+всем, что вызывают: `DefaultTransport` → `net`, TLS, 47 пакетов `crypto`. В Go нет `"sideEffects": false`.
+
+</details>
+
+**3.** Образ `scratch` выводит `unknown time zone`. Что делать?
+
+<details>
+<summary>Ответ</summary>
+
+База часовых поясов читается из системы, а в `scratch` её нет. Добавьте в пакет `main` `import _ "time/tzdata"`
+(+410 КБ), или используйте `go build -tags timetzdata`, или возьмите образ distroless. А `time.Now()` без пояса ошибки
+не даёт и молча показывает UTC: проверьте и это.
+
+</details>
+
+**4.** В папке `salom/` файл `main-sw` собран с `-ldflags="-s -w"`. Что выведет `../paketlar.sh main-sw`?
+**A)** ту же таблицу, что и для `main` · **B)** числа поменьше · **C)** пустой результат
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `-s` убирает таблицу символов, а `go tool nm` читает именно её. Функции в бинарнике есть, нет только таблицы с их
+именами и размерами. Если вы выбрали B, вы думали, что `-s -w` уменьшает код: машинный код не меняется.
+
+```console
+$ ../paketlar.sh main-sw
+reading main-sw: no symbol section
+reading main-sw: no symbols
+       0 100.0% JAMI
+```
+
+</details>
+
+**5.** Из начала урока: `scratch` выводит `exec /api: no such file or directory`. Что проверите первым?
+
+<details>
+<summary>Ответ</summary>
+
+Собран ли бинарник с cgo: тогда он ищет в системе libc и её загрузчик, а в `scratch` их нет. Пересоберите с
+`CGO_ENABLED=0`. Это тот же вопрос «что не попадает в бинарник», что и с базой часовых поясов.
+
+</details>
+
+## Домашнее задание
+
+Стартовые файлы и ответы — в папке урока на GitHub:
+[lessons/001-why-go](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go) (папка `uyga/` —
+«домой»; ответы в
+[uyga/README.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/001-why-go/uyga/README.md)).
+Сначала угадайте, потом измерьте, потом откройте ответ. Команды в каждом ответе начинаются из папки урока
+(`lessons/001-why-go`).
+
+🟢 **Легко** (`statustext/`): замените `fmt.Println(http.StatusText(404))` на `fmt.Println("salom")` и сделайте импорт
+`_ "net/http"`. Теперь из `net/http` ничего не вызывается. Угадайте **до** сборки: бинарник упадёт до 2,4 МБ или
+останется ~5,1 МБ? Потом посмотрите долю `net/http` через `paketlar.sh`.
+
+🟡 **Средне** (`uyga/orta/`, сломанная версия из видео и `Dockerfile`): заставьте сервис `vaqt` работать в `scratch`, не
+трогая `main.go`; меняйте только команду сборки. Подсказка: `go doc time/tzdata`.
+
+```go filename="uyga/orta/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	loc, err := time.LoadLocation("Asia/Tashkent")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("Toshkent soati:", time.Now().In(loc).Hour())
+}
+```
+
+🔍 **Любопытство** (`uyga/qiziq/`): соберите обычным способом и с `-ldflags="-s -w"`, сравните два вывода паники
+(panic). Пропадут ли имена функций и номера строк?
+
+```go filename="uyga/qiziq/main.go" showLineNumbers
+package main
+
+func boshla(n int) int {
+	s := []int{1, 2, 3}
+	return s[n]
+}
+
+func main() {
+	println(boshla(5))
+}
+```
+
+`boshla` («начать») читает индекс 5 из слайса с 3 элементами: программа падает с panic. `println` — встроенная
+функция Go, импорт не нужен.
+
+➕ **Повторение GO-X.01** (`uyga/qoshimcha/`): программа с `http.Get("https://go.dev")` работает в `scratch`. Что она
+выведет и как это исправить?
+
+<details>
+<summary>Ответ</summary>
+
+🟢 Этого решения нет в папке курса: мы скопировали `statustext/main.go` в отдельную папку и изменили. Путь к папке
+хранится внутри бинарника, поэтому размер на несколько байт отличается от указанного в `uyga/README.md` (5 139 103).
+
+```go
+package main
+
+import (
+	"fmt"
+	_ "net/http"
+)
+
+func main() {
+	fmt.Println("salom")
+}
+```
+
+```console
+$ CGO_ENABLED=0 go build -o st main.go && ls -l st
+-rwxr-xr-x 1 haywan users 5139127 Nov 26 17:50 st
+$ ../paketlar.sh st 300 | grep ' net/http$'
+    3729   0.3% net/http
+```
+
+Почти ничего не изменилось (5 143 595 → 5 139 127). Сам `StatusText` был ничтожен. Размер дают init-код и глобальные
+переменные `net/http` и его зависимостей, а они выполняются сразу при импорте пакета. Именно это и значит `import _`:
+«только ради init».
+
+🟡 `go doc time/tzdata`: «This package will be automatically imported if you build with -tags timetzdata».
+
+```console
+$ cd uyga/orta && go build -tags timetzdata -o vaqt main.go && ls -l vaqt
+-rwxr-xr-x 1 haywan users 2884802 Nov 26 17:50 vaqt
+```
+
+```bash
+docker build -t vaqt .
+```
+
+```console
+$ docker run --rm vaqt
+Toshkent soati: 17
+```
+
+Размер почти такой же, как с `import _ "time/tzdata"`. Что лучше? `import _` живёт в самом коде, его не забудешь.
+`-tags` удобен для нескольких бинарников. Документация советует, чтобы tzdata импортировал пакет `main`, а не
+библиотека.
+
+🔍 Мы добавили `-trimpath` в обе сборки, чтобы в выводе паники не было полного пути к папке (он убирает пути к файлам из
+бинарника). Поэтому размеры чуть меньше, чем в `uyga/README.md` (1 830 012 и 1 208 482).
+
+```console
+$ cd uyga/qiziq && go build -trimpath -o p main.go && ./p
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.boshla(...)
+	./main.go:5
+main.main()
+	./main.go:9 +0xa
+$ go build -trimpath -ldflags="-s -w" -o p2 main.go && ./p2
+panic: runtime error: index out of range [5] with length 3
+
+goroutine 1 [running]:
+main.boshla(...)
+	./main.go:5
+main.main()
+	./main.go:9 +0xa
+$ ls -l p p2
+-rwxr-xr-x 1 haywan users 1821476 Nov 26 17:50 p
+-rwxr-xr-x 1 haywan users 1200290 Nov 26 17:50 p2
+```
+
+Ничего не пропало, а файл уменьшился на 34 %. Stack trace берётся из таблицы `.gopclntab`: её использует runtime, и
+linker её не выбрасывает. `-w` убирает только DWARF (для отладчика), `-s` — таблицу символов.
+
+➕ Корневые сертификаты HTTPS тоже читаются из системы (`crypto/x509/root_linux.go`), а в `scratch` их нет:
+
+```console
+$ cd uyga/qoshimcha && CGO_ENABLED=0 go build -o app main.go
+```
+
+```bash
+docker build -t https .
+```
+
+```console
+$ docker run --rm https
+xato: Get "https://go.dev": tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+Исправление: скопировать сертификаты в образ или взять distroless (оба варианта дают `200 OK`):
+
+```dockerfile
+FROM scratch
+COPY --from=alpine:3.24 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY app /app
+ENTRYPOINT ["/app"]
+```
+
+или `FROM gcr.io/distroless/static-debian13` (в нём есть и сертификаты, и часовые пояса).
+
+</details>
+
+## Источники
+
+- Go FAQ: [runtime](https://go.dev/doc/faq#runtime) («is part of every Go program») ·
+  [Why is my trivial program such a large binary?](https://go.dev/doc/faq#Why_is_my_trivial_program_such_a_large_binary)
+- Go spec: [Package initialization](https://go.dev/ref/spec#Package_initialization) ·
+  [Import declarations](https://go.dev/ref/spec#Import_declarations)
+- Linker: [cmd/link/internal/ld/deadcode.go](https://github.com/golang/go/blob/go1.26.8/src/cmd/link/internal/ld/deadcode.go) ·
+  [cmd/link](https://pkg.go.dev/cmd/link) (`-s`, `-w`)
+- [`net/http.StatusText`](https://pkg.go.dev/net/http#StatusText) · [`time.LoadLocation`](https://pkg.go.dev/time#LoadLocation) ·
+  [`time/tzdata`](https://pkg.go.dev/time/tzdata)
+- Docker, [образ `scratch`](https://docs.docker.com/build/building/base-images/#create-a-minimal-base-image-using-scratch) ·
+  [distroless](https://github.com/GoogleContainerTools/distroless)
+- Node.js, [Internationalization support](https://nodejs.org/api/intl.html) (full-icu)
+- Rob Pike, [Go at Google: Language Design in the Service of Software Engineering](https://go.dev/talks/2012/splash.article) (2012)
+- Папка курса: [lessons/001-why-go](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go) ·
+  API из GO-X.01: [lessons/0x-01-http-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-01-http-api)
+- Все результаты получены на `go1.26.8 linux/amd64`, Docker 29.8.1 и Node v24.10.0, 2026-11-26. В другой папке размеры
+  отличаются на несколько байт: пути к файлам тоже хранятся внутри бинарника.
+
+## Видео и код
+
+<iframe src="https://www.youtube-nocookie.com/embed/TaGL7BmLP3Y" title="Зачем нужен Go? Что внутри go build" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen style={{width: "100%", aspectRatio: "16 / 9", border: 0, borderRadius: 8}} />
+
+▶️ [Смотреть видео на YouTube](https://youtu.be/TaGL7BmLP3Y)
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/001-why-go)
+
+---
+
+← Предыдущий урок: [GO-X.04](/lab/youtube/go#go-x-04) · Следующий урок: [GO-1.02](/lab/youtube/go/go-1-02/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
