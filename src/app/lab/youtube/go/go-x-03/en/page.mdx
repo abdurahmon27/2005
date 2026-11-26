@@ -1,0 +1,1327 @@
+---
+title: "No try/catch: error values and defer"
+date: "2026/11/26"
+description: "In Go an error is not thrown but returned as a value: if err != nil, an error silently lost in a bare call, errcheck, and defer instead of finally."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-03/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-03"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-03"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-03) · [Русский](/lab/youtube/go/go-x-03/ru) · **English**  
+Lesson GO-X.03 · [Go: 0 → Guru](/lab/youtube/go#go-x-03) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+One extra comma was left in `config.json`. The Node service does not start and crashes with a `SyntaxError`. The
+same service in Go writes `listening on :0` and keeps running, but nobody is listening on port 8080. Where did the
+error go?
+
+**One idea:** in Go an error is an ordinary returned value. You check it yourself after every call (and you write
+the cleanup yourself too, with a `defer` you place), otherwise the program silently continues with a wrong value.
+
+By the end of the lesson you will:
+
+- read a signature like `func ReadFile(name string) ([]byte, error)` and see where an error comes back;
+- check an error with `if err != nil` and either return it up or stop with `log.Fatal`;
+- find an error silently lost in a bare call, by eye and with golangci-lint's errcheck;
+- put `defer` in the right place instead of `finally`: `resp.Body.Close()` after the error check.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| error value | a value of type `error` that a function returns as its last result; `nil` means no error | error value |
+| `if err != nil` | checking the error: if there is one, you handle it or return it up; instead of `try…catch` | `if err != nil` |
+| `defer` | delays a call until the function finishes, whichever `return` it leaves by; instead of `finally` | defer statement |
+
+There are also two helper words: **`errors.New`** (makes a new error from text) and **errcheck** (a check in the
+golangci-lint set of linters: it finds unchecked errors).
+
+## Before you start
+
+- [GO-X.01 · A 20-line HTTP API: your first Go service and one binary](/lab/youtube/go/go-x-01/en): an HTTP service,
+  `log.Fatal(http.ListenAndServe(…))`, `go run` / `go build`, reading an error as `file:line:column`.
+- [GO-X.02 · Types exist at runtime too](/lab/youtube/go/go-x-02/en): zero value, `nil`, `:=` vs `=`, the underscore `_`
+  (blank identifier), shadowing, `json.Unmarshal(…, &cfg)`, `go vet`. We do not explain these again here.
+- The examples in this lesson use the `config.json` file and folders that depend on each other, so you need the
+  course folder, not go.dev/play. Open a terminal in the lesson folder (`lessons/0x-03-errors`): every command runs
+  from there. The extra comma in `config.json` is there **on purpose**.
+- The folders that use `net/http` (`hook/`, `tuzat/`, `http/`) are run with `CGO_ENABLED=0` on a computer without a
+  C compiler (gcc), as in GO-X.01.
+- `ikki/` and `qamrov/` do not build on purpose. So `go vet ./...` reports errors for them: run each folder on its
+  own.
+- For comparison, the `js/` folder has Node 24 files. The Python 3 and PHP 8 commands are one line in the terminal.
+
+First, one question from GO-X.02. In the first line `a` and `err` were declared with `:=`. In the second line `b`
+and `err` again with `:=`:
+
+```go
+a, err := strconv.Atoi("42")
+b, err := strconv.Atoi("x")
+```
+
+`strconv.Atoi` is from the GO-X.02 homework: it turns a string into a number and returns the number and an error.
+Does this code build?
+
+**A)** build error: `err` is declared twice · **B)** it builds: `b` is new, `err` just gets a new value · **C)** the
+second `err` is a new variable
+
+<details>
+<summary>Answer</summary>
+
+**B.** It is enough for at least one name on the left of `:=` to be new. `b` is new, and `err` is not a new
+variable, it only gets a new value. If you chose "build error", you carried over the rule about writing `let err`
+twice in JavaScript. If you chose "new variable", you remembered shadowing: it only happens in an inner block, and
+here there is one block.
+
+</details>
+
+```go filename="eslash/main.go" showLineNumbers
+// Takrorlash (GO-X.02): := chap tomonida kamida bitta yangi nom bo'lsa yetarli, qolganlari qiymat oladi.
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	a, err := strconv.Atoi("42")
+	b, err := strconv.Atoi("x") // b yangi, err esa qayta yoziladi
+	fmt.Println(a, b, err)
+}
+```
+
+```console
+$ go run ./eslash
+42 0 strconv.Atoi: parsing "x": invalid syntax
+```
+
+`a` is 42. `"x"` is not a number, so `b` is at its zero value (`0`), and `err` carries the error text: *parsing "x":
+invalid syntax* — "could not parse `"x"`: wrong syntax". Go code reuses `err` exactly like this again and again.
+Today's lesson is about that `err`.
+
+## One comma: Node crashes, Go runs silently
+
+The config file from the hook. After the `"users_api"` line there is an extra comma, and JSON does not accept it:
+
+```console
+$ cat config.json
+{
+  "port": 8080,
+  "users_api": "http://localhost:9090",
+}
+```
+
+The Node service reads this file with `JSON.parse` and takes the port from it:
+
+```js filename="js/server.js"
+// GO-X.03 hook: Node'dagi xuddi shu xizmat. config.json'da ortiqcha vergul bor.
+const fs = require("node:fs");
+const http = require("node:http");
+
+const cfg = JSON.parse(fs.readFileSync("config.json", "utf8"));
+
+http
+  .createServer((req, res) => res.end("ok"))
+  .listen(cfg.port, () => console.log("listening on :" + cfg.port));
+```
+
+```console
+$ node js/server.js
+<anonymous_script>:4
+}
+^
+
+SyntaxError: Expected double-quoted property name in JSON at position 58 (line 4 column 1)
+    at JSON.parse (<anonymous>)
+    at Object.<anonymous> (…/js/server.js:5:18)
+    at Module._compile (node:internal/modules/cjs/loader:1760:14)
+    at Object..js (node:internal/modules/cjs/loader:1893:10)
+    at Module.load (node:internal/modules/cjs/loader:1480:32)
+    at Module._load (node:internal/modules/cjs/loader:1299:12)
+    at TracingChannel.traceSync (node:diagnostics_channel:328:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:244:24)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.10.0
+```
+
+(The full path of the file is shortened to `…`: it depends on the folder on your computer.) `JSON.parse` threw a
+`SyntaxError`, nobody caught it, and the process ended with code 1. The service did not start, but the cause, the
+file and the line (`server.js:5:18`) are all visible.
+
+The same service in Go (the `hook/` folder; we will look at its code later):
+
+```console
+$ go run ./hook
+2026/11/26 18:38:28 listening on :0
+```
+
+The service started and keeps running (you stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>). But the port is not
+`8080`, it is `:0`. The error was not written anywhere. We answer this question by the end of the lesson.
+
+## Python and PHP: loud and silent
+
+Python's `json.load` also throws the error (raise):
+
+```console
+$ python3 -c 'import json; json.load(open("config.json"))'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json; json.load(open("config.json"))
+                 ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "…/json/__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "…/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "…/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "…/json/decoder.py", line 361, in raw_decode
+    obj, end = self.scan_once(s, idx)
+               ~~~~~~~~~~~~~~^^^^^^^^
+json.decoder.JSONDecodeError: Illegal trailing comma before end of object: line 3 column 39 (char 56)
+```
+
+(The folder of the Python library is also shortened to `…`.) *Illegal trailing comma before end of object* — "an
+extra comma before the end of the object". PHP's `json_decode`, on the other hand, does not throw by default; it
+silently returns `null`:
+
+```console
+$ php -r 'var_dump(json_decode(file_get_contents("config.json")));'
+NULL
+```
+
+The PHP manual says so: if the JSON cannot be decoded, `null` is returned. You have to ask for the cause yourself
+with `json_last_error_msg()` (it says `Syntax error`), or turn exceptions on with the `JSON_THROW_ON_ERROR` flag.
+(Run with PHP 8.4.26, through `nix shell nixpkgs#php`.)
+
+| | JavaScript | Python | PHP |
+|---|---|---|---|
+| broken JSON | `JSON.parse` → `throw SyntaxError` | `json.load` → `raise JSONDecodeError` | `json_decode` → silent `null` |
+| if you don't check | the process crashes, with the cause | the process crashes, with the cause | the program continues with `null` |
+
+Go behaves somewhere between the two. Let's see.
+
+## Error value: `error` is an ordinary return value
+
+In Go an error is not thrown. A function that can fail returns the error as an ordinary value, usually as its last
+result. This is an **error value**. `os.ReadFile` reads a file and returns two results: a slice of bytes (`[]byte`)
+and an error. `oqish/main.go` (`oqish` means "reading") reads a file that does not exist:
+
+```go filename="oqish/main.go" showLineNumbers
+// error qiymat: fayl yo'q bo'lsa, data bo'sh, err esa xato matnini olib keladi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	data, err := os.ReadFile("yoq.json")
+	fmt.Println(len(data), err)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 4–7 | `import ( … )` | the `fmt` and `os` (working with files and the operating system) packages |
+| 10 | `data, err := os.ReadFile("yoq.json")` | `data` — the file's bytes (`[]byte`), `err` — the error; both are new |
+| 11 | `fmt.Println(len(data), err)` | `len(data)` — the number of bytes; then the error |
+
+`error` is a built-in Go type. It has one method: `Error()`, which returns the error text. `Println` prints the
+error with that text. On success `err` is `nil`, meaning "no error" (GO-X.02). In memory it looks like this:
+
+| After line | `data` (`[]byte`) | `err` (`error`) | On screen |
+|---|---|---|---|
+| 10, no file | `nil` (0 bytes) | `open yoq.json: no such file or directory` | |
+| 10, file exists | the file's bytes | `nil` | |
+| 11 (no file) | `nil` | the error | `0 open yoq.json: no such file or directory` |
+
+```console
+$ go run ./oqish
+0 open yoq.json: no such file or directory
+```
+
+*open yoq.json: no such file or directory* — "could not open `yoq.json`: there is no such file or directory"
+(`yoq` means "missing"). The important part: line 11 still ran. In JavaScript `fs.readFileSync("yoq.json")` would
+throw and control would jump to the nearest `catch`. In Go nothing jumps: the error sits in `err`, and the next line
+runs. If there is an error, do not trust the other results: `data` is empty.
+
+### Can you take just one of the results?
+
+Now we take one result: `data := os.ReadFile("config.json")`, without `err`. In JavaScript you can take the first
+element of an array, and Python returns a tuple. What does Go do?
+
+**A)** `data` is the first result, `err` is dropped · **B)** build error · **C)** `data` is a `(bytes, err)` pair
+
+<details>
+<summary>Answer</summary>
+
+**B: build error.** If you assign the results to variables, Go requires you to take all of them. If you chose "the
+first result", you carried over `const [data] = …` destructuring. If you chose "a pair", you remembered Python's
+tuple: in Go several results are not packed into one value.
+
+</details>
+
+```go filename="ikki/main.go" showLineNumbers
+// Bashorat: os.ReadFile ikki qiymat qaytaradi, biz bittasini oldik. Ataylab build bo'lmaydi.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	data := os.ReadFile("config.json")
+	fmt.Println(len(data))
+}
+```
+
+```console
+$ go run ikki/main.go
+# command-line-arguments
+ikki/main.go:10:10: assignment mismatch: 1 variable but os.ReadFile returns 2 values
+```
+
+`ikki/main.go:10:10` — line 10, column 10: `os.ReadFile`. *assignment mismatch: 1 variable but os.ReadFile returns
+2 values* — "the assignment does not match: there is one variable, but `os.ReadFile` returns 2 values". To drop the
+error on purpose there is the underscore: `data, _ := os.ReadFile(…)`. But the Go team's code review guide says not
+to: *Do not discard errors using `_` variables*.
+
+### The error is visible in the signature
+
+`go doc` shows a package's documentation in the terminal. `grep func` takes only the signature line from it:
+
+```console
+$ go doc os.ReadFile | grep func
+func ReadFile(name string) ([]byte, error)
+```
+
+The signature has two results, and `error` is always last. In JavaScript you cannot tell from the signature that
+a function throws, and TypeScript has no `throws` either (such a proposal for TypeScript was closed as "not
+planned"). In Go the signature itself shows whether an error comes back.
+
+Why did Go not choose exceptions? The Go FAQ gives the reason: tying exceptions to a control structure such as
+`try-catch-finally` leads to convoluted code. It also pushes programmers to label ordinary errors, such as failing
+to open a file, as exceptional. Go's multiple return values, on the other hand, make it easy to return the error
+next to the main value.
+
+## `if err != nil`: check and return it up
+
+Now a function that loads the config. `config/main.go`:
+
+```go filename="config/main.go" showLineNumbers
+// if err != nil: xatoni yuqoriga qaytarish (loadConfig) va ishga tushishda to'xtatish (main).
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = json.Unmarshal(data, &cfg)
+	return cfg, err
+}
+
+func main() {
+	cfg, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11–13 | `type Config struct { … }` | the config structure: the `Port` field comes from the `port` key in JSON (GO-X.02) |
+| 15 | `func loadConfig(path string) (Config, error) {` | in parameters, too, the name comes first and then the type; `(Config, error)` in parentheses — two results |
+| 16 | `var cfg Config` | the config to return, at its zero value for now |
+| 17 | `data, err := os.ReadFile(path)` | reading the file: bytes and an error |
+| 18 | `if err != nil {` | is there an error? No parentheses around the condition, but `{ }` is required |
+| 19 | `return cfg, err` | returns the error to the caller: like a `throw` with no `catch` written, except that you can see it |
+| 21 | `err = json.Unmarshal(data, &cfg)` | `Unmarshal` returns only an `error`; `err` already exists, so plain `=` |
+| 22 | `return cfg, err` | error or not, the caller checks `err` itself |
+| 26 | `cfg, err := loadConfig("config.json")` | `main` takes the results |
+| 27–29 | `if err != nil { log.Fatal(err) }` | an error at startup: prints the text and stops the program with code 1 (GO-X.01) |
+| 30 | `fmt.Println("port:", cfg.Port)` | no error: the port |
+
+This is the **`if err != nil`** pattern: in Go it takes the place of `try…catch`. In the video there is a
+`// JS: catch'siz throw` ("JS: a throw without catch") comment next to line 18 (it is not in the course file). In
+JavaScript, if you do not write a `catch`, the error rises up by itself. In Go you write the return up by hand with
+`return cfg, err`, and it stays visible in the code.
+
+With the broken `config.json`:
+
+```console
+$ go run ./config
+2026/11/26 18:38:10 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+*invalid character '\}' looking for beginning of object key string* — "invalid character `}`: the start of an object
+key was expected". The comma means "another key follows", and then `}` came. `exit status 1` — `go run` reports that
+the program ended with exit code 1: `log.Fatal` did that.
+
+### Where to handle the error
+
+The rule from the code review guide: handle the error or return it up.
+
+```text
+loadConfig            return cfg, err       → returns it up
+   │
+   ▼
+main (startup)        log.Fatal(err)        → prints the cause, stops
+HTTP handler          http.Error(w, …, 400/500); return
+                                            → answers the client, leaves the handler
+
+the normal path stays at the left edge, the error path inside the if
+```
+
+| Where | What you do | Example |
+|---|---|---|
+| a helper function | return it up | `return cfg, err` |
+| startup (`main`) | print the cause and stop | `log.Fatal(err)` |
+| HTTP handler | return 400 or 500 to the client | `http.Error(w, …, http.StatusBadRequest)` and `return` |
+
+Another rule from the guide (*Indent Error Flow*): the normal path stays at the left edge, the error path goes inside
+the `if`. No `else` is written: there is a `return` inside the `if`, and the main code continues after it.
+
+## The lost error: a bare call
+
+Now back to the service from the start. `hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+// GO-X.03 hook: GO-X.01 xizmati config.json'ni o'qiydi. Unmarshal'ning xatosi tekshirilmagan.
+// Ishga tushirish (dars papkasidan): go run ./hook   (config.json'da ortiqcha vergul bor)
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func main() {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg Config
+	json.Unmarshal(data, &cfg)
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 18–21 | `data, err := os.ReadFile(…)` + `if err != nil` | `ReadFile` is checked |
+| 22 | `var cfg Config` | `cfg.Port` is `0` for now (zero value) |
+| 23 | `json.Unmarshal(data, &cfg)` | a bare call: its result is not taken |
+| 25 | `addr := fmt.Sprintf(":%d", cfg.Port)` | `Sprintf` formats text and returns it; `%d` — an integer: port `8080` → `":8080"` |
+| 26–28 | `http.HandleFunc("GET /health", …)` | a handler for the health check: returns `200 OK` (GO-X.01) |
+| 29–30 | `log.Println(…)`, `log.Fatal(http.ListenAndServe(addr, nil))` | starts the service on `addr` (GO-X.01) |
+
+A hint: `fmt.Println` also returns two results, `n` and `err` (`func Println(a ...any) (n int, err error)`). But we
+always call it without taking its results, and neither the build nor `go vet` has ever objected. What do `go build`
+and `go vet` say about `json.Unmarshal` on line 23?
+
+**A)** build error: the result was not used · **B)** it builds, `go vet` warns · **C)** both are silent
+
+<details>
+<summary>Answer</summary>
+
+**C: both are silent.** The rule has two sides. If you assign the results to variables, you take all of them
+(*assignment mismatch* in `ikki/`). If you write the call on its own, all its results are silently dropped: by the
+Go spec a function call can stand alone as a statement. If you chose "build error", you remembered *declared and not
+used* from GO-X.02: it is about variables, not results. If you chose "`go vet`", you thought it checks everything:
+its `unusedresult` check only looks at functions from a fixed list, such as `fmt.Sprintf`.
+
+</details>
+
+```console
+$ go build -o /dev/null ./hook && go vet ./hook; echo "exit $?"
+exit 0
+```
+
+`-o /dev/null` writes the binary nowhere: a plain `go build ./hook` cannot write the binary here because a folder
+named `hook` already exists. `echo "exit $?"` prints the exit code of the last command: `0`, so both are silent.
+
+| How it is written | What Go does |
+|---|---|
+| `data := os.ReadFile(…)` | build error: *assignment mismatch* |
+| `data, _ := os.ReadFile(…)` | builds: the error is dropped on purpose |
+| `json.Unmarshal(data, &cfg)` | builds, `go vet` is silent: the result is silently dropped |
+
+Now the hook gets its answer. `Unmarshal` tripped on the comma and returned an error, and nobody read it.
+`cfg.Port` stayed at its zero value, `0`:
+
+| After line | `err` | `cfg.Port` | `addr` |
+|---|---|---|---|
+| 18 | `nil` (the file exists) | | |
+| 22 | `nil` | `0` | |
+| 23 | `nil` (`Unmarshal`'s error was stored nowhere) | `0` | |
+| 25 | `nil` | `0` | `":0"` |
+
+### Port `0`: a random port
+
+According to the `net.Listen` documentation, if the port is `"0"`, a port number is chosen automatically. That
+is, the operating system gives any free port. The `ss` command shows listening ports. While `go run ./hook` is
+running in another terminal:
+
+```console
+$ ss -ltnp | grep hook
+LISTEN 0      4096               *:44139            *:*    users:(("hook",pid=1063504,fd=3))
+```
+
+The service is on port `44139` (a different number on every run). The health check goes to `8080` and gets no
+answer. This is the Go version of PHP's silent `null`: if the error is not checked, the program continues with a
+wrong value.
+
+## The fix: a short declaration inside `if`
+
+`tuzat/main.go` (`tuzat` means "fix") is the same as the hook, only the `Unmarshal` line changed:
+
+```go filename="tuzat/main.go" showLineNumbers
+// Tuzatilgan hook: Unmarshal xatosi tekshiriladi, buzuq config bilan xizmat ishga tushmaydi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func main() {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal(err)
+	}
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	http.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 22 | `if err := json.Unmarshal(data, &cfg); err != nil {` | a short declaration after `if`, up to the semicolon: first `Unmarshal` runs, then the condition is checked |
+| 23 | `log.Fatal(err)` | broken config: prints the cause and stops |
+
+By the Go spec, one simple statement may stand before the condition of an `if`. This `err` lives only inside this
+`if`: the `if` has its own block. It hides the outer `err` (line 17), that is shadowing (GO-X.02), but here it is
+harmless: the outer `err` is not used afterwards.
+
+```console
+$ go run ./tuzat
+2026/11/26 18:38:10 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+Now the service does not start with a broken config, and it prints the cause.
+
+### errcheck: a linter instead of your eyes
+
+**golangci-lint** is a set of linters, like ESLint for Go. Its **errcheck** finds unchecked errors and is enabled by
+default. On the old version of the hook:
+
+```console
+$ golangci-lint run ./hook
+hook/main.go:23:16: Error return value of `json.Unmarshal` is not checked (errcheck)
+	json.Unmarshal(data, &cfg)
+	              ^
+1 issues:
+* errcheck: 1
+```
+
+*Error return value of `json.Unmarshal` is not checked* — "the error returned by `json.Unmarshal` is not checked".
+Line 23, column 16: the parenthesis that `^` points to. Add it to CI. Know two things: by default errcheck does not
+see errors dropped with `_` (`check-blank: false`). And it does flag `defer resp.Body.Close()`: ignoring the `Close`
+error on a body opened for reading is common practice. (golangci-lint 2.12.2, no config file.)
+
+### Mid-lesson question: a result declared inside `if`
+
+Someone wrote the short form with `loadConfig`, and the result was declared inside the `if` too:
+
+```go
+if cfg, err := loadConfig("config.json"); err != nil {
+	log.Fatal(err)
+}
+fmt.Println(cfg.Port)
+```
+
+If the config is correct, what does the last line print?
+
+**A)** `8080` · **B)** `0` (zero value) · **C)** build error
+
+<details>
+<summary>Answer</summary>
+
+**C: build error, two of them.** The `cfg` declared in the `if` header lives only inside the `if`: outside it does
+not exist, and inside it is not used. If you chose "`8080`", you thought `cfg` is visible in the whole function. If
+you chose "`0`", you remembered the zero value from GO-X.02: here the issue is not the value, the name does not
+exist at all. In JavaScript, if you use a block's `const` outside the block, the error appears only when the code
+runs; in Go it appears at build time.
+
+</details>
+
+```go filename="qamrov/main.go" showLineNumbers
+// O'rtadagi sinov: if ichida := bilan e'lon qilingan nom if'dan keyin yo'q. Ataylab build bo'lmaydi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = json.Unmarshal(data, &cfg)
+	return cfg, err
+}
+
+func main() {
+	if cfg, err := loadConfig("config.json"); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(cfg.Port)
+}
+```
+
+```console
+$ go run qamrov/main.go
+# command-line-arguments
+qamrov/main.go:26:5: declared and not used: cfg
+qamrov/main.go:29:14: undefined: cfg
+```
+
+`qamrov/main.go` (`qamrov` means "scope"). `26:5` — *declared and not used: cfg* — "`cfg` is declared but not
+used": nobody read it inside the `if`. `29:14` — *undefined: cfg* — "`cfg` is not defined": after the `if` this
+name does not exist.
+
+| Line | Is `cfg` visible | Is `err` visible |
+|---|---|---|
+| 26 (the `if` header) | yes, declared here | yes |
+| 27 (inside the `if`) | yes (but not used) | yes |
+| 29 (after the `if`) | no → *undefined* | no |
+
+**The fix:** if you need the result later, take it on a separate line before the `if`, as in `config/main.go`:
+`cfg, err := loadConfig(…)`, then `if err != nil`.
+
+## `defer`: instead of `finally`
+
+Now cleanup. In JavaScript you close a file with `try…finally`, in Python with `with`. `js/finally.mjs`:
+
+```js filename="js/finally.mjs"
+// defer'ning JS'dagi tanish tomoni: try…finally. Ishga tushirish: node js/finally.mjs
+import { open } from "node:fs/promises";
+
+async function loadUsers(path) {
+  const fh = await open(path);
+  try {
+    return JSON.parse(await fh.readFile("utf8"));
+  } finally {
+    await fh.close();
+  }
+}
+
+console.log(await loadUsers("js/users.json"));
+```
+
+```console
+$ node js/finally.mjs
+[ { id: 42, name: 'Dilnoza' } ]
+```
+
+According to MDN, the `finally` block always runs before control leaves `try…catch…finally`. Go has no `finally`.
+In its place there is **`defer`**: one line that delays a call until the function it is in finishes.
+
+### Predict: `defer` after an early `return`
+
+Instead of a file, we print to the screen. The `load` function in `defer/main.go`:
+
+```go
+func load(fail bool) error {
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	defer fmt.Println("yopildi")
+	fmt.Println("o'qildi")
+	return nil
+}
+```
+
+`ochildi` means "opened", `yopildi` — "closed", `o'qildi` — "read". **`errors.New`** makes a new error from text.
+The function returns only an `error`: `nil` means success. Note: the `defer` line stands **after** the early
+`return`. `main` calls `load(false)` first, then `load(true)`, and prints `xato: …` ("error: …") if there is an
+error.
+
+`finally` would always run. What is printed when `load(true)` is called?
+
+**A)** `ochildi` · `yopildi` · `xato: buzuq JSON` · **B)** `ochildi` · `xato: buzuq JSON` · **C)** `yopildi` ·
+`ochildi` · `xato: buzuq JSON`
+
+<details>
+<summary>Answer</summary>
+
+**B: `ochildi` and the error, no `yopildi`.** A `defer` is registered only when its line executes. With `fail` true,
+the `return` happened on line 13, and the `defer` on line 15 was never reached. If you chose "A", you carried over
+the `finally` model: `finally` is tied to a block, `defer` to a line that executed. If you chose "C", you thought
+`defer` runs at the start of the function: it runs at the end.
+
+</details>
+
+```go filename="defer/main.go" showLineNumbers
+// defer: chaqiruv funksiya tugaguncha kechiktiriladi. Lekin u faqat defer qatori bajarilganda ro'yxatga yoziladi:
+// undan oldingi return'da hech narsa yopilmaydi (finally'dan farqi).
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func load(fail bool) error {
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	defer fmt.Println("yopildi")
+	fmt.Println("o'qildi")
+	return nil
+}
+
+func main() {
+	if err := load(false); err != nil {
+		fmt.Println("xato:", err)
+	}
+	if err := load(true); err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+```
+
+Lines 21 and 24 in `main` use today's short form: `if err := …; err != nil`.
+
+```console
+$ go run ./defer
+ochildi
+o'qildi
+yopildi
+ochildi
+xato: buzuq JSON
+```
+
+| Call | Line | What happened | On screen |
+|---|---|---|---|
+| `load(false)` | 11 | | `ochildi` |
+| | 15 | `defer` registered: `fmt.Println("yopildi")` | |
+| | 16 | | `o'qildi` |
+| | 17 | `return nil` → the list runs first | `yopildi` |
+| `load(true)` | 11 | | `ochildi` |
+| | 13 | `return errors.New(…)`: the list is empty | |
+| `main` | 25 | | `xato: buzuq JSON` |
+
+With `fail` false, `yopildi` came at the end of the function, after `o'qildi`. This is the difference from
+`finally`: `defer` does not cover a block, it covers the path after it. In short: `defer` runs at the end of the
+function, but only if it was executed itself.
+
+## `defer` in practice: `resp.Body.Close()`
+
+Our service fetches a user from another service (the users API) over HTTP. `http/main.go`:
+
+```go filename="http/main.go" showLineNumbers
+// defer amalda: xizmat boshqa xizmatdan (users API) foydalanuvchini HTTP orqali oladi.
+// resp.Body — tarmoq ulanishidan oqim; uni yopish shart. Demo uchun users API'ni httptest bilan shu dasturda ko'taramiz.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type User struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+func fetchUser(baseURL, id string) (User, error) {
+	var u User
+	resp, err := http.Get(baseURL + "/users/" + id)
+	if err != nil {
+		return u, err
+	}
+	defer resp.Body.Close()
+	err = json.NewDecoder(resp.Body).Decode(&u)
+	return u, err
+}
+
+func main() {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id": 42, "name": "Dilnoza"}`)
+	}))
+	defer api.Close()
+
+	u, err := fetchUser(api.URL, "42")
+	fmt.Println(u, err)
+
+	_, err = fetchUser("http://localhost:9", "42") // 9-port: hech kim tinglamaydi
+	fmt.Println(err)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 17 | `func fetchUser(baseURL, id string) (User, error) {` | both parameters are `string` (the type is written once); results — a user and an error |
+| 19 | `resp, err := http.Get(…)` | a GET request; `resp` — the response (`*http.Response`; `*` is a pointer, see [GO-X.04](/lab/youtube/go/go-x-04/en)) |
+| 20–22 | `if err != nil { return u, err }` | a network error: returns it up |
+| 23 | `defer resp.Body.Close()` | `resp.Body` — the stream from the network connection; closed when the function finishes |
+| 24 | `err = json.NewDecoder(resp.Body).Decode(&u)` | reads JSON straight from the stream into `u` (like `await res.json()` in JS) |
+| 29–32 | `httptest.NewServer(…)` | a users API for the demo: a real HTTP server inside the same program, on a random port; `api.URL` is its address |
+| 33 | `defer api.Close()` | stops the server when `main` finishes |
+| 38 | `fetchUser("http://localhost:9", "42")` | nobody listens on port 9: a network error; `_` — the user is not needed |
+
+```console
+$ go run ./http
+{42 Dilnoza} <nil>
+Get "http://localhost:9/users/42": dial tcp [::1]:9: connect: connection refused
+```
+
+The first line: the user and `<nil>` (no error). The second: *connect: connection refused*. The `net/http`
+documentation says: closing `Body` is the caller's responsibility. If the body is not read to the end and closed,
+the HTTP/1.x keep-alive connection may not be reused.
+
+`defer` stands **after** the error check. If there is an error, `resp` is `nil`. The `defer` line reads `resp.Body`
+immediately, and the program crashes. `go vet` checks this order (the example is in "Common mistakes").
+
+### How `defer` works
+
+When the `defer` line executes, the call is added to the function's list. Whichever `return` the function leaves
+by, the list runs first:
+
+```text
+fetchUser(…)
+  19  resp, err := http.Get(…)
+  20  if err != nil → return u, err      list is empty: nothing to close
+  23  defer resp.Body.Close()           list: [ resp.Body.Close() ]
+  24  err = json.NewDecoder(…).Decode(&u)
+  25  return u, err                     → first resp.Body.Close(), then leave
+```
+
+The reason from Effective Go: even if you later add a new `return` to the function, the close is not forgotten. The
+close sits next to the open. Databases use the same pattern: after `tx, err := db.BeginTx(…)` comes
+`defer tx.Rollback()`, that is, cancel the transaction. After `Commit` it is harmless: it returns `sql.ErrTxDone`
+and does nothing.
+
+| | JavaScript | Python | Go |
+|---|---|---|---|
+| cleanup | `try { … } finally { fh.close() }` | `with open(…) as f:` | `defer f.Close()` |
+| tied to | a block | a block | the function; only if the `defer` line executed |
+
+## Going deeper (optional): why `if err != nil` stays and there is no stack trace
+
+`if err != nil` is repeated a lot. According to a Go blog post from June 3, 2025 (R. Griesemer), complaints about
+error handling have topped Go's annual user surveys for years. The Go team considered several proposals:
+
+| Year | Proposal |
+|---|---|
+| 2018 | `check` / `handle` |
+| 2019 | `try` |
+| 2024 | the `?` operator (Ian Lance Taylor) |
+| 2025 | decision: the error syntax will not change in the foreseeable future |
+
+Seven years later, in 2025, the Go team stopped looking for a new error syntax. So `if err != nil` stays.
+
+One more difference: a standard `error` has no stack trace, only a value and text. In the go1.26.8 source, the type
+that `errors.New` creates is this: `type errorString struct { s string }` — a single string field. In `tuzat/`,
+`log.Fatal` said *invalid character*, but did not say which file. Node showed the file and the line
+(`server.js:5:18`).
+
+| | JavaScript `Error` | Go `error` |
+|---|---|---|
+| what is inside | text + stack (file:line) | only a value and text |
+| context | from the stack | you add it yourself |
+
+Adding context to an error (`%w`, `errors.Is`) is in [GO-1.14](/lab/youtube/go/go-1-14/en), `panic` and the order of `defer`
+are in [GO-1.15](/lab/youtube/go/go-1-15/en).
+
+## Common mistakes
+
+**1. A bare call: the error disappears silently.** The most classic mistake of this topic: `json.Unmarshal(data,
+&cfg)` builds, `go vet` is silent too, and `cfg` stays at its zero value (`listening on :0`). The full example is in
+the section "The lost error". **The fix:** `if err := json.Unmarshal(data, &cfg); err != nil { … }`, and
+golangci-lint (errcheck) in CI.
+
+**2. Taking one of several results.** `data := os.ReadFile(…)` → *assignment mismatch: 1 variable but os.ReadFile
+returns 2 values* (`ikki/main.go`, in the section "Error value"). **The fix:** `data, err := …` and
+`if err != nil`. `data, _ :=` builds, but drops the error: don't do it.
+
+**3. `defer` before the error check.** The video only mentions it; the course folder has the example:
+
+```go filename="defer-oldin/main.go" showLineNumbers
+// Xato: defer xato tekshiruvidan OLDIN. http.Get xato qaytarsa resp nil bo'ladi, defer qatori esa resp.Body'ni
+// darhol o'qiydi — dastur nil pointer bilan yiqiladi (panic va defer tafsilotlari: GO-1.15).
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	resp, err := http.Get("http://localhost:9/users/42") // 9-port: hech kim tinglamaydi
+	defer resp.Body.Close()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+}
+```
+
+```console
+$ go run ./defer-oldin
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x62bbd7]
+
+goroutine 1 [running]:
+main.main()
+	…/defer-oldin/main.go:12 +0x37
+exit status 2
+```
+
+*invalid memory address or nil pointer dereference* — "an invalid memory address: access through a `nil`
+pointer". `main.go:12` is the `defer` line. `http.Get` returned an error, `resp` is `nil`, and `defer` read
+`resp.Body` on that line. This is a run-time **panic**: the program crashed with code 2 (details in
+[GO-1.15](/lab/youtube/go/go-1-15/en)). `go vet` catches it in advance:
+
+```console
+$ go vet ./defer-oldin
+defer-oldin/main.go:12:8: using resp before checking for errors
+```
+
+*using resp before checking for errors* — "`resp` is used before the errors are checked". **The fix:** first
+`if err != nil { return … }`, then `defer resp.Body.Close()`, as in `http/main.go`.
+
+**4. Thinking `defer` is `finally`.** A `defer` placed after an early `return` does not run on that path:
+`load(true)` did not print `yopildi` (section "Predict: `defer` after an early `return`"). **The fix:** write the
+`defer` as soon as you get the resource, right after its error check.
+
+**5. Declaring a result you need in the `if` header.** After `if cfg, err := loadConfig(…); err != nil` there is no
+`cfg`: *undefined: cfg* (section "Mid-lesson question"). **The fix:** take the result on a separate line before
+the `if`. The short form is only for a result you won't need later.
+
+## Check yourself
+
+Answer first, then open.
+
+**1.** `json.Unmarshal(data, &cfg)` was written as a bare call. Does it build, and where does the error go?
+
+<details>
+<summary>Answer</summary>
+
+Both the build and `go vet` are silent. The error is dropped, nobody sees it, and `cfg` stays at its zero value.
+golangci-lint's errcheck finds it.
+
+</details>
+
+**2.** When does `defer resp.Body.Close()` run, and why does it stand after the error check?
+
+<details>
+<summary>Answer</summary>
+
+When `fetchUser` finishes, whichever `return` it is. If there is an error, `resp` is `nil`, the `defer` line reads
+`resp.Body` immediately, and the program crashes with a panic. `go vet` catches this as *using resp before checking
+for errors*.
+
+</details>
+
+**3.** From GO-X.01: why is `http.ListenAndServe(…)` written inside `log.Fatal(…)`?
+
+<details>
+<summary>Answer</summary>
+
+According to the documentation, `ListenAndServe` always returns a non-`nil` error: it only returns with an error,
+for example when the port is busy. `log.Fatal` prints that error and stops the program with code 1. In today's
+words: this is handling the error at startup.
+
+</details>
+
+**4.** What does this program print? (It is not in the course folder; it was run separately for this lesson: this
+time the `defer` stands **before** the `return`.)
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func load(fail bool) error {
+	defer fmt.Println("yopildi")
+	fmt.Println("ochildi")
+	if fail {
+		return errors.New("buzuq JSON")
+	}
+	return nil
+}
+
+func main() {
+	err := load(true)
+	fmt.Println("xato:", err)
+}
+```
+
+**A)** `ochildi` · `xato: buzuq JSON` · **B)** `ochildi` · `yopildi` · `xato: buzuq JSON` · **C)** `yopildi` ·
+`ochildi` · `xato: buzuq JSON`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The `defer` line executed first, so it ran on `return errors.New(…)` too: `yopildi` before the function
+returns. Then `main` printed the error. If you chose "A", you carried over the result of `defer/main.go`: there the
+`defer` came after the `return`. If you chose "C", you thought `defer` runs immediately: it is only registered.
+
+```console
+$ go run oldin/main.go
+ochildi
+yopildi
+xato: buzuq JSON
+```
+
+</details>
+
+## Homework
+
+The starter files are in the lesson folder on GitHub:
+[lessons/0x-03-errors](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors) (the `uyga/`
+folder). The commands run from the lesson folder.
+
+🟢 **Easy** (`uyga/oson/main.go`): the config loader drops the error in three places. First predict the output,
+then fix them all with `if err != nil`: `loadConfig` should return the error, and `main` should stop with
+`log.Fatal`. `os.Getenv("CONFIG")` reads the `CONFIG` environment variable (set as `CONFIG=… go run …`).
+
+```go filename="uyga/oson/main.go" showLineNumbers
+// Uy vazifasi 🟢 (GO-X.03): bu config yuklovchi xatolarni uch joyda tashlab yuboradi.
+//
+//  1. Avval taxmin qiling, keyin dars papkasidan ishga tushiring:
+//     go run ./uyga/oson                                  # buzuq config.json (ortiqcha vergul)
+//     CONFIG=uyga/oson/config.json go run ./uyga/oson     # to'g'ri config
+//  2. Uchala joyni ham if err != nil bilan tuzating:
+//     loadConfig xatoni chaqiruvchiga qaytarsin, main esa log.Fatal bilan sababini yozib to'xtasin.
+//  3. Tekshiring: buzuq config → "invalid character '}' …", CONFIG=yoq.json → "open yoq.json: no such file
+//     or directory", to'g'ri config → "port: 8080".
+//     Qiziq: golangci-lint run ./uyga/oson hozir faqat Unmarshal'ni ko'rsatadi — _ bilan tashlangan xatolarni
+//     errcheck sukut bo'yicha sanamaydi (check-blank: false). Ko'z bilan topasiz.
+//
+// Javob: uyga/javob/oson/main.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, _ := os.ReadFile(path)
+	json.Unmarshal(data, &cfg)
+	return cfg, nil
+}
+
+func main() {
+	path := os.Getenv("CONFIG")
+	if path == "" {
+		path = "config.json"
+	}
+	cfg, _ := loadConfig(path)
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+```console
+$ go run ./uyga/oson
+port: 0
+```
+
+`port: 0` both with a broken config and with a missing file. With a correct solution: broken config →
+`invalid character '}' …`, `CONFIG=yoq.json` → `open yoq.json: no such file or directory`,
+`CONFIG=uyga/oson/config.json` → `port: 8080`.
+
+🟡 **Medium** (`uyga/orta/main.go`): the users API returns `404` for an unknown id, and `fetchUser` returns an empty
+user with no error. In Go, as with `fetch`, a `404` is not an error: the `net/http` documentation says *A non-2xx
+response doesn't cause an error*. After the `defer`, check `resp.StatusCode` and, if it is not `200`, return
+`fmt.Errorf("users API: %s", resp.Status)`. `fmt.Errorf` formats like `Sprintf` and makes an error.
+
+In the starter file `fetchUser` is the same as in `http/main.go`, only a task comment stands after
+`defer resp.Body.Close()`. `usersAPI()` is a fake users API for the demo (`httptest`): only user 42 exists; for other
+ids it returns `404` and `{"error": "not found"}`. `main` calls `fetchUser` with `"42"` and `"7"`. The full text of
+the file and the task comment are in the `uyga/orta/` folder on GitHub.
+
+```console
+$ go run ./uyga/orta
+{42 Dilnoza} <nil>
+{0 } <nil>
+```
+
+`{0 }` is an empty `User`: `ID` is `0`, `Name` is an empty string. With a correct solution the second line is
+`{0 } users API: 404 Not Found`.
+
+⭐ **Extra:** write the `GET /users/{id}` handler from GO-X.01 with `fetchUser`. On error,
+`http.Error(w, err.Error(), http.StatusBadGateway)` and `return`.
+
+Answers: the [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors/uyga/javob)
+folder. Try it yourself first.
+
+<details>
+<summary>Answer</summary>
+
+🟢 There were three places: `data, _ :=` (the `ReadFile` error dropped with `_`), the bare `json.Unmarshal`, and
+`cfg, _ :=` in `main`. `return cfg, nil` was a lie too: it said "no error" even when there was one. errcheck flags
+only `Unmarshal`; you find the other two by eye.
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// Javob 🟢 (GO-X.03): uchala xato tekshiriladi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+)
+
+type Config struct {
+	Port int `json:"port"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func main() {
+	path := os.Getenv("CONFIG")
+	if path == "" {
+		path = "config.json"
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("port:", cfg.Port)
+}
+```
+
+```console
+$ go run ./uyga/javob/oson
+2026/11/26 18:38:21 invalid character '}' looking for beginning of object key string
+exit status 1
+```
+
+```console
+$ CONFIG=yoq.json go run ./uyga/javob/oson
+2026/11/26 18:38:22 open yoq.json: no such file or directory
+exit status 1
+```
+
+```console
+$ CONFIG=uyga/oson/config.json go run ./uyga/javob/oson
+port: 8080
+```
+
+🟡 The status is checked after the `defer`. If it is not `200`, the body is not read as JSON and an error is
+returned. `resp.Status` is text like `"404 Not Found"`.
+
+```go filename="uyga/javob/orta/main.go" showLineNumbers
+// Javob 🟡 (GO-X.03): 200 bo'lmagan javob xato sifatida qaytariladi.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type User struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+func fetchUser(baseURL, id string) (User, error) {
+	var u User
+	resp, err := http.Get(baseURL + "/users/" + id)
+	if err != nil {
+		return u, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return u, fmt.Errorf("users API: %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&u)
+	return u, err
+}
+
+// usersAPI — demo uchun soxta users API: faqat 42-foydalanuvchi bor.
+func usersAPI() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/users/42" {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error": "not found"}`)
+			return
+		}
+		fmt.Fprint(w, `{"id": 42, "name": "Dilnoza"}`)
+	}))
+}
+
+func main() {
+	api := usersAPI()
+	defer api.Close()
+
+	fmt.Println(fetchUser(api.URL, "42"))
+	fmt.Println(fetchUser(api.URL, "7"))
+}
+```
+
+```console
+$ go run ./uyga/javob/orta
+{42 Dilnoza} <nil>
+{0 } users API: 404 Not Found
+```
+
+There is no answer file for ⭐: in the handler, `u, err := fetchUser(…)`; on error
+`http.Error(w, err.Error(), http.StatusBadGateway)` and `return`, otherwise write `u` as JSON (GO-X.01).
+
+</details>
+
+## Sources
+
+- Go FAQ: [Why does Go not have exceptions?](https://go.dev/doc/faq#exceptions)
+- Go's official rules (Go spec): [If statements](https://go.dev/ref/spec#If_statements),
+  [Blocks](https://go.dev/ref/spec#Blocks), [Expression statements](https://go.dev/ref/spec#Expression_statements),
+  [Assignment statements](https://go.dev/ref/spec#Assignment_statements),
+  [Short variable declarations](https://go.dev/ref/spec#Short_variable_declarations),
+  [Defer statements](https://go.dev/ref/spec#Defer_statements)
+- Go Code Review Comments: [Handle Errors](https://go.dev/wiki/CodeReviewComments#handle-errors),
+  [Indent Error Flow](https://go.dev/wiki/CodeReviewComments#indent-error-flow)
+- Effective Go: [Errors](https://go.dev/doc/effective_go#errors), [Defer](https://go.dev/doc/effective_go#defer) ·
+  [A Tour of Go: Errors](https://go.dev/tour/methods/19)
+- Go blog: [Defer, Panic, and Recover](https://go.dev/blog/defer-panic-and-recover) (A. Gerrand, 2010) ·
+  [On | No syntactic support for error handling](https://go.dev/blog/error-syntax) (R. Griesemer, 2025)
+- Packages: [os.ReadFile](https://pkg.go.dev/os#ReadFile) · [errors.New](https://pkg.go.dev/errors#New) ·
+  [fmt.Println](https://pkg.go.dev/fmt#Println) · [net.Listen](https://pkg.go.dev/net#Listen) ·
+  [net/http.Response](https://pkg.go.dev/net/http#Response) · [net/http.Get](https://pkg.go.dev/net/http#Get) ·
+  [net/http.ListenAndServe](https://pkg.go.dev/net/http#ListenAndServe) ·
+  [go vet: httpresponse](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/httpresponse) ·
+  [go vet: unusedresult](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unusedresult) ·
+  [errors.go (go1.26.8)](https://github.com/golang/go/blob/go1.26.8/src/errors/errors.go)
+- [Executing transactions](https://go.dev/doc/database/execute-transactions) (`defer tx.Rollback()`)
+- [golangci-lint: linters (errcheck)](https://golangci-lint.run/docs/linters/)
+- PHP: [json_decode](https://www.php.net/manual/en/function.json-decode.php) ·
+  [JSON_THROW_ON_ERROR](https://www.php.net/manual/en/json.constants.php)
+- MDN: [try...catch](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/try...catch) ·
+  [fetch()](https://developer.mozilla.org/en-US/docs/Web/API/Window/fetch) · Python:
+  [the with statement](https://docs.python.org/3/reference/compound_stmts.html#the-with-statement)
+- TypeScript: [throws clause proposal #13219](https://github.com/microsoft/TypeScript/issues/13219)
+- Course folder and README: [lessons/0x-03-errors](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+- All results were obtained with `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15, PHP 8.4.26 and
+  golangci-lint 2.12.2 on 2026-11-26. The time, port and pid differ on every run.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-03-errors)
+
+---
+
+← Previous lesson: [GO-X.02](/lab/youtube/go/go-x-02/en) · Next lesson: [GO-X.04](/lab/youtube/go/go-x-04/en) → · [All lessons](/lab/youtube/go)
+
+</div>

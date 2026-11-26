@@ -1,0 +1,1357 @@
+---
+title: "Копия или ссылка? Семантика значений и указатели"
+date: "2026/11/26"
+description: "В Go = и передача в функцию копируют struct: ловушка range, &user и *User, ошибка со struct в map, разница слайса и массива."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-x-04/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-x-04"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-x-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-x-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-x-04"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-x-04) · **Русский** · [English](/lab/youtube/go/go-x-04/en)  
+Урок GO-X.04 · [Go: 0 → Guru](/lab/youtube/go#go-x-04) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Вы написали эндпоинт, который увеличивает баланс на 50. В ответе на `POST` баланс 150, всё в порядке. Но следующий
+`GET` снова показывает 100: ни ошибки, ни записи в логе. А тот же цикл `for…of` в Node сохраняет 150. Короткий
+ответ: `range` в Go отдаёт копию элемента. Почему так и как это исправить?
+
+**Одна идея:** в Go `=` и передача в функцию копируют значение (и struct, и массив), а не дают ссылку на тот же
+объект, как в JS/Python. Чтобы изменить исходное значение, вы пишете в него через указатель (`&user`, `*User`)
+или через индекс.
+
+К концу урока вы:
+
+- объясните, почему изменение внутри `for _, user := range users` теряется, и исправите его через `users[i]` или
+  `&users[i]`;
+- будете писать параметр `*User` и `&user`, когда функция должна изменить struct вызывающего, а иначе передавать
+  значение;
+- прочитаете ошибку `cannot assign to struct field … in map` и исправите её двумя способами;
+- будете знать, чем отличается копия массива (`[3]int`) от копии слайса (`[]int`).
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| копия значения | `=` и передача в функцию переносят всё значение (все поля struct) в новое место | value semantics |
+| указатель | адрес значения в памяти: `&user` берёт адрес, `*User` — тип «указатель на User» | pointer |
+| массив и слайс | `[3]int` — массив, копируется целиком; `[]int` — слайс, его копия видит те же элементы | array, slice |
+
+Есть и два вспомогательных слова: **addressable** (адресуемое значение: Go пишет только в поля того, у чего есть
+адрес; у элемента map его нет) и **заголовок слайса** (slice header: указатель на элементы, длина и ёмкость).
+
+## Что нужно знать заранее
+
+- [GO-X.01 · HTTP API в 20 строк: первый сервис на Go и один бинарник](/lab/youtube/go/go-x-01/ru): сервис на `:3000`,
+  `GET /users/{id}`, `r.PathValue("id")`, параметр обработчика (handler) `r *http.Request` и один бинарник.
+- [GO-X.02 · Типы есть и в рантайме](/lab/youtube/go/go-x-02/ru): struct и JSON-теги, `:=`, `for _, p := range`, нижнее
+  подчёркивание `_`, название слайса (`[]int`), `&` в `json.Unmarshal(…, &item)` и zero value.
+- [GO-X.03 · Нет try/catch: ошибка как значение и defer](/lab/youtube/go/go-x-03/ru): `resp`, равный `nil`, и panic, `go vet` и
+  golangci-lint.
+- Небольшие программы (`nusxa/`, `param/`, `pointer/`, `range/`, `manzil/`, `mapxato/`, `maptuzat/`, `slice/`)
+  можно скопировать в [go.dev/play](https://go.dev/play) и запустить там. А `hook/` и `tuzat/` — HTTP-серверы,
+  их запускайте в папке курса (`lessons/0x-04-values-pointers`): все команды работают оттуда.
+- Программы с `net/http` на компьютере без компилятора C (gcc) могут выдать `cgo: C compiler "gcc" not found`.
+  Тогда добавьте `CGO_ENABLED=0` перед командой: `CGO_ENABLED=0 go run ./hook`.
+- `mapxato/` и `uyga/orta/` намеренно не собираются, поэтому `go vet ./...` в этой папке выдаёт ошибку.
+- Файлы для сравнения: `js/server.js` (Node 24), `anchor/topup.py` (Python 3) и `anchor/topup.php` (PHP 8).
+  Запускать их не обязательно, их вывод есть на этой странице.
+
+Сначала один вопрос по GO-X.03. `defer resp.Body.Close()` написан **до** проверки ошибки, и `http.Get` вернул
+ошибку:
+
+```go
+resp, err := http.Get("http://localhost:9/users/42") // 9-port: hech kim tinglamaydi
+defer resp.Body.Close()
+if err != nil {
+```
+
+Что произойдёт? **A)** `defer` будет пропущен · **B)** panic: nil pointer · **C)** ошибка сборки
+
+<details>
+<summary>Ответ</summary>
+
+**B: panic.** Когда `http.Get` возвращает ошибку, `resp` — `nil`. Строка `defer` сразу вычисляет `resp.Body`, то
+есть читает поле через `nil`. Программа падает с ошибкой времени выполнения: *nil pointer dereference* — «чтение
+через nil-указатель». Это похоже на `Cannot read properties of null` в JavaScript.
+
+```console
+$ go run ../0x-03-errors/defer-oldin
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x62bbd7]
+
+goroutine 1 [running]:
+main.main()
+	…/0x-03-errors/defer-oldin/main.go:12 +0x37
+exit status 2
+```
+
+(Начало пути сокращено до `…`: оно зависит от папки на вашем компьютере.) Если вы выбрали «будет пропущен», вы
+думали, что аргументы `defer` вычисляются позже: они вычисляются прямо в строке `defer`. Если вы выбрали «ошибка
+сборки», вы думали, что компилятор заранее знает про `nil`: это выясняется только во время выполнения.
+
+</details>
+
+`resp` был указателем. Сегодня разберём, что такое указатель и зачем он нужен в Go.
+
+## Куда пропал баланс: обработчик на Go и на Node
+
+Вот сервис из хука. Это сервис из GO-X.01, только пользователи хранятся не в базе данных, а в слайсе `users` в
+памяти. `hook/main.go`:
+
+```go filename="hook/main.go" showLineNumbers
+// Hook (GO-X.04): GO-X.01 xizmati + xotiradagi users ro'yxati. POST /users/{id}/topup balansni 50 ga oshirishi
+// kerak. Javob 150 deydi, keyingi GET esa 100: range bergan user — elementning NUSXASI.
+// Ishga tushirish: go run ./hook   (boshqa terminalda: curl -X POST localhost:3000/users/42/topup; curl localhost:3000/users/42)
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+type User struct {
+	ID      string `json:"id"`
+	Balance int    `json:"balance"`
+}
+
+var users = []User{{ID: "42", Balance: 100}}
+
+func main() {
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	http.HandleFunc("POST /users/{id}/topup", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				user.Balance += 50
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–3 | `// …` | комментарии: задача и команды запуска |
+| 4–10 | `package main`, `import ( … )` | исполняемая программа; пакеты: `encoding/json` (JSON), `log` (запись в лог), `net/http` (HTTP-сервер) |
+| 12–15 | `type User struct { … }` | тип `User`: поля `ID` и `Balance` («баланс») с JSON-тегами (GO-X.02) |
+| 17 | `var users = []User{{ID: "42", Balance: 100}}` | `users` — слайс значений `User` вместо базы данных. `{ID: "42", Balance: 100}` в фигурных скобках — **литерал struct**, как объектный литерал в JavaScript |
+| 20–28 | `GET /users/{id}` | обработчик получает `w` (ответ) и `r` (запрос) (GO-X.01; `*` в `*http.Request` — ниже, в разделе «Указатель»). Возвращает `user` с совпавшим id в JSON, иначе `http.NotFound` — `404` |
+| 29 | `POST /users/{id}/topup` | эндпоинт, который увеличивает баланс |
+| 30 | `for _, user := range users {` | выглядит как `for (const user of users)` в JavaScript |
+| 31 | `if user.ID == r.PathValue("id") {` | сравнивает с id из URL |
+| 32 | `user.Balance += 50` | добавляет 50 к найденному `user` |
+| 33 | `json.NewEncoder(w).Encode(user)` | пишет `user` в ответ как JSON |
+| 34 | `return` | выходит из обработчика |
+| 39–40 | `log.Println(…)`, `http.ListenAndServe(":3000", nil)` | запускает сервис на `:3000` (GO-X.01) |
+
+Запускаем:
+
+```console
+$ go run ./hook
+2026/11/26 18:39:17 listening on :3000
+```
+
+Сервер занимает терминал. Во втором терминале сначала `POST`, потом `GET`:
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":100}
+```
+
+В ответе на `POST` 150, в следующем `GET` — 100. Ошибки нет, лог молчит.
+
+Теперь тот же сервис на Node. `js/server.js` написан без библиотек:
+
+```js filename="js/server.js"
+// Hook'ning Node tomoni (GO-X.04): xuddi shu xizmat, kutubxonasiz. for…of bergan user — massivdagi O'SHA obyekt.
+// Ishga tushirish: node js/server.js
+const http = require("node:http");
+
+const users = [{ id: "42", balance: 100 }];
+
+http
+  .createServer((req, res) => {
+    const m = req.url.match(/^\/users\/(\w+)(\/topup)?$/);
+    if (!m) return res.writeHead(404).end();
+    for (const user of users) {
+      if (user.id === m[1]) {
+        if (req.method === "POST" && m[2]) user.balance += 50;
+        return res.end(JSON.stringify(user) + "\n");
+      }
+    }
+    res.writeHead(404).end();
+  })
+  .listen(3000, () => console.log("listening on :3000"));
+```
+
+Остановите сервер Go через <kbd>Ctrl</kbd>+<kbd>C</kbd> (порт один и тот же), затем:
+
+```console
+$ node js/server.js
+listening on :3000
+```
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":150}
+```
+
+В Node оба ответа — 150. Циклы выглядят одинаково, а результат разный. Причина — в следующих разделах.
+
+## Тот же цикл в Python и PHP
+
+Python ведёт себя как JavaScript. `anchor/topup.py`:
+
+```python filename="anchor/topup.py"
+# Python tomoni (GO-X.04): for bergan user — ro'yxatdagi O'SHA dict (nom obyektga bog'lanadi).
+users = [{"id": "42", "name": "Dilnoza", "balance": 100}]
+for user in users:
+    if user["id"] == "42":
+        user["balance"] += 50
+print(users[0]["balance"])  # 150
+```
+
+```console
+$ python3 anchor/topup.py
+150
+```
+
+`user` из `for` — тот же самый dict из списка. В Python имя привязывается к объекту, копия не создаётся.
+
+А в PHP есть разница. `anchor/topup.php` проходит сначала по массивам, потом по объектам:
+
+```php filename="anchor/topup.php"
+<?php
+// PHP tomoni (GO-X.04): massiv qiymat bilan nusxalanadi (Go struct kabi), obyekt esa handle bilan (Go pointer kabi).
+$users = [["id" => "42", "name" => "Dilnoza", "balance" => 100]];
+foreach ($users as $u) {
+    if ($u["id"] === "42") {
+        $u["balance"] += 50; // $u — nusxa
+    }
+}
+echo $users[0]["balance"], "\n"; // 100
+
+$objs = [(object) ["id" => "42", "name" => "Dilnoza", "balance" => 100]];
+foreach ($objs as $o) {
+    if ($o->id === "42") {
+        $o->balance += 50; // $o — o'sha obyektning handle'i
+    }
+}
+echo $objs[0]->balance, "\n"; // 150
+```
+
+```console
+$ php anchor/topup.php
+100
+150
+```
+
+В руководстве PHP сказано: присваивание массива всегда означает копирование значения. Поэтому изменение в
+`foreach` теряется и остаётся 100. А объект PHP меняет через **handle**, то есть идентификатор объекта: 150. В PHP
+ссылку можно написать явно: `foreach ($users as &$u)` (`anchor/topup-ref.php`):
+
+```console
+$ php anchor/topup-ref.php
+150
+```
+
+| Язык | Цикл | Элемент | Результат |
+|---|---|---|---|
+| JavaScript | `for (const user of users)` | тот же объект | 150 |
+| Python | `for user in users` | тот же dict | 150 |
+| PHP, массив | `foreach ($users as $u)` | копия | 100 |
+| PHP, объект | `foreach ($objs as $o)` | handle того же объекта | 150 |
+| Go | `for _, user := range users` | ? | `POST` 150, `GET` 100 |
+
+Массив PHP ближе всего к struct в Go. Это видно в следующем разделе.
+
+## Копия значения: `c := user`
+
+В Go struct — это значение, а не ссылка, как объект в JavaScript. `nusxa/main.go` («копия»):
+
+```go filename="nusxa/main.go" showLineNumbers
+// Qiymat nusxasi (GO-X.04): c := user butun struct'ni (hamma maydonlarini) yangi joyga nusxalaydi.
+// JS'da const c = user — o'sha obyektga ikkinchi havola bo'lardi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	c := user
+	c.Balance += 50
+	fmt.Println(user.Balance, c.Balance) // 100 150
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7–10 | `type User struct { … }` | `User` из хука, без тегов |
+| 13 | `user := User{ID: "42", Balance: 100}` | новый `user` из литерала struct |
+| 14 | `c := user` | не ссылка: все поля `user` копируются в новое место |
+| 15 | `c.Balance += 50` | меняется только поле `c` |
+| 16 | `fmt.Println(user.Balance, c.Balance)` | выводит оба баланса |
+
+В памяти, строка за строкой:
+
+| После строки | `user.ID` | `user.Balance` | `c.ID` | `c.Balance` | На экране |
+|---|---|---|---|---|---|
+| 13 | `"42"` | 100 | | | |
+| 14 | `"42"` | 100 | `"42"` (копия) | 100 (копия) | |
+| 15 | `"42"` | 100 | `"42"` | **150** | |
+| 16 | `"42"` | 100 | `"42"` | 150 | `100 150` |
+
+```console
+$ go run ./nusxa
+100 150
+```
+
+Это **семантика значений** (value semantics): `=` копирует само значение. В JavaScript `const c = user` был бы
+второй ссылкой на тот же объект, и `user.balance` тоже стал бы 150. Правило присваивания (assignment) в спецификации
+Go говорит то же самое: значение записывается в переменную.
+
+## Параметр функции — тоже копия
+
+На практике баланс обычно увеличивает отдельная функция. В JavaScript, если передать объект в функцию, она меняет
+именно этот объект. В Go тоже передаём `User` в `topUp` («пополнить»). `param/main.go`:
+
+```go filename="param/main.go" showLineNumbers
+// Bashorat 1 (GO-X.04): funksiya parametri ham qiymat berish — topUp user'ning nusxasini oladi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func topUp(user User, amount int) {
+	user.Balance += amount
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	topUp(user, 50)           // JS: topUp(user) → 150
+	fmt.Println(user.Balance) // 100
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `func topUp(user User, amount int) {` | параметр `user` типа `User`, `amount` («сумма») — число типа `int` |
+| 12 | `user.Balance += amount` | увеличивает баланс параметра |
+| 17 | `topUp(user, 50)` | передаёт `user` из `main` |
+
+Что выведет `Println` после `topUp`? (Постарайтесь не смотреть на комментарий `// 100` в файле.)
+
+**A)** `150` · **B)** `100` · **C)** ошибка сборки
+
+<details>
+<summary>Ответ</summary>
+
+**B: `100`.** Передача в функцию — тоже присваивание: параметр — копия `user` вызывающего. Когда функция
+завершается, копия исчезает. В Go FAQ правило записано так: как во всех языках семейства C, в Go всё передаётся по
+значению. Функция всегда получает копию переданного, как будто параметру присвоили значение. Если вы выбрали
+«`150`», вы перенесли привычку из JavaScript: там объект передаётся как ссылка. Если вы выбрали «ошибка сборки», вы
+думали, что Go считает это ошибкой: это не ошибка, а правило.
+
+</details>
+
+```console
+$ go run ./param
+100
+```
+
+| Шаг | `user.Balance` в `main` | `user.Balance` в `topUp` (копия) |
+|---|---|---|
+| после строки 16 | 100 | — |
+| вход в `topUp` | 100 | 100 |
+| после строки 12 | 100 | 150 |
+| `topUp` завершилась | 100 | — (копия исчезла) |
+
+И сборка, и `go vet` молчат:
+
+```console
+$ go vet ./param
+```
+
+`go vet` ничего не вывел. Это не ошибка, а правило языка.
+
+**Почему Go выбрал так?** В JavaScript любая функция может молча изменить ваш объект, и по сигнатуре этого не
+понять. В Go функция, которая хочет изменить ваш struct, пишет это в сигнатуре: указателем, его увидим сейчас.
+А слайсы и map — отдельный случай: о них в конце.
+
+| | Кто может изменить? |
+|---|---|
+| JavaScript: `f(user)` | любая функция; в сигнатуре не видно |
+| Go: `topUp(user User, …)` | никто: функция получает копию и не трогает ваш `user` |
+| Go: изменяющая функция | в её сигнатуре есть указатель (следующий раздел) |
+
+## Указатель: `&user` и `*User`
+
+Теперь пусть `topUp` изменит исходный `user`. `pointer/main.go` отличается от `param/main.go` двумя строками:
+
+```go filename="pointer/main.go" showLineNumbers
+// Pointer (GO-X.04): &user — user'ning manzili, *User — "User'ga pointer". topUp nusxa emas, manzil oladi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func topUp(user *User, amount int) {
+	user.Balance += amount // Go o'zi (*user).Balance deb o'qiydi
+}
+
+func main() {
+	user := User{ID: "42", Balance: 100}
+	topUp(&user, 50)          // JS'da havola yashirin, Go'da &
+	fmt.Println(user.Balance) // 150
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 17 | `topUp(&user, 50)` | `&user` — **адрес** `user` в памяти. В JavaScript ссылка скрыта, в Go она пишется явно через `&` |
+| 11 | `func topUp(user *User, amount int) {` | `*User` — имя типа: «**указатель** (pointer) на `User`», то есть адрес значения типа `User` |
+| 12 | `user.Balance += amount` | пишем в поле через обычную точку: Go сам идёт по адресу и читает это как `(*user).Balance`. Отдельный знак, как `->` в C, не нужен |
+
+```console
+$ go run ./pointer
+150
+```
+
+Что происходит в памяти? Короткий фрагмент (такого файла в папке курса нет, идея та же, что в `pointer/`):
+
+```go
+user := User{Balance: 100}
+p := &user
+p.Balance += 50
+fmt.Println(user.Balance)
+```
+
+`p := &user` не создаёт новый `User`. `p` хранит только то, где находится `user`. Если писать через `p`, меняется
+само значение `user`:
+
+| После строки | `user.Balance` | `p` (`*User`) | На экране |
+|---|---|---|---|
+| 1 | 100 | — | |
+| 2 | 100 | адрес `user` (нового `User` нет) | |
+| 3 | **150** (через `p`, сам `user`) | адрес `user` | |
+| 4 | 150 | | `150` |
+
+```text
+p := &user
+
+  user (User)                       p (*User)
+  ┌──────────┬──────────────┐       ┌────────────────────┐
+  │ ID "42"  │ Balance 150  │ ◄──── │ адрес user         │
+  └──────────┴──────────────┘       └────────────────────┘
+
+topUp(&user, 50): копируется адрес
+
+  &user в main ──────────┐
+                         ├──► один и тот же user
+  user в topUp ──────────┘   (обе копии указывают на одно место)
+```
+
+Внимание: когда вы передаёте `&user` в `topUp`, копия тоже создаётся, только на этот раз копия **адреса**. Обе
+копии указывают на одно место. Поэтому правило не меняется: в Go всё передаётся по значению. Go FAQ: передача
+указателя копирует сам указатель, но не данные, на которые он указывает.
+
+Zero value указателя — `nil`: он ни на что не указывает. Panic из вопроса по GO-X.03 в начале был именно таким:
+`resp` был `nil`, а `resp.Body` — чтение через `nil`.
+
+### Когда нужен указатель?
+
+| Ситуация | Тип параметра |
+|---|---|
+| нужно изменить значение вызывающего | `*User` |
+| struct большой | `*User` |
+| маленький struct, только читается | `User` (обычный случай) |
+
+Рекомендация команды Go (Code Review Comments): не передавайте указатели, чтобы сэкономить несколько байт. Этот совет
+не относится к большим struct и даже к маленьким, которые могут вырасти.
+
+Два обещания из прошлых уроков — тоже об этом:
+
+- `json.Unmarshal([]byte(body), &item)` из GO-X.02: `Unmarshal` должен заполнить `item`, поэтому получает `&item`.
+  В документации сказано: если аргумент не указатель, `Unmarshal` возвращает `InvalidUnmarshalError`.
+- Обработчик из GO-X.01 получает запрос как `r *http.Request`, то есть через указатель.
+
+## Копия в `range`: ответ на хук
+
+Вернёмся к обработчику из начала. Цикл в нём — вариант A. Посмотрите ещё на два варианта. Перед каждым `users`
+заново сбрасывается на 100 через `fresh()` («свежий»). В варианте B есть индекс, в варианте C — указатель.
+`range/main.go`:
+
+```go filename="range/main.go" showLineNumbers
+// Bashorat 2 (GO-X.04): uchta sikl — qaysi biri users'ni o'zgartiradi?
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func fresh() []User { return []User{{ID: "42", Balance: 100}} }
+
+func main() {
+	users := fresh()
+	for _, user := range users { // A: user — elementning nusxasi
+		user.Balance += 50
+	}
+	fmt.Println("A:", users[0].Balance)
+
+	users = fresh()
+	for i := range users { // B: users[i] — elementning o'zi
+		users[i].Balance += 50
+	}
+	fmt.Println("B:", users[0].Balance)
+
+	users = fresh()
+	for _, user := range users { // C: &user — NUSXAning manzili
+		p := &user
+		p.Balance += 50
+	}
+	fmt.Println("C:", users[0].Balance)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `func fresh() []User { … }` | при каждом вызове возвращает новый слайс с одним пользователем |
+| 15–17 | A: `for _, user := range users { user.Balance += 50 }` | цикл из хука |
+| 21–23 | B: `for i := range users { users[i].Balance += 50 }` | `i` — индекс (GO-X.02); `users[i]` — элемент, взятый по индексу |
+| 27–30 | C: `p := &user; p.Balance += 50` | пишет через адрес `user`, который дал `range` |
+| 18, 24, 31 | `fmt.Println("A:", users[0].Balance)` | баланс первого элемента слайса |
+
+Закройте ответы в комментариях. Какой вариант сделает баланс в `users` равным 150?
+
+**A)** только B · **B)** B и C · **C)** все три
+
+<details>
+<summary>Ответ</summary>
+
+**A: только B.** `user` из `range` — копия элемента, как `c := user`. Указатель в C — адрес этой **копии**. В B
+`users[i]`, взятый по индексу, — сам элемент внутри слайса. Если вы выбрали «B и C», вы думали, что указатель всегда
+указывает на оригинал: он указывает на то, адрес чего вы взяли, здесь — на копию. Если вы выбрали «все три», вы
+прочитали `range` как `for…of` из JavaScript.
+
+</details>
+
+```console
+$ go run ./range
+A: 100
+B: 150
+C: 100
+```
+
+| Вариант | Куда записали | `users[0].Balance` |
+|---|---|---|
+| A | `user` — копия элемента | 100 |
+| B | `users[i]` — сам элемент | **150** |
+| C | `p` → адрес копии `user` | 100 |
+
+Правило `for range` из спецификации: на каждом шаге значения итерации **присваиваются** переменным цикла, затем
+выполняется блок. Ошибка №30 из книги «100 Go Mistakes» именно об этом: элемент-значение в `range` — копия.
+
+### Вопрос посередине: `&users[i]`
+
+На этот раз идём по индексу, но берём адрес элемента, взятого по индексу, через `&`. Затем пишем через `p`.
+`manzil/main.go` («адрес»):
+
+```go filename="manzil/main.go" showLineNumbers
+// O'rtadagi sinov (GO-X.04): &users[i] — slice elementining o'z manzili (C variantdagi &user esa nusxaning manzili).
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := []User{{ID: "42", Balance: 100}}
+	for i := range users {
+		p := &users[i]
+		p.Balance += 50
+	}
+	fmt.Println(users[0].Balance) // 150
+}
+```
+
+В строке 14 `&users[i]`, а в варианте C был `&user`. Что выведется на экран?
+
+**A)** `100` — `p` опять копия · **B)** `150` · **C)** ошибка сборки
+
+<details>
+<summary>Ответ</summary>
+
+**B: `150`.** `users[i]`, взятый по индексу, — исходный элемент слайса, а `&` даёт его собственный адрес. В C это
+был адрес копии. Если вы выбрали «`100`», вы думали, что любое `p := &…` даёт копию: `&` ничего не копирует, а
+только берёт адрес. Если вы выбрали «ошибка сборки», вы думали, что адрес элемента слайса взять нельзя: по
+спецификации Go элемент слайса — адресуемое значение (addressable), то есть у него есть адрес.
+
+</details>
+
+```console
+$ go run ./manzil
+150
+```
+
+Эта форма удобна, когда struct большой или элемент нужно передать в другую функцию.
+
+### Исправляем обработчик
+
+Идём по индексу и пишем в элемент по индексу, в ответ тоже отдаём этот элемент. `tuzat/main.go` («исправление»;
+отличается от `hook/main.go`, кроме комментариев в строках 1–3, только строками 30–33):
+
+```go filename="tuzat/main.go" showLineNumbers
+// Tuzatilgan hook (GO-X.04): range indeks bilan, element users[i] orqali o'zgartiriladi.
+// ⚠️ Demo: users global, so'rovlar esa parallel goroutine'larda — haqiqiy xizmatda sync.Mutex kerak (GO-1.09).
+// Ishga tushirish: go run ./tuzat   (boshqa terminalda: curl -X POST localhost:3000/users/42/topup; curl localhost:3000/users/42)
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+type User struct {
+	ID      string `json:"id"`
+	Balance int    `json:"balance"`
+}
+
+var users = []User{{ID: "42", Balance: 100}}
+
+func main() {
+	http.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		for _, user := range users {
+			if user.ID == r.PathValue("id") {
+				json.NewEncoder(w).Encode(user)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	http.HandleFunc("POST /users/{id}/topup", func(w http.ResponseWriter, r *http.Request) {
+		for i := range users {
+			if users[i].ID == r.PathValue("id") {
+				users[i].Balance += 50
+				json.NewEncoder(w).Encode(users[i])
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+	log.Println("listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+```
+
+| Строка | Код | Что изменилось |
+|---|---|---|
+| 30 | `for i := range users {` | индекс, а не элемент |
+| 31 | `if users[i].ID == r.PathValue("id") {` | читаем сам элемент |
+| 32 | `users[i].Balance += 50` | пишем в сам элемент слайса |
+| 33 | `json.NewEncoder(w).Encode(users[i])` | в ответ — тоже этот элемент |
+
+Копия `range` в обработчике `GET` безвредна: он только читает.
+
+```console
+$ go run ./tuzat
+2026/11/26 18:39:32 listening on :3000
+```
+
+```console
+$ curl -X POST localhost:3000/users/42/topup
+{"id":"42","balance":150}
+$ curl localhost:3000/users/42
+{"id":"42","balance":150}
+```
+
+Теперь и `POST`, и `GET` — 150. Стандартные линтеры не видят ошибку в хуке: копия записана в ответ, то есть
+использована (вывод golangci-lint — в разделе «Частые ошибки»).
+
+Это демо. `net/http` выполняет каждый запрос в отдельной горутине (goroutine), то есть в отдельной задаче, которая
+работает параллельно. В реальном сервисе для записи в общий `users` нужен мьютекс (mutex), то есть замок. Он — в
+[GO-1.09](/lab/youtube/go/go-1-09/ru).
+
+## Struct в map: элемент без адреса
+
+Многие сервисы хранят пользователей не в слайсе, а в map по id. Map — таблица ключ → значение, как `Map` в
+JavaScript. Сначала одно правило.
+
+Go пишет только в поля того, у чего есть адрес. Такое значение называется **addressable** (адресуемое). Список из
+спецификации Go:
+
+| Что | Addressable? | Пример |
+|---|---|---|
+| переменная | да | `user.Balance = 0` ✓ |
+| элемент слайса | да | `users[i].Balance = 0` ✓ |
+| через указатель | да | `p.Balance = 0` ✓ |
+| элемент map | **нет** | `users["42"].Balance = 0` ✗ |
+| замена всего элемента map | (отдельное правило) | `users["42"] = user` ✓ |
+
+Почему не элемент map? При росте map переносит элементы в новую память (в исходниках go1.26.8 это делает функция
+`grow` в пакете `runtime/maps`). Адрес элемента устарел бы. Роберт Гриземер, один из авторов Go, написал в 2012
+году: мы не хотим, чтобы указатель на элемент map оставался жить.
+
+В JavaScript взять элемент из `Map` и увеличить баланс работает. Напишем то же самое в Go. `mapxato/main.go`
+(«ошибка с map»):
+
+```go filename="mapxato/main.go" showLineNumbers
+// O'rtadagi sinov (GO-X.04): map'dagi struct maydoniga to'g'ridan-to'g'ri yozib bo'lmaydi. Ataylab build bo'lmaydi.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := map[string]User{"42": {ID: "42", Balance: 100}}
+	// JS: users.get("42").balance += 50 — ishlaydi
+	users["42"].Balance += 50
+	fmt.Println(users["42"].Balance)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 12 | `users := map[string]User{"42": {…}}` | `map[string]User` — map с ключом `string` и значением `User`; по ключу `"42"` один `User` |
+| 14 | `users["42"].Balance += 50` | пытается записать в поле `User` по ключу `"42"` |
+| 15 | `fmt.Println(users["42"].Balance)` | выводит баланс |
+
+Что сделает эта программа?
+
+**A)** выведет `150` · **B)** выведет `100` (копия) · **C)** ошибка сборки
+
+<details>
+<summary>Ответ</summary>
+
+**C: ошибка сборки.** Элемент map не addressable, в его поле писать нельзя. Вместо того чтобы молча изменить копию,
+Go останавливает это при сборке. Если вы выбрали «`100` (копия)», вы применили правило «всё копируется»: здесь Go
+не молчит. Если вы выбрали «`150`», вы перенесли поведение `Map` из JavaScript.
+
+</details>
+
+```console
+$ go run ./mapxato
+# github.com/abdurahmon27/go-backend-uz/lessons/0x-04-values-pointers/mapxato
+mapxato/main.go:14:2: cannot assign to struct field users["42"].Balance in map
+```
+
+Первая строка — в каком пакете ошибка. В команде указана папка (`./mapxato`), поэтому Go пишет полное имя пакета:
+путь модуля + папка. (В GO-X.02 команде давали файл `.go`, поэтому там было `# command-line-arguments`.)
+`mapxato/main.go:14:2` — строка 14, столбец 2. *cannot assign to struct field users["42"].Balance in map* —
+«нельзя присвоить значение полю struct `users["42"].Balance` в map».
+
+### Два исправления
+
+`maptuzat/main.go` («исправление map»):
+
+```go filename="maptuzat/main.go" showLineNumbers
+// Tuzatish (GO-X.04): map'dagi struct — o'qing, o'zgartiring, qaytarib yozing; yoki map'da pointer saqlang.
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	users := map[string]User{"42": {ID: "42", Balance: 100}}
+	user := users["42"] // nusxa
+	user.Balance += 50
+	users["42"] = user               // qaytarib yozamiz
+	fmt.Println(users["42"].Balance) // 150
+
+	ptrs := map[string]*User{"42": &User{ID: "42", Balance: 100}}
+	ptrs["42"].Balance += 50        // pointer orqali: build bo'ladi
+	fmt.Println(ptrs["42"].Balance) // 150
+	// Diqqat: kalit yo'q bo'lsa ptrs["x"] nil, ptrs["x"].Balance esa panic beradi.
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 13 | `user := users["42"]` | **способ 1:** читаем копию значения из map |
+| 14 | `user.Balance += 50` | меняем копию (`user` — переменная, addressable) |
+| 15 | `users["42"] = user` | записываем весь элемент обратно в map |
+| 18 | `ptrs := map[string]*User{"42": &User{…}}` | **способ 2:** храним в map указатели. `&User{…}` — адрес нового `User` |
+| 19 | `ptrs["42"].Balance += 50` | map возвращает указатель, запись через указатель собирается |
+
+```console
+$ go run ./maptuzat
+150
+150
+```
+
+Осторожно: если ключа нет, map возвращает zero value типа элемента. Для `*User` это `nil`, а запись через `nil`
+даёт panic (пример — в разделе «Частые ошибки»).
+
+## Слайс и массив
+
+Последнее понятие. Если в квадратных скобках стоит длина (`[3]int`), это **массив** (array), и длина — часть типа:
+`[3]int` и `[4]int` — два разных типа. Пустые скобки (`[]int`) — это **слайс** (slice), список из прошлых уроков. На
+практике массивы встречаются редко, почти везде слайсы. Но разница хорошо показывает правило копирования.
+`slice/main.go`:
+
+```go filename="slice/main.go" showLineNumbers
+// Bashorat 3 (GO-X.04): massiv qiymat — butunlay nusxalanadi; slice esa elementlarni bo'lishadi.
+package main
+
+import "fmt"
+
+func main() {
+	a := [3]int{1, 2, 3} // massiv: uzunligi turning bir qismi
+	b := a
+	b[0] = 9
+
+	s := []int{1, 2, 3} // slice
+	t := s
+	t[0] = 9
+
+	fmt.Println(a[0], s[0]) // 1 9
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7 | `a := [3]int{1, 2, 3}` | массив из трёх чисел `int` |
+| 8–9 | `b := a`, `b[0] = 9` | присваиваем `a` в `b`, меняем первый элемент `b` |
+| 11 | `s := []int{1, 2, 3}` | такой же слайс |
+| 12–13 | `t := s`, `t[0] = 9` | присваиваем `s` в `t`, меняем `t[0]` |
+| 15 | `fmt.Println(a[0], s[0])` | первые элементы исходных `a` и `s` |
+
+Закройте комментарии в начале файла. Что выведет `Println`?
+
+**A)** `1 1` · **B)** `9 9` · **C)** `1 9`
+
+<details>
+<summary>Ответ</summary>
+
+**C: `1 9`.** Массив — значение: `b := a` копирует все элементы, как struct. А слайс, как массив в JavaScript,
+делит элементы, потому что внутри него указатель на элементы. Если вы выбрали «`9 9`», вы перенесли привычку из
+JavaScript: там `b = a` — тот же массив. Если вы выбрали «`1 1`», вы применили только что выученное правило
+копирования и к слайсу: у слайса копируется только маленький заголовок (ниже).
+
+</details>
+
+```console
+$ go run ./slice
+1 9
+```
+
+В JavaScript для копии массива вы написали бы spread с тремя точками (`[...a]`). А простое `t = s` — тот же массив:
+
+```console
+$ node -e 'const s=[1,2,3]; const t=s; t[0]=9; console.log(s[0])'
+9
+```
+
+А в PHP массив копируется, как `[3]int` в Go:
+
+```console
+$ php -r '$a=[1,2,3]; $b=$a; $b[0]=9; echo $a[0];'
+1
+```
+
+(Этих двух команд нет в папке курса в виде файлов: код записан в самой команде.)
+
+### Заголовок слайса
+
+Слайс — это маленький **заголовок** (slice header). Внутри три вещи: указатель на элементы, длина и ёмкость
+(capacity). `t := s` копирует только заголовок, элементы остаются одни и те же:
+
+```text
+a := [3]int{1, 2, 3};  b := a            s := []int{1, 2, 3};  t := s
+
+  a  [1 2 3]                               s  ┌─────────┬───────┬───────┐
+  b  [9 2 3]   ← отдельная копия              │ pointer │ len 3 │ cap 3 │
+                                              └────┬────┴───────┴───────┘
+                                                   ▼
+                                                [9 2 3]   ← элементы одни, общие
+                                                   ▲
+                                              t  ┌─┴───────┬───────┬───────┐
+                                                 │ pointer │ len 3 │ cap 3 │  ← копия заголовка
+                                                 └─────────┴───────┴───────┘
+```
+
+В Go FAQ сказано: значения map и слайсов ведут себя как указатели, и их копирование не копирует данные, на которые
+они указывают. Поэтому если передать слайс в функцию, она может изменить его элементы, даже без указателя в
+сигнатуре.
+
+Внимание: если в struct есть поле-слайс, копия struct тоже получает только заголовок. Это поверхностная копия:
+элементы остаются общими (пример — в разделе «Частые ошибки»). Ловушки с `append`, `len` и `cap` — в
+[GO-1.08](/lab/youtube/go/go-1-08/ru).
+
+| | Что переносится в копию | Элементы |
+|---|---|---|
+| struct `c := user` | все поля | — |
+| массив `b := a` | все элементы | отдельные |
+| слайс `t := s` | только заголовок (указатель, длина, ёмкость) | общие |
+| указатель `q := p` | только адрес | одно значение |
+
+## Глубже (необязательно): массив JS и `[]User` в Go в памяти
+
+Массив объектов в JavaScript на самом деле список ссылок: каждый элемент указывает на объект (MDN: объекты —
+ссылочный тип). А `[]User` в Go хранит сами значения `User` подряд. `range` берёт копию именно оттуда.
+
+```text
+JS:  users = [ ссылка ─┐ ]              Go:  users []User
+                       ▼                     ┌───────────────────────┬─────┐
+              { id: "42", balance: 100 }     │ User{ID "42", 100}    │ ... │
+                                             └───────────────────────┴─────┘
+  for (const user of users)                   for _, user := range users
+  → user = та же ссылка                       → user = копия элемента
+```
+
+Если указатель выходит за пределы функции, значение может переехать в **кучу** (heap), то есть в память, которой
+управляет сборщик мусора (garbage collector, GC). Go FAQ: если компилятор не может доказать, что переменная не
+используется после возврата из функции, он размещает её в куче. Это **escape-анализ** (escape analysis), он — в
+[GO-1.11](/lab/youtube/go/go-1-11/ru).
+
+В Go нет арифметики указателей (без пакета `unsafe`). Причина в Go FAQ — одно слово: «Safety», то есть
+безопасность. Язык без арифметики указателей никогда не сможет получить некорректный адрес.
+
+## Частые ошибки
+
+**1. Изменять элемент, который дал `range`.** Самая классическая ошибка этой темы:
+`for _, user := range users { user.Balance += 50 }` не трогает слайс. В хуке `POST` давал 150, а `GET` — 100 (раздел «Копия в `range`»). Хуже
+всего, что стандартный линтер этого не видит, потому что копия прочитана в `Encode(user)`:
+
+```console
+$ golangci-lint run ./hook
+hook/main.go:23:30: Error return value of `(*encoding/json.Encoder).Encode` is not checked (errcheck)
+				json.NewEncoder(w).Encode(user)
+				                         ^
+hook/main.go:33:30: Error return value of `(*encoding/json.Encoder).Encode` is not checked (errcheck)
+				json.NewEncoder(w).Encode(user)
+				                         ^
+2 issues:
+* errcheck: 2
+```
+
+Оба предупреждения только о том, что не проверена ошибка, которую вернул `Encode`: *Error return value … is not
+checked* — «возвращённая ошибка не проверена». О копии — ничего (golangci-lint 2.12.2, линтеры по умолчанию).
+**Исправление:** `for i := range users { users[i].Balance += 50 }` или `p := &users[i]`.
+
+**2. Брать адрес копии.** `for _, user := range users { p := &user; … }` тоже не трогает слайс: `p` — адрес копии
+(вариант C, `C: 100`). **Исправление:** `p := &users[i]`.
+
+**3. Передавать struct по значению в изменяющую функцию.** `func topUp(user User, …)` не трогает `user`
+вызывающего, и сборка, и `go vet` молчат (раздел «Параметр функции — тоже копия»). **Исправление:**
+`func topUp(user *User, …)` и `topUp(&user, 50)`.
+
+**4. Писать в поле struct внутри map.** `users["42"].Balance += 50` → *cannot assign to struct field
+users["42"].Balance in map* (ошибка сборки, раздел «Struct в map»). **Исправление:** прочитать → изменить →
+`users["42"] = user`, или `map[string]*User`.
+
+**5. Отсутствующий ключ в `map[string]*User`.** Отсутствующий ключ даёт zero value типа `*User`, то есть `nil`.
+Этого примера нет в папке курса, его запускали отдельно для урока (чтобы попробовать, создайте `nilptr/main.go` в
+папке урока):
+
+```go
+package main
+
+import "fmt"
+
+type User struct {
+	ID      string
+	Balance int
+}
+
+func main() {
+	ptrs := map[string]*User{"42": &User{ID: "42", Balance: 100}}
+	fmt.Println(ptrs["x"] == nil)
+	ptrs["x"].Balance += 50
+}
+```
+
+```console
+$ go run ./nilptr
+true
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x10 pc=0x49e2bd]
+
+goroutine 1 [running]:
+main.main()
+	…/nilptr/main.go:13 +0x17d
+exit status 2
+```
+
+Строка 12 вывела `true`: `ptrs["x"]` — `nil`. В строке 13 запись через `nil` дала тот же panic, что в вопросе по
+GO-X.03 в начале: *invalid memory address or nil pointer dereference* — «неверный адрес памяти или обращение через
+nil-указатель». `main.go:13` — строка, на которой программа упала. **Исправление:** сначала проверьте, есть ли
+ключ: `p, ok := ptrs[id]`, и при `!ok` верните `404` (так делает обработчик `GET` в 🟡 домашнем задании; подробно —
+в [GO-1.09](/lab/youtube/go/go-1-09/ru)).
+
+**6. Считать копию struct «глубокой».** Если в struct есть поле-слайс, `c := user` копирует только заголовок
+слайса. Этого примера тоже нет в папке курса, его запускали отдельно для урока (`sayoz/main.go`, «sayoz» —
+«поверхностный»):
+
+```go
+package main
+
+import "fmt"
+
+type User struct {
+	ID   string
+	Tags []string
+}
+
+func main() {
+	user := User{ID: "42", Tags: []string{"new"}}
+	c := user
+	c.ID = "7"
+	c.Tags[0] = "vip"
+	fmt.Println(user.ID, user.Tags[0])
+}
+```
+
+```console
+$ go run ./sayoz
+42 vip
+```
+
+Изменение `c.ID` не затронуло `user` (`42`), а `c.Tags[0]` изменил и `user.Tags[0]` (`vip`): оба заголовка указывают
+на одни и те же элементы. **Исправление:** если нужны отдельные элементы, скопируйте слайс явно:
+`c.Tags = slices.Clone(user.Tags)` (тема [GO-1.08](/lab/youtube/go/go-1-08/ru)).
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Почему цикл, который меняет `user` из `range`, не трогает `users`, и как его исправить двумя способами?
+
+<details>
+<summary>Ответ</summary>
+
+`user` — копия элемента. Исправление: писать по индексу (`users[i].Balance += 50`) или взять адрес элемента по
+индексу (`p := &users[i]`).
+
+</details>
+
+**2.** Что копируется, когда в `topUp` передают `&user`, и почему `user` меняется?
+
+<details>
+<summary>Ответ</summary>
+
+Копируется адрес. Копия тоже указывает на тот же `user`, поэтому `user.Balance += amount` внутри `topUp` пишет в
+исходный `user`. Правило не меняется: всё передаётся по значению, здесь значение — адрес.
+
+</details>
+
+**3.** Что выведет эта программа? (Её нет в папке курса, её запускали отдельно для урока.)
+
+```go
+package main
+
+import "fmt"
+
+func reset(a [3]int, s []int) {
+	a[0] = 0
+	s[0] = 0
+}
+
+func main() {
+	a := [3]int{1, 2, 3}
+	s := []int{1, 2, 3}
+	reset(a, s)
+	fmt.Println(a[0], s[0])
+}
+```
+
+**A)** `0 0` · **B)** `1 0` · **C)** `1 1`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `1 0`.** `reset` («сбросить») получает полную копию массива, поэтому `a[0]` остаётся 1. А у слайса копируется
+только заголовок, элементы общие: `s[0]` становится 0. Указателя в сигнатуре нет, но функция изменила элементы
+слайса. Если вы выбрали «`0 0`», вы считали массив ссылкой, как массив в JavaScript. Если вы выбрали «`1 1`», вы
+думали, что слайс тоже копируется целиком.
+
+```console
+$ go run ./reset
+1 0
+```
+
+</details>
+
+**4.** Если `m := map[string]User{…}`, почему `m["42"].Balance = 0` не собирается, а `m["42"] = user` собирается?
+
+<details>
+<summary>Ответ</summary>
+
+Элемент map не addressable: при росте map переносит элементы в новую память, поэтому Go не разрешает писать в его
+поле. А замена всего элемента разрешена отдельно: индекс map может стоять в левой части присваивания.
+
+</details>
+
+**5.** Из GO-X.01: если скопировать бинарник после `go build` на сервер, нужен ли там Go?
+
+<details>
+<summary>Ответ</summary>
+
+Не нужен. Runtime тоже внутри бинарника. Только собирается он под одну ОС и один процессор (`GOOS`/`GOARCH`).
+
+</details>
+
+На этом курс GO-X закончен: один бинарник, типы в рантайме, ошибка как значение и теперь копия и указатель.
+Следующий шаг — курс «Основы Go»: [GO-1.01 · Зачем нужен Go? Что внутри go build](/lab/youtube/go/go-1-01/ru).
+
+## Домашнее задание
+
+Стартовые файлы — в папке урока на GitHub:
+[lessons/0x-04-values-pointers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+(папка `uyga/`). Команды запускаются из папки урока.
+
+🟢 **Лёгкое** (`uyga/oson/main.go`): `deactivate` и `rename` должны изменять пользователя, но ничего не меняется.
+Исправьте одну функцию через индекс, другую — через указатель (вызов в `main` тоже изменится). Сначала угадайте
+результат.
+
+```go filename="uyga/oson/main.go" showLineNumbers
+// Uy vazifasi 🟢 (GO-X.04): ikkala funksiya users'ni o'zgartirishi kerak, lekin hech narsa o'zgarmaydi.
+//
+//  1. Avval taxmin qiling, keyin dars papkasidan ishga tushiring: go run ./uyga/oson
+//  2. deactivate'ni indeks bilan, rename'ni pointer bilan tuzating (main'dagi chaqiruv ham o'zgaradi).
+//  3. Kutilgan natija:
+//     true
+//     [{42 Dilnoza false} {7 Bekzod true}]
+//
+// Ishora: golangci-lint'da govet'ning unusedwrite tekshiruvini yoqsangiz, ikkala joyni ham ko'rsatadi
+// (README'dagi .golangci.yml namunasi).
+// Javob: uyga/javob/oson/main.go
+package main
+
+import "fmt"
+
+type User struct {
+	ID     string
+	Name   string
+	Active bool
+}
+
+var users = []User{
+	{ID: "42", Name: "Dilnoza", Active: true},
+	{ID: "7", Name: "Jasur", Active: true},
+}
+
+// deactivate id'si mos foydalanuvchini o'chiradi (Active = false).
+func deactivate(id string) bool {
+	for _, u := range users {
+		if u.ID == id {
+			u.Active = false
+			return true
+		}
+	}
+	return false
+}
+
+// rename foydalanuvchining nomini o'zgartiradi.
+func rename(u User, name string) {
+	u.Name = name
+}
+
+func main() {
+	fmt.Println(deactivate("42"))
+	rename(users[1], "Bekzod")
+	fmt.Println(users)
+}
+```
+
+```console
+$ go run ./uyga/oson
+true
+[{42 Dilnoza true} {7 Jasur true}]
+```
+
+`Println` выводит слайс в виде `[{…} {…}]`, а каждый struct — значениями его полей. Ожидаемый результат: `true` и
+`[{42 Dilnoza false} {7 Bekzod true}]`. Подсказка в файле отсылает к настройке golangci-lint в README: проверка
+`unusedwrite` из govet находит запись, которую никто никогда не читает.
+
+🟡 **Среднее** (`uyga/orta/main.go`): `PATCH /users/{id}` должен менять имя пользователя в map, но файл не
+собирается:
+
+```console
+$ go run ./uyga/orta
+# github.com/abdurahmon27/go-backend-uz/lessons/0x-04-values-pointers/uyga/orta
+uyga/orta/main.go:53:3: cannot assign to struct field users[id].Name in map
+```
+
+Исправьте двумя способами: a) прочитать → изменить → записать обратно в map; b) `map[string]*User`.
+`u, ok := users[…]` в файле — вторая форма чтения из map: `ok` говорит, есть ли ключ (подробно — в
+[GO-1.09](/lab/youtube/go/go-1-09/ru)). `var body struct { … }` — безымянный struct только для этого обработчика. Запустите
+(без gcc — с `CGO_ENABLED=0`) и проверьте в другом терминале:
+
+```bash
+go run ./uyga/orta
+curl -X PATCH -d '{"name":"Dilnoza A."}' localhost:3000/users/42   # {"id":"42","name":"Dilnoza A.","balance":100}
+curl localhost:3000/users/42                                        # oʻsha
+curl -X PATCH -d '{"name":"X"}' localhost:3000/users/1              # 404 page not found
+```
+
+⚠️ `net/http` выполняет каждый запрос в отдельной горутине, поэтому в реальном сервисе запись в map защищают
+`sync.Mutex` ([GO-1.09](/lab/youtube/go/go-1-09/ru)). В этом задании проверяем одним `curl`.
+
+Ответы: папка [uyga/javob/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers/uyga/javob).
+Сначала попробуйте сами.
+
+<details>
+<summary>Ответ</summary>
+
+🟢 В `deactivate` `u` — копия элемента (`range`), в `rename` `u` — копия значения вызывающего (параметр-значение).
+Исправляем `deactivate` через индекс, а `rename` — через указатель:
+
+```go filename="uyga/javob/oson/main.go" showLineNumbers
+// Javob 🟢 (GO-X.04): deactivate — indeks orqali elementning o'zi; rename — pointer (&users[1]).
+package main
+
+import "fmt"
+
+type User struct {
+	ID     string
+	Name   string
+	Active bool
+}
+
+var users = []User{
+	{ID: "42", Name: "Dilnoza", Active: true},
+	{ID: "7", Name: "Jasur", Active: true},
+}
+
+func deactivate(id string) bool {
+	for i := range users {
+		if users[i].ID == id {
+			users[i].Active = false // nusxa emas, slice'dagi element
+			return true
+		}
+	}
+	return false
+}
+
+func rename(u *User, name string) {
+	u.Name = name // u — pointer: chaqiruvchining qiymatiga yozadi
+}
+
+func main() {
+	fmt.Println(deactivate("42"))
+	rename(&users[1], "Bekzod") // slice elementining manzili
+	fmt.Println(users)
+}
+```
+
+```console
+$ go run ./uyga/javob/oson
+true
+[{42 Dilnoza false} {7 Bekzod true}]
+```
+
+`rename(&users[1], …)` — та же идея, что `&users[i]` в `manzil/`: собственный адрес элемента слайса.
+
+🟡 При способе a) конец обработчика `PATCH` выглядит так (`uyga/javob/orta/main.go`):
+
+```go
+u, ok := users[id] // u — map'dagi qiymatning nusxasi
+if !ok {
+	http.NotFound(w, r)
+	return
+}
+u.Name = body.Name
+users[id] = u // nusxani qaytarib yozamiz
+json.NewEncoder(w).Encode(u)
+```
+
+При способе b) `var users = map[string]*User{…}`: `u` — указатель, поэтому после `u.Name = body.Name` записывать
+обратно не нужно. А `sync.Mutex` нужен при обоих способах. При подготовке урока ответ запускали с `CGO_ENABLED=0`:
+`PATCH` и следующий `GET` → `{"id":"42","name":"Dilnoza A.","balance":100}`, `/users/1` → `404 page not found`.
+
+</details>
+
+## Источники
+
+- Go FAQ: [When are function parameters passed by value?](https://go.dev/doc/faq#pass_by_value) ·
+  [Why is there no pointer arithmetic?](https://go.dev/doc/faq#no_pointer_arithmetic) ·
+  [Stack or heap](https://go.dev/doc/faq#stack_or_heap)
+- Спецификация Go: [Address operators](https://go.dev/ref/spec#Address_operators) ·
+  [Selectors](https://go.dev/ref/spec#Selectors) · [Assignment statements](https://go.dev/ref/spec#Assignment_statements) ·
+  [Calls](https://go.dev/ref/spec#Calls) · [For range](https://go.dev/ref/spec#For_range) ·
+  [Index expressions](https://go.dev/ref/spec#Index_expressions) · [Array types](https://go.dev/ref/spec#Array_types) ·
+  [Slice types](https://go.dev/ref/spec#Slice_types)
+- A. Gerrand, блог Go: [Go Slices: usage and internals](https://go.dev/blog/slices-intro)
+- [Go Code Review Comments: Pass Values](https://go.dev/wiki/CodeReviewComments#pass-values) ·
+  [encoding/json.Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal)
+- Элемент map: [go1.26.8 runtime/maps table.go](https://github.com/golang/go/blob/go1.26.8/src/internal/runtime/maps/table.go) ·
+  [golang/go#3117](https://github.com/golang/go/issues/3117)
+- [100 Go Mistakes #30: elements are copied in range loops](https://100go.co/#ignoring-that-elements-are-copied-in-range-loops-30)
+- MDN: [Working with objects](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Working_with_objects#comparing_objects) ·
+  Python FAQ: [call by reference](https://docs.python.org/3/faq/programming.html#how-do-i-write-a-function-with-output-parameters-call-by-reference)
+- PHP: [Arrays](https://www.php.net/manual/en/language.types.array.php) ·
+  [Objects and references](https://www.php.net/manual/en/language.oop5.references.php) ·
+  [foreach](https://www.php.net/manual/en/control-structures.foreach.php)
+- Папка курса и README: [lessons/0x-04-values-pointers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+- Все результаты получены 2026-11-26 на `go1.26.8 linux/amd64`, Node v24.10.0, Python 3.13.15, PHP 8.4.26 и
+  golangci-lint 2.12.2.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/0x-04-values-pointers)
+
+---
+
+← Предыдущий урок: [GO-X.03](/lab/youtube/go/go-x-03/ru) · Следующий урок: [GO-1.01](/lab/youtube/go/go-1-01/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
