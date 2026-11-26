@@ -1,0 +1,949 @@
+---
+title: "git: коммит — это снимок (snapshot), ветка — один хеш в файле"
+date: "2026/11/26"
+description: "Заглядываем в .git: коммит — снимок всего проекта, ветка — файл в 41 байт, HEAD, fast-forward merge и git revert на живом репозитории."
+tag: "youtube, git, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/git/git-1-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/git/git-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/git/git-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/git/git-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/git/git-1-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/git/git-1-01) · **Русский** · [English](/lab/youtube/git/git-1-01/en)  
+Урок GIT-1.01 · [Git va GitHub: 0 → Pro](/lab/youtube/git#git-1-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-01-commit-snapshot)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Вы каждый день пишете `git add`, `git commit` и `git push`. Вопрос: если написать `git branch chegirma`, копируется
+ли весь проект? Сегодня проверим это прямо внутри папки `.git`. Ответ: в `.git/refs` появляется всего один новый
+файл, в нём 40-символьный хеш и символ конца строки, всего 41 байт.
+
+**Одна идея:** коммит — это снимок (snapshot) всего проекта плюс ссылка на предыдущий коммит, а ветка — обычно
+маленький файл, в котором записан хеш одного коммита. Никакой магии внутри git нет: только объекты, названные по
+хешу, и маленькие файлы со ссылками на них.
+
+После урока вы сможете:
+
+- открыть объекты commit, tree и blob через `git cat-file -p` и прочитать каждую их строку;
+- сами проверить, откуда берётся хеш, с помощью `git hash-object` и `sha1sum`;
+- показать, в каком файле живут ветка и `HEAD` и как fast-forward merge сдвигает этот файл;
+- откатить попавшую в `main` ошибку через `git revert`, не ломая историю, и понимать, чего revert *не* делает.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| снимок (snapshot) | состояние всего проекта в момент коммита, а не список изменений | snapshot |
+| объект | запись в `.git/objects`, названная по хешу своего содержимого: **blob** (содержимое файла), **tree** (папка), **commit** | object (blob, tree, commit) |
+| ref (ссылка) | имя, внутри которого записан хеш коммита: ветка — такой ref, а `HEAD` обычно ссылка на ветку | ref (reference) |
+
+Вспомогательные слова объясняются одной фразой там, где встречаются впервые: **parent** (предыдущий коммит),
+**HEAD** (где вы сейчас находитесь), **fast-forward** (сдвиг файла ветки вперёд), **revert** (обратный коммит).
+
+## Что нужно знать заранее
+
+- [SYS-0.01 · Терминал: pipe, `grep` и задачи, которые решаются одной строкой](/lab/youtube/sys/sys-0-01/ru): вертикальная черта
+  (pipe) `|`. Сегодня она нужна в `find … | sort`, `printf … | git hash-object --stdin` и `… | od`.
+- [SYS-0.02 · Процесс и окружение: `ps`, `kill`, `$PATH` и переменные окружения](/lab/youtube/sys/sys-0-02/ru): переменная
+  окружения через `export`. Так мы фиксируем время коммита (`vaqt.sh`).
+
+Мы считаем, что команды git (`add`, `commit`, `push`) вы знаете. В этом уроке смотрим, что они пишут внутрь `.git`.
+
+**Как запускать код.** Нужны `git` 2.29 или новее, `bash` и Go (Go только для `go run main.go`). На Windows
+используйте **Git Bash**: в PowerShell 5 `>` пишет файл в UTF-16, и записанный вручную ref ломается. Скачайте
+репозиторий курса и перейдите в папку урока (`cd` меняет текущую папку терминала):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/git-01-commit-snapshot
+```
+
+Команды на странице записаны как в видео и README: каждая начинается **из папки урока**, поэтому большинство
+начинается с `cd ombor && …`. В терминале `cd` сохраняется: если вы уже внутри `ombor`, не пишите часть
+`cd ombor && ` (или сначала `cd ..`). Выполняйте команды в порядке страницы: каждая продолжает с того состояния,
+которое оставила предыдущая. Чтобы начать сначала, снова запустите `./qur.sh`.
+
+Хеш коммита вычисляется из автора, времени и содержимого. `qur.sh` собирает учебный репозиторий с фиксированными
+именем и временем, поэтому все хеши на странице должны совпасть у вас символ в символ. В вашем собственном
+репозитории хеши будут другими, это нормально.
+
+Сначала вопрос из SYS-0.01. Если команде после вертикальной черты не передать файл, откуда она читает данные?
+
+**A)** из текущей папки · **B)** со стандартного ввода (stdin), то есть из pipe · **C)** ниоткуда, будет ошибка
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Команда без файла читает стандартный ввод, а pipe как раз подаёт туда вывод левой команды. Сегодня мы напишем
+`printf 'non: 3000\n' | git hash-object --stdin`: флаг `--stdin` говорит `git hash-object` «бери текст не из файла,
+а со стандартного ввода». «A» — особенность `grep -r` (без файла `-r` читает текущую папку), а не общее правило.
+
+</details>
+
+## Новая ветка: файл в 41 байт
+
+Сначала соберём учебный репозиторий. Что внутри `qur.sh`, разберём построчно в следующих разделах. Пока достаточно
+результата: два коммита, самый новый сверху.
+
+```console
+$ ./qur.sh
+daac3a4 narx dasturi
+e657f41 README
+```
+
+Теперь создадим ветку `chegirma` («скидка»). Что появится на диске?
+
+**A)** полная копия проекта · **B)** новая папка внутри `.git` с копией объектов · **C)** один маленький файл
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `git branch chegirma` записывает только файл `.git/refs/heads/chegirma`. Внутри — полный хеш текущего
+коммита. Если вы выбрали «A» или «B», вы думали, что ветка — это копия проекта. В git ветка ничего не копирует.
+
+</details>
+
+```console
+$ cd ombor && git branch chegirma && find .git/refs -type f | sort && cat .git/refs/heads/chegirma
+.git/refs/heads/chegirma
+.git/refs/heads/main
+daac3a47cb72faf965c5385ab1002bc04bf89b45
+```
+
+`find .git/refs -type f` — все файлы внутри `.git/refs`, `sort` упорядочивает их по алфавиту. Два файла: `main`
+(он был и раньше) и новый `chegirma`. Внутри `chegirma` 40-символьный хеш: это коммит `daac3a4`, первая строка вывода
+`./qur.sh`. Измерим размер файла:
+
+```console
+$ cd ombor && wc -c .git/refs/heads/chegirma && tail -c 3 .git/refs/heads/chegirma | od -An -c
+41 .git/refs/heads/chegirma
+   4   5  \n
+```
+
+`wc -c` считает байты: 41. `tail -c 3` берёт последние 3 байта файла, `od -An -c` показывает их посимвольно
+(`-An` — без колонки адресов слева). Последние три байта: два последних символа хеша `4`, `5` и конец строки `\n`.
+Значит, 40 символов + 1 = 41 байт. Это вся ветка.
+
+Так при стандартных настройках: в репозитории на SHA-256 хеш длиной 64 символа и файл 65 байт, а в будущем формате
+**reftable** ссылки вообще не лежат в отдельных файлах (об этом в разделе «Ветка вручную»).
+
+## Коммит — не diff, а снимок
+
+Многие думают, что коммит — это список изменений, то есть **diff**: «этот коммит поменял одну строку в `main.go`».
+На самом деле git в каждом коммите хранит **снимок всего проекта**. Книга Pro Git говорит так: git думает о своих
+данных как о «последовательности **снимков** (snapshots) миниатюрной файловой системы».
+
+А diff, который показывают `git show` или `git diff`, внутри коммита не хранится. Git каждый раз заново вычисляет его
+между двумя снимками.
+
+Кроме снимка, в коммите есть:
+
+- автор и время;
+- сообщение (`-m "…"`);
+- **parent** — хеш предыдущего коммита.
+
+Аналогия из фронтенда: в React вы не меняете state на месте, а каждый раз передаёте новый объект состояния. Разницу
+между двумя состояниями можно вычислить, когда она нужна. С коммитами git так же: каждый — полное неизменяемое
+состояние, а разница вычисляется. Отличие: git даёт каждому файлу и каждой папке снимка имя — хеш их содержимого.
+К чему это приводит, увидим в разделе «Сохраняется ли неизменённый файл заново?».
+
+## Как собран учебный репозиторий: `qur.sh`
+
+`git init` создаёт пустой репозиторий и внутри него папку `.git`. `git add` готовит файл к следующему коммиту.
+`git commit` делает снимок и записывает его в историю. Скрипт использует эти три команды, остальное нужно, чтобы
+хеши везде совпадали.
+
+```bash filename="qur.sh" showLineNumbers
+#!/usr/bin/env bash
+# ombor/ ni noldan quradi: ikkita commit. Muallif va vaqt qat'iy (vaqt.sh). git >= 2.29.
+set -e; cd "$(dirname "$0")"; rm -rf ombor; mkdir ombor; cd ombor
+rf=--ref-format=files; git init -h 2>&1 | grep -q ref-format || rf=   # eski git'da bu bayroq yo'q
+git init -q --template= -b main --object-format=sha1 $rf
+git config user.name Lola
+git config user.email lola@example.com
+git config commit.gpgsign false; git config core.hooksPath /dev/null   # imzo va hook’lar hash’ni o’zgartiradi
+git config core.pager cat; git config color.ui false; git config core.abbrev 7
+git config core.autocrlf false; git config core.excludesFile /dev/null; git config core.attributesFile /dev/null
+git config log.decorate false; git config branch.sort refname
+git config merge.ff true; git config merge.stat true
+
+cp ../fayllar/README.md .
+git add README.md
+. ../vaqt.sh; git commit -q -m "README"
+
+cp ../fayllar/main.go .
+git add main.go
+. ../vaqt.sh; git commit -q -m "narx dasturi"
+git log --oneline
+```
+
+Комментарии в скриптах на узбекском: код курса общий. `ombor` — «хранилище» (папка учебного репозитория),
+`fayllar` — «файлы», `narx dasturi` — «программа цен».
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `#!/usr/bin/env bash` | скрипт запускается через `bash` |
+| 3 | `set -e; cd …; rm -rf ombor; mkdir ombor; cd ombor` | остановиться на первой ошибке; перейти в папку скрипта; удалить старый `ombor` и создать пустой |
+| 4 | `rf=--ref-format=files … \|\| rf=` | молча (`-q`) ищет слово `ref-format` в справке `git init -h` (`2>&1` — вместе со stderr): если нашлось (git 2.45+), ссылки хранятся в обычных файлах; если нет (`\|\|`), `rf` пустая |
+| 5 | `git init -q --template= -b main --object-format=sha1 $rf` | пустой репозиторий и `.git`: первая ветка `main`, хеш SHA-1, без файлов-шаблонов |
+| 6–7 | `git config user.name` / `user.email` | имя и email автора, только для этого репозитория |
+| 8 | `commit.gpgsign false`, `core.hooksPath /dev/null` | подпись коммитов и хуки выключены: они могут изменить содержимое коммита, а значит и хеш |
+| 9–12 | `core.pager cat`, `color.ui false`, `core.abbrev 7`, … | фиксируют вид вывода: без пейджера и цвета, короткий хеш 7 символов; концы строк, файлы ignore и attributes из ваших глобальных настроек игнорируются; `git log` без пометок, `git branch` по имени, merge может делать fast-forward и печатает статистику |
+| 14–16 | `cp …README.md .`, `git add`, `. ../vaqt.sh; git commit` | первый снимок: только `README.md` |
+| 18–20 | то же с `main.go` | второй снимок: `README.md` + `main.go` |
+| 21 | `git log --oneline` | две строки выше: короткий хеш и сообщение |
+
+Время фиксирует `vaqt.sh` («время»):
+
+```bash filename="vaqt.sh" showLineNumbers
+# Manba qiling: `. ../vaqt.sh` (ombor/ ichidan). Commit vaqtini qat'iy qiladi:
+# 2026-01-05 10:00 (+05:00) va har bir mavjud commit uchun +10 daqiqa.
+# Shuning uchun commit hash'lari sizda ham, bizda ham bir xil chiqadi.
+# muallif repo sozlamasidan olinsin (user.name/email), muhitdagi qiymatdan emas
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+n=$(git rev-list --all --count 2>/dev/null || echo 0)
+t=$((1767589200 + n * 600))
+export GIT_AUTHOR_DATE="@$t +0500" GIT_COMMITTER_DATE="@$t +0500"
+```
+
+- Строка 5: если в окружении есть переменная вроде `GIT_AUTHOR_NAME`, она удаляется, имя берётся из настроек
+  репозитория.
+- Строка 6: число коммитов в репозитории (`n`). `$(…)` подставляет вывод команды как значение; если коммитов ещё нет
+  (`||`), `0`.
+- Строка 7: `$((…))` — арифметика оболочки. `1767589200` — 2026-01-05 10:00 по Ташкенту в секундах Unix; +600 секунд
+  (10 минут) на каждый коммит.
+- Строка 8: из этих двух переменных окружения git берёт время. После `@` — время Unix, `+0500` — смещение от UTC.
+
+`. ../vaqt.sh` (точка и пробел) выполняет скрипт в **текущей** оболочке, поэтому экспортированные (`export`) значения
+доходят до следующего `git commit`. А `bash vaqt.sh` работал бы в отдельном процессе, и окружение исчезло бы вместе с ним
+(SYS-0.02).
+
+В вашем репозитории всё это не нужно: один раз записываете имя и email, дальше обычный `git commit`.
+
+```bash
+git config --global user.name "Ism"
+git config --global user.email "siz@example.com"
+```
+
+## Что внутри коммита
+
+Теперь откроем коммит. `git cat-file -p` выводит объект в читаемом виде (`-p` — *pretty-print*). **HEAD** — место,
+где вы сейчас находитесь, то есть последний коммит текущей ветки.
+
+```console
+$ cd ombor && git cat-file -p HEAD
+tree 651f29e7e2b98f1f8f5b84a4051ff7e85e41e3fb
+parent e657f417275efcc319ccce4e1badded9976a8fa6
+author Lola <lola@example.com> 1767589800 +0500
+committer Lola <lola@example.com> 1767589800 +0500
+
+narx dasturi
+```
+
+| Строка | Что это |
+|---|---|
+| `tree 651f29e…` | снимок папки проекта: хеш объекта tree (откроем в следующем разделе) |
+| `parent e657f41…` | 40-символьный хеш предыдущего коммита. Эта ссылка связывает коммиты в цепочку |
+| `author Lola … 1767589800 +0500` | кто написал код и когда: секунды Unix и смещение от UTC (+5 часов, ташкентское время): 2026-01-05 10:10 |
+| `committer …` | кто создал коммит. Обычно совпадает с автором; отличается, если вы применяете чужой патч |
+| пустая строка, `narx dasturi` | сообщение коммита |
+
+Diff нет: внутри коммита только снимок (tree), parent, кто, когда и зачем. Всю цепочку посмотрим через `git log`.
+`%h` — короткий хеш, `%p` — короткий хеш parent, `%s` — сообщение:
+
+```console
+$ cd ombor && git log --format='%h  parent: %p  %s'
+daac3a4  parent: e657f41  narx dasturi
+e657f41  parent:   README
+```
+
+У первого коммита parent нет: это начало цепочки.
+
+## tree и blob
+
+В `tree` по одной строке на каждый файл или вложенную папку. `'HEAD^{tree}'` — «tree коммита HEAD»; кавычки нужны,
+чтобы оболочка не трогала `{}`.
+
+```console
+$ cd ombor && git cat-file -p 'HEAD^{tree}'
+100644 blob 51c4fee9be20d18260ace91ce44e4b9c0ca396ab	README.md
+100644 blob 12b6d3bcf6f52e8be1d6f34b155db13dfbc46215	main.go
+```
+
+В каждой строке четыре поля: **режим**, тип объекта, хеш и имя. Шестизначный режим — не права доступа, а тип файла:
+
+| Режим | Значение |
+|---|---|
+| `100644` | обычный файл (оба наших) |
+| `100755` | исполняемый файл |
+| `120000` | symlink |
+| `040000` | вложенная папка: эта строка ссылается на ещё один `tree` |
+
+Содержимое файла лежит в объекте **blob**. `HEAD:main.go` — «`main.go` в tree коммита HEAD»:
+
+```console
+$ cd ombor && git cat-file -p HEAD:main.go
+package main
+
+import "fmt"
+
+func main() { fmt.Println("non: 3000 so'm") }
+```
+
+Вывелся сам файл (`non: 3000 so'm` — «хлеб: 3000 сумов»). В blob нет ни имени файла, ни времени, только содержимое:
+имя хранится в tree. Объекты лежат на диске сжатыми через zlib, поэтому читаем их не `cat`, а `git cat-file`.
+
+Оба коммита и их объекты на одной картинке:
+
+```text
+ .git/refs/heads/main
+        │
+        ▼
+ commit daac3a4 "narx dasturi" ──parent──► commit e657f41 "README"
+        │ tree                                    │ tree
+        ▼                                         ▼
+ tree 651f29e                              tree 19c7d67
+ ├── README.md ──► blob 51c4fee ◄───────── └── README.md
+ └── main.go   ──► blob 12b6d3b
+```
+
+## Сохраняется ли неизменённый файл заново?
+
+Вопрос на паузе из видео. `README.md` добавлен в первом коммите, а во втором не менялся. Оба коммита — полные
+снимки. Сохранит ли git README ещё раз для второго снимка?
+
+**A)** да, каждый снимок хранит свою копию · **B)** нет, оба tree ссылаются на один blob · **C)** нет, потому что второй
+коммит хранит только diff
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Хеш вычисляется из содержимого. Одинаковое содержимое — одинаковый хеш, значит и объект один. Второй tree
+ссылается на тот же blob, новая копия не создаётся. Если вы выбрали «A», вы думали, что снимок = копия. «C» — ошибка
+«коммит = diff» из начала урока: diff в коммите нет.
+
+</details>
+
+Проверим. `HEAD~1` — parent коммита HEAD; `git rev-parse` превращает имя в полный хеш:
+
+```console
+$ cd ombor && git rev-parse HEAD:README.md HEAD~1:README.md
+51c4fee9be20d18260ace91ce44e4b9c0ca396ab
+51c4fee9be20d18260ace91ce44e4b9c0ca396ab
+```
+
+Хеш README в обоих коммитах одинаковый. Выведем все объекты репозитория с их типами (`cut -c1-20` оставляет первые
+20 символов каждой строки):
+
+```console
+$ cd ombor && git cat-file --batch-all-objects --batch-check='%(objecttype) %(objectname)' | cut -c1-20
+blob 12b6d3bcf6f52e8
+tree 19c7d673a51f53a
+blob 51c4fee9be20d18
+tree 651f29e7e2b98f1
+commit daac3a47cb72f
+commit e657f417275ef
+```
+
+Два коммита, два tree и два blob, всего шесть. Для README один blob, как на картинке выше.
+
+Здесь видно отличие от JavaScript. В JS `{ a: 1 }` и `{ a: 1 }` — два разных объекта, `===` даёт `false`: имя объекта —
+его место в памяти. В git имя объекта — хеш его содержимого, поэтому одинаковое содержимое всегда даёт один объект.
+Такое хранение называется **content-addressable** (адресация по содержимому).
+
+В склонированном или большом репозитории git собирает объекты не в отдельные файлы, а в пакеты — **packfile**
+(при `git gc`, push и clone). Внутри пакета похожие файлы сжимаются в виде разницы (delta). Но это только способ
+хранения: `git cat-file -p` всё равно возвращает полный tree и полный файл, а коммит всё равно полный снимок.
+
+## Откуда берётся хеш
+
+Проверим хеш сами. `git hash-object --stdin` вычисляет хеш blob для текста со стандартного ввода.
+`printf 'non: 3000\n'` — текст из одной строки (`\n` — конец строки), всего 10 байт:
+
+```console
+$ printf 'non: 3000\n' | git hash-object --stdin
+2ecbbc99c0932c7b1430e07e274c706f3afb62ef
+```
+
+Теперь получим тот же хеш без git. Передадим `sha1sum` заголовок: слово `blob`, пробел и длину (`10`). Затем нулевой
+байт (`\0`) и тот же текст:
+
+```console
+$ printf 'blob 10\0non: 3000\n' | sha1sum
+2ecbbc99c0932c7b1430e07e274c706f3afb62ef  -
+```
+
+Совпадает символ в символ (`-` значит «прочитано со стандартного ввода»). Значит, хеш объекта =
+SHA-1(`<тип> <длина>\0` + содержимое). На macOS вместо `sha1sum` используйте `shasum`.
+
+Если поменять одну цифру, изменится только конец хеша?
+
+**A)** да, последние один-два символа · **B)** нет, получится совсем другой хеш · **C)** хеш не изменится, длина та же
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Посмотрите на вывод ниже: изменилась одна цифра, а все 40 символов другие. Если вы выбрали «C», вы думали, что
+хеш считается из длины: длина — лишь часть заголовка, содержимое тоже входит в расчёт.
+
+</details>
+
+```console
+$ printf 'non: 3001\n' | git hash-object --stdin
+a3fad3e262bce90907d0538b01444aaa526edd9a
+```
+
+Коммит — тоже объект, а в его содержимом есть хеш `parent`. Поэтому если переписать старый коммит, изменятся хеши
+всех коммитов после него: каждый хранит внутри хеш предыдущего.
+
+SHA-1 теперь считается устаревшим. Документ BreakingChanges проекта Git планирует в Git 3.0 сменить хеш по умолчанию
+для новых репозиториев на SHA-256 (дата не назначена). Посчитать хеш на Go самим —
+[GIT-2.01](/lab/youtube/git#git-2-01).
+
+## Ветка — файл с одним хешем, HEAD — текущая ветка
+
+Теперь посмотрим на саму ветку. Сначала `HEAD`:
+
+```console
+$ cd ombor && cat .git/HEAD
+ref: refs/heads/main
+```
+
+В файле `HEAD` обычно лежит не хеш, а путь к другому ref: `refs/heads/main`. То есть `HEAD` говорит, на какой ветке
+вы сейчас. А в файле `main`:
+
+```console
+$ cd ombor && cat .git/refs/heads/main
+daac3a47cb72faf965c5385ab1002bc04bf89b45
+```
+
+40-символьный хеш последнего коммита. Определение из Pro Git такое же: ветка — ссылка на последний коммит в цепочке
+коммитов. Ни копии, ни папки.
+
+```text
+ .git/HEAD                    .git/refs/heads/main         .git/objects
+ ┌──────────────────────┐     ┌──────────────────┐        ┌────────────────────┐
+ │ ref: refs/heads/main │ ──► │ daac3a47cb72…45  │ ─────► │ commit daac3a4 …   │
+ └──────────────────────┘     └──────────────────┘        └────────────────────┘
+   на какой вы ветке            ветка = 41 байт             неизменяемый объект
+```
+
+Если сравнить с JS: коммит — замороженный (`Object.freeze`) объект, а ветка — переменная `let`, которая хранит
+ссылку на него. Новый коммит создаёт новый объект и перепривязывает переменную к нему; старый объект остаётся на месте.
+
+Слово «обычно» важно. Если перейти прямо на коммит (`git switch --detach`), в файле `HEAD` будет хеш: это называется
+**detached HEAD**. Этого примера нет в видео, он только для наглядности (`git switch -q main` в конце возвращает вас
+на `main`):
+
+```console
+$ cd ombor && git switch -q --detach HEAD~1 && cat .git/HEAD && git switch -q main
+e657f417275efcc319ccce4e1badded9976a8fa6
+```
+
+## Ветка вручную (только эксперимент)
+
+Для доказательства создадим ветку без команды `git branch`: запишем хеш первого коммита в обычный файл. `>` — запись
+вывода команды в файл.
+
+```console
+$ cd ombor && git rev-parse HEAD~1 > .git/refs/heads/eski && git branch
+  chegirma
+  eski
+* main
+```
+
+В списке `git branch` появилась `eski` («старая»; `*` — ветка, на которой стоит `HEAD`). Файл записан — ветка есть.
+Но это только эксперимент для понимания. `git branch` или `git update-ref` проверяют значение и ещё пишут в журнал
+**reflog** (reflog — журнал того, где побывала ветка, [GIT-3.04](/lab/youtube/git#git-3-04)):
+
+```console
+$ cd ombor && ls .git/logs/refs/heads/
+chegirma
+main
+```
+
+Для `chegirma` и `main` журнал есть, для записанной вручную `eski` — нет. Кроме того:
+
+- git иногда собирает ссылки в один файл `.git/packed-refs` (после `git gc` или `git pack-refs --all`); тогда файлы
+  в `refs/heads` исчезают;
+- в Git 3.0 для новых репозиториев планируется хранить ссылки в формате **reftable**.
+
+Поэтому не трогайте файлы ref руками: для создания ветки используйте `git branch <имя> <коммит>`.
+
+## Работа в ветке: switch, status, add, commit
+
+Перейдём в ветку `chegirma` и поменяем цену. Хотели сделать скидку 10 процентов, но по ошибке обнулили цену.
+`git switch -q chegirma` переводит `HEAD` на `chegirma` (`-q` — тихо). `sed -i.bak 's/3000/0/' main.go` заменяет
+в файле `3000` на `0` (резервная копия `.bak` — чтобы команда работала и на macOS, потом её удаляет `rm`).
+`git status --short` коротко показывает изменённые файлы:
+
+```console
+$ cd ombor && git switch -q chegirma && sed -i.bak 's/3000/0/' main.go && rm main.go.bak && git status --short
+ M main.go
+```
+
+` M` — файл изменён, но ещё не добавлен через `git add`. `git add` его готовит, потом коммитим (время снова из
+`vaqt.sh`; `chegirma: 10 foiz` — «скидка: 10 процентов»):
+
+```console
+$ cd ombor && git add main.go && . ../vaqt.sh && git commit -m "chegirma: 10 foiz"
+[chegirma 5a239b1] chegirma: 10 foiz
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+```
+
+`[chegirma 5a239b1]` — в какую ветку и с каким хешем записан коммит. Теперь посмотрим все ветки (`--all` — от всех
+ссылок, `--decorate` — рядом с коммитом ссылки, которые на него указывают):
+
+```console
+$ cd ombor && git log --oneline --decorate --all
+5a239b1 (HEAD -> chegirma) chegirma: 10 foiz
+daac3a4 (main) narx dasturi
+e657f41 (eski) README
+```
+
+Вперёд ушла только `chegirma`, а `main` осталась на месте. `HEAD -> chegirma` — в файле `HEAD` теперь
+`ref: refs/heads/chegirma`.
+
+| Файл | После `qur.sh` | После коммита в `chegirma` |
+|---|---|---|
+| `.git/HEAD` | `ref: refs/heads/main` | `ref: refs/heads/chegirma` |
+| `refs/heads/main` | `daac3a4…` | `daac3a4…` |
+| `refs/heads/chegirma` | `daac3a4…` | `5a239b1…` |
+| `refs/heads/eski` | — | `e657f41…` |
+
+## Merge: fast-forward
+
+Вернёмся в `main` и сделаем merge скидки. Создаст ли git новый коммит?
+
+**A)** да, merge-коммит с двумя parent · **B)** нет, в файл `main` запишется хеш `chegirma` · **C)** коммит из `chegirma`
+скопируется в `main`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** С момента создания `chegirma` в `main` не было новых коммитов: последний коммит `main` — предок `chegirma`.
+Объединять нечего, git просто сдвигает `main` вперёд. Это называется **fast-forward**. «A» — случай, когда новые
+коммиты есть в обеих ветках. Если вы выбрали «C», вы думали, что коммит принадлежит ветке: коммит один, обе ветки
+просто ссылаются на него.
+
+</details>
+
+```console
+$ cd ombor && git switch -q main && git merge chegirma
+Updating daac3a4..5a239b1
+Fast-forward
+ main.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+```
+
+`Updating daac3a4..5a239b1` — `main` сдвинулась с `daac3a4` на `5a239b1`; `Fast-forward` — merge-коммит не
+понадобился. Git записал в файл `main` хеш `chegirma` и обновил рабочие файлы (working tree): `main.go` на диске
+теперь версия с `0`. Файлы двух веток теперь одинаковые:
+
+```console
+$ cd ombor && cat .git/refs/heads/main .git/refs/heads/chegirma
+5a239b10ba4641d54a7500d0de49f8352df729ce
+5a239b10ba4641d54a7500d0de49f8352df729ce
+```
+
+Если новые коммиты есть в обеих ветках, появится merge-коммит с двумя parent. Его разберём во втором модуле:
+[GIT-2.03](/lab/youtube/git#git-2-03).
+
+## Revert: откат ошибки новым коммитом
+
+Запустим программу:
+
+```console
+$ cd ombor && go run main.go
+non: 0 so'm
+```
+
+Хлеб за ноль сумов. Ошибка уже попала в ветку `main`. Историю не удаляем, используем `git revert`: он записывает
+обратное изменение указанного коммита как **новый коммит** (`--no-edit` — сообщение автоматически, без редактора).
+
+Сколько коммитов покажет `git log --oneline` после revert?
+
+**A)** 3: ошибочный коммит уходит из истории · **B)** 4: и ошибочный коммит, и его отмена · **C)** 2
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Revert ничего не удаляет, только добавляет. Если вы выбрали «A», вы перепутали revert с `git reset`: `reset`
+сдвигает файл ветки назад и переписывает историю ([GIT-3.03](/lab/youtube/git#git-3-03)).
+
+</details>
+
+```console
+$ cd ombor && . ../vaqt.sh && git revert --no-edit HEAD
+[main 14b041d] Revert "chegirma: 10 foiz"
+ Date: Mon Jan 5 10:30:00 2026 +0500
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+```
+
+Строка ` Date:` появляется только у нас: время автора задано отдельно через `vaqt.sh`. В вашем репозитории её не
+будет.
+
+```console
+$ cd ombor && git log --oneline
+14b041d Revert "chegirma: 10 foiz"
+5a239b1 chegirma: 10 foiz
+daac3a4 narx dasturi
+e657f41 README
+```
+
+В истории теперь четыре коммита, ни один не пропал. Проверим цену:
+
+```console
+$ cd ombor && go run main.go
+non: 3000 so'm
+```
+
+Цена снова 3000 сумов. В ветке, где работает команда, безопасен именно этот путь: коммиты, которые уже есть у
+коллег, не меняются, сверху добавляется только новый, поэтому ничья история не ломается.
+
+**Но внимание:** revert не удаляет старый коммит. Если в коммит попал пароль или ключ, он остаётся в истории, как
+`5a239b1`, и по-прежнему читается через `git cat-file -p`. Что делать — следующий урок,
+[GIT-1.02](/lab/youtube/git#git-1-02).
+
+## Вся модель в одной таблице
+
+| Команда | Что меняется внутри `.git` |
+|---|---|
+| `git commit` | новые объекты (blob для изменённых файлов, tree, commit) + новый хеш в файле текущей ветки |
+| `git branch X` | новый файл `refs/heads/X` с хешем текущего коммита (+ reflog) |
+| `git switch X` | в файл `HEAD` пишется `ref: refs/heads/X` + рабочие файлы приводятся к этому коммиту |
+| `git merge X` (fast-forward) | хеш `X` в файл текущей ветки + рабочие файлы |
+| `git revert C` | новый коммит, обратный `C`; старые объекты на месте |
+
+Коротко: коммит — снимок всего проекта и ссылка на parent. Ветка — обычно маленький файл с одним хешем. `HEAD`
+показывает, на какой ветке вы стоите. Fast-forward merge сдвигает этот файл вперёд. Revert откатывает ошибку новым
+коммитом и не ломает историю. Rebase, reset и reflog работают с теми же объектами и ссылками.
+
+## Частые ошибки
+
+Некоторых команд этого раздела нет в видео: мы запустили их в том же учебном репозитории и перед каждой написали,
+из какого состояния она выполняется.
+
+### 1. «Коммит — это diff»
+
+Самое частое неверное представление. Если в него верить, не ответить на вопросы «где хранится неизменённый файл?»
+или «почему для восстановления одного коммита не нужно применять все предыдущие?». В коммите нет diff: `tree`,
+`parent`, автор, время и сообщение (раздел «Что внутри коммита»). Diff вычисляют `git show` и `git diff` между двумя
+снимками. А delta в пакетах — только способ хранения (раздел «Сохраняется ли неизменённый файл заново?»).
+
+### 2. «Мой коммит пропал»: `git log` показывает только текущую ветку
+
+Состояние: после коммита в `chegirma`, до merge (`./qur.sh`, `git branch chegirma`, затем две команды из раздела
+«Работа в ветке»). Если перейти в `main` и посмотреть историю:
+
+```console
+$ cd ombor && git switch -q main && git log --oneline
+daac3a4 narx dasturi
+e657f41 README
+```
+
+`5a239b1` нет. Он не удалён: обычный `git log` идёт от `HEAD` назад по parent, а `5a239b1` не предок `main`.
+Чтобы видеть все ссылки, нужен `--all`:
+
+```console
+$ cd ombor && git log --oneline --all
+5a239b1 chegirma: 10 foiz
+daac3a4 narx dasturi
+e657f41 README
+```
+
+### 3. `cd ombor` дважды
+
+Команды на странице начинаются из папки урока. Если вы уже внутри `ombor` и снова пишете `cd ombor && …`:
+
+```console
+$ cd ombor && git log --oneline
+bash: cd: ombor: No such file or directory
+```
+
+Как читать: `bash: cd:` — ошибку написала команда `cd` в bash; `ombor: No such file or directory` — «нет такого
+файла или папки `ombor`»: вы уже внутри неё. Команда после `&&` не выполнилась. Исправление: не пишите часть
+`cd ombor && ` или сначала `cd ..`. (В zsh текст сообщения немного другой: `no such file or directory: ombor`.)
+
+### 4. Читать объект через `cat`
+
+`.git/objects/51/c4fee9…` — файл blob для README (первые два символа хеша — имя папки). Если открыть его через `cat`,
+на экран выйдут нечитаемые байты. Посмотрим на первые два байта (`-tx1` — каждый байт в шестнадцатеричном виде):
+
+```console
+$ cd ombor && head -c 2 .git/objects/51/c4fee9be20d18260ace91ce44e4b9c0ca396ab | od -An -tx1
+ 78 01
+```
+
+`78 01` — заголовок zlib (RFC 1950: `78` — сжатие deflate): файл сжат. Исправление: `git cat-file -p 51c4fee` или
+`git cat-file -p HEAD:README.md`. В склонированном репозитории или после `git gc` этого файла может вообще не быть:
+объект лежит внутри packfile.
+
+### 5. Неправильно записанный вручную файл ref
+
+Состояние: конец урока (после revert). Запишем вместо хеша имя ветки:
+
+```console
+$ cd ombor && echo chegirma > .git/refs/heads/buzuq && git branch
+warning: ignoring broken ref refs/heads/buzuq
+  chegirma
+  eski
+* main
+```
+
+`warning: ignoring broken ref refs/heads/buzuq` — «предупреждение: сломанный ref `refs/heads/buzuq` игнорируется»
+(`buzuq` — «сломанный»). В файле ref ожидается 40-символьный хеш (или `ref: …`). Git не выдал ошибку, ветки просто нет
+в списке. Удалим сломанный файл:
+
+```console
+$ cd ombor && rm .git/refs/heads/buzuq && git branch
+  chegirma
+  eski
+* main
+```
+
+Правильный путь — команда git: она превращает имя в хеш, проверяет его и пишет reflog.
+
+```bash
+git branch buzuq chegirma            # yoki: git update-ref refs/heads/buzuq chegirma
+```
+
+(`yoki` — «или».)
+
+### 6. После `git gc` файла ветки нет
+
+Состояние: после ошибки 5. `git gc` (`-q` — тихо) упаковывает объекты и ссылки:
+
+```console
+$ cd ombor && git gc -q && cat .git/refs/heads/main
+cat: .git/refs/heads/main: No such file or directory
+```
+
+«`.git/refs/heads/main`: нет такого файла или папки». Ветка не пропала, она переехала в `.git/packed-refs`. Где бы
+ветка ни хранилась, её хеш выдаёт `git rev-parse`:
+
+```console
+$ cd ombor && git rev-parse main
+14b041d603417386d5d82e8f1e0bde53420b4980
+```
+
+```console
+$ cd ombor && cat .git/packed-refs
+# pack-refs with: peeled fully-peeled sorted 
+5a239b10ba4641d54a7500d0de49f8352df729ce refs/heads/chegirma
+e657f417275efcc319ccce4e1badded9976a8fa6 refs/heads/eski
+14b041d603417386d5d82e8f1e0bde53420b4980 refs/heads/main
+```
+
+Правило: в скриптах пишите не `cat .git/refs/heads/…`, а `git rev-parse <ветка>`.
+
+### 7. «Мои хеши не такие, как в видео»
+
+В вашем собственном репозитории (или собранном вручную, без `qur.sh`) хеши будут другими. Это не ошибка: в
+содержимом коммита есть имя, email и время с точностью до секунды; другие значения — другой хеш. Хеши blob зависят
+только от содержимого: `printf 'non: 3000\n' | git hash-object --stdin` везде даёт `2ecbbc99…`. Если хеши отличаются
+в репозитории, собранном через `qur.sh`, проверьте версию git (`git --version`, нужна 2.29 или новее).
+
+### 8. «Сделал revert — ключ ушёл из истории»
+
+Не ушёл. Revert добавляет новый коммит, старый коммит и его blob остаются на месте (раздел «Revert»). Утёкший ключ
+нужно сначала отозвать: [GIT-1.02](/lab/youtube/git#git-1-02).
+
+## Проверьте себя
+
+1. Какие строки есть в объекте commit и какая из них связывает коммиты в цепочку?
+
+<details>
+<summary>Ответ</summary>
+
+`tree` (снимок проекта), `parent` (хеш предыдущего коммита; у первого коммита его нет), `author`, `committer` (имя,
+email, время Unix и смещение от UTC) и сообщение. Цепочку связывает `parent`. Строки с diff нет.
+
+</details>
+
+2. Что лежит в файле ветки `.git/refs/heads/main` и почему он 41 байт?
+
+<details>
+<summary>Ответ</summary>
+
+Полный SHA-1-хеш последнего коммита: 40 шестнадцатеричных символов и конец строки `\n`, всего 41 байт. В репозитории
+на SHA-256 было бы 65 байт; после `git gc` файла может вообще не быть (`packed-refs`).
+
+</details>
+
+3. Откройте коммит, созданный revert. Какой хеш в строке `parent`?
+
+```text
+cd ombor && git cat-file -p HEAD
+```
+
+<details>
+<summary>Ответ</summary>
+
+Ошибочный коммит `5a239b1…`: revert добавлен поверх него. А `tree` — `651f29e…`, тот же, что у второго коммита из
+`qur.sh`, потому что файлы вернулись в состояние с ценой 3000 сумов. Одинаковое содержимое — одинаковый хеш.
+
+```console
+$ cd ombor && git cat-file -p HEAD
+tree 651f29e7e2b98f1f8f5b84a4051ff7e85e41e3fb
+parent 5a239b10ba4641d54a7500d0de49f8352df729ce
+author Lola <lola@example.com> 1767591000 +0500
+committer Lola <lola@example.com> 1767591000 +0500
+
+Revert "chegirma: 10 foiz"
+
+This reverts commit 5a239b10ba4641d54a7500d0de49f8352df729ce.
+```
+
+</details>
+
+4. Почему `git merge chegirma` не создал новый коммит? Когда создал бы?
+
+<details>
+<summary>Ответ</summary>
+
+С момента создания `chegirma` в `main` не было новых коммитов, поэтому git сдвинул файл `main` на хеш `chegirma`
+(fast-forward) и обновил рабочие файлы. Когда новые коммиты есть в обеих ветках, появляется merge-коммит с двумя
+parent (GIT-2.03).
+
+</details>
+
+5. В `main`, где работает команда, есть ошибочный коммит. Почему `git revert` и чего он не делает?
+
+<details>
+<summary>Ответ</summary>
+
+Revert не переписывает историю, а только добавляет обратный коммит: коммиты и хеши у коллег не меняются. Но старый
+коммит он не удаляет: попавший в него пароль или ключ остаётся в истории.
+
+</details>
+
+6. Из SYS-0.01: что выведет эта команда после `git branch chegirma` (в состоянии сразу после `./qur.sh`)?
+
+```text
+cd ombor && find .git/refs -type f | wc -l
+```
+
+<details>
+<summary>Ответ</summary>
+
+`2`. `find` пишет в pipe два пути (`main` и `chegirma`), `wc -l` их считает.
+
+```console
+$ cd ombor && git branch chegirma && find .git/refs -type f | wc -l
+2
+```
+
+(Здесь есть и `git branch chegirma`: чтобы проверить на чистом состоянии после `./qur.sh`.)
+
+</details>
+
+## Домашнее задание
+
+Папка курса: [lessons/git-01-commit-snapshot](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-01-commit-snapshot).
+Всё выполняйте после шагов из видео, внутри `ombor`.
+
+1. 🟢 **Легко.** Добавьте в `ombor` новый файл, сделайте коммит и откройте его через `git cat-file -p HEAD`. Какой
+   коммит стоит в строке `parent`?
+2. 🟡 **Средне.** Сделайте скидку правильно, 10 процентов: `go run main.go` → `non: 2700 so'm`.
+3. 🟠 **Сложно.** `git branch -d eski`: ветка удаляется. А коммит?
+4. 🔴 **Гуру.** Измените сообщение последнего, ещё не запушенного коммита через `git commit --amend`. Какие хеши
+   изменятся, а какие останутся?
+
+Скрипт с ответами:
+[homework/javoblar.sh](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/git-01-commit-snapshot/homework/javoblar.sh)
+(`bash homework/javoblar.sh`, из папки урока). Он собирает `ombor` с нуля, повторяет шаги из видео и показывает
+каждый ответ. Сначала попробуйте сами.
+
+<details>
+<summary>Ответ</summary>
+
+```console
+$ bash homework/javoblar.sh
+== Oson: yangi commit va uning ichi
+tree 530f9ba8cd2e53324afb489e607065d85c667033
+parent 14b041d603417386d5d82e8f1e0bde53420b4980
+author Lola <lola@example.com> 1767591600 +0500
+committer Lola <lola@example.com> 1767591600 +0500
+
+sut narxi
+
+== O'rta: chegirma to'g'ri, 10 foiz (3000 -> 2700)
+non: 2700 so'm
+
+== Qiyin: branch o'chadi, commit qoladi
+Deleted branch eski (was e657f41).
+e657f417275efcc319ccce4e1badded9976a8fa6 main tarixida bor: commit yo'qolmadi
+eski uchun reflog bormi? 0 (qo'lda yozilgan edi)
+
+== Guru: --amend dan oldin va keyin (faqat push qilinmagan commit'da!)
+commit: 914b512d66ad3dd5638296a84dde4025e086c339  tree: 4cf5d8f72e7368423bc8301442ffe415074f71e1  parent: 5f4efe002c6d79b8d234ddd4a0cbfdc5ba83f094
+commit: cdd8662a7199bdd9232c9abbc859b80325afa472  tree: 4cf5d8f72e7368423bc8301442ffe415074f71e1  parent: 5f4efe002c6d79b8d234ddd4a0cbfdc5ba83f094
+eski commit reflog'da: 914b512 commit: chegirma: 10 foiz, to'g'ri
+```
+
+Вывод скрипта на узбекском (заголовки — уровни задач: «Легко», «Средне», «Сложно», «Гуру»).
+
+🟢 `git add` + `git commit`, затем `git cat-file -p HEAD`: `parent` — коммит revert `14b041d6…`, `tree` — новый
+(добавлен `sut.txt`, «молоко»).
+
+🟡 `sed -i.bak 's/3000/2700/' main.go`, `git commit -am "…"`, `go run main.go` → `non: 2700 so'm`.
+
+🟠 `Deleted branch eski (was e657f41).` Удалён только файл ref. Коммит на месте и достижим:
+`git merge-base --is-ancestor e657f41 main` завершается успешно, потому что он предок `main`. (`git cat-file -t` —
+недостаточное доказательство: даже коммит, до которого не доходит ни одна ссылка, отвечает `commit`, пока его не
+удалит `gc`.) `-d` удаляет только слитую ветку, неслитую удаляет `-D`. Тогда коммит обычно находят через
+`git reflog`, но у записанной вручную `eski` reflog нет: поможет только `git fsck --lost-found`.
+
+🔴 Хеш коммита другой (`914b512…` → `cdd8662…`), потому что сообщение (и у нас время committer) входит в содержимое
+коммита. `tree` (`4cf5d8f7…`) и `parent` (`5f4efe00…`) не меняются: и файлы, и предыдущая история те же. Старый
+коммит не удаляется, он остаётся в `git reflog`. Не делайте amend запушенного коммита: это переписывание истории
+и проблемы для коллег ([GIT-2.05](/lab/youtube/git#git-2-05), [GIT-3.03](/lab/youtube/git#git-3-03)).
+
+</details>
+
+## Источники
+
+- Pro Git: [1.3 What is Git? (snapshots, not differences)](https://git-scm.com/book/en/v2/Getting-Started-What-is-Git%3F) ·
+  [2.3 Viewing the Commit History (author и committer)](https://git-scm.com/book/en/v2/Git-Basics-Viewing-the-Commit-History) ·
+  [7.8 Advanced Merging (revert или reset)](https://git-scm.com/book/en/v2/Git-Tools-Advanced-Merging)
+- Pro Git: [10.2 Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects) (blob, tree, commit, режимы,
+  zlib, заголовок + SHA-1) · [10.3 Git References](https://git-scm.com/book/en/v2/Git-Internals-Git-References) (ветка,
+  HEAD, `update-ref`) · [10.4 Packfiles](https://git-scm.com/book/en/v2/Git-Internals-Packfiles)
+- Документация git: [git-cat-file](https://git-scm.com/docs/git-cat-file), [git-hash-object](https://git-scm.com/docs/git-hash-object),
+  [git-commit (DATE FORMATS)](https://git-scm.com/docs/git-commit), [git-show](https://git-scm.com/docs/git-show),
+  [git-switch](https://git-scm.com/docs/git-switch), [git-status](https://git-scm.com/docs/git-status),
+  [git-merge (FAST-FORWARD MERGE)](https://git-scm.com/docs/git-merge), [git-revert](https://git-scm.com/docs/git-revert),
+  [git-update-ref](https://git-scm.com/docs/git-update-ref), [git-pack-refs](https://git-scm.com/docs/git-pack-refs)
+- [Git 3.0 BreakingChanges](https://git-scm.com/docs/BreakingChanges): планы на SHA-256 и reftable, без даты
+- Документация React: [Updating Objects in State](https://react.dev/learn/updating-objects-in-state) (не менять
+  state, а передавать новый объект)
+- [RFC 1950: ZLIB Compressed Data Format](https://www.rfc-editor.org/rfc/rfc1950) (`78` — заголовок deflate)
+- [MIT Missing Semester: Version Control (Git)](https://missing.csail.mit.edu/2020/version-control/)
+- Julia Evans: [Inside .git](https://jvns.ca/blog/2024/01/26/inside-git/) ·
+  [Do we think of git commits as diffs, snapshots, and/or histories?](https://jvns.ca/blog/2024/01/05/do-we-think-of-git-commits-as-diffs--snapshots--or-histories/)
+- Папка курса и README: [lessons/git-01-commit-snapshot](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-01-commit-snapshot)
+- Все результаты получены на git 2.54.0, GNU bash 5.3.9, GNU coreutils 9.11 и `go1.26.8 linux/amd64`, в Linux,
+  2026-11-26. Сведения о macOS (`shasum`) и Windows (Git Bash) взяты из README курса, не проверены.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-01-commit-snapshot)
+
+---
+
+Следующий урок: [GIT-1.02](/lab/youtube/git#git-1-02) → · [Все уроки](/lab/youtube/git)
+
+</div>

@@ -1,0 +1,1091 @@
+---
+title: "docker compose: Postgres и Go-приложение одной командой"
+date: "2026/11/26"
+description: "Go-сервер и Postgres в compose.yaml: подключение по имени сервиса, пароль в .env, healthcheck, down и down -v, ловушка с томом в Postgres 18."
+tag: "youtube, sys, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/sys/sys-0-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/sys/sys-0-06"
+    ru: "https://www.haywan.uz/lab/youtube/sys/sys-0-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/sys/sys-0-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/sys/sys-0-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/sys/sys-0-06) · **Русский** · [English](/lab/youtube/sys/sys-0-06/en)  
+Урок SYS-0.06 · [Kompyuter, OS va tarmoq](/lab/youtube/sys#sys-0-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-06-compose)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Go-сервер, Postgres, сеть и том поднимаются одной командой `docker compose up`. У вас всё работает. Коллега клонирует
+репозиторий на чистый компьютер, вводит ту же команду, и сервер падает с `connection refused`. Файл тот же, команда та
+же. Какой строки не хватает?
+
+**Одна идея:** `compose.yaml` описывает не команды, а результат: какие нужны сервисы, сеть и тома.
+`docker compose up` создаёт то, чего не хватает. Но «контейнер запустился» не значит «база готова»: `depends_on` задаёт
+только порядок, а готовность проверяет healthcheck.
+
+После урока вы:
+
+- поднимете Postgres и Go-сервер одним `compose.yaml` и сможете объяснить каждую его строку;
+- будете хранить пароль в файле `.env`, вне git, и остановите compose с ошибкой, если пароля нет;
+- увидите гонку `depends_on` («у меня работает») и исправите её через `healthcheck` + `condition: service_healthy`;
+- будете знать разницу между `down` и `down -v`, ловушку со сменой пароля на старом томе и новый путь тома в
+  Postgres 18.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| сервис | описание одного контейнера в `compose.yaml`: образ или сборка, окружение, порты. Имя сервиса — это ещё и DNS-имя в сети | service |
+| healthcheck | команда-проверка, которую Docker периодически запускает внутри контейнера: если она завершилась успешно, контейнер «здоров» (healthy) | healthcheck |
+| подстановка (интерполяция) | при чтении compose-файла вместо `${DB_PASSWORD}` подставляется значение из `.env` или из shell | interpolation |
+
+Есть и два вспомогательных слова. **Проект** (project) — общее имя всего, что описано в compose-файле: с него
+начинаются имена контейнеров, сети и томов. **pgx** — драйвер Postgres для Go (библиотека того же рода, что `pg` в Node
+или psycopg в Python).
+
+## Что нужно знать заранее
+
+- [SYS-0.05 · Docker: решение проблемы «на моём компьютере работает»](/lab/youtube/sys/sys-0-05/ru): образ и контейнер,
+  многоэтапный Dockerfile → `scratch`, `-p` (порт), совет `-p 127.0.0.1:…`, том живёт дольше контейнера, у контейнера
+  своя сеть. Сегодня продолжаем тот же сервер `mehmon` («гость»).
+- [SYS-0.02 · Процесс и окружение: ps, kill, $PATH и переменные окружения](/lab/youtube/sys/sys-0-02/ru): настройки живут вне кода,
+  в переменной окружения; код выхода 1 — ошибка; функция `kut` («жди») для корректной остановки сервера.
+- [GIT-1.02 · Запушили .env? Ключ больше не только ваш](/lab/youtube/git#git-1-02): добавить `.env*` в `.gitignore` до первого
+  коммита, а `.env.example` сделать исключением.
+- [SYS-0.01 · Терминал: pipe, grep и задачи, которые решаются одной строкой](/lab/youtube/sys/sys-0-01/ru): вертикальная черта
+  (`|`), `grep`, `2>&1` (отправить в черту и stderr) и `>/dev/null`.
+
+**Как запускать код.** Все команды выполняются в папке курса (`lessons/sys-06-compose`). Нужен Docker Engine 25 или
+новее (ради `start_interval`) и `docker compose` (Compose v2). Сначала создайте файл с паролем:
+
+```bash
+cp .env.example .env    # затем впишите свой пароль в строку DB_PASSWORD= в .env
+```
+
+Порты 8077 и 8078 должны быть свободны. Первый `docker compose up` соберёт образ приложения и скачает образы
+`golang:1.26.8` и `postgres:18-alpine`. В выводах на этой странице виден пароль из нашего `.env`:
+`parol-faqat-menda` («пароль только у меня»).
+
+Вопрос из SYS-0.05. Go-сервер работает в контейнере и подключается к `localhost:5432`. Postgres же слушает порт 5432 на
+хосте (на вашем компьютере). Куда подключится сервер?
+
+**A)** к Postgres на хосте · **B)** к самому контейнеру: там на 5432 никого нет · **C)** Docker сам перенаправит на
+хост
+
+<details>
+<summary>Ответ</summary>
+
+**B.** У контейнера своя сеть (сетевое пространство имён, network namespace), и `localhost` внутри — это сам
+контейнер. В SYS-0.05 мы видели то же самое с другой стороны: без `-p` `curl` с хоста не достаёт до сервера в
+контейнере. Если вы выбрали «A», вы считали, что контейнер и хост в одной сети. «C»: Docker никуда не перенаправляет
+`localhost` внутри контейнера. Этот ответ понадобится сегодня в разделе «Сеть».
+
+</details>
+
+## Одна команда: `docker compose up`
+
+Начнём с результата урока. `docker compose up -d` поднимает проект в фоне (`-d`, как у `docker run -d`):
+
+```console
+$ docker compose up -d 2>&1 | grep -E 'Created|Healthy|Started' | uniq
+ Volume mehmonxona_pgdata Created 
+ Network mehmonxona_default Created 
+ Container mehmonxona-db-1 Created 
+ Container mehmonxona-app-1 Created 
+ Container mehmonxona-db-1 Started 
+ Container mehmonxona-db-1 Healthy 
+ Container mehmonxona-app-1 Started 
+$ sleep 1; curl -s localhost:8077; curl -s localhost:8077
+Salom! Siz 1-mehmonsiz
+Salom! Siz 2-mehmonsiz
+```
+
+Compose пишет сообщения о ходе работы в stderr. `2>&1` отправляет их в вертикальную черту, `grep -E` оставляет строки
+трёх видов, а `uniq` убирает подряд повторяющиеся строки. Читаем по порядку:
+
+| Строка | Что произошло |
+|---|---|
+| `Volume mehmonxona_pgdata Created` | создан том для файлов базы |
+| `Network mehmonxona_default Created` | создана отдельная сеть проекта |
+| `Container … Created` (2 шт.) | оба контейнера созданы, но ещё не запущены |
+| `Container mehmonxona-db-1 Started` | Postgres запущен |
+| `Container mehmonxona-db-1 Healthy` | Postgres принимает подключения: healthcheck прошёл |
+| `Container mehmonxona-app-1 Started` | **только после этого** запущен Go-сервер |
+
+Зачем `sleep 1`? `Started` значит, что процесс запущен. А сервер за мгновение подключается к базе и создаёт таблицу и
+только потом открывает порт. И здесь «запустился» ≠ «готов» — главная тема урока.
+
+В SYS-0.05 счётчик жил в файле в папке `/data`. Теперь каждый гость записывается в таблицу Postgres. В этом уроке мы
+прочитаем `compose.yaml` строка за строкой и своими глазами увидим, зачем нужна каждая строка.
+
+## Без Compose: `qolda.sh`
+
+Без Compose то же самое делали бы обычными командами `docker`. Именно так устроен `qolda.sh` («вручную») из папки
+курса:
+
+```bash filename="qolda.sh" showLineNumbers
+#!/usr/bin/env bash
+# compose'siz: xuddi shu ikki container'ni qoʻlda koʻtarish (compose.yaml bilan solishtiring)
+set -euo pipefail
+source .env
+docker network create qolda
+docker volume create qolda-pg
+docker run -d --name qolda-db --network qolda -v qolda-pg:/var/lib/postgresql \
+  -e POSTGRES_USER="$DB_USER" -e POSTGRES_PASSWORD="$DB_PASSWORD" -e POSTGRES_DB="$DB_NAME" postgres:18-alpine
+until docker exec qolda-db pg_isready -q -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME"; do sleep 1; done
+docker build -q -t qolda-app .
+docker run -d --name qolda-app --network qolda -p 127.0.0.1:8077:8077 \
+  -e DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@qolda-db:5432/$DB_NAME?sslmode=disable" qolda-app
+# tozalash: docker rm -f qolda-app qolda-db; docker network rm qolda; docker volume rm qolda-pg; docker image rm qolda-app
+```
+
+| Строка | Что делает |
+|---|---|
+| 3 | `set -euo pipefail`: останавливает скрипт при первой ошибке |
+| 4 | `source .env`: читает `DB_USER`, `DB_PASSWORD`, `DB_NAME` как переменные оболочки |
+| 5 | отдельная сеть `qolda`. В своей сети контейнеры находят друг друга по имени |
+| 6 | том `qolda-pg` (для файлов базы) |
+| 7–8 | контейнер Postgres: с сетью, томом и тремя переменными окружения (`-e`) |
+| 9 | цикл, который каждую секунду спрашивает `pg_isready`, пока база не готова |
+| 10 | собирает образ сервера |
+| 11–12 | запускает сервер в той же сети, с портом и `DATABASE_URL`. Имя хоста `qolda-db` — имя контейнера |
+| 13 | комментарий: чтобы всё убрать, нужно ещё четыре команды |
+
+Работает. Этого запуска нет в видео, мы сделали его для проверки:
+
+```console
+$ ./qolda.sh >/dev/null; sleep 1; curl -s localhost:8077
+Salom! Siz 1-mehmonsiz
+$ docker rm -f qolda-app qolda-db; docker network rm qolda; docker volume rm qolda-pg; docker image rm qolda-app | head -1
+qolda-app
+qolda-db
+qolda
+qolda-pg
+Untagged: qolda-app:latest
+```
+
+Но нужно помнить все флаги, имена и порядок. Забудете сеть — сервер не найдёт имя `qolda-db`. Забудете цикл в 9-й
+строке — сервер подключится раньше, чем база готова. Скрипт описывает шаги: «что сделать». Файл из следующего раздела
+описывает результат: «что должно быть».
+
+## `compose.yaml` строка за строкой
+
+Compose записывает то же самое в один файл. Имя по умолчанию — `compose.yaml`. В нём описаны не команды, а
+**результат**: какие должны быть сервисы, сеть и тома. `docker compose up` сравнивает то, что есть, с тем, что нужно,
+и создаёт недостающее. Знакомая по фронтенду разница: в jQuery вы меняете DOM шаг за шагом (`qolda.sh`), а в React
+описываете нужное состояние, и разницу находит React (`compose.yaml`).
+
+```yaml filename="compose.yaml" showLineNumbers
+name: mehmonxona
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:?.env faylida DB_USER yoʻq}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?.env faylida DB_PASSWORD yoʻq}
+      POSTGRES_DB: ${DB_NAME:?.env faylida DB_NAME yoʻq}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "${DB_USER}", "-d", "${DB_NAME}"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 10s
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}?sslmode=disable
+    ports:
+      - "127.0.0.1:8077:8077"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `name: mehmonxona` | имя **проекта** («гостиница»). С него начинаются имена контейнеров, сети и тома: `mehmonxona-db-1`, `mehmonxona_default`, `mehmonxona_pgdata`. Если его нет, берётся имя папки |
+| 3 | `services:` | список **сервисов**. У нас два: `db` и `app` |
+| 4–5 | `db:` · `image: postgres:18-alpine` | `db` запускается из официального образа `postgres`: Postgres 18 на alpine |
+| 6–9 | `environment:` | переменные окружения внутри контейнера (`docker run -e`). Из них официальный образ берёт пользователя, пароль и имя базы. `${…}` — в следующем разделе |
+| 10–11 | `volumes:` · `- pgdata:/var/lib/postgresql` | подключает том `pgdata` к папке Postgres (`docker run -v`). Почему именно этот путь — в разделе «Postgres 18» |
+| 12–16 | `healthcheck:` | команда, проверяющая готовность Postgres. Подробно — в разделе «healthcheck» |
+| 18–19 | `app:` · `build: .` | `app` не берётся из готового образа, а собирается из `Dockerfile` в этой папке |
+| 20–21 | `DATABASE_URL: …@db:5432/…` | передаёт серверу адрес базы. Имя хоста `db` — имя сервиса (раздел «Сеть») |
+| 22–23 | `ports:` · `"127.0.0.1:8077:8077"` | тот же `-p` из SYS-0.05. Loopback-адрес `127.0.0.1` впереди открывает порт только для этого компьютера |
+| 24–26 | `depends_on:` · `condition: service_healthy` | запускает `app` после того, как `db` стал здоровым. Самая важная строка урока |
+| 28–29 | `volumes:` · `pgdata:` | объявляет том `pgdata`: Compose создаст его сам |
+
+В старых руководствах файл называется `docker-compose.yml` и начинается со строки `version: "3"`. По документации
+Compose, `version` теперь только информационное поле: если его указать, появится предупреждение, что оно устарело.
+Имя по умолчанию — `compose.yaml`.
+
+| `qolda.sh` | `compose.yaml` |
+|---|---|
+| `docker network create qolda` | не пишется: Compose сам создаёт `mehmonxona_default` |
+| `docker volume create qolda-pg` | `volumes: pgdata:` (28–29) |
+| `docker run … -e POSTGRES_USER=… postgres:18-alpine` | сервис `db:` (4–11) |
+| `until … pg_isready …; do sleep 1; done` | `healthcheck` (12–16) + `condition: service_healthy` (24–26) |
+| `docker build -q -t qolda-app .` | `build: .` (19) |
+| `docker run … -p 127.0.0.1:8077:8077 … qolda-app` | сервис `app:`, `ports` (18–23) |
+| четыре команды очистки | `docker compose down` (и `-v`) |
+
+`Dockerfile` из `build: .` — это многоэтапный Dockerfile из SYS-0.05 с двумя изменениями:
+
+```dockerfile filename="Dockerfile" showLineNumbers
+# 1-bosqich: yigʻish (SYS-0.05 dagi Dockerfile, endi modullar bilan)
+FROM golang:1.26.8 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY server ./server
+RUN CGO_ENABLED=0 go build -o /server ./server
+
+# 2-bosqich: boʻm-boʻsh image, faqat binary
+FROM scratch
+COPY --from=build /server /server
+USER 65532:65532
+EXPOSE 8077
+CMD ["/server"]
+```
+
+Строки 4–5 сначала копируют `go.mod` и `go.sum` и скачивают модули: теперь у сервера есть внешняя библиотека (`pgx`).
+Эти строки стоят до `server/`, поэтому при изменении Go-кода скачанные модули берутся из кеша. Строка 12 запускает
+сервер не от root, а от пользователя с номером 65532. Итог — образ 15.1 МБ.
+
+**`up` не пересобирает образ.** Собрав образ один раз, `docker compose up` использует его снова. Если вы изменили
+Go-код, пишите `docker compose up -d --build`, иначе продолжит работать старый образ. Эксперимент из README курса (мы
+его не повторяли): текст приветствия изменили, после `up` был старый текст, после `up --build` — новый.
+
+В `.dockerignore` есть и `.env*`, значит пароль не попадает ни в build context, ни в образ:
+
+```text
+# image'ga keraksiz narsalar build context'ga ham yuborilmaydi
+.env*
+*.md
+tuzoq.*
+```
+
+## `.env`: пароль в файле, но не в репозитории
+
+Записи вида `${DB_USER}` в `compose.yaml` — это переменные. Читая файл, Compose подставляет вместо них значения. Это
+**подстановка** (интерполяция, interpolation). Значения берутся из двух мест:
+
+1. переменная с тем же именем в окружении shell (она главнее);
+2. файл `.env` рядом с `compose.yaml`.
+
+Есть важное отличие от Laravel или `dotenv` в Node. Там `.env` загружается в процесс приложения, и код читает его
+через `env('DB_PASSWORD')` или `process.env.DB_PASSWORD`. В Compose `.env` **сам в контейнер не попадает**: он только
+заполняет `${…}` в `compose.yaml`. В контейнер доходит только то, что записано в `environment:`: в `db` — три
+`POSTGRES_*`, в `app` — только `DATABASE_URL`.
+
+```text
+.env  ──подстановка──▶  compose.yaml  ──environment:──▶  окружение контейнера
+DB_PASSWORD=…           ${DB_PASSWORD}                   POSTGRES_PASSWORD=…
+(DB_PASSWORD из shell    (при чтении                     DATABASE_URL=…
+ главнее)                 compose-файла)                 (самого .env нет)
+```
+
+В строках 7–9, в `${DB_USER:?.env faylida DB_USER yoʻq}`, после имени стоит `:?`. Это **страж**: если значения нет
+или оно пустое, compose остановится с этим сообщением («в файле .env нет DB_USER»). А `${DB_USER}` без стража (строки
+13 и 21) превращается в пустую строку.
+
+| Запись | Значение есть | Значения нет или оно пустое |
+|---|---|---|
+| `${DB_USER}` | значение | пустая строка + предупреждение |
+| `${DB_USER:?xabar}` | значение | compose останавливается с сообщением `xabar` |
+
+Чтобы пароль не попал в репозиторий, — привычка из GIT-1.02. У папки курса свой `.gitignore`:
+
+```console
+$ cat .gitignore .env.example
+# sirlar faqat sizning kompyuteringizda qoladi (GIT-1.02)
+.env*
+!.env.example
+# nusxa oling: cp .env.example .env, keyin DB_PASSWORD ga oʻz parolingizni yozing
+DB_USER=mehmon
+DB_PASSWORD=
+DB_NAME=mehmonxona
+```
+
+Первые три строки — `.gitignore`: скрыты все файлы, начинающиеся с `.env`, а `!.env.example` — исключение. Следующие
+четыре — `.env.example`: имена есть, пароль пустой. Его кладём в репозиторий, коллега копирует его и вписывает свой
+пароль.
+
+Файл с подставленными значениями показывает `docker compose config`:
+
+```console
+$ docker compose config | grep DATABASE_URL
+      DATABASE_URL: postgres://mehmon:parol-faqat-menda@db:5432/mehmonxona?sslmode=disable
+```
+
+Пароль виден открыто. Не выкладывайте вывод `docker compose config` в issue, чат или лог.
+
+Что будет без `.env`? `--env-file /dev/null` даёт compose пустой файл вместо `.env`. Какой результат вы ожидаете?
+
+**A)** compose запустится с пустыми значениями · **B)** будет только предупреждение, контейнеры запустятся ·
+**C)** compose остановится с ошибкой
+
+<details>
+<summary>Ответ</summary>
+
+**C**, но сначала будет и предупреждение. `sed -n '1p;$p'` оставляет первую и последнюю строку вывода:
+
+```console
+$ docker compose --env-file /dev/null up -d 2>&1 | sed -n '1p;$p'
+time="2026-11-26T20:44:11+05:00" level=warning msg="The \"DB_USER\" variable is not set. Defaulting to a blank string."
+error while interpolating services.db.environment.POSTGRES_USER: required variable DB_USER is missing a value: .env faylida DB_USER yoʻq
+```
+
+Первая строка — предупреждение для `${DB_USER}` без стража: *variable is not set. Defaulting to a blank string* —
+«переменная не задана, подставляется пустая строка». Вторая — ошибка в строке 7 со стражем: *required variable DB_USER
+is missing a value* — «у обязательной переменной нет значения», а в конце наше сообщение. Compose ничего не изменил.
+Если вы выбрали «A» или «B», так и было бы без стража: при пустом `POSTGRES_USER` образ молча берёт пользователя
+`postgres`, и ошибка появляется гораздо позже.
+
+</details>
+
+## Сеть: имя сервиса — это DNS-имя
+
+По какому адресу сервер подключается к базе? В `DATABASE_URL` имя хоста — `db`, то есть имя сервиса. Compose создаёт
+для проекта отдельную сеть (`mehmonxona_default`). По документации Docker, в ней каждый сервис можно найти по имени.
+`docker compose exec db …` выполняет команду внутри работающего контейнера `db`. `getent hosts` превращает имя в
+IP-адрес:
+
+```console
+$ docker compose exec db getent hosts db app
+172.19.0.2        db  db
+172.19.0.3        app  app
+```
+
+Оба имени нашлись. Писать здесь `localhost` было бы ошибкой: вспомните вопрос из «Что нужно знать заранее», `localhost`
+внутри контейнера — сам контейнер. В «Частых ошибках» увидим настоящий вывод этой ошибки.
+
+`docker compose ps` показывает ещё кое-что:
+
+```console
+$ docker compose ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
+SERVICE   STATUS                   PORTS
+app       Up 1 second              127.0.0.1:8077->8077/tcp
+db        Up 4 seconds (healthy)   5432/tcp
+```
+
+Порт `app` связан с хостом стрелкой (`->`): `127.0.0.1:8077` → порт 8077 контейнера. У `db` стрелки нет: 5432 открыт
+только во внутренней сети, с хоста к нему не подключиться. А сервер подключается к нему через эту сеть. Не открывать
+базу миру — бесплатная безопасность.
+
+```text
+хост (ваш компьютер)
+  curl localhost:8077
+        │  127.0.0.1:8077 -> 8077
+        ▼
+  сеть: mehmonxona_default
+  ┌──────────────────────┐   db:5432   ┌──────────────────────┐
+  │ app  172.19.0.3:8077 │ ──────────▶ │ db   172.19.0.2:5432 │
+  │ (Go-сервер)          │             │ (Postgres)           │
+  └──────────────────────┘             └──────────┬───────────┘
+                                                  │ /var/lib/postgresql
+                                         том: mehmonxona_pgdata
+```
+
+(IP-адреса у вас могут быть другими: их выбирает Docker. Имена же всегда одинаковы, поэтому в адресе пишут имя, а не
+IP.)
+
+## Сторона Go: `DATABASE_URL`, `pgx` и `Ping`
+
+В Go-коде изменений немного. Вот `server/main.go`:
+
+```go filename="server/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	port := os.Getenv("PORT") // sozlama muhitdan (SYS-0.02)
+	if port == "" {
+		port = "8077"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err == nil {
+		err = db.Ping(ctx) // pgxpool.New ulanmaydi: ulanishni shu yerda tekshiramiz
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "server: baza:", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, jadval); err != nil {
+		fmt.Fprintln(os.Stderr, "server: jadval:", err)
+		os.Exit(1)
+	}
+	fmt.Println("server: bazaga ulandim")
+
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "server:", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{Handler: daftar(db)}
+	go srv.Serve(ln)
+	fmt.Println("server: :" + port + " da tinglayapman")
+	kut(srv)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `"github.com/jackc/pgx/v5/pgxpool"` | пул подключений библиотеки **pgx**. `require github.com/jackc/pgx/v5 v5.13.0` в `go.mod` — как зависимость в `package.json` |
+| 15–18 | `os.Getenv("PORT")` | берёт порт из окружения, если пусто — 8077 (как в SYS-0.05) |
+| 19–20 | `context.WithTimeout(…, 5*time.Second)` | срок 5 секунд на подключение к базе. `context` подробно — в GO-1.23 |
+| 21 | `pgxpool.New(ctx, os.Getenv("DATABASE_URL"))` | адрес из переменной окружения: настройки вне кода (правило SYS-0.02) |
+| 22–24 | `db.Ping(ctx)` | проверяет подключение **сразу** (ниже) |
+| 25–28 | `fmt.Fprintln(os.Stderr, …)` · `os.Exit(1)` | если база не отвечает, пишет ошибку в stderr и завершается с кодом выхода 1 |
+| 29 | `defer db.Close()` | закрывает пул, когда `main` завершится |
+| 30–33 | `db.Exec(ctx, jadval)` | создаёт таблицу `mehmonlar` («гости»), если её нет |
+| 34 | `fmt.Println("server: bazaga ulandim")` | подключение и таблица готовы («подключился к базе») |
+| 36–44 | | как в SYS-0.05: открывает порт, принимает запросы, ждёт сигнал |
+
+**Зачем `Ping`?** По документации pgx, `pgxpool.New` не возвращает ошибку подключения. С настройками по умолчанию
+(`MinConns` = 0) он ещё не открывает ни одного подключения: первое открывается при первом запросе. Без `Ping` сервер
+написал бы «подключился к базе» и запустился, а ошибка всплыла бы на первом госте. С `Ping` сервер сразу падает с
+кодом выхода 1, если базы нет. Эта деталь очень пригодится в разделе «Вопрос».
+
+`server/daftar.go` («журнал») теперь хранит счётчик не в файле, а в таблице Postgres:
+
+```go filename="server/daftar.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const jadval = `CREATE TABLE IF NOT EXISTS mehmonlar (
+	id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	vaqt  timestamptz NOT NULL DEFAULT now()
+)`
+
+// daftar har bir mehmonni Postgres'ga yozadi va nechanchi ekanini aytadi.
+// SYS-0.05 da bu fayl edi, endi bir vaqtdagi soʻrovlarni baza oʻzi tartibga soladi.
+func daftar(db *pgxpool.Pool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var n int64
+		err := db.QueryRow(r.Context(),
+			`INSERT INTO mehmonlar DEFAULT VALUES RETURNING id`).Scan(&n)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "server: daftar:", err) // tafsilot logga, mijozga emas
+			http.Error(w, "bazada xato", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "Salom! Siz %d-mehmonsiz\n", n)
+	})
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 11–14 | таблица: `id` — номер, который выдаёт сам Postgres (identity-столбец), `vaqt` («время») — время записи |
+| 21–22 | на каждый запрос добавляет одну строку и возвращает её `id` (`RETURNING id`). `Scan(&n)` записывает результат в `n` (`&` — адрес `n`, указатели — в GO-1.11) |
+| 23–27 | подробности ошибки пишутся в stderr (в лог), а клиенту — только «bazada xato» («ошибка в базе») и 500 |
+| 28 | `Salom! Siz N-mehmonsiz` («Здравствуйте! Вы N-й гость») |
+
+В SYS-0.05 файл защищал `sync.Mutex`. Теперь одновременные запросы упорядочивает сама база. `id` — не счётчик, а
+номер строки: после отменённых строк в номерах могут быть дыры. `server/kut.go` не изменился со времён SYS-0.05: он
+ждёт SIGTERM и выполняет корректную остановку сервера.
+
+## Вопрос: `depends_on` без healthcheck
+
+Теперь уберём `healthcheck` и сделаем `depends_on` простым списком:
+
+```yaml
+    depends_on:
+      - db
+```
+
+Compose всё равно запустит сначала `db`, потом `app`. Сможет ли сервер подключиться к базе?
+
+**A)** да, всегда: `db` стартует первым · **B)** нет, никогда · **C)** иногда: зависит от того, есть ли уже база в
+этом томе
+
+Подумайте, потом откройте ответ.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** В папке курса для этого случая есть `tuzoq.yaml` («ловушка»):
+
+```yaml filename="tuzoq.yaml" showLineNumbers
+# Tuzoq: healthcheck yoʻq, depends_on faqat ishga tushish tartibini beradi
+name: tuzoq
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:?.env faylida DB_USER yoʻq}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?.env faylida DB_PASSWORD yoʻq}
+      POSTGRES_DB: ${DB_NAME:?.env faylida DB_NAME yoʻq}
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}?sslmode=disable
+    ports:
+      - "127.0.0.1:8078:8077"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
+```
+
+От `compose.yaml` три отличия: в строке 2 имя проекта `tuzoq`, healthcheck нет, а в строках 20–21 `depends_on` —
+простой список. Порт 8078, поэтому он может работать рядом с `mehmonxona`. `tuzoq.sh` поднимает его и через 3 секунды
+показывает состояние:
+
+```bash filename="tuzoq.sh" showLineNumbers
+#!/usr/bin/env bash
+# tuzoq.yaml (healthcheck yoʻq) ni koʻtaradi va 3 soniyadan keyin holatni koʻrsatadi.
+#   ./tuzoq.sh       toza volume bilan (baza endi yaratiladi)
+#   ./tuzoq.sh bor   volume'dagi tayyor baza bilan
+c() { docker compose -f tuzoq.yaml "$@"; }
+if [ "${1:-}" = bor ]; then c down >/dev/null 2>&1; else c down -v >/dev/null 2>&1; fi
+c up -d >/dev/null 2>&1
+sleep 3
+c ps -a --format '{{.Service}}: {{.Status}}'
+c logs app --no-log-prefix
+```
+
+Функция `c` в строке 5 сокращает `docker compose -f tuzoq.yaml` (`-f` — какой compose-файл). Строка 6: без аргумента —
+`down -v` (том тоже удаляется, база с нуля), с `bor` («есть») — `down` (база в томе остаётся). Строки 9–10 выводят
+состояние контейнеров (`ps -a` — и остановленных тоже) и лог сервера.
+
+С чистым томом:
+
+```console
+$ grep -A1 '  depends_on' tuzoq.yaml
+    depends_on:
+      - db
+$ ./tuzoq.sh
+app: Exited (1) 3 seconds ago
+db: Up 3 seconds
+server: baza: failed to connect to `user=mehmon database=mehmonxona`: 172.20.0.2:5432 (db): dial error: dial tcp 172.20.0.2:5432: connect: connection refused
+```
+
+Сервер упал с кодом выхода 1 (`Exited (1)`). *failed to connect … connect: connection refused* — «не удалось
+подключиться: в подключении отказано». Имя `db` превратилось в IP (`172.20.0.2`), но на порту 5432 ещё никто не
+слушает.
+
+Теперь тот же файл, но в томе база уже есть:
+
+```console
+$ ./tuzoq.sh bor
+app: Up 3 seconds
+db: Up 3 seconds
+server: bazaga ulandim
+server: :8077 da tinglayapman
+```
+
+Работает. Если вы выбрали «A», вы думали, что `depends_on` ждёт базу. Если «B», вы не видели второй случай: это гонка,
+и с готовой базой сервер обычно выигрывает.
+
+</details>
+
+В документации Docker это сказано прямо: «On startup, Compose does not wait until a container is "ready", only until
+it's running» — «при запуске Compose ждёт не "готовности" контейнера, а только его запуска». Запускаясь впервые на
+чистом томе, Postgres сначала создаёт базу (`initdb`). Это время измерили при подготовке видео (2026-11-25), мы его не
+перемеряли:
+
+| Том | От старта контейнера до того, как Postgres слушает TCP | Результат `tuzoq.yaml` |
+|---|---|---|
+| чистый (базы нет) | 1.24 / 1.30 / 1.66 с | сервер упал: 8 из 8 попыток |
+| база есть | 0.121 / 0.124 / 0.121 с | сервер подключился: 6 из 6 попыток |
+
+А Go-сервер пытается подключиться через миллисекунды. Это классическое «у меня работает»: в вашем томе база уже есть,
+а у коллеги, в CI и на новом сервере — нет. Успех во второй строке — тоже не гарантия, а просто выигранная гонка.
+
+Решение — две части `compose.yaml`:
+
+```console
+$ grep -A4 healthcheck compose.yaml; grep -A2 depends_on compose.yaml
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "${DB_USER}", "-d", "${DB_NAME}"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 10s
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+С `condition: service_healthy` compose не запускает `app`, пока `db` не станет здоровым. Строка
+`Container mehmonxona-db-1 Healthy` из раздела «Одна команда» — это оно и есть.
+
+## healthcheck строка за строкой
+
+**healthcheck** — команда, которую Docker периодически запускает внутри контейнера. Если она завершилась с кодом 0,
+контейнер здоров (healthy). Цикл `until pg_isready …` из 9-й строки `qolda.sh` теперь выполняет сам Docker.
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 13 | `test: ["CMD", "pg_isready", …]` | `pg_isready` — программа, проверяющая, принимает ли Postgres подключения. `CMD` — запуск напрямую, без shell |
+| 13 | `"-h", "127.0.0.1"` | спрашивает **по TCP** (ниже) |
+| 13 | `"-U", "${DB_USER}", "-d", "${DB_NAME}"` | от имени какого пользователя и для какой базы спрашивать |
+| 14 | `start_period: 30s` | период запуска: неудачные проверки в эти 30 секунд не засчитываются в `retries` (по умолчанию 3) |
+| 15 | `start_interval: 1s` | в период запуска проверяет каждую секунду, поэтому `app` не ждёт лишнего |
+| 16 | `interval: 10s` | потом каждые 10 секунд (по умолчанию 30 с) |
+
+Коды выхода `pg_isready`: 0 — подключения принимаются, 1 — отклоняются (например, сервер запускается), 2 — нет ответа,
+3 — попытки не было. Для Docker «здоров» только 0.
+
+**Почему `-h 127.0.0.1`?** Без `-h` `pg_isready` спрашивает через Unix-сокет (подключение через файл). Скрипт
+`docker-entrypoint.sh` официального образа при первом запуске стартует временный сервер с `listen_addresses=''`, то
+есть только на Unix-сокете. Настроив базу, он останавливает его и запускает настоящий сервер с TCP:
+
+| Этап (чистый том) | Unix-сокет | TCP 5432 (по нему подключается сервер) |
+|---|---|---|
+| `initdb`: создание файлов базы | нет | нет |
+| временный сервер: создаются `POSTGRES_USER`, `POSTGRES_DB` | **готов** | закрыт |
+| остановка и перезапуск | нет | нет |
+| настоящий сервер | готов | **готов** |
+
+Если на втором этапе спросить через сокет, ответ «готов» может прийти раньше времени. При подготовке видео, наблюдая с
+шагом 0.1 с, такое состояние поймали один раз, окно примерно 0.1–0.2 с. А `-h 127.0.0.1` проверяет тот самый путь, по
+которому подключается сервер, — TCP.
+
+**Чего healthcheck не даёт.** Он задаёт только порядок **запуска**. Если база позже перезапустится (обновление,
+нехватка памяти), compose не будет снова придерживать `app`. Сервер должен уметь переподключаться сам: это сложное
+домашнее задание.
+
+## Том: `down` и `down -v`
+
+Где на самом деле наши гости? `psql` — терминальный клиент Postgres. Запустим его внутри контейнера `db` (`-U` —
+пользователь, `-d` — база, `-c` — одна SQL-команда):
+
+```console
+$ docker compose exec db psql -U mehmon -d mehmonxona -c 'SELECT id, vaqt::time(0) AS vaqt FROM mehmonlar'
+ id |   vaqt   
+----+----------
+  1 | 15:44:12
+  2 | 15:44:12
+(2 rows)
+```
+
+Две строки, два гостя. (`vaqt::time(0)` отбрасывает дату и показывает время с точностью до секунды. Часовой пояс в
+контейнере — UTC: 15:44 — это 20:44 по ташкентскому времени.) Теперь `docker compose down`, потом снова `up`. Каким
+по счёту будет третий запрос?
+
+**A)** `1-mehmon`: контейнеры удалены · **B)** `3-mehmon` · **C)** сервер выдаст ошибку
+
+<details>
+<summary>Ответ</summary>
+
+**B.**
+
+```console
+$ docker compose down 2>&1 | grep Removed | uniq
+ Container mehmonxona-app-1 Removed 
+ Container mehmonxona-db-1 Removed 
+ Network mehmonxona_default Removed 
+$ docker compose up -d >/dev/null 2>&1; sleep 1; curl -s localhost:8077
+Salom! Siz 3-mehmonsiz
+```
+
+`down` удалил контейнеры и сеть, а том не тронул: `Volume` в списке нет. Новый контейнер `db` подключил тот же том, в
+таблице две строки. Если вы выбрали «A», вы думали, что данные в контейнере: правило тома из SYS-0.05 работает и
+здесь. Сервер тоже не падает («C»): `CREATE TABLE IF NOT EXISTS` ничего не делает, если таблица есть.
+
+</details>
+
+**Смена пароля на старом томе.** Передадим пароль через shell: переменная из shell главнее `.env`.
+
+```console
+$ DB_PASSWORD=yangi-parol docker compose up -d >/dev/null 2>&1; sleep 2; docker compose logs app --no-log-prefix | tail -1
+server: baza: failed to connect to `user=mehmon database=mehmonxona`: 172.19.0.2:5432 (db): failed SASL auth: FATAL: password authentication failed for user "mehmon" (SQLSTATE 28P01)
+```
+
+*password authentication failed for user "mehmon"* — «неверный пароль пользователя mehmon». Compose пересоздал `app` с
+новым `DATABASE_URL`, но в базе остался старый пароль. Официальный образ читает переменные `POSTGRES_*` только при
+**пустой** папке данных. Если поменять пароль в `.env`, будет то же самое. Если пароль действительно нужно сменить,
+сначала сделайте это в самой базе:
+
+```bash
+docker compose exec db psql -U mehmon -d mehmonxona -c "ALTER USER mehmon PASSWORD 'yangi-parol'"
+```
+
+потом в `.env`. Или удалите том — `-v`:
+
+```console
+$ docker compose down -v 2>&1 | grep Removed | uniq; docker compose up -d >/dev/null 2>&1; sleep 1; curl -s localhost:8077
+ Container mehmonxona-app-1 Removed 
+ Container mehmonxona-db-1 Removed 
+ Volume mehmonxona_pgdata Removed 
+ Network mehmonxona_default Removed 
+Salom! Siz 1-mehmonsiz
+```
+
+Теперь есть и `Volume mehmonxona_pgdata Removed`. База началась с нуля, создана с паролем из `.env`, гость снова
+первый.
+
+| Команда | Контейнеры | Сеть | Том (база) |
+|---|---|---|---|
+| `docker compose down` | удаляются | удаляется | **остаётся** |
+| `docker compose down -v` | удаляются | удаляется | **удаляется** |
+
+**Осторожно:** на сервере `docker compose down -v` безвозвратно удаляет все данные базы.
+
+## Postgres 18: новый путь тома
+
+Ещё одна новая ловушка, она пришла вместе с Postgres 18. В старых руководствах том подключают к папке
+`/var/lib/postgresql/data`. Запустим `postgres:18-alpine` с этим путём (`eski` («старый») — временный том, в конце он
+удаляется):
+
+```console
+$ docker run --rm -e POSTGRES_PASSWORD=x -v eski:/var/lib/postgresql/data postgres:18-alpine 2>&1 | grep -E -A1 '^Error|Counter|suggested'; docker volume rm eski >/dev/null
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" (specifically, using
+--
+       Counter to that, there appears to be PostgreSQL data in:
+         /var/lib/postgresql/data (unused mount/volume)
+--
+       The suggested container configuration for 18+ is to place a single mount
+       at /var/lib/postgresql which will then place PostgreSQL data in a
+```
+
+Контейнер не запустился. Сообщение длинное, `grep -A1` оставляет три его места:
+
+- *Error: in 18+, these Docker images are configured to store database data in a format which is compatible with
+  "pg_ctlcluster"* — «образы 18+ хранят данные в формате, совместимом с `pg_ctlcluster`»;
+- *Counter to that, there appears to be PostgreSQL data in: /var/lib/postgresql/data (unused mount/volume)* — «однако
+  в `/var/lib/postgresql/data`, похоже, есть данные PostgreSQL (неиспользуемое подключение/том)»;
+- *The suggested container configuration for 18+ is to place a single mount at /var/lib/postgresql* — «для 18+
+  рекомендуется одно подключение в `/var/lib/postgresql`».
+
+По документации официального образа на Docker Hub, начиная с 18-й версии `PGDATA` — папка с номером версии:
+`/var/lib/postgresql/18/docker`. А `VOLUME` образа переехал в `/var/lib/postgresql`. Папка с номером версии упрощает
+переход на следующую мажорную версию (через `pg_upgrade`): данные 18 и 19 могут лежать рядом в одном томе.
+
+| Образ | `PGDATA` | Куда подключать том |
+|---|---|---|
+| `postgres:17` и старше | `/var/lib/postgresql/data` | `/var/lib/postgresql/data` |
+| `postgres:18` и новее | `/var/lib/postgresql/18/docker` | `/var/lib/postgresql` |
+
+Если вы не меняли `PGDATA`, в 18+ подключайте том к `/var/lib/postgresql`. Именно так в 11-й строке нашего
+`compose.yaml`.
+
+Сервер переехал из файла в Postgres. Следующие лабораторные по базам данных и бэкенду работают именно в этом
+окружении. А следующий урок трека Sys — [SYS-1.01 · От наносекунд до миллисекунд](/lab/youtube/sys/sys-1-01/ru): таблицу задержек (latency) измерим сами.
+
+## Частые ошибки
+
+**1. «`depends_on` ждёт базу».** Самое распространённое заблуждение. `depends_on: [db]` задаёт только порядок
+запуска. На чистом томе сервер падает с `connect: connection refused`, а с готовой базой обычно работает (раздел
+«Вопрос»). **Исправление:** `healthcheck` у `db`, а у `app` —
+`depends_on: db: condition: service_healthy`.
+
+**2. `localhost` в `DATABASE_URL`.** Этого запуска нет в видео. `docker compose run` запускает одноразовый контейнер
+из сервиса `app`, а `-e` подменяет `DATABASE_URL` (пароль не важен: до подключения дело не доходит):
+
+```console
+$ docker compose run --rm -e DATABASE_URL='postgres://mehmon:x@localhost:5432/mehmonxona?sslmode=disable' app 2>&1 | grep -A2 '^server'
+server: baza: failed to connect to `user=mehmon database=mehmonxona`:
+	127.0.0.1:5432 (localhost): dial error: dial tcp 127.0.0.1:5432: connect: connection refused
+	[::1]:5432 (localhost): dial error: dial tcp [::1]:5432: connect: connection refused
+```
+
+pgx попробовал оба адреса `localhost` (IPv4 `127.0.0.1` и IPv6 `::1`), на обоих *connection refused*. Оба — сам
+контейнер `app`, там на 5432 никого нет. **Исправление:** имя хоста — имя сервиса: `@db:5432`.
+
+**3. `.env` скопирован, пароль не вписан.** Сделали `cp .env.example .env`, а `DB_PASSWORD=` остался пустым. Покажем
+это через `--env-file .env.example` (этого тоже нет в видео):
+
+```console
+$ docker compose --env-file .env.example up -d 2>&1 | tail -1
+error while interpolating services.db.environment.POSTGRES_PASSWORD: required variable DB_PASSWORD is missing a value: .env faylida DB_PASSWORD yoʻq
+```
+
+Сработал страж (`:?`): *required variable DB_PASSWORD is missing a value* — «у обязательной `DB_PASSWORD` нет
+значения». Контейнеры не созданы. **Исправление:** впишите пароль в `.env`. Без стража ошибка вышла бы куда менее
+понятной: по документации официального образа, `POSTGRES_PASSWORD` не должен быть пустым.
+
+**4. В томе есть база, а пароль в `.env` поменяли.** `password authentication failed for user "mehmon"` (раздел
+«Том»). `POSTGRES_*` работают только при пустой папке данных. **Исправление:** сначала
+`ALTER USER mehmon PASSWORD '…'`, потом `.env`; если данные не нужны — `down -v`.
+
+**5. Go-код изменился, а `up` запустил старый образ (тихая ошибка).** Ошибки нет, просто ваших изменений не видно
+(раздел «`compose.yaml` строка за строкой»). **Исправление:** `docker compose up -d --build`.
+
+**6. В Postgres 18 том подключён к `/var/lib/postgresql/data`.** Контейнер выходит с
+`Error: in 18+, these Docker images are configured…` (раздел «Postgres 18»). **Исправление:**
+`pgdata:/var/lib/postgresql`.
+
+**7. Порт базы открыт миру (тихий риск).** Часто встречается в руководствах: `ports: ["5432:5432"]` у `db`. Приложение
+подключается к базе по внутренней сети, порт ему не нужен. А `5432:5432` открывает базу на всех адресах хоста
+(`0.0.0.0` из SYS-0.05). Если на вашем компьютере на 5432 работает свой Postgres, то, по README курса, будет ещё и
+конфликт портов. **Исправление:** не пишите `ports` у `db`. Если нужно смотреть базу с хоста —
+`docker compose exec db psql …` или `ports: ["127.0.0.1:5433:5432"]`.
+
+**8. Пароль в репозитории или в чате.** Пароль вписан прямо в `compose.yaml` или выложен вывод `docker compose config`.
+**Исправление:** пароль только в `.env`, а `.env*` — в `.gitignore` (раздел «`.env`», GIT-1.02).
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Чем `depends_on: [db]` отличается от `depends_on: db: condition: service_healthy`?
+
+<details>
+<summary>Ответ</summary>
+
+Первое ждёт **запуска** контейнера `db`: процесс начался, а база может быть ещё не готова. Второе ждёт, пока пройдёт
+healthcheck `db`, то есть пока `pg_isready` по TCP не вернёт 0. Поэтому первое «работает» только на готовом томе, а
+второе — и на чистом компьютере.
+
+</details>
+
+**2.** В `.env` записано `DB_PASSWORD=parol-faqat-menda`. Вы пишете:
+`DB_PASSWORD=boshqa docker compose config | grep DATABASE_URL`. Какой пароль будет в `DATABASE_URL`?
+
+**A)** `parol-faqat-menda` · **B)** `boshqa` («другой») · **C)** compose увидит два значения и выдаст ошибку
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Переменная из окружения shell главнее `.env` (порядок из документации Docker: сначала shell, потом
+`--env-file`, потом `.env`).
+
+```console
+$ DB_PASSWORD=boshqa docker compose config | grep DATABASE_URL
+      DATABASE_URL: postgres://mehmon:boshqa@db:5432/mehmonxona?sslmode=disable
+```
+
+Если вы выбрали «A», вы считали `.env` главным источником. Эксперимент с `DB_PASSWORD=yangi-parol` из раздела «Том»
+опирался именно на это правило.
+
+</details>
+
+**3.** Что остаётся после `docker compose down`? А после `down -v`?
+
+<details>
+<summary>Ответ</summary>
+
+`down` удаляет контейнеры и сеть проекта, именованный том (`mehmonxona_pgdata`) остаётся: при следующем `up` счёт
+продолжится. `down -v` удаляет и том: база создаётся с нуля, с паролем из `.env`. На сервере `down -v` — конец всех
+данных базы.
+
+</details>
+
+**4.** Почему в healthcheck `pg_isready -h 127.0.0.1`, а не просто `pg_isready`?
+
+<details>
+<summary>Ответ</summary>
+
+Без `-h` `pg_isready` спрашивает через Unix-сокет. На чистом томе Postgres сначала запускает временный сервер только на
+Unix-сокете, а TCP ещё закрыт. Проверка через сокет может ответить «готов» слишком рано, а сервер подключается по TCP.
+`-h 127.0.0.1` проверяет тот путь, которым пользуется сервер.
+
+</details>
+
+**5.** Из SYS-0.05: чем `ports: ["8077:8077"]` отличается от `ports: ["127.0.0.1:8077:8077"]`?
+
+<details>
+<summary>Ответ</summary>
+
+`8077:8077` открывает порт на всех адресах хоста (`0.0.0.0` и `[::]`): на VPS он будет открыт в интернет.
+`127.0.0.1:8077:8077` открывает только на loopback-адресе: подключиться можно только с этого компьютера (например, из
+Nginx перед приложением). Оба варианта — форма `docker run -p` в compose.
+
+</details>
+
+## Домашнее задание
+
+Условия и ответы — в папке урока на GitHub:
+[lessons/sys-06-compose](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-06-compose).
+Ответы — в папке [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-06-compose/homework).
+Сначала попробуйте сами.
+
+- 🟢 **Легко:** берите порт приложения из переменной `APP_PORT`, а если её нет, пусть остаётся 8077.
+- 🟡 **Средне:** добавьте в `tuzoq.yaml` `restart: on-failure`. Восстановится ли сервер сам? Сколько раз он
+  перезапустился?
+- 🟠 **Сложно:** пусть всё работает и при перезапуске базы (и без healthcheck): Go-сервер сам ждёт базу. Напишите
+  `Ping` с повторными попытками и backoff (ожиданием, которое каждый раз растёт).
+- 🔴 **Гуру:** пароль лежит в переменной окружения: `docker inspect mehmonxona-db-1` показывает его открыто, дочерние
+  процессы его наследуют, при ошибке он может попасть в лог. Перенесите пароль в secret-файл, и пусть сервер тоже
+  читает его оттуда.
+
+Все ответы проверяет один скрипт (порты 8078 и 9000 должны быть свободны; если `.env` нет, скрипт сам создаст его из
+`.env.example`):
+
+```bash
+bash homework/javoblar.sh
+```
+
+<details>
+<summary>Ответ</summary>
+
+Вывод скрипта у нас (время и число попыток у вас могут немного отличаться):
+
+```console
+$ bash homework/javoblar.sh
+== Oson: APP_PORT=9000
+Salom! Siz 1-mehmonsiz
+== Oʻrta: restart: on-failure, healthcheck yoʻq
+app: Up 3 seconds
+db: Up 6 seconds
+app qayta ishga tushdi: 4 marta
+server: baza: failed to connect to `user=mehmon database=mehmonxona`: 172.20.0.2:5432 (db): dial error: dial tcp 172.20.0.2:5432: connect: connection refused
+server: bazaga ulandim
+server: :8077 da tinglayapman
+Salom! Siz 1-mehmonsiz
+== Qiyin: server bazani oʻzi kutadi, healthcheck yoʻq
+app: Up 6 seconds
+db: Up 6 seconds
+server: baza hali tayyor emas (4-urinish), 800ms kutaman
+server: bazaga ulandim
+server: :8077 da tinglayapman
+Salom! Siz 1-mehmonsiz
+== Guru: parol secret faylda
+Salom! Siz 1-mehmonsiz
+POSTGRES_PASSWORD_FILE=/run/secrets/db_parol
+DB_PASSWORD_FILE=/run/secrets/db_parol
+DATABASE_URL=postgres://mehmon@db:5432/mehmonxona?sslmode=disable
+total 4
+-r--r--r--    1 root     root            17 Nov 26 15:45 db_parol
+```
+
+🟢 Строка 25 файла `homework/oson.yaml`:
+
+```yaml
+      - "127.0.0.1:${APP_PORT:-8077}:8077"
+```
+
+`:-` — «если пусто или нет, значение по умолчанию», а `:?` — «если пусто или нет, ошибка». `APP_PORT=9000` можно
+записать в `.env` или задать в shell (`APP_PORT=9000 docker compose up -d`): shell главнее.
+
+🟡 `homework/orta.yaml` — это `tuzoq.yaml` + `restart: on-failure` у `app`. Сервер несколько раз падает с
+`connection refused`, Docker перезапускает его (у нас 4 раза), затем `bazaga ulandim`. Работает, но логи забиты
+ошибками, и настоящая ошибка (например, неверный пароль) теряется в этом шуме. Healthcheck всё равно нужен.
+
+🟠 Функция `ulan` («подключись») из `homework/qiyin/main.go`:
+
+```go
+func ulan(url string) (*pgxpool.Pool, error) {
+	db, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		return nil, err // manzil notoʻgʻri: qayta urinishdan foyda yoʻq
+	}
+	oxiri := time.Now().Add(30 * time.Second)
+	kutish := 100 * time.Millisecond
+	for urinish := 1; ; urinish++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = db.Ping(ctx)
+		cancel()
+		if err == nil {
+			return db, nil
+		}
+		if time.Now().Add(kutish).After(oxiri) {
+			db.Close()
+			return nil, err
+		}
+		fmt.Printf("server: baza hali tayyor emas (%d-urinish), %v kutaman\n", urinish, kutish)
+		time.Sleep(kutish)
+		kutish = min(kutish*2, 5*time.Second)
+	}
+}
+```
+
+Если `Ping` не удался, она ждёт и пробует снова. Ожидание каждый раз удваивается (`kutish*2`: 100, 200, 400, 800 мс…),
+но не больше 5 секунд (`min`), всего до 30 секунд (`oxiri`, «конец»). Это **экспоненциальный backoff** (exponential
+backoff): чтобы не заваливать запросами базу, которой и так тяжело. У каждой попытки свой срок — 2 секунды. Неверный
+адрес (ошибка `pgxpool.New`) возвращается сразу: ждать бесполезно. У нас подключилось после 4 неудачных попыток. `min` —
+встроенная функция с Go 1.21.
+
+🔴 В `homework/guru.yaml` пароль передаётся как **secret**:
+
+```yaml
+secrets:
+  db_parol:
+    environment: DB_PASSWORD   # qiymat .env dan olinadi, lekin container'ga fayl boʻlib tushadi
+```
+
+Значение берётся из `.env`, а в контейнер попадает как файл `/run/secrets/db_parol`. У `db` —
+`POSTGRES_PASSWORD_FILE: /run/secrets/db_parol` (официальный образ поддерживает суффикс `_FILE`). У `app`
+`DATABASE_URL` без пароля, а Go читает пароль из файла `DB_PASSWORD_FILE` и кладёт в `cfg.ConnConfig.Password`.
+`docker inspect` теперь показывает только `*_PASSWORD_FILE` и `DATABASE_URL` без пароля, а файл доступен только для
+чтения (`-r--r--r--`). Это защита от случайной утечки: документация Docker говорит, что передача паролей через
+переменные окружения грозит «unintentional information exposure» («непреднамеренным раскрытием информации»). Тот, кто
+может сделать `docker exec`, всё равно прочитает файл: без Swarm secret в compose — обычный подключённый файл.
+
+</details>
+
+## Источники
+
+- Docker Compose: [Overview](https://docs.docker.com/compose/) ·
+  [Application model / compose.yaml](https://docs.docker.com/compose/intro/compose-application-model/) ·
+  [Version and name (`version` устарел)](https://docs.docker.com/reference/compose-file/version-and-name/) ·
+  [Startup order (`depends_on`, `service_healthy`)](https://docs.docker.com/compose/how-tos/startup-order/) ·
+  [Interpolation (`.env`, порядок приоритета, `${VAR:?error}`)](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/) ·
+  [Networking in Compose](https://docs.docker.com/compose/how-tos/networking/) ·
+  [docker compose up (`--build`)](https://docs.docker.com/reference/cli/docker/compose/up/) ·
+  [docker compose down (`-v`)](https://docs.docker.com/reference/cli/docker/compose/down/) ·
+  [docker compose config](https://docs.docker.com/reference/cli/docker/compose/config/) ·
+  [Services: `restart`](https://docs.docker.com/reference/compose-file/services/) ·
+  [Build](https://docs.docker.com/reference/compose-file/build/) ·
+  [Secrets](https://docs.docker.com/compose/how-tos/use-secrets/)
+- Docker: [Dockerfile HEALTHCHECK (`start-period`, `start-interval`)](https://docs.docker.com/reference/dockerfile/#healthcheck) ·
+  [Bridge network (DNS by name)](https://docs.docker.com/engine/network/drivers/bridge/)
+- Postgres: [Docker Hub postgres (`POSTGRES_*`, `_FILE`, 18+ `PGDATA`)](https://hub.docker.com/_/postgres) ·
+  [docker-library/postgres PR #1259](https://github.com/docker-library/postgres/pull/1259) ·
+  [docker-entrypoint.sh (`listen_addresses=''`)](https://github.com/docker-library/postgres/blob/master/docker-entrypoint.sh) ·
+  [pg_isready](https://www.postgresql.org/docs/18/app-pg-isready.html)
+- Go: [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool) ·
+  [pool.go v5.13.0: NewWithConfig, `defaultMinConns`](https://github.com/jackc/pgx/blob/v5.13.0/pgxpool/pool.go#L228-L233)
+- Kubernetes: [Init containers](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/) (в оркестраторах
+  нет `depends_on`, приложение должно ждать базу само)
+- Папка курса и README: [lessons/sys-06-compose](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-06-compose)
+- Все выводы получены повторным запуском 2026-11-26 на Docker Engine 29.8.1, Docker Compose 5.4.0, `postgres:18-alpine`
+  (PostgreSQL 18.7), pgx v5.13.0, `golang:1.26.8` (go1.26.8 linux/amd64), Linux 6.18. От записи видео (2026-11-25)
+  отличаются только значения времени (`time=`, `vaqt` в psql). Время запуска Postgres, статистика гонки (8/8, 6/6),
+  окно сокета и эксперимент с `up --build` взяты из измерений при подготовке видео, мы их не перемеряли.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/sys-06-compose)
+
+---
+
+← Предыдущий урок: [SYS-0.05](/lab/youtube/sys/sys-0-05/ru) · Следующий урок: [SYS-1.01](/lab/youtube/sys/sys-1-01/ru) → · [Все уроки](/lab/youtube/sys)
+
+</div>
