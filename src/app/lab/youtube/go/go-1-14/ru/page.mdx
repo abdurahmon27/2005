@@ -1,0 +1,1541 @@
+---
+title: "Ошибка — тоже значение: %w, errors.Is, AsType и Join"
+date: "2026/11/26"
+description: "Обёртывание ошибок через %w, поиск в цепочке через errors.Is и errors.AsType, errors.Join и исправление nil-проверки в Go 1.25."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-14/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-14"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-14/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-14/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-14"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-14) · **Русский** · [English](/lab/youtube/go/go-1-14/en)  
+Урок GO-1.14 · [Go: 0 → Guru](/lab/youtube/go#go-1-14) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/014-errors-values)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Одна программа на Go 1.24.13 печатает `xato: buyurtma topilmadi` («ошибка: заказ не найден») и тихо завершается.
+Та же программа на Go 1.26.8 падает с `panic`. В коде не изменился ни один символ. Какая версия права: старая или
+новая? Ответ откроем в конце урока. Сначала разберёмся, каким значением в Go является ошибка.
+
+**Одна идея:** в Go ошибка — не исключение, которое бросают через `throw`, а обычное значение, которое функция
+возвращает. Поэтому её можно обернуть через `%w`, добавив контекст, найти внутри цепочки через `errors.Is` и
+`errors.AsType` и собрать несколько ошибок через `errors.Join`. Условие одно: ошибку нужно проверить до того, как
+используете результат.
+
+К концу урока вы:
+
+- поймёте разницу между `%w` и `%v`: сможете добавить к ошибке контекст и скажете, когда оборачивать не нужно;
+- будете проверять обёрнутую ошибку через `errors.Is`, а не `==`, а тип ошибки — через `errors.AsType`
+  (Go 1.26);
+- сможете собрать несколько ошибок в одно значение через `errors.Join`;
+- объясните и исправите nil pointer panic, который внезапно появляется в Go 1.25.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| sentinel-ошибка | готовое значение ошибки, созданное один раз на уровне пакета, с которым сравнивает вызывающий код: `io.EOF`, `sql.ErrNoRows` | sentinel error |
+| обёртывание | добавить к ошибке контекст и сохранить исходную ошибку внутри: `fmt.Errorf("…: %w", err)` | wrapping |
+| цепочка ошибок | обёрнутая ошибка → ошибка внутри неё → … ; раскрывается слой за слоем через `Unwrap` | error chain |
+
+По дороге встретятся ещё два вспомогательных слова: **`GOTOOLCHAIN`** (переменная, которая говорит команде go,
+какую версию Go использовать) и **аргумент типа** в квадратных скобках (`errors.AsType[*SummaXato]`, type
+argument). Оба объясним там, где они понадобятся.
+
+## Что нужно знать заранее
+
+- [GO-1.13 · Интерфейсы: почему nil не равен nil?](/lab/youtube/go/go-1-13/ru): значение интерфейса — пара (тип, значение);
+  два интерфейса равны, только если совпадают и тип, и значение; type assertion `x.(T)` и comma ok; typed nil и
+  правило «если ошибки нет, возвращайте явный `nil`».
+- [GO-1.12 · Методы: value receiver или pointer receiver?](/lab/youtube/go/go-1-12/ru): method set. Метод
+  `func (e *SummaXato) Error()` принадлежит только `*SummaXato`, а не `SummaXato`.
+- [GO-1.11 · Указатели: почему эта переменная сбежала в кучу?](/lab/youtube/go/go-1-11/ru): `&`, `*`, чтение поля через nil
+  указатель → panic, `-gcflags=-m` и `moved to heap`.
+- [GO-1.07 · Не гадайте, измеряйте: первый тест и бенчмарк](/lab/youtube/go/go-1-07/ru): `go test -bench . -benchmem`,
+  `for b.Loop()`, столбцы `ns/op`, `B/op`, `allocs/op`.
+- [GO-1.06 · Функции: два возвращаемых значения, замыкания и variadic](/lab/youtube/go/go-1-06/ru): возврат
+  `(значение, error)`, `if err != nil`, variadic-параметр `...`.
+- [GO-X.03 · Нет try/catch: значение error и defer](/lab/youtube/go#go-x-03): почему в Go нет исключений. Этот урок
+  продолжает ту же идею.
+- Большинство программ можно скопировать в [go.dev/play](https://go.dev/play) и запустить кнопкой **Run**
+  (для `errors.AsType` нужен Go 1.26 или новее). Для `tartib/` (у него свой `go.mod`, и он скачивает несколько
+  версий Go), бенчмарка `tezlik/`, `go vet` и staticcheck нужен Go на вашем компьютере: откройте терминал в папке
+  курса (`lessons/014-errors-values`), все команды запускаются оттуда.
+- Результаты получены на `go1.26.8`.
+
+Сначала вспомним прошлый урок. Что даст `tekshir(100) == nil`? (`tekshir` — «проверить», `SummaXato` — «ошибка
+суммы», сообщение `summa notoʻgʻri` — «неверная сумма».)
+
+```go
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func tekshir(summa int64) error {
+	var sx *SummaXato
+	if summa <= 0 {
+		sx = &SummaXato{Summa: summa}
+	}
+	return sx
+}
+```
+
+<details>
+<summary>Ответ</summary>
+
+**`false`.** Сумма верная, поэтому `sx` остаётся nil-указателем. Но `return sx` кладёт его в интерфейс `error`:
+внутри есть тип (`*SummaXato`), а значение — nil. Интерфейс равен `nil`, только когда пусты и тип, и значение. Эта
+ловушка typed nil сегодня вернётся в `errors.Join`. Полная программа (её нет в папке курса, запущена отдельно):
+
+```go
+package main
+
+import "fmt"
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func tekshir(summa int64) error {
+	var sx *SummaXato
+	if summa <= 0 {
+		sx = &SummaXato{Summa: summa}
+	}
+	return sx
+}
+
+func main() {
+	err := tekshir(100)
+	fmt.Println(err == nil)
+}
+```
+
+```console
+$ go run eslash/main.go
+false
+```
+
+</details>
+
+## Загадка: один код, две версии Go
+
+Функция `main` из `tartib/main.go` в папке курса:
+
+```go
+func main() {
+	b, err := top(42)
+	summa := b.Summa // XATO: err hali tekshirilmagan, b esa nil
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("summa:", summa)
+```
+
+Функция `top` («найти») возвращает `(*Buyurtma, error)` (`Buyurtma` — «заказ»). Заказа 42 нет, поэтому она
+возвращает `nil, ErrTopilmadi` («заказ не найден»). А код читает `b.Summa` (`summa` — «сумма») **до** проверки
+`err`, хотя `b` равен nil.
+
+`tartib/` — отдельный модуль (у него свой `go.mod`), поэтому команда сначала переходит в эту папку (`cd tartib`).
+`GOTOOLCHAIN=go1.24.13` говорит команде go использовать именно эту версию Go: при необходимости она скачивает её с
+`proxy.golang.org` (в первый раз, ~70 МБ). `-trimpath` делает пути к файлам в сообщениях об ошибках короткими.
+
+```console
+$ cd tartib && GOTOOLCHAIN=go1.24.13 go run -trimpath .
+xato: buyurtma topilmadi
+```
+
+Go 1.24.13: ошибка аккуратно выведена, программа завершилась с кодом 0. Теперь тот же код на Go 1.26.8:
+
+```console
+$ cd tartib && GOTOOLCHAIN=go1.26.8 go run -trimpath .
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x49e154]
+
+goroutine 1 [running]:
+main.main()
+	tartib/main.go:29 +0x14
+exit status 2
+```
+
+Строка 29 — это `summa := b.Summa`. Один код, два поведения. Какое из них правильное и почему до Go 1.25 эта
+программа не падала? Ответ — в разделе «Возвращаемся к загадке».
+
+## Ошибка — обычное значение
+
+Функция может не справиться: заказ не найден, сумма неверная. В JS для этого делают `throw`, в Python — `raise`, в
+PHP — `throw`. Ошибка выходит из функции отдельным путём и поднимается по стеку до первого подходящего `catch` /
+`except`. В Go исключений нет. Ошибка — обычное значение, которое функция **возвращает**, обычно последним
+возвращаемым значением. Официальный FAQ Go объясняет причину: если привязать исключения к управляющей конструкции,
+как в try-catch-finally, это *"results in convoluted code"* — «приводит к запутанному коду».
+
+Вот как тип `error` объявлен в самом Go:
+
+```console
+$ sed -n 315,319p $(go env GOROOT)/src/builtin/builtin.go
+// The error built-in interface type is the conventional interface for
+// representing an error condition, with the nil value representing no error.
+type error interface {
+	Error() string
+}
+```
+
+`error` — интерфейс с одним методом `Error() string` ([GO-1.13](/lab/youtube/go/go-1-13/ru)). Любой тип с этим методом может
+быть ошибкой. `nil` означает «ошибки нет». Ошибка обычно идёт последним возвращаемым значением: этого требует
+проверка ST1008 в staticcheck (*"A function's error value should be its last return value"*).
+
+Самую простую ошибку создаёт `errors.New`: она хранит только текст. Мы сохраняем её в переменной уровня пакета
+(`wrap/main.go`, строки 10–17):
+
+```console
+$ sed -n 10,17p wrap/main.go
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func top(id int) error {
+	if id != 7 {
+		return ErrTopilmadi
+	}
+	return nil
+}
+```
+
+`ErrTopilmadi` («заказ не найден») — одно значение, которое создаётся один раз при запуске пакета. Вызывающий код
+сравнивает ошибку именно с этим значением. Такую ошибку называют **sentinel-ошибкой** (sentinel error): так
+устроены `io.EOF` («конец файла») и `sql.ErrNoRows` («строк нет») в стандартной библиотеке. Отличие от
+`except TopilmadiError` в Python: здесь проверяется не класс ошибки, а одно конкретное значение.
+
+Раз ошибка — обычное значение, с ней можно писать обычный код: хранить, сравнивать, оборачивать, собирать. Об этом
+статья Роба Пайка 2015 года: *"Errors are values. Values can be programmed, and since errors are values, errors can
+be programmed."* — «Ошибки — это значения. Значения можно программировать, а раз ошибки — значения, программировать
+можно и ошибки».
+
+## %v или %w: текст одинаковый, внутри разное
+
+Когда ошибка поднимается вверх, ей нужен контекст: в каком заказе она произошла? Для этого есть `fmt.Errorf`: он
+собирает текст, как `fmt.Sprintf`, но возвращает результат как `error`. Исходную ошибку можно вставить в текст
+двумя способами: `%v` или `%w`. `wrap/main.go` из папки курса:
+
+```go filename="wrap/main.go" showLineNumbers
+// wrap: %v xatoni matnga aylantiradi, %w esa asl xatoni ichida saqlaydi.
+// go run ./wrap
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func top(id int) error {
+	if id != 7 {
+		return ErrTopilmadi
+	}
+	return nil
+}
+
+func olishV(id int) error {
+	if err := top(id); err != nil {
+		return fmt.Errorf("buyurtma %d: %v", id, err) // faqat matn qoladi
+	}
+	return nil
+}
+
+func olishW(id int) error {
+	if err := top(id); err != nil {
+		return fmt.Errorf("buyurtma %d: %w", id, err) // asl xato ichida
+	}
+	return nil
+}
+
+func main() {
+	for _, x := range []struct {
+		nom string
+		err error
+	}{{"oddiy", top(42)}, {"%v", olishV(42)}, {"%w", olishW(42)}} {
+		fmt.Printf("%-5s  %-34q ==: %-5v  errors.Is: %v\n",
+			x.nom, x.err.Error(), x.err == ErrTopilmadi, errors.Is(x.err, ErrTopilmadi))
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10 | `var ErrTopilmadi = errors.New(…)` | sentinel-ошибка |
+| 12–17 | `func top(id int) error` | существует только заказ 7; для любого другого `id` возвращает сам `ErrTopilmadi` |
+| 19–24 | `func olishV(…)` | `olish` — «получить»: добавляет к ошибке контекст `buyurtma 42: ` («заказ 42: ») и вставляет исходную ошибку через `%v` |
+| 20 | `if err := top(id); err != nil {` | короткая форма `if`: `err` виден только внутри этого `if` |
+| 21 | `fmt.Errorf("buyurtma %d: %v", id, err)` | `%d` — целое число, `%v` — стандартный вид значения; для ошибки это текст `err.Error()` |
+| 26–31 | `func olishW(…)` | то же самое, только через `%w` (строка 28) |
+| 34–37 | `for _, x := range []struct{…}{…}` | таблица из трёх случаев: слайс анонимных структур (`nom` — «имя», `err` — ошибка), как table test в [GO-1.07](/lab/youtube/go/go-1-07/ru) |
+| 38 | `fmt.Printf("%-5s  %-34q …")` | `%-5s` — поле в 5 символов с выравниванием влево; `%q` выводит текст в кавычках |
+| 39 | `x.err == ErrTopilmadi`, `errors.Is(x.err, ErrTopilmadi)` | две разные проверки: обычное равенство и `errors.Is` |
+
+`errors.Is(err, target)` задаёт вопрос: «есть ли где-то внутри `err` значение `target`?» Как он ищет, разберём в
+следующем разделе.
+
+Подумайте до запуска: что дадут `==` и `errors.Is` в строках `%v` и `%w`?
+
+**A)** в обеих `==: true`, ведь внутри тот же `ErrTopilmadi` · **B)** в обеих `==: false`; `errors.Is` равен
+`true` только для `%w` · **C)** в обеих `==: false`, и `errors.Is` в обеих `true`, ведь в тексте есть «buyurtma
+topilmadi»
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `fmt.Errorf` всегда создаёт **новое** значение ошибки, поэтому оно не `==` `ErrTopilmadi`. `%v` берёт у
+исходной ошибки только текст, а `%w` сохраняет внутри саму исходную ошибку. `errors.Is` на текст не смотрит: он
+ищет значения внутри и находит их только для `%w`. Если вы выбрали «A», вы думали, что `fmt.Errorf` возвращает
+исходную ошибку. Если выбрали «C», вы думали, что `errors.Is` сравнивает текст.
+
+</details>
+
+```console
+$ go run ./wrap
+oddiy  "buyurtma topilmadi"               ==: true   errors.Is: true
+%v     "buyurtma 42: buyurtma topilmadi"  ==: false  errors.Is: false
+%w     "buyurtma 42: buyurtma topilmadi"  ==: false  errors.Is: true
+```
+
+Текст в обоих случаях одинаковый: `"buyurtma 42: buyurtma topilmadi"`. Разница внутри. Блог Go говорит так:
+создание новой ошибки через `fmt.Errorf` *"discards everything from the original error except the text"* —
+«отбрасывает у исходной ошибки всё, кроме текста». Именно поэтому и появился `%w` (с Go 1.13).
+
+Что лежит внутри каждого интерфейса `x.err`? Выведем типы через `%T` (этой программы нет в папке курса, она
+запущена отдельно):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func main() {
+	v := fmt.Errorf("buyurtma 42: %v", ErrTopilmadi)
+	w := fmt.Errorf("buyurtma 42: %w", ErrTopilmadi)
+	fmt.Printf("oddiy  %T\n", ErrTopilmadi)
+	fmt.Printf("%%v     %T\n", v)
+	fmt.Printf("%%w     %T\n", w)
+}
+```
+
+```console
+$ go run turlar/main.go
+oddiy  *errors.errorString
+%v     *errors.errorString
+%w     *fmt.wrapError
+```
+
+(`%%` выводит в `Printf` обычный знак `%`.) Теперь картинка:
+
+| Строка | внутри интерфейса: тип | внутри интерфейса: значение | `== ErrTopilmadi` | `errors.Is` |
+|---|---|---|---|---|
+| oddiy (простая) | `*errors.errorString` | сам `ErrTopilmadi` (тот же указатель) | `true` | `true` |
+| `%v` | `*errors.errorString` | **новый** указатель, текст `buyurtma 42: …` | `false`: тип тот же, указатель другой | `false`: исходной ошибки внутри нет |
+| `%w` | `*fmt.wrapError` | текст + ссылка на исходную ошибку | `false`: другой тип | `true`: `Unwrap()` возвращает исходную ошибку |
+
+Правило из [GO-1.13](/lab/youtube/go/go-1-13/ru): два интерфейса равны, только если совпадают и их типы, и их значения. У
+`%v` тип тот же, но значение (указатель) новое. У `%w` отличается даже тип. Значит, **обёрнутую ошибку нельзя
+проверять через `==`**. Добавление контекста с сохранением исходной ошибки внутри называется **обёртыванием**
+(wrapping): `%w` оборачивает, `%v` — нет.
+
+## Цепочка: errors.Unwrap и что внутри errors.Is
+
+В реальной программе ошибку оборачивают несколько раз: хранилище → заказ → оплата. `zanjir/main.go` (`zanjir` —
+«цепочка»):
+
+```go filename="zanjir/main.go" showLineNumbers
+// zanjir: %w bilan oʻralgan xatolar zanjiri. errors.Unwrap har safar bitta qavatni ochadi.
+// go run ./zanjir
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func top(id int) error { return ErrTopilmadi }
+
+func olish(id int) error {
+	if err := top(id); err != nil {
+		return fmt.Errorf("buyurtma %d: %w", id, err)
+	}
+	return nil
+}
+
+func tolov(id int) error {
+	if err := olish(id); err != nil {
+		return fmt.Errorf("toʻlov: %w", err)
+	}
+	return nil
+}
+
+func main() {
+	err := tolov(42)
+	for i, e := 0, err; e != nil; i, e = i+1, errors.Unwrap(e) {
+		fmt.Printf("%d  %-20T  %s\n", i, e, e)
+	}
+	fmt.Println("errors.Is(err, ErrTopilmadi):", errors.Is(err, ErrTopilmadi))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 12 | `func top(id int) error { return ErrTopilmadi }` | всегда возвращает sentinel-ошибку |
+| 14–19 | `func olish(…)` | слой 1: добавляет `buyurtma 42: `, через `%w` |
+| 21–26 | `func tolov(…)` | слой 2: `tolov` — «оплата», добавляет `toʻlov: `, снова через `%w` |
+| 30 | `for i, e := 0, err; e != nil; i, e = i+1, errors.Unwrap(e) {` | `for` с двумя переменными: начинает с `e` и на каждом круге цикла (итерации) спускается на слой ниже через `errors.Unwrap(e)`; останавливается, когда `e` равен nil |
+| 31 | `fmt.Printf("%d  %-20T  %s\n", i, e, e)` | номер слоя, его тип (`%T`) и текст (`%s`) |
+| 33 | `errors.Is(err, ErrTopilmadi)` | ищет, начиная с самой внешней ошибки |
+
+`errors.Unwrap(e)`: если у `e` есть метод `Unwrap() error`, вызывает его и возвращает ошибку изнутри; иначе
+возвращает `nil`. Каждый `fmt.Errorf` с `%w` создаёт новую ошибку с таким методом.
+
+Подумайте: сколько строк выведет цикл? **A)** 1 · **B)** 2 · **C)** 3
+
+<details>
+<summary>Ответ</summary>
+
+**C: 3.** Два вызова `fmt.Errorf` — две обёртки, а внутри них сам `ErrTopilmadi`. У третьего слоя
+(`ErrTopilmadi`) метода `Unwrap` нет, поэтому `errors.Unwrap` возвращает `nil`, и цикл заканчивается. Если вы
+выбрали «B», вы не посчитали самую внутреннюю ошибку.
+
+</details>
+
+```console
+$ go run ./zanjir
+0  *fmt.wrapError        toʻlov: buyurtma 42: buyurtma topilmadi
+1  *fmt.wrapError        buyurtma 42: buyurtma topilmadi
+2  *errors.errorString   buyurtma topilmadi
+errors.Is(err, ErrTopilmadi): true
+```
+
+Это **цепочка ошибок** (error chain):
+
+```text
+err ─► 0: *fmt.wrapError      "toʻlov: buyurtma 42: buyurtma topilmadi"
+            │ Unwrap()
+            ▼
+       1: *fmt.wrapError      "buyurtma 42: buyurtma topilmadi"
+            │ Unwrap()
+            ▼
+       2: *errors.errorString "buyurtma topilmadi"   ◄── то же значение, что ErrTopilmadi
+            │ метода Unwrap нет
+            ▼
+          конец цепочки (errors.Unwrap → nil)
+```
+
+`errors.Is` идёт по той же цепочке. Вот что у него внутри (`errors/wrap.go`, go1.26.8):
+
+```console
+$ sed -n 54,75p $(go env GOROOT)/src/errors/wrap.go
+func is(err, target error, targetComparable bool) bool {
+	for {
+		if targetComparable && err == target {
+			return true
+		}
+		if x, ok := err.(interface{ Is(error) bool }); ok && x.Is(target) {
+			return true
+		}
+		switch x := err.(type) {
+		case interface{ Unwrap() error }:
+			err = x.Unwrap()
+			if err == nil {
+				return false
+			}
+		case interface{ Unwrap() []error }:
+			for _, err := range x.Unwrap() {
+				if is(err, target, targetComparable) {
+					return true
+				}
+			}
+			return false
+		default:
+```
+
+На каждом слое три шага:
+
+1. `err == target` сравнивает саму ошибку (`targetComparable` — можно ли сравнивать тип `target` через `==`;
+   например, структуру со слайсом внутри нельзя).
+2. Если у ошибки есть собственный метод `Is(error) bool`, он вызывается: тип может сам решить «я равен этой
+   ошибке».
+3. Type switch ([GO-1.13](/lab/youtube/go/go-1-13/ru)): при `Unwrap() error` спускается на слой ниже и повторяет цикл; при
+   `Unwrap() []error` проверяет каждую ветку отдельно (это для `errors.Join`, увидим ниже); если нет ни того, ни
+   другого (`default`), возвращает `false`.
+
+## Сравниваем с JS, Python и PHP
+
+Оборачивать ошибки умеют и другие языки. Три одинаковые программы: внутренняя функция бросает ошибку «не найдено»,
+внешний код оборачивает её с контекстом и бросает снова. Этих файлов нет в папке курса, они запущены отдельно
+(Node.js 24, Python 3.13, PHP 8.4).
+
+```js
+class TopilmadiError extends Error {}
+
+function top(id) {
+  throw new TopilmadiError("buyurtma topilmadi");
+}
+
+try {
+  try {
+    top(42);
+  } catch (e) {
+    throw new Error(`buyurtma 42: ${e.message}`, { cause: e });
+  }
+} catch (e) {
+  console.log(e.message);
+  console.log("instanceof:      ", e instanceof TopilmadiError);
+  console.log("cause instanceof:", e.cause instanceof TopilmadiError);
+}
+```
+
+```python
+class TopilmadiError(Exception):
+    pass
+
+def top(id):
+    raise TopilmadiError("buyurtma topilmadi")
+
+try:
+    try:
+        top(42)
+    except TopilmadiError as e:
+        raise RuntimeError(f"buyurtma 42: {e}") from e
+except TopilmadiError:
+    print("except TopilmadiError ishladi")
+except RuntimeError as e:
+    print("except RuntimeError:", e)
+    print("__cause__:", type(e.__cause__).__name__)
+```
+
+```php
+<?php
+class TopilmadiException extends Exception {}
+
+function top($id) {
+    throw new TopilmadiException("buyurtma topilmadi");
+}
+
+try {
+    try {
+        top(42);
+    } catch (TopilmadiException $e) {
+        throw new RuntimeException("buyurtma 42: " . $e->getMessage(), 0, $e);
+    }
+} catch (TopilmadiException $e) {
+    echo "catch TopilmadiException ishladi\n";
+} catch (RuntimeException $e) {
+    echo "catch RuntimeException: ", $e->getMessage(), "\n";
+    echo "getPrevious: ", get_class($e->getPrevious()), "\n";
+}
+```
+
+```console
+$ node wrap.js
+buyurtma 42: buyurtma topilmadi
+instanceof:       false
+cause instanceof: true
+$ python3 wrap.py
+except RuntimeError: buyurtma 42: buyurtma topilmadi
+__cause__: TopilmadiError
+$ php wrap.php
+catch RuntimeException: buyurtma 42: buyurtma topilmadi
+getPrevious: TopilmadiException
+```
+
+Во всех трёх языках исходная ошибка сохраняется (`cause`, `__cause__`, `getPrevious()`), но `instanceof`, `except`
+и `catch` смотрят только на **самую внешнюю** ошибку. Если после обёртывания нужно поймать «не найдено», цепочку
+придётся обходить вручную.
+
+| | Обёртывание | На один слой внутрь | Поиск по цепочке |
+|---|---|---|---|
+| JS / TS | `new Error(msg, { cause: e })` (ES2022) | `e.cause` | вручную: `instanceof` проверяет только внешнюю ошибку |
+| Python | `raise … from e` | `e.__cause__` | вручную: `except` ловит только внешнюю ошибку |
+| PHP | `new RuntimeException($msg, 0, $e)` | `$e->getPrevious()` | вручную: `catch` ловит только внешнюю ошибку |
+| Go | `fmt.Errorf("…: %w", err)` | `errors.Unwrap(err)` | `errors.Is`, `errors.AsType` проходят всю цепочку |
+
+Go отличается в двух местах. Во-первых, ошибка не «улетает» по стеку сама: это возвращаемое значение, и каждый
+вызывающий видит её явно через `if err != nil`. Во-вторых, проверка (`errors.Is`) сама проходит по цепочке, поэтому
+контекст, добавленный в среднем слое, не ломает проверку у вызывающего.
+
+## Когда не нужно оборачивать
+
+Оборачивать каждую ошибку через `%w` не обязательно. Статья «Working with Errors in Go 1.13» в блоге Go
+предупреждает: *"wrapping an error makes that error part of your API"* — «обернув ошибку, вы делаете её частью API
+вашего пакета».
+
+Пример: ваша функция `BuyurtmaTop` читает из PostgreSQL и оборачивает ошибку `sql.ErrNoRows` из `database/sql`
+через `%w`. Теперь вызывающий код пишет `errors.Is(err, sql.ErrNoRows)` и привязывается к тому, что вы используете
+SQL. Если завтра вы перенесёте хранилище в другую систему, `sql.ErrNoRows` больше не вернётся, и их код тихо
+сломается.
+
+Если хотите скрыть внутреннюю деталь, используйте `%v`. Как сказано в статье, *"whether you wrap or not, the error
+text will be the same"* — «оборачиваете вы или нет, текст ошибки будет тем же». Style guide Uber для Go советует
+то же: `%w`, если вызывающему нужна исходная ошибка, `%v`, если её нужно скрыть.
+
+| Ситуация | Что писать |
+|---|---|
+| вызывающий должен проверить исходную ошибку (ваш собственный `ErrTopilmadi`) | `fmt.Errorf("buyurtma %d: %w", id, err)` |
+| исходная ошибка — внутренняя деталь (`sql.ErrNoRows`, ошибка сторонней библиотеки) | `fmt.Errorf("buyurtma %d: %v", id, err)` |
+
+## errors.As и errors.AsType: достаём свой тип из ошибки
+
+Sentinel-ошибка отвечает на вопрос «что случилось». Но иногда нужны **данные** внутри ошибки: какой была сумма?
+Для этого пишем свой тип ошибки: `SummaXato` («ошибка суммы») с полем `Summa` внутри. В Python это было бы
+`except SummaError as e: print(e.summa)`, в JS —
+`if (e instanceof SummaError) console.log(e.summa)`. В Go для этого две функции. `astype/main.go`:
+
+```go filename="astype/main.go" showLineNumbers
+// astype: oʻralgan xatodan oʻz turimizni olish. errors.As (Go 1.13) va errors.AsType (Go 1.26).
+// go run ./astype
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Buyurtma struct {
+	ID    int
+	Summa int64
+}
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func saqla(b Buyurtma) error {
+	if b.Summa <= 0 {
+		return fmt.Errorf("buyurtma %d: %w", b.ID, &SummaXato{Summa: b.Summa})
+	}
+	return nil
+}
+
+func main() {
+	err := saqla(Buyurtma{ID: 9, Summa: -5})
+	fmt.Println("err:", err)
+
+	// eski usul (Go 1.13): avval oʻzgaruvchi, keyin uning manzili
+	var sx *SummaXato
+	if errors.As(err, &sx) {
+		fmt.Println("As:     summa =", sx.Summa)
+	}
+
+	// yangi usul (Go 1.26): tur qavs ichida, natija qaytadi
+	if sx, ok := errors.AsType[*SummaXato](err); ok {
+		fmt.Println("AsType: summa =", sx.Summa)
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 15 | `type SummaXato struct{ Summa int64 }` | наш собственный тип ошибки, одно поле |
+| 17 | `func (e *SummaXato) Error() string` | написан с **pointer receiver**: `error` реализует только `*SummaXato` ([GO-1.12](/lab/youtube/go/go-1-12/ru)) |
+| 19–24 | `func saqla(…)` | `saqla` — «сохранить»: если сумма ≤ 0, возвращает `&SummaXato{…}`, обёрнутый через `%w` |
+| 31 | `var sx *SummaXato` | пустая (nil) переменная-указатель для `errors.As` |
+| 32 | `errors.As(err, &sx)` | проходит по цепочке; если находит `*SummaXato`, записывает его в `sx` и возвращает `true`. Поэтому передаётся **адрес** `sx` (`&sx`) |
+| 37 | `sx, ok := errors.AsType[*SummaXato](err)` | `[*SummaXato]` — искомый тип. Возвращаются результат и `ok`; `sx` существует только внутри этого `if` |
+
+`errors.As` есть с Go 1.13. `errors.AsType` добавили в Go 1.26. Тип в квадратных скобках — **аргумент типа** (type
+argument): функции передаётся не значение, а тип (это дженерики, их разберём в [GO-1.17](/lab/youtube/go#go-1-17)).
+Объявление `AsType` — `func AsType[E error](err error) (E, bool)`: `E` может быть любым типом, лишь бы он
+реализовывал `error`. Форма `sx, ok := …` похожа на type assertion `err.(*SummaXato)` из [GO-1.13](/lab/youtube/go/go-1-13/ru).
+Разница: type assertion смотрит только на самое внешнее значение, а `AsType` проходит всю цепочку.
+
+```console
+$ go run ./astype
+err: buyurtma 9: summa notoʻgʻri: -5
+As:     summa = -5
+AsType: summa = -5
+```
+
+Обе дали один и тот же результат: `SummaXato` нашёлся, хотя он внутри обёртки `buyurtma 9: `. Зачем тогда новая
+функция? Release notes Go 1.26: *"The new AsType function is a generic version of As. It is type-safe, faster, and,
+in most cases, easier to use."* — «типобезопасна, быстрее и в большинстве случаев удобнее». В следующих двух
+разделах проверим «type-safe» и «faster».
+
+## Type-safe: кто поймает вашу ошибку?
+
+Разница видна, когда программист ошибается. В `asxato/` у `errors.As` забыт `&`:
+
+```console
+$ sed -n 18p asxato/main.go
+	if errors.As(err, sx) { // & yoʻq
+```
+
+Остальное как в `astype/`: `err` — обёрнутый `*SummaXato`, `sx` — `var sx *SummaXato`. Что произойдёт?
+
+**A)** ошибка компиляции · **B)** скомпилируется, а при запуске panic · **C)** запустится, и `errors.As` просто
+вернёт `false`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Объявление `errors.As` — `func As(err error, target any) bool`: второй параметр `any`, то есть любое
+значение. Компилятор ничего не отвергает. `As` проверяет во время выполнения: `target` должен быть ненулевым
+указателем, а `sx` равен nil — panic. Если вы выбрали «A», вы думали, что компилятор проверяет, что попадает в
+`any`. Если выбрали «C», вы думали, что неверный аргумент тихо даёт `false`.
+
+</details>
+
+`2>&1 | head -1` показывает только первую строку сообщения panic:
+
+```console
+$ go run ./asxato 2>&1 | head -1
+panic: errors: target must be a non-nil pointer
+```
+
+*target must be a non-nil pointer* — «target должен быть ненулевым указателем». Это ловит не компилятор, а
+`go vet` (его проверка `errorsas`):
+
+```console
+$ go vet ./asxato
+asxato/main.go:18:5: second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type
+```
+
+«Второй аргумент `errors.As` должен быть ненулевым указателем либо на тип, реализующий `error`, либо на любой тип
+интерфейса». `go test` тоже запускает эту проверку автоматически: по `go help test`, перед тестами работает надёжная
+часть проверок `go vet` (*"atomic, bool, buildtags, directive, errorsas, …"*). А вот `go run` и `go build` её не
+запускают.
+
+Теперь ошибёмся с `errors.AsType`. В `astypexato/` тип написан без звёздочки:
+
+```console
+$ sed -n 17p astypexato/main.go
+	if sx, ok := errors.AsType[SummaXato](err); ok { // * yoʻq
+```
+
+`-o /dev/null` не сохраняет готовый файл: нам нужен только результат компиляции.
+
+```console
+$ go build -o /dev/null ./astypexato
+# github.com/abdurahmon27/go-backend-uz/lessons/014-errors-values/astypexato
+astypexato/main.go:17:29: SummaXato does not satisfy error (method Error has pointer receiver)
+```
+
+*SummaXato does not satisfy error (method Error has pointer receiver)* — «`SummaXato` не удовлетворяет `error`
+(метод `Error` написан с pointer receiver)». Это правило method set из [GO-1.12](/lab/youtube/go/go-1-12/ru): в method set
+значения `SummaXato` нет `Error`. Ограничение `AsType[E error]` проверяет это при компиляции, программа даже не
+запускается.
+
+| Ошибка программиста | `errors.As` | `errors.AsType` |
+|---|---|---|
+| вместо указателя что-то другое | компилируется → panic при запуске; находят `go vet` / `go test` | такого аргумента нет: результат возвращается |
+| тип, который не реализует `error` | компилируется → panic; находит `go vet` | ошибка компиляции |
+
+У ограничения две границы (из README; примера нет в папке курса, он запущен отдельно). Тип, который реализует
+`error`, но которого нет в цепочке (`*os.PathError`), компилируется и просто даёт `ok == false`. Интерфейс, который
+требует метод помимо `error`, нужно писать как `interface{ error; … }`:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+)
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+func main() {
+	err := fmt.Errorf("buyurtma 9: %w", &SummaXato{Summa: -5})
+
+	// error'ni bajaradi, lekin zanjirda yoʻq: kompilyatsiya boʻladi, ok = false
+	_, ok := errors.AsType[*os.PathError](err)
+	fmt.Println("*os.PathError:", ok)
+
+	// error'ga qoʻshimcha metod talab qiladigan interface
+	_, ok = errors.AsType[interface {
+		error
+		Timeout() bool
+	}](err)
+	fmt.Println("Timeout():", ok)
+}
+```
+
+```console
+$ go run chegara/main.go
+*os.PathError: false
+Timeout(): false
+```
+
+Интерфейс без `error` отвергается (`errors.As` бы его принял):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func main() {
+	err := fmt.Errorf("ulanish: %w", errors.New("vaqt tugadi"))
+	_, ok := errors.AsType[interface{ Timeout() bool }](err)
+	fmt.Println(ok)
+}
+```
+
+```console
+$ go run chegara2/main.go
+# command-line-arguments
+chegara2/main.go:10:25: interface{Timeout() bool} does not satisfy error (missing method Error)
+```
+
+*missing method Error* — «нет метода `Error`». Исправление: `AsType[interface{ error; Timeout() bool }]`.
+
+## Измеряем: насколько быстр AsType?
+
+Release notes говорят «быстрее», но чисел не дают. Измерим сами. `tezlik/tezlik_test.go` (`tezlik` — «скорость»):
+
+```go filename="tezlik/tezlik_test.go" showLineNumbers
+// tezlik: errors.As va errors.AsType ni oʻlchaymiz.
+// go test -bench . -benchmem ./tezlik
+package tezlik
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+)
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+// ikki qavat oʻralgan xato: toʻlov → buyurtma → *SummaXato
+var err = fmt.Errorf("toʻlov: %w", fmt.Errorf("buyurtma 9: %w", &SummaXato{Summa: -5}))
+
+func BenchmarkAs(b *testing.B) {
+	for b.Loop() {
+		var sx *SummaXato
+		if !errors.As(err, &sx) {
+			b.Fatal("topilmadi")
+		}
+	}
+}
+
+func BenchmarkAsType(b *testing.B) {
+	for b.Loop() {
+		if _, ok := errors.AsType[*SummaXato](err); !ok {
+			b.Fatal("topilmadi")
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 16 | `var err = fmt.Errorf("toʻlov: %w", fmt.Errorf(…))` | дважды обёрнутая ошибка, создаётся один раз: `SummaXato` на 3-м слое цепочки |
+| 18–25 | `BenchmarkAs` | на каждой итерации новый `sx` и `errors.As(err, &sx)`; если не нашлось, бенчмарк останавливается (`b.Fatal`) |
+| 27–33 | `BenchmarkAsType` | тот же поиск через `errors.AsType`; `_` — сам результат не нужен |
+
+Подумайте: что покажет `allocs/op` (число выделений памяти на вызов)? **A)** 0 у обоих · **B)** 1 у `As`, 0 у
+`AsType` · **C)** 1 у обоих
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `&sx` передаётся в `errors.As` как `any` и внутри используется через рефлексию (проверку типов во время работы программы). Компилятор не может
+доказать, что `sx` не нужен после функции, и кладёт его в кучу: одно выделение на итерацию. `AsType` делает
+обычный type assertion и возвращает результат как значение: выделений нет. Если вы выбрали «A», вы думали, что
+`var sx` всегда остаётся на стеке (правило из [GO-1.11](/lab/youtube/go/go-1-11/ru): не может доказать — значит, куча).
+
+</details>
+
+```console
+$ go test -bench . -benchmem ./tezlik
+goos: linux
+goarch: amd64
+pkg: github.com/abdurahmon27/go-backend-uz/lessons/014-errors-values/tezlik
+cpu: 12th Gen Intel(R) Core(TM) i5-12450H
+BenchmarkAs-12        	15107502	        77.97 ns/op	       8 B/op	       1 allocs/op
+BenchmarkAsType-12    	127402555	         9.376 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/014-errors-values/tezlik	2.379s
+```
+
+| | `ns/op` (для этой страницы) | `ns/op` (для видео) | `B/op` | `allocs/op` |
+|---|---|---|---|---|
+| `errors.As` | 77.97 | 96.46 | 8 | 1 |
+| `errors.AsType` | 9.376 | 11.30 | 0 | 0 |
+| разница | ≈ 8,3 раза | ≈ 8,5 раза | | |
+
+Оба измерения сделаны на одном компьютере (i5-12450H, go1.26.8). Наносекунды каждый раз немного меняются, но
+`AsType` каждый раз оказывался быстрее больше чем в восемь раз. `B/op` и `allocs/op` не меняются.
+
+Откуда выделение? Спросим компилятор ([GO-1.11](/lab/youtube/go/go-1-11/ru)). `-run '^$'` не совпадает ни с одним именем
+теста, поэтому тесты не запускаются, происходит только компиляция с `-gcflags=-m`. `grep moved` оставляет нужную
+строку:
+
+```console
+$ go test -gcflags=-m -run '^$' ./tezlik 2>&1 | grep moved
+tezlik/tezlik_test.go:20:7: moved to heap: sx
+```
+
+Строка 20 — это `var sx *SummaXato` в `BenchmarkAs`. Причина в `errors/wrap.go`: `As` работает через
+`internal/reflectlite` (облегчённую версию рефлексии) и принимает `target` как `any`. `AsType` же на каждом слое
+цепочки делает обычный type assertion `err.(E)`.
+
+## errors.Join: несколько ошибок в одном значении
+
+Иногда ошибка не одна. При проверке заказа и сумма неверная, и адрес пустой. Если остановиться на первой ошибке,
+пользователь узнает о второй только при следующей попытке. Начиная с Go 1.20, `errors.Join` собирает несколько
+ошибок в один `error`. `join/main.go`:
+
+```go filename="join/main.go" showLineNumbers
+// join: bir nechta xatoni bitta error'ga yigʻish (Go 1.20).
+// go run ./join
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Buyurtma struct {
+	Summa  int64
+	Manzil string
+}
+
+type SummaXato struct{ Summa int64 }
+
+func (e *SummaXato) Error() string { return fmt.Sprintf("summa notoʻgʻri: %d", e.Summa) }
+
+var ErrManzilYoq = errors.New("manzil boʻsh")
+
+func tekshir(b Buyurtma) error {
+	var summaXato, manzilXato error // turi error: typed nil boʻlmaydi
+	if b.Summa <= 0 {
+		summaXato = &SummaXato{Summa: b.Summa}
+	}
+	if b.Manzil == "" {
+		manzilXato = ErrManzilYoq
+	}
+	return errors.Join(summaXato, manzilXato)
+}
+
+func main() {
+	err := tekshir(Buyurtma{Summa: -5})
+	fmt.Println(err)
+	fmt.Println("manzil xatosi bormi:", errors.Is(err, ErrManzilYoq))
+	if sx, ok := errors.AsType[*SummaXato](err); ok {
+		fmt.Println("summa xatosi:", sx.Summa)
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 19 | `var ErrManzilYoq = errors.New("manzil boʻsh")` | ещё одна sentinel-ошибка («адрес пустой») |
+| 22 | `var summaXato, manzilXato error` | обе переменные **типа `error`**, в начале `nil`. Почему это важно — в вопросе на паузе |
+| 23–28 | два `if` | своя ошибка для каждой проблемы |
+| 29 | `errors.Join(summaXato, manzilXato)` | `Join(errs ...error) error`: variadic, собирает ненулевые в одну ошибку |
+| 33 | `tekshir(Buyurtma{Summa: -5})` | сумма −5, адрес пустой: обе ошибки |
+| 35–38 | `errors.Is`, `errors.AsType` | ищут каждую внутри собранной ошибки |
+
+```console
+$ go run ./join
+summa notoʻgʻri: -5
+manzil boʻsh
+manzil xatosi bormi: true
+summa xatosi: -5
+```
+
+Текст `Join` — это тексты ошибок, каждый на отдельной строке. А внутри ошибка с методом `Unwrap() []error`:
+
+```text
+err ─► *errors.joinError
+          │ Unwrap() []error
+          ├──► *SummaXato      "summa notoʻgʻri: -5"   ◄── находит errors.AsType[*SummaXato]
+          └──► ErrManzilYoq    "manzil boʻsh"          ◄── находит errors.Is(err, ErrManzilYoq)
+```
+
+Цепочка теперь не линия, а дерево. `case interface{ Unwrap() []error }`, который мы видели внутри `errors.Is`, —
+как раз для этого случая: каждая ветка проверяется отдельно. `errors.AsType` делает так же. С той же версии
+(Go 1.20) `fmt.Errorf` тоже принимает несколько `%w`: `fmt.Errorf("saqlash: %w; %w", ErrDisk, ErrLog)` (задача
+среднего уровня в домашнем задании).
+
+В Python 3.11 есть похожее: `ExceptionGroup` и `except*` (в JS — `AggregateError`). Для сравнения (нет в папке
+курса, запущено отдельно):
+
+```python
+class SummaError(Exception):
+    pass
+
+class ManzilError(Exception):
+    pass
+
+try:
+    raise ExceptionGroup("buyurtma", [SummaError("summa: -5"), ManzilError("manzil boʻsh")])
+except* ManzilError as g:
+    print("manzil:", g.exceptions)
+except* SummaError as g:
+    print("summa:", g.exceptions)
+```
+
+```console
+$ python3 join.py
+manzil: (ManzilError('manzil boʻsh'),)
+summa: (SummaError('summa: -5'),)
+```
+
+В Python группа бросается, и каждый `except*` вынимает из неё свой тип. В Go группа — обычное возвращаемое
+значение, и `errors.Is` и `errors.AsType` заглядывают внутрь неё.
+
+## Пауза: равен ли errors.Join(nil, nil) nil?
+
+```go
+err := errors.Join(nil, nil)
+fmt.Println("err == nil:", err == nil)
+```
+
+Подсказка: как `Join` определяет nil? **A)** `true` · **B)** `false`: `Join` возвращает пустой `joinError` ·
+**C)** panic
+
+<details>
+<summary>Ответ</summary>
+
+**A: `true`.** `Join` сначала считает ненулевые ошибки. Если их нет, сразу возвращает `nil` — правило из
+[GO-1.13](/lab/youtube/go/go-1-13/ru): «если ошибки нет, возвращайте явный `nil`». Если вы выбрали «B», это была бы как раз
+ловушка typed nil: команда Go обошла её внутри `Join`.
+
+</details>
+
+`savol/main.go` (`savol` — «вопрос»):
+
+```go filename="savol/main.go" showLineNumbers
+// savol: errors.Join(nil, nil) == nil ?
+// go run ./savol
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func main() {
+	err := errors.Join(nil, nil)
+	fmt.Println("err == nil:", err == nil)
+	fmt.Printf("ichida: %T\n", err)
+}
+```
+
+```console
+$ go run ./savol
+err == nil: true
+ichida: <nil>
+```
+
+`%T` вывел `<nil>`: внутри интерфейса нет даже типа (`ichida` — «внутри»). Начало `Join`:
+
+```console
+$ sed -n 20,29p $(go env GOROOT)/src/errors/join.go
+func Join(errs ...error) error {
+	n := 0
+	for _, err := range errs {
+		if err != nil {
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+```
+
+Но `Join` проверяет только `err != nil`. А typed nil ([GO-1.13](/lab/youtube/go/go-1-13/ru)) **не** равен `nil`: nil
+`*SummaXato` внутри `error` выглядит для `Join` как настоящая ошибка. Поэтому в строке 22 `join/main.go` обе
+переменные объявлены как `error`, а не как `*SummaXato`:
+
+```console
+$ sed -n 21,29p join/main.go
+func tekshir(b Buyurtma) error {
+	var summaXato, manzilXato error // turi error: typed nil boʻlmaydi
+	if b.Summa <= 0 {
+		summaXato = &SummaXato{Summa: b.Summa}
+	}
+	if b.Manzil == "" {
+		manzilXato = ErrManzilYoq
+	}
+	return errors.Join(summaXato, manzilXato)
+```
+
+Что будет, если объявить `summaXato` как `*SummaXato`, — это задача 🔴 Guru в домашнем задании.
+
+## Возвращаемся к загадке: Go 1.25 и nil-проверка
+
+Теперь программа из начала. Полный `tartib/main.go` (`tartib` — «порядок», порядок проверок):
+
+```go filename="tartib/main.go" showLineNumbers
+// tartib: natija err tekshirilmasdan OLDIN ishlatiladi. ATAYLAB XATO.
+// Go 1.21.5–1.24 kompilyatori nil tekshiruvini kechiktirib yuborardi (golang/go#72860;
+// bug CL 537775 bilan 1.21.5 ga backport qilingan, #63743),
+// shuning uchun bu dastur u versiyalarda jim ishlaydi. Go 1.21.4 gacha va 1.25+ da panic.
+// ./versiyalar.sh
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+type Buyurtma struct {
+	ID    int
+	Summa int64
+}
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func top(id int) (*Buyurtma, error) {
+	if id != 7 {
+		return nil, ErrTopilmadi
+	}
+	return &Buyurtma{ID: 7, Summa: 150000}, nil
+}
+
+func main() {
+	b, err := top(42)
+	summa := b.Summa // XATO: err hali tekshirilmagan, b esa nil
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println("summa:", summa)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 20–25 | `func top(id int) (*Buyurtma, error)` | для заказа 7 — указатель и `nil`; для любого другого `id` — `nil, ErrTopilmadi` |
+| 28 | `b, err := top(42)` | `b` — nil, `err` — `ErrTopilmadi` |
+| 29 | `summa := b.Summa` | чтение поля через nil-указатель. Спецификация Go (Selectors): *"If x is of pointer type and has the value nil and x.f denotes a struct field, assigning to or evaluating x.f causes a run-time panic."* — panic **обязан** случиться |
+| 30–33 | `if err != nil { … return }` | проверка ошибки слишком поздно: после строки 29 |
+
+У модуля свой `go.mod` со строкой `go 1.20`, чтобы эту папку могли запускать и старые версии Go:
+
+```text
+module tartib
+
+go 1.20
+```
+
+`tartib/versiyalar.sh` (`versiyalar` — «версии») запускает одну программу на шести версиях Go:
+
+```bash
+#!/usr/bin/env bash
+# Bitta dasturni olti xil Go versiyasida ishga tushiradi.
+# GOTOOLCHAIN kerakli versiyani proxy.golang.org dan yuklab oladi (birinchi marta).
+cd "$(dirname "$0")"
+for v in go1.20.14 go1.21.4 go1.21.5 go1.24.13 go1.25.0 local; do
+  out=$(GOTOOLCHAIN=$v go run -trimpath . 2>&1 | grep -v '^go: downloading' | head -1)
+  [ "$v" = local ] && v=$(go env GOVERSION)
+  printf '%-10s %s\n' "$v" "$out"
+done
+```
+
+Для каждой версии берётся первая строка вывода `go run` (строки `go: downloading` отбрасываются).
+`GOTOOLCHAIN=local` — Go, установленный на компьютере; его версию даёт `go env GOVERSION`.
+
+```console
+$ ./tartib/versiyalar.sh
+go1.20.14  panic: runtime error: invalid memory address or nil pointer dereference
+go1.21.4   panic: runtime error: invalid memory address or nil pointer dereference
+go1.21.5   xato: buyurtma topilmadi
+go1.24.13  xato: buyurtma topilmadi
+go1.25.0   panic: runtime error: invalid memory address or nil pointer dereference
+go1.26.8   panic: runtime error: invalid memory address or nil pointer dereference
+```
+
+До Go 1.21.4 — panic. С Go 1.21.5 по Go 1.24 — без panic. С Go 1.25 — снова panic. Значит, ответ на загадку:
+**прав Go 1.26**, а Go 1.24 работал неправильно.
+
+Что произошло? Перед чтением `b.Summa` компилятор вставляет скрытую **nil-проверку**: «если `b` равен nil — panic».
+Это не ваш `if`, а машинная проверка, которую компилятор добавляет сам. Баг в Go 1.21.5–1.24 переносил эту проверку
+**после** `if err != nil`. Поскольку `err` не nil, программа выходит через `return` и до отложенной проверки не
+доходит.
+
+| Шаг | По спецификации (≤ 1.21.4, ≥ 1.25) | С багом (1.21.5 … 1.24) |
+|---|---|---|
+| 1 | `b, err := top(42)` → `b = nil` | `b, err := top(42)` → `b = nil` |
+| 2 | nil-проверка: `b == nil` → **panic**, строка 29 | `if err != nil` → `true` |
+| 3 | — | `xato: buyurtma topilmadi`, `return` |
+| 4 | — | nil-проверка стояла бы здесь, но до неё никогда не доходит |
+
+Release notes Go 1.25: компилятор *"incorrectly delayed the nil check until after the error check"* — «ошибочно
+откладывал nil-проверку до момента после проверки ошибки». Исправление — CL 657715 (CL — одно изменение кода в Go, как pull request; *"cmd/compile: don't move
+nilCheck operations during tighten"*).
+
+Одно уточнение: release notes говорят, что баг *"introduced in Go 1.21"*. В измерениях go1.21.0, 1.21.1, 1.21.3 и
+1.21.4 ещё дают panic (как и пример с `os.Open` из release notes). Баг начинается с go1.21.5. Причина: изменение,
+которое его вызвало, CL 537775 (на него указал Ian Lance Taylor в #72860), бэкпортировали в 1.21 позже (перенесли в ветку старой версии): #63743,
+milestone Go1.21.5.
+
+Правило простое: **проверяйте ошибку сразу, до того как используете результат.**
+
+## Сломал ли Go 1.25 старый код?
+
+На первый взгляд — да: программа, которая работала на Go 1.24, падает на Go 1.25. Но release notes (их пример —
+`os.Open` и `f.Name()`, та же форма) говорят прямо: *"This program is incorrect because it uses the result of
+os.Open before checking the error"* — программа и раньше была неправильной, а её успешная работа шла *"in violation
+of the Go spec"*, то есть противоречила спецификации Go. Баг лишь скрывал ошибку.
+
+Команда Go не добавила исправление в патч-релизы 1.23 и 1.24. Кит Рэндалл (randall77) написал в #72860
+2025-03-18: *"We've found instances of code that depend on the buggy behavior. … We don't want a point release to
+break anyone's (even incorrect) code without a very compelling reason."* — «Мы нашли код, который зависит от
+ошибочного поведения. Патч-релиз не должен ломать ничей (даже неправильный) код без очень веской причины».
+
+Находят ли такой код инструменты?
+
+```console
+$ cd tartib && go vet . && echo vet: jim
+vet: jim
+```
+
+```console
+$ cd tartib && ~/go/bin/staticcheck . && echo staticcheck: jim
+staticcheck: jim
+```
+
+Ни `go vet`, ни staticcheck (2026.2.1) ничего не сказали: `echo` после `&&` выполняется, только если предыдущая
+команда завершилась успешно (`jim` — «тихо»). Согласно README курса, анализатор кода NilAway от Uber находит эту
+строку (*"Potential nil panic detected"*), но он ставится отдельно и в видео не показан. Если после обновления Go
+появился неожиданный nil panic, сначала посмотрите, где стоит проверка ошибки.
+
+## Итог: правила работы с ошибками
+
+| Задача | Как писать | Почему |
+|---|---|---|
+| обернуть с контекстом | `fmt.Errorf("buyurtma %d: %w", id, err)` | текст + исходная ошибка остаётся внутри |
+| скрыть деталь | `fmt.Errorf("buyurtma %d: %v", id, err)` | текст тот же, вызывающий не привязывается к внутренней ошибке |
+| проверить sentinel | `errors.Is(err, ErrTopilmadi)`, а не `==` | для обёрнутой ошибки `==` всегда `false` |
+| получить тип ошибки | `sx, ok := errors.AsType[*SummaXato](err)` | проверяет компилятор, ~8× быстрее, без выделений |
+| несколько ошибок | `errors.Join(a, b)` | отбрасывает nil; `Is`/`AsType` видят каждую |
+| использовать результат | `v, err := f(); if err != nil { … }` — потом `v` | начиная с Go 1.25, код, написанный иначе, даёт panic |
+
+## Частые ошибки
+
+**1. Проверять обёрнутую ошибку через `==`.** Самая частая ошибка в этой теме. Код работал с
+`if err == ErrTopilmadi`, потом кто-то добавил в среднем слое `fmt.Errorf("…: %w", err)`, и проверка начала тихо
+давать `false`. Сообщения об ошибке нет: программа просто идёт не по той ветке. Мы видели это в таблице в разделе
+«%v или %w»: `==: false`, `errors.Is: true`. **Исправление:** sentinel-ошибку всегда проверяйте через
+`errors.Is(err, ErrTopilmadi)`, а тип ошибки получайте через `errors.AsType`, а не через type assertion.
+
+**2. Использовать результат до проверки ошибки.** `tartib/main.go` из раздела «Возвращаемся к загадке»:
+`summa := b.Summa` стоит до `if err != nil`. На Go 1.21.5–1.24 работает тихо, с Go 1.25 даёт panic:
+`panic: runtime error: invalid memory address or nil pointer dereference` — «неверный адрес памяти или
+разыменование nil-указателя», `tartib/main.go:29`. **Исправление:** сделайте `if err != nil` первой строкой после
+вызова и читайте результат только после неё.
+
+**3. Забыть `&` в `errors.As`.** Видели в разделе «Type-safe»: компилируется, а при запуске даёт
+`panic: errors: target must be a non-nil pointer`. **Исправление:** `errors.As(err, &sx)`, а лучше
+`errors.AsType[*SummaXato](err)` — он такую ошибку не допускает.
+
+**4. Передать в `%w` текст вместо ошибки.** Передать в `%w` `err.Error()` — лёгкая оплошность. (Этого примера нет
+в папке курса, он запущен отдельно.)
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func main() {
+	err := fmt.Errorf("buyurtma 42: %w", ErrTopilmadi.Error())
+	fmt.Println(err)
+	fmt.Println(errors.Is(err, ErrTopilmadi))
+}
+```
+
+```console
+$ go run wxato/main.go
+buyurtma 42: %!w(string=buyurtma topilmadi)
+false
+```
+
+Компилятор молчит: аргументы `fmt.Errorf` — это `...any`. При запуске `fmt` выводит неверный аргумент как
+`%!w(string=…)`, а `errors.Is` даёт `false`. `go vet` это находит (и `go test` запускает его автоматически, потому
+что проверка `printf` входит в ту же надёжную часть):
+
+```console
+$ go vet wxato/main.go
+wxato/main.go:11:34: fmt.Errorf format %w has arg ErrTopilmadi.Error() of wrong type string
+```
+
+Строка 11, столбец 34: *format %w has arg … of wrong type string* — «формату `%w` передан аргумент неверного типа
+`string`». **Исправление:** передавайте в `%w` саму ошибку: `fmt.Errorf("buyurtma 42: %w", ErrTopilmadi)`.
+
+**5. Выпускать наружу внутреннюю деталь через `%w`.** Тихая проблема: код работает, но вызывающие привязываются к
+вашему `sql.ErrNoRows` (раздел «Когда не нужно оборачивать»). **Исправление:** на границе API используйте `%v` или
+возвращайте свою sentinel-ошибку.
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Чем отличаются `%w` и `%v`? Когда что использовать?
+
+<details>
+<summary>Ответ</summary>
+
+Оба дают одинаковый текст. `%v` берёт у исходной ошибки только текст, а `%w` хранит внутри саму исходную ошибку
+(`*fmt.wrapError` с методом `Unwrap`). Если вызывающий должен проверять исходную ошибку — `%w`; если внутреннюю
+деталь нужно скрыть — `%v`, потому что обёрнутая ошибка становится частью API.
+
+</details>
+
+**2.** Почему для обёрнутой ошибки `err == ErrTopilmadi` даёт `false`, а `errors.Is` — `true`?
+
+<details>
+<summary>Ответ</summary>
+
+`fmt.Errorf` создаёт новое значение ошибки: внутри интерфейса теперь другой тип (`*fmt.wrapError`), а два
+интерфейса равны, только если совпадают и типы, и значения. `errors.Is` спускается по цепочке через `Unwrap` и
+сравнивает каждый слой с `target`.
+
+</details>
+
+**3.** Что выведет этот код? **A)** `true true true` · **B)** `true false true` · **C)** `true false false`
+
+```go
+a := fmt.Errorf("buyurtma 42: %w", ErrTopilmadi)
+b := fmt.Errorf("toʻlov: %v", a)
+c := fmt.Errorf("toʻlov: %w", a)
+fmt.Println(errors.Is(a, ErrTopilmadi), errors.Is(b, ErrTopilmadi), errors.Is(c, ErrTopilmadi))
+```
+
+<details>
+<summary>Ответ</summary>
+
+**B: `true false true`.** `a` — простая обёртка. В `b` `%v` разорвал цепочку: внутри остался только текст, хотя
+сам `a` был обёрнут. В `c` два слоя `%w`, и `errors.Is` раскрывает оба. Если вы выбрали «A», вы думали, что ошибка,
+однажды обёрнутая через `%w`, и дальше остаётся «обёрнутой»: один `%v` в цепочке отрезает всё, что ниже.
+
+Полная программа (нет в папке курса, запущена отдельно):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrTopilmadi = errors.New("buyurtma topilmadi")
+
+func main() {
+	a := fmt.Errorf("buyurtma 42: %w", ErrTopilmadi)
+	b := fmt.Errorf("toʻlov: %v", a)
+	c := fmt.Errorf("toʻlov: %w", a)
+	fmt.Println(errors.Is(a, ErrTopilmadi), errors.Is(b, ErrTopilmadi), errors.Is(c, ErrTopilmadi))
+}
+```
+
+```console
+$ go run savol2/main.go
+true false true
+```
+
+</details>
+
+**4.** `errors.As(err, sx)` (без `&`) и `errors.AsType[SummaXato](err)` (без `*`): какая ошибка когда ловится?
+
+<details>
+<summary>Ответ</summary>
+
+Второй параметр `errors.As` — `any`, поэтому первый вариант компилируется и даёт panic только при запуске; его
+находят `go vet` (и `go test`). Второй компилятор отвергает сразу:
+`SummaXato does not satisfy error (method Error has pointer receiver)`.
+
+</details>
+
+**5.** Что даёт `errors.Join(nil, nil) == nil`? А если передать в `errors.Join` значение `error`, в котором лежит
+nil `*SummaXato`?
+
+<details>
+<summary>Ответ</summary>
+
+Первое даёт `true`: `Join` считает ненулевые и, если их нет, возвращает явный `nil`. Во втором случае typed nil
+проходит проверку `err != nil`, `Join` сохраняет его как настоящую ошибку, и результат не `nil`.
+
+</details>
+
+**6.** Из [GO-1.12](/lab/youtube/go/go-1-12/ru): почему `SummaXato` (без звёздочки) не реализует `error`, а `*SummaXato`
+реализует?
+
+<details>
+<summary>Ответ</summary>
+
+Метод `Error` написан с pointer receiver: `func (e *SummaXato) Error()`. Методы с pointer receiver входят только в
+method set `*SummaXato`. В method set значения `SummaXato` нет `Error`, поэтому оно не реализует интерфейс `error`.
+
+</details>
+
+## Домашнее задание
+
+Четыре задачи четырёх уровней. Все файлы — в папке урока на GitHub:
+[lessons/014-errors-values](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/014-errors-values).
+Ответы: папка [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/014-errors-values/homework).
+Сначала попробуйте сами.
+
+🟢 **Лёгкая:** создайте sentinel-ошибку `ErrTolangan` («уже оплачен») для оплаченного заказа, оберните её через
+`%w` и найдите через `errors.Is`.
+
+<details>
+<summary>Ответ</summary>
+
+`homework/oson/main.go`: `var ErrTolangan = errors.New("buyurtma allaqachon toʻlangan")` («заказ уже оплачен»), а
+функция `tola` («оплатить») оборачивает её через `fmt.Errorf("toʻlov %d: %w", id, ErrTolangan)`.
+
+```console
+$ go run ./homework/oson
+toʻlov 7: buyurtma allaqachon toʻlangan
+==: false  errors.Is: true
+```
+
+`==` — `false` (новое значение), `errors.Is` — `true` (нашёл в цепочке).
+
+</details>
+
+🟡 **Средняя:** `fmt.Errorf("saqlash: %w; %w", ErrDisk, ErrLog)` (`saqlash` — «сохранение»). Найдёт ли `errors.Is`
+обе ошибки? Что вернёт `errors.Unwrap(err)`?
+
+<details>
+<summary>Ответ</summary>
+
+`homework/orta/main.go`:
+
+```console
+$ go run ./homework/orta
+saqlash: disk toʻla; log yozilmadi
+Is(ErrDisk): true  Is(ErrLog): true
+errors.Unwrap: <nil>
+Unwrap() []error: 2 ta
+```
+
+`errors.Is` находит обе. А `errors.Unwrap` возвращает **`nil`**: у ошибки с несколькими `%w` нет `Unwrap() error`,
+есть метод `Unwrap() []error`, а `errors.Unwrap` вызывает только первый вид (документация: *"Unwrap only calls a
+method of the form "Unwrap() error""*). Чтобы увидеть обе ошибки, ответ проверяет `interface{ Unwrap() []error }`
+через type assertion.
+
+</details>
+
+🟠 **Сложная:** напишите тип `MaydonXato{Maydon string; Err error}` (`maydon` — «поле»), чтобы `errors.Is` и
+`errors.AsType` заглядывали и внутрь него. Проверьте тестом.
+
+<details>
+<summary>Ответ</summary>
+
+`homework/qiyin/qiyin.go`. `MaydonXato` говорит, в каком поле ошибка, и хранит исходную ошибку в `Err`. Чтобы
+встроиться в цепочку, хватает одного метода:
+
+```go
+func (e *MaydonXato) Unwrap() error { return e.Err }
+```
+
+`TestMaydonXato` в `qiyin_test.go` проверяет текст, `errors.Is(err, ErrBosh)`, `errors.AsType[*MaydonXato]` и то,
+что для правильного адреса возвращается `nil`:
+
+```console
+$ go test -v ./homework/qiyin
+=== RUN   TestMaydonXato
+--- PASS: TestMaydonXato (0.00s)
+PASS
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/014-errors-values/homework/qiyin	0.002s
+```
+
+Если удалить `Unwrap`, `errors.Is` не найдёт `ErrBosh`, и тест упадёт.
+
+</details>
+
+🔴 **Guru:** в `tekshir` из `join/` объявите `summaXato` как `*SummaXato`. Что выведется для правильного заказа и
+почему?
+
+<details>
+<summary>Ответ</summary>
+
+`homework/guru/main.go`: `var summaXato *SummaXato`, заказ правильный (`Summa: 150000, Manzil: "Toshkent"`).
+
+```console
+$ go run ./homework/guru
+err == nil: false
+err: %!v(PANIC=Error method: runtime error: invalid memory address or nil pointer dereference)
+```
+
+При вызове `errors.Join(summaXato, manzilXato)` nil `*SummaXato` кладётся в параметр типа `error`: получается typed
+nil. `Join` проверяет его через `err != nil`, а typed nil не равен `nil` ([GO-1.13](/lab/youtube/go/go-1-13/ru)), поэтому `Join`
+сохраняет его, и результат не `nil`. `Println` вызывает `Error()`, тот читает `e.Summa` через nil-указатель и
+паникует. `fmt` перехватывает panic и пишет `%!v(PANIC=…)` (указатель `joinError` не nil, поэтому не `<nil>`).
+Исправление — объявить переменную как `error`, как в `join/main.go`.
+
+</details>
+
+## Источники
+
+- Спецификация Go: [Errors](https://go.dev/ref/spec#Errors), [Selectors](https://go.dev/ref/spec#Selectors) (поле
+  через nil-указатель → panic), [Comparison operators](https://go.dev/ref/spec#Comparison_operators) (равенство
+  интерфейсов)
+- [pkg.go.dev/errors](https://pkg.go.dev/errors), [fmt.Errorf](https://pkg.go.dev/fmt#Errorf); исходный код
+  (go1.26.8): [errors/wrap.go](https://github.com/golang/go/blob/go1.26.8/src/errors/wrap.go#L54-L79) (`is`),
+  [errors/join.go](https://github.com/golang/go/blob/go1.26.8/src/errors/join.go#L20-L29)
+- Release notes: [Go 1.13: Error wrapping](https://go.dev/doc/go1.13#error_wrapping),
+  [Go 1.20: Wrapping multiple errors](https://go.dev/doc/go1.20#errors),
+  [Go 1.25: nil pointer bug](https://go.dev/doc/go1.25#nil-pointer-bug),
+  [Go 1.26: errors](https://go.dev/doc/go1.26#errorspkgerrors)
+- Блог Go: [Working with Errors in Go 1.13](https://go.dev/blog/go1.13-errors) (D. Neil, J. Amsterdam, 2019),
+  [Whether to Wrap](https://go.dev/blog/go1.13-errors#whether-to-wrap),
+  [Errors are values](https://go.dev/blog/errors-are-values) (R. Pike, 2015)
+- [Go FAQ: Why does Go not have exceptions?](https://go.dev/doc/faq#exceptions)
+- Issues: [#51945](https://github.com/golang/go/issues/51945) (предложение AsType),
+  [#72860](https://github.com/golang/go/issues/72860) (баг nil-проверки, randall77 2025-03-18),
+  [#63743](https://github.com/golang/go/issues/63743) (бэкпорт, Go1.21.5), CL [537775](https://go.dev/cl/537775),
+  CL [657715](https://go.dev/cl/657715)
+- [go vet errorsas](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/errorsas); `go help test` (проверки
+  vet, которые запускаются перед тестами)
+- staticcheck [ST1008](https://staticcheck.dev/docs/checks/#ST1008);
+  [NilAway](https://github.com/uber-go/nilaway) от Uber
+- [Uber Go Style Guide: Error Wrapping](https://github.com/uber-go/guide/blob/master/style.md#error-wrapping)
+- Другие языки: [MDN: Error cause](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause),
+  [MDN: AggregateError](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/AggregateError),
+  [Python: Exception chaining](https://docs.python.org/3/tutorial/errors.html#exception-chaining),
+  [Python: Raising and handling multiple unrelated exceptions](https://docs.python.org/3/tutorial/errors.html#raising-and-handling-multiple-unrelated-exceptions),
+  [PHP: Exception::getPrevious](https://www.php.net/manual/en/exception.getprevious.php)
+- Все результаты Go — на `go1.26.8 linux/amd64` (Intel i5-12450H), получены 2026-11-26; старые версии — через
+  `GOTOOLCHAIN`; staticcheck 2026.2.1. Сравнение: Node.js v24.10.0, Python 3.13.15, PHP 8.4.26. `ns/op` каждый раз
+  немного меняется, `B/op` и `allocs/op` — нет.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/014-errors-values)
+
+---
+
+← Предыдущий урок: [GO-1.13](/lab/youtube/go/go-1-13/ru) · Следующий урок: [GO-1.15](/lab/youtube/go#go-1-15) → · [Все уроки](/lab/youtube/go)
+
+</div>

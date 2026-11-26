@@ -1,0 +1,1433 @@
+---
+title: "Методы: value receiver или pointer receiver?"
+date: "2026/11/26"
+description: "Метод и receiver, method set и адресуемость: какой вызов компилируется, почему String не вызывается и какой receiver выбрать."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-12/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-12"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-12/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-12/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-12"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-12) · **Русский** · [English](/lab/youtube/go/go-1-12/en)  
+Урок GO-1.12 · [Go: 0 → Guru](/lab/youtube/go#go-1-12) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/012-methods-receivers)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Метод `Tola` («оплатить») отмечает заказ как оплаченный, его receiver — указатель. Если вызвать этот метод у
+элемента слайса, программа компилируется. Если у элемента map, компилятор отказывает: `cannot call pointer method`.
+В Python и `orders[0].pay()`, и `orders["a1"].pay()` работают одинаково. Почему в Go есть разница?
+
+**Главная идея:** receiver — обычный аргумент метода: value receiver получает копию значения, а pointer receiver —
+его адрес. Какой вызов компилируется, решают два правила: **method set** и **адресуемость** (addressability). А
+method set решает ещё и то, какому интерфейсу (interface — типу, состоящему из списка методов) тип удовлетворяет.
+
+К концу урока вы сможете:
+
+- объявлять методы и объяснять разницу между value receiver и pointer receiver (копия или адрес), сравнивая с
+  `self` в Python и `this` в JS;
+- читать ошибку `cannot call pointer method`, объяснять, почему значение не адресуемое (элемент map, результат
+  функции), и исправлять её;
+- понимать, почему метод `String()` иногда не вызывается и что означает ошибка `has pointer receiver`;
+- выбирать receiver для своего типа по Go FAQ и правилам code review (и почему у структуры с мьютексом — только
+  указатель).
+
+Три главных новых слова сегодня:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| receiver | значение, у которого вызван метод; на месте `self` в Python и `this` / `$this` в JS и PHP, но в Go оно копируется как обычный аргумент | receiver |
+| method set | набор методов типа: у `T` — только методы с value receiver, у `*T` — все | method set |
+| адресуемое значение | значение, у которого можно взять адрес (`&`): переменная, элемент слайса и другие; элемент map — нет | addressable |
+
+По дороге встретятся ещё два вспомогательных слова: **method value** (`f := b.Jami` — метод вместе с receiver
+сохраняется в переменную) и **method expression** (`Buyurtma.Jami` — метод превращается в обычную функцию). Оба
+объясним там, где они понадобятся.
+
+## Что нужно знать заранее
+
+- [GO-1.11 · Указатели: почему эта переменная сбежала в кучу?](/lab/youtube/go/go-1-11/ru): `&b` («адрес `b`»), `*p`
+  («значение по адресу `p`»), тип `*Buyurtma`, указатель `nil` и panic, функции `tola` / `tolaP`, ловушка
+  `&s[0]` + `append`.
+- [GO-1.10 · Структуры и память: одинаковые поля, 24 и 16 байт](/lab/youtube/go/go-1-10/ru): структура, поле, составной литерал
+  (`Buyurtma{Summa: 100}`), встраивание (embedding) и подъём полей во внешнюю структуру.
+- [GO-1.09 · Map: почему порядок случайный и почему recover не спасает](/lab/youtube/go/go-1-09/ru): map, Swiss table начиная с
+  Go 1.24, `defer`, `fatal error`.
+- [GO-1.06 · Функции: возврат двух значений, замыкания и variadic](/lab/youtube/go/go-1-06/ru): в Go функция всегда получает
+  копию аргумента; замыкание.
+- [GO-1.08 · Слайсы: ловушка append и устаревшее правило 1024](/lab/youtube/go/go-1-08/ru): элемент слайса лежит во внутреннем
+  массиве.
+- Программы можно скопировать на [go.dev/play](https://go.dev/play) и запустить. Для `go vet`, staticcheck и
+  `go doc` нужен Go на вашем компьютере: откройте терминал в папке курса (`lessons/012-methods-receivers`), команды
+  запускаются оттуда. Четыре папки намеренно не компилируются (`hook`, `manzilsiz`, `stringerxato`, `homework/orta`), а
+  `myuteks` и `nilp` намеренно дают deadlock и panic. Поэтому запускайте каждую папку отдельно, а не `./...`.
+
+Сначала вспомним прошлый урок. Что выведет этот код?
+
+```go
+func tola(b Buyurtma) { b.Tolandi = true }
+
+b := Buyurtma{Summa: 50_000}
+tola(b)
+fmt.Println(b.Tolandi)
+```
+
+<details>
+<summary>Ответ</summary>
+
+**`false`.** `tola` получает копию заказа и меняет копию, `b` в `main` никто не трогает. Чтобы изменить исходный
+заказ, нужен адрес: `tolaP(&b)`. Сегодня эти две функции станут методами.
+
+</details>
+
+## Загадка: у слайса компилируется, у map — нет
+
+Файл `hook/main.go` из папки курса. Один тип, один метод, два вызова:
+
+```go filename="hook/main.go" showLineNumbers
+// hook: bitta metod, bitta tur. Slice elementida chaqiruv ishlaydi, map elementida esa
+// dastur kompilyatsiya ham boʻlmaydi. Bu papka ATAYLAB kompilyatsiya boʻlmaydi: go build ./hook
+package main
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) Tola() { b.Tolandi = true }
+
+func main() {
+	s := []Buyurtma{{Summa: 50_000}}
+	s[0].Tola() // ishlaydi: slice elementi addressable
+
+	m := map[string]Buyurtma{"a1": {Summa: 50_000}}
+	m["a1"].Tola() // xato: map elementining manzilini olib boʻlmaydi
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 5–8 | `type Buyurtma struct {…}` | заказ из GO-1.11: сумма и «оплачен ли?» |
+| 10 | `func (b *Buyurtma) Tola() {…}` | функция, привязанная к `Buyurtma`, — **метод**. `(b *Buyurtma)` — его receiver, разберём в следующем разделе |
+| 13 | `s := []Buyurtma{{Summa: 50_000}}` | слайс из одного заказа |
+| 14 | `s[0].Tola()` | вызывает метод у элемента слайса |
+| 16 | `m := map[string]Buyurtma{…}` | map с ключом `"a1"` и значением `Buyurtma` |
+| 17 | `m["a1"].Tola()` | вызывает тот же метод у элемента map |
+
+`go build -o /dev/null` переводит программу, но никуда не записывает бинарник (`/dev/null` — «пустой» файл
+Linux). Нам нужен только ответ компилятора:
+
+```console
+$ go build -o /dev/null ./hook
+# github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/hook
+hook/main.go:17:10: cannot call pointer method Tola on Buyurtma
+```
+
+Только строка 17: *cannot call pointer method Tola on Buyurtma* — «нельзя вызвать метод с указателем `Tola` у значения
+`Buyurtma`». К строке 14 претензий нет. Причина в двух правилах: **method set** и **адресуемость**. Чтобы дойти до
+них, сначала посмотрим, что такое метод и receiver.
+
+## Метод и receiver: receiver — обычный аргумент
+
+**Метод** — функция с receiver (спецификация Go, *Method declarations*). **Receiver** пишется в скобках между словом
+`func` и именем метода: `func (b Buyurtma) Jami()`. Здесь `b` — имя receiver, `Buyurtma` — его тип. Внутри метода
+`b` используется как обычный параметр.
+
+Если вы пришли из Python, это знакомо: `self` тоже первый параметр метода. В Python метод можно вызвать через класс,
+передав `self` вручную. В JS то же делает `call`, в PHP `$this` скрыт. Этих примеров нет в папке курса, они запущены
+отдельно:
+
+```python
+class Order:
+    def __init__(self, summa):
+        self.summa = summa
+        self.paid = False
+
+    def total(self):
+        return self.summa + self.summa // 100
+
+    def pay(self):
+        self.paid = True
+
+o = Order(50_000)
+print(o.total(), Order.total(o))
+o.pay()
+print(o.paid)
+```
+
+```js
+class Order {
+  constructor(summa) {
+    this.summa = summa;
+    this.paid = false;
+  }
+  total() {
+    return this.summa + Math.floor(this.summa / 100);
+  }
+  pay() {
+    this.paid = true;
+  }
+}
+
+const o = new Order(50000);
+console.log(o.total(), Order.prototype.total.call(o));
+o.pay();
+console.log(o.paid);
+```
+
+```php
+<?php
+class Order {
+    public bool $paid = false;
+    public function __construct(public int $summa) {}
+    public function pay(): void { $this->paid = true; }
+}
+
+$o = new Order(50000);
+$o->pay();
+var_dump($o->paid);
+```
+
+```console
+$ python3 receiver.py
+50500 50500
+True
+$ node receiver.js
+50500 50500
+true
+$ php receiver.php
+bool(true)
+```
+
+Во всех трёх языках `pay()` изменил исходный объект. Причина: `self`, `this` и `$this` — всегда **ссылка**
+(reference) на объект. Теперь тот же заказ в Go, `metod/main.go`:
+
+```go filename="metod/main.go" showLineNumbers
+// metod: metod — receiver'li funksiya. Value receiver nusxa oladi, pointer receiver manzil oladi.
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64 // tiyinda
+	Tolandi bool
+}
+
+// Jami: value receiver. b — buyurtmaning nusxasi.
+func (b Buyurtma) Jami() int64 { return b.Summa + b.Summa/100 } // +1% xizmat haqi
+
+// Tola: value receiver. Nusxani oʻzgartiradi, asl buyurtma oʻzgarmaydi.
+func (b Buyurtma) Tola() { b.Tolandi = true }
+
+// TolaP: pointer receiver. Asl buyurtmani oʻzgartiradi.
+func (b *Buyurtma) TolaP() { b.Tolandi = true }
+
+func main() {
+	b := Buyurtma{Summa: 50_000}
+	fmt.Println("Jami:          ", b.Jami())
+	fmt.Println("Buyurtma.Jami: ", Buyurtma.Jami(b)) // receiver — birinchi argument
+
+	b.Tola()
+	fmt.Println("Tola:  ", b.Tolandi)
+
+	b.TolaP() // (&b).TolaP() ning qisqa yozuvi
+	fmt.Println("TolaP: ", b.Tolandi)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7 | `Summa int64 // tiyinda` | сумма хранится в тийинах: `50_000` тийинов = 500 сумов |
+| 12 | `func (b Buyurtma) Jami() int64` | метод `Jami` («итого»). Его receiver — значение типа `Buyurtma`, не указатель: это **value receiver**. Возвращает сумму плюс 1% сервисного сбора |
+| 15 | `func (b Buyurtma) Tola()` | `Tola` тоже value receiver: ставит `true` в поле `Tolandi` («оплачен») копии |
+| 18 | `func (b *Buyurtma) TolaP()` | у `TolaP` перед именем типа стоит `*`: это **pointer receiver**. `b` — адрес заказа. `b.Tolandi` — краткая запись `(*b).Tolandi` (GO-1.11) |
+| 22 | `b.Jami()` | обычный вызов метода |
+| 23 | `Buyurtma.Jami(b)` | **method expression**: `Buyurtma.Jami` — обычная функция, её первый аргумент — receiver. Ровно как `Order.total(o)` в Python |
+| 25 | `b.Tola()` | метод с value receiver: передаётся копия `b` |
+| 28 | `b.TolaP()` | метод с pointer receiver. Мы не написали `&`, Go добавил его сам (следующий раздел) |
+
+Go FAQ говорит: receiver *"behaves exactly as if it were an argument to the method"* — «ведёт себя как аргумент
+метода». Строка 23 это показывает: `b.Jami()` и `Buyurtma.Jami(b)` — две записи одного вызова. А правило GO-1.06:
+аргумент всегда копируется. Значит, value receiver — тоже копия.
+
+Прежде чем запускать, подумайте: что выведут строки `Tola:` и `TolaP:`? **A)** `true`, `true` ·
+**B)** `false`, `true` · **C)** `false`, `false`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `false`, потом `true`.** Receiver у `Tola` — копия `b`: метод изменил копию, и копия исчезла, когда метод
+закончился. `TolaP` же получил адрес `b` и изменил сам `b` в `main`. Если вы выбрали «A», вы считали receiver
+всегда ссылкой, как `self` в Python или `this` в JS. Если выбрали «C», вы решили, что указатель тоже копируется,
+значит, тоже не поможет: копируется, но копия хранит тот же адрес (GO-1.11).
+
+</details>
+
+```console
+$ go run ./metod
+Jami:           50500
+Buyurtma.Jami:  50500
+Tola:   false
+TolaP:  true
+```
+
+Обе записи дали одинаковую сумму: 50 000 + 500 = 50 500. `Tola` вызван, но заказ не оплачен. Картина памяти:
+
+```text
+b.Tola():   main:  b [ 50000 | false ]
+            Tola:  b [ 50000 | true  ]     копия, исчезает, когда метод заканчивается
+
+b.TolaP():  main:  b [ 50000 | true  ]  ◄──┐
+            TolaP: b [ адрес main.b ]   ───┘  копия адреса, смотрит на тот же b
+```
+
+| Язык | Объект внутри метода | Меняет ли `pay()` / `Tola()` исходное значение? |
+|---|---|---|
+| Python | `self` — ссылка | да |
+| JS / TS | `this` — ссылка | да |
+| PHP | `$this` — ссылка | да |
+| Go, value receiver `(b T)` | `b` — копия | **нет** |
+| Go, pointer receiver `(b *T)` | `b` — адрес | да |
+
+В Go структура — не ссылка на объект, а само значение (GO-1.11). Поэтому Go просит вас выбрать: нужна методу
+копия или адрес.
+
+Эта ошибка тихая. Молчат и компилятор, и `go vet`:
+
+```console
+$ go vet ./metod
+```
+
+`go vet` ничего не вывел. Её ловит **staticcheck** — линтер, который не входит в Go и ставится отдельно
+(`go install honnef.co/go/tools/cmd/staticcheck@latest`, программа попадает в `~/go/bin`):
+
+```console
+$ ~/go/bin/staticcheck ./metod
+metod/main.go:15:28: ineffective assignment to field Buyurtma.Tolandi (SA4005)
+```
+
+Строка 15, столбец 28: *ineffective assignment to field Buyurtma.Tolandi* — «бесполезная запись в поле
+`Buyurtma.Tolandi`». `SA4005` — номер проверки. Заголовок в её документации спрашивает прямо: *"Did you mean to use a
+pointer receiver?"* — «может, вы хотели pointer receiver?»
+
+## Go сам добавляет `&` и `*`
+
+В `metod` мы написали `b.TolaP()`, а не `(&b).TolaP()`. Спецификация (*Calls*): *"If x is addressable and &x's method
+set contains m, x.m() is shorthand for (&x).m()"* — «если `x` адресуемое и в method set `&x` есть `m`, то `x.m()` —
+краткая запись `(&x).m()`».
+
+Работает и в обратную сторону. Если вызвать метод с value receiver через указатель, Go поставит `*`: `p.Jami()` —
+это `(*p).Jami()` (спецификация, *Method values*). Если `p` равен `nil`, это `*p` вызывает panic. А метод с pointer
+receiver вызывается и с `nil` receiver и может сам это проверить. `nilp/main.go`:
+
+```go filename="nilp/main.go" showLineNumbers
+// nilp: nil pointer orqali metod. Pointer receiver nil'ni oʻzi tekshira oladi,
+// value receiver esa chaqiruvdan oldin *p ni oʻqiydi va panic beradi (ATAYLAB).
+package main
+
+import "fmt"
+
+type Buyurtma struct{ Summa int64 }
+
+func (b Buyurtma) Jami() int64 { return b.Summa }
+
+func (b *Buyurtma) JamiP() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.Summa
+}
+
+func main() {
+	var p *Buyurtma
+	fmt.Println("JamiP:", p.JamiP()) // 0: receiver nil, metod buni tekshirdi
+	fmt.Println("Jami: ", p.Jami())  // (*p).Jami() → panic
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 9 | `func (b Buyurtma) Jami()` | value receiver |
+| 11–16 | `func (b *Buyurtma) JamiP()` | pointer receiver: если `b` равен `nil`, возвращает 0 |
+| 19 | `var p *Buyurtma` | указатель без значения: `nil` |
+| 20 | `p.JamiP()` | receiver — сам указатель `nil`; он проверяется внутри метода |
+| 21 | `p.Jami()` | Go превращает это в `(*p).Jami()`: переход по `nil` к значению |
+
+`-trimpath` только сокращает путь к файлу в сообщении (GO-1.11):
+
+```console
+$ go run -trimpath ./nilp
+JamiP: 0
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x49e1b2]
+
+goroutine 1 [running]:
+main.main()
+	github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/nilp/main.go:21 +0x72
+exit status 2
+```
+
+Вывелось `JamiP: 0`, потом panic в строке 21. В JS `null.total()` и в Python `None.total()` — всегда ошибка. А в
+Go метод с указателем можно вызвать с `nil` receiver, потому что receiver — просто аргумент.
+
+Спецификация описывает эти правила «Go сам добавляет» через **method set**. Method set — набор методов типа
+(*Method sets*):
+
+| Тип | В его method set | В примере `metod` |
+|---|---|---|
+| `Buyurtma` (`T`) | только методы с receiver `T` | `Jami`, `Tola` |
+| `*Buyurtma` (`*T`) | методы с receiver `T` **и** `*T` | `Jami`, `Tola`, `TolaP` |
+
+В `b.TolaP()` метода `TolaP` нет в method set `Buyurtma`. Поэтому Go берёт `&b` и вызывает метод `*Buyurtma`. Но
+чтобы взять `&b`, есть одно условие: `b` должно быть **адресуемым** (addressable), то есть у него можно взять адрес.
+
+## Какие значения адресуемые?
+
+Спецификация (*Address operators*) даёт точный список: переменная, значение через указатель (`*p`), элемент слайса,
+поле адресуемой структуры и элемент адресуемого массива. Проверим компилятором, `manzilsiz/main.go`:
+
+```go filename="manzilsiz/main.go" showLineNumbers
+// manzilsiz: pointer metodni qaysi qiymatda chaqirsa boʻladi? Faqat addressable qiymatda.
+// Bu papka ATAYLAB kompilyatsiya boʻlmaydi: go build -o /dev/null ./manzilsiz
+package main
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) Tola() { b.Tolandi = true }
+
+type Savat struct{ B Buyurtma }
+
+func yarat() Buyurtma { return Buyurtma{Summa: 50_000} }
+
+func main() {
+	var b Buyurtma
+	b.Tola() // ✅ oʻzgaruvchi
+	s := []Buyurtma{{}}
+	s[0].Tola() // ✅ slice elementi
+	var a [2]Buyurtma
+	a[1].Tola() // ✅ addressable massiv elementi
+	var sv Savat
+	sv.B.Tola() // ✅ addressable struct'ning maydoni
+	p := &b
+	(*p).Tola() // ✅ pointer orqali qiymat (pointer indirection)
+
+	(&Buyurtma{}).Tola() // ✅ lekin bu yerda receiver allaqachon pointer: &T{} — & uchun istisno
+
+	m := map[string]Buyurtma{}
+	m["a1"].Tola()    // ❌ map elementi
+	yarat().Tola()    // ❌ funksiya natijasi
+	Buyurtma{}.Tola() // ❌ composite literal'ning oʻzi
+}
+```
+
+| Строка | Код | Адресуемое? |
+|---|---|---|
+| 18 | `b.Tola()` | да: `b` — переменная |
+| 20 | `s[0].Tola()` | да: элемент слайса лежит во внутреннем массиве (GO-1.08) |
+| 22 | `a[1].Tola()` | да: `a` — массив в переменной (`[2]Buyurtma`), его элемент тоже адресуемый |
+| 24 | `sv.B.Tola()` | да: `sv` адресуемая, значит, и её поле `B` тоже. `Savat` («корзина») — структура с одним полем `Buyurtma` |
+| 26 | `(*p).Tola()` | да: значение через указатель (*pointer indirection*) |
+| 28 | `(&Buyurtma{}).Tola()` | receiver уже указатель, адресуемость не нужна. Составной литерал не адресуемый, но к нему можно написать `&`: это исключение только для `&` |
+| 31 | `m["a1"].Tola()` | нет: элемент map |
+| 32 | `yarat().Tola()` | нет: результат функции. `yarat` («создать») возвращает новый заказ |
+| 33 | `Buyurtma{}.Tola()` | нет: составной литерал без `&` |
+
+```console
+$ go build -o /dev/null ./manzilsiz
+# github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/manzilsiz
+manzilsiz/main.go:31:10: cannot call pointer method Tola on Buyurtma
+manzilsiz/main.go:32:10: cannot call pointer method Tola on Buyurtma
+manzilsiz/main.go:33:13: cannot call pointer method Tola on Buyurtma
+```
+
+По одному сообщению на каждую строку с ошибкой: 31, 32 и 33. К остальным шести вызовам у компилятора претензий
+нет. Это и ответ на загадку: `s[0]` — элемент слайса, адресуемый; `m["a1"]` — элемент map, не адресуемый.
+
+## Почему нельзя взять адрес элемента map?
+
+Одна из причин — рост map. В [GO-1.09](/lab/youtube/go/go-1-09/ru) мы видели: начиная с Go 1.24 map работает на **Swiss
+table**. Когда элементов становится больше, runtime заменяет таблицу на бо́льшую и переносит в неё элементы. В
+исходном коде Go написано так:
+
+```console
+$ sed -n 100,102p $(go env GOROOT)/src/internal/runtime/maps/map.go
+// A map starts with a single table. Up to [maxTableCapacity], growth simply
+// replaces this table with a replacement with double capacity. Beyond this
+// limit, growth splits the table into two.
+```
+
+«Map начинается с одной таблицы. До определённого предела рост заменяет таблицу на таблицу двойной ёмкости. После
+этого таблица делится на две.» Если бы `&m["a1"]` было возможно, после роста этот адрес указывал бы на устаревшую
+копию в старой таблице.
+
+Это ровно ловушка `&s[0]` + `append` из [GO-1.11](/lab/youtube/go/go-1-11/ru). В слайсе эта ошибка тихо случается во время
+выполнения. А в map язык запрещает её ещё при компиляции. (Донован и Керниган в §4.3 приводят ту же причину.)
+
+В Python этой проблемы нет: dict хранит ссылки на объекты. Этого примера тоже нет в папке курса:
+
+```python
+class Order:
+    def __init__(self, summa):
+        self.summa = summa
+        self.paid = False
+
+    def pay(self):
+        self.paid = True
+
+m = {"a1": Order(50_000)}
+m["a1"].pay()
+print(m["a1"].paid)
+```
+
+```console
+$ python3 mapref.py
+True
+```
+
+Ближе всего к этому в Go — хранить в map указатели. Решения два, `mapfix/main.go`:
+
+```go filename="mapfix/main.go" showLineNumbers
+// mapfix: map elementida pointer metodni chaqirishning ikki yoʻli.
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) Tola() { b.Tolandi = true }
+
+func main() {
+	// 1-yoʻl: nusxa ol, oʻzgartir, qaytarib yoz.
+	m := map[string]Buyurtma{"a1": {Summa: 50_000}}
+	b := m["a1"]
+	b.Tola()
+	m["a1"] = b
+	fmt.Println("1-yoʻl:", m["a1"].Tolandi)
+
+	// 2-yoʻl: map'da pointer saqla. m2["a1"] — pointer, uning ortidagi buyurtma addressable.
+	m2 := map[string]*Buyurtma{"a1": {Summa: 50_000}}
+	m2["a1"].Tola()
+	fmt.Println("2-yoʻl:", m2["a1"].Tolandi)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 16 | `b := m["a1"]` | берёт копию элемента map в переменную: теперь она адресуемая |
+| 17 | `b.Tola()` | `(&b).Tola()`: меняет копию |
+| 18 | `m["a1"] = b` | записывает изменённую копию обратно в map |
+| 22 | `map[string]*Buyurtma{"a1": {Summa: 50_000}}` | в map хранятся указатели. `{Summa: 50_000}` здесь — краткая запись `&Buyurtma{…}` |
+| 23 | `m2["a1"].Tola()` | `m2["a1"]` — указатель, receiver тоже указатель: `&` не нужен |
+
+```console
+$ go run ./mapfix
+1-yoʻl: true
+2-yoʻl: true
+```
+
+Go wiki (*MethodSets*) говорит: map со структурами в качестве элементов почти всегда делают с указателями. Но
+первый способ тоже правильный, особенно для маленькой структуры.
+
+## Method set и `fmt.Stringer`: почему `String()` не вызвался?
+
+В Python — `__str__`, в JS — `toString()`, в PHP — `__toString()`. В Go — метод `String() string`: если пакет `fmt`
+его находит, то вызывает его при печати значения. Тип с таким методом называется **`fmt.Stringer`**. В Python
+`print` находит `__str__` всегда (этого примера тоже нет в папке курса):
+
+```python
+class Order:
+    def __init__(self, summa):
+        self.summa = summa
+
+    def __str__(self):
+        return f"buyurtma: {self.summa // 100} soʻm"
+
+print(Order(50_000))
+```
+
+```console
+$ python3 stringer.py
+buyurtma: 500 soʻm
+```
+
+В Go напишем `String()` с pointer receiver, `stringer/main.go`:
+
+```go filename="stringer/main.go" showLineNumbers
+// stringer: String metodi pointer receiver'da. fmt.Println(b) uni chaqirmaydi, fmt.Println(&b) chaqiradi.
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64 // tiyinda
+	Tolandi bool
+}
+
+// String: *Buyurtma ning metodi. Buyurtma (pointer emas) ning method set'ida yoʻq.
+func (b *Buyurtma) String() string {
+	return fmt.Sprintf("buyurtma: %d soʻm, toʻlandi: %t", b.Summa/100, b.Tolandi)
+}
+
+func main() {
+	b := Buyurtma{Summa: 50_000}
+	fmt.Println(b)  // Buyurtma fmt.Stringer emas: maydonlar chiqadi
+	fmt.Println(&b) // *Buyurtma fmt.Stringer: String() chaqiriladi
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 12 | `func (b *Buyurtma) String() string` | `String` с pointer receiver |
+| 13 | `fmt.Sprintf(…)` | форматирует как `Printf`, но не печатает, а возвращает строку. `%d` — целое число, `%t` — `bool`. `b.Summa/100` — из тийинов в сумы |
+| 18 | `fmt.Println(b)` | передаёт сам заказ |
+| 19 | `fmt.Println(&b)` | передаёт адрес заказа |
+
+Перед запуском: что выведет строка 18? **A)** `buyurtma: 500 soʻm, toʻlandi: false` ·
+**B)** `{50000 false}` · **C)** ошибка компиляции
+
+<details>
+<summary>Ответ</summary>
+
+**B: `{50000 false}`.** Тип `b` — `Buyurtma`, в его method set нет `String`: `String` есть только у `*Buyurtma`.
+`fmt` не находит `String` и печатает поля как есть. Если вы выбрали «A», вы думали, что Go добавит `&` и здесь, как в
+`b.TolaP()`. Но `Println` не вызывает метод, он только получает значение. Не «C»: `Println` принимает любое
+значение, ниже увидим почему.
+
+</details>
+
+```console
+$ go run ./stringer
+{50000 false}
+buyurtma: 500 soʻm, toʻlandi: false
+```
+
+Почему так? Параметр `Println` — `...any`: в него помещается любое значение. А есть ли `String`, `fmt` проверяет во
+время выполнения программы (`case Stringer:` внутри `handleMethods` в `fmt/print.go`). Эта проверка смотрит на
+method set типа значения: у `Buyurtma` нет `String`, у `*Buyurtma` есть.
+
+И эта ошибка тихая. С `Println` молчит и `go vet`:
+
+```console
+$ go vet ./stringer && echo vet: jim
+vet: jim
+```
+
+`&&` — «если команда слева завершилась успешно, запусти команду справа». `go vet` не нашёл ошибок, поэтому сработал
+`echo`.
+
+Теперь передадим значение в переменную типа `fmt.Stringer`. **Интерфейс** (interface) — тип, состоящий из списка методов:
+`fmt.Stringer` означает «любой тип с методом `String() string`». Подробно в следующем уроке:
+[GO-1.13 · Интерфейсы: почему `nil` не равен `nil`?](/lab/youtube/go/go-1-13/ru). `stringerxato/main.go`:
+
+```go filename="stringerxato/main.go" showLineNumbers
+// stringerxato: kompilyator method set'ni tekshiradi. Bu papka ATAYLAB kompilyatsiya boʻlmaydi:
+// go build -o /dev/null ./stringerxato
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa   int64
+	Tolandi bool
+}
+
+func (b *Buyurtma) String() string { return fmt.Sprint(b.Summa) }
+
+func main() {
+	b := Buyurtma{Summa: 50_000}
+	var s fmt.Stringer = b // ❌ String pointer receiver'da
+	fmt.Println(s)
+}
+```
+
+`fmt.Sprint` в строке 12 превращает значение в строку. В строке 16 `b` присваивается `s` типа `fmt.Stringer`. На этот
+раз проверку делает компилятор:
+
+```console
+$ go build -o /dev/null ./stringerxato
+# github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/stringerxato
+stringerxato/main.go:16:23: cannot use b (variable of struct type Buyurtma) as fmt.Stringer value in variable declaration: Buyurtma does not implement fmt.Stringer (method String has pointer receiver)
+```
+
+Читаем сообщение: *cannot use b … as fmt.Stringer value* — «нельзя использовать `b` как значение `fmt.Stringer`».
+*Buyurtma does not implement fmt.Stringer (method String has pointer receiver)* — «`Buyurtma` не реализует
+`fmt.Stringer`: метод `String` с pointer receiver». **Исправление:** `var s fmt.Stringer = &b` или написать `String`
+с value receiver.
+
+Почему здесь Go сам не добавляет `&b`? Go FAQ (*Why do T and \*T have different method sets?*) отвечает: адрес
+значения внутри интерфейса нельзя безопасно взять. А если бы и можно было, метод менял бы копию внутри интерфейса, и
+изменение потерялось бы, не дойдя до вызывающего кода.
+
+## Встраивание: методы тоже поднимаются
+
+В [GO-1.10](/lab/youtube/go/go-1-10/ru) мы видели: при встраивании (embedding) поля вложенной структуры поднимаются во внешнюю
+(*promoted*). Методы поднимаются точно так же. `embed/main.go`:
+
+```go filename="embed/main.go" showLineNumbers
+// embed: embedding'da metodlar ham koʻtariladi (GO-1.10 vaʼdasi). Receiver baribir ichki struct.
+package main
+
+import "fmt"
+
+type Manzil struct {
+	Shahar string
+	Kocha  string
+}
+
+func (m Manzil) Toliq() string         { return m.Shahar + ", " + m.Kocha }
+func (m *Manzil) Kochir(shahar string) { m.Shahar = shahar }
+
+type Mijoz struct {
+	Ism    string
+	Manzil // embedding
+}
+
+func main() {
+	a := Mijoz{Ism: "Aziza", Manzil: Manzil{Shahar: "Toshkent", Kocha: "Navoiy"}}
+	a.Kochir("Samarqand")  // (&a.Manzil).Kochir("Samarqand")
+	fmt.Println(a.Toliq()) // a.Manzil.Toliq()
+	fmt.Println(a.Ism, "—", a.Manzil.Shahar)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `func (m Manzil) Toliq() string` | `Toliq` («полный») — value receiver: возвращает город и улицу |
+| 12 | `func (m *Manzil) Kochir(shahar string)` | `Kochir` («переселить») — pointer receiver: меняет город |
+| 14–17 | `type Mijoz struct {…}` | в `Mijoz` («клиент») встроен `Manzil` («адрес») |
+| 21 | `a.Kochir("Samarqand")` | поднятый метод: на самом деле `(&a.Manzil).Kochir(…)`. Работает, потому что `a` — переменная, а `a.Manzil` — поле адресуемой структуры |
+| 22 | `a.Toliq()` | на самом деле `a.Manzil.Toliq()` |
+| 23 | `a.Manzil.Shahar` | читает город вложенного `Manzil` напрямую |
+
+В Python похожий код пишут через наследование (inheritance). Этого примера тоже нет в папке курса:
+
+```python
+class Address:
+    def __init__(self, city):
+        self.city = city
+
+    def move(self, city):
+        print(type(self).__name__)
+        self.city = city
+
+class Customer(Address):
+    pass
+
+c = Customer("Toshkent")
+c.move("Samarqand")
+print(c.city)
+```
+
+```console
+$ python3 inherit.py
+Customer
+Samarqand
+```
+
+В Python внутри унаследованного метода `self` — сам `Customer`. А в Go:
+
+```console
+$ go run ./embed
+Samarqand, Navoiy
+Aziza — Samarqand
+```
+
+Азиза переехала в Самарканд, но изменение записалось во вложенный `Manzil`: receiver у `Kochir` — именно эта
+вложенная структура. Effective Go (*Embedding*): при вызове метода его receiver — внутренний тип, а не внешний. Это
+не наследование, а обычное делегирование: `Kochir` ничего не знает о `Mijoz`.
+
+Влияние на method set (спецификация, *Struct types*): если в `S` встроен `T`, в method set `S` и `*S` входят методы с
+receiver `T`. А методы с receiver `*T` входят только в `*S`. Это правило проверим в уровне «гуру» домашнего задания.
+
+## Пауза: когда method value берёт receiver?
+
+Метод можно не вызывать, а сохранить в переменную: `f := b.Jami`. Это называется **method value**: `f` — функция,
+её потом вызывают как `f()`. Вопрос:
+
+```go
+type Buyurtma struct {
+	Summa int64
+}
+
+func (b Buyurtma) Jami() int64   { return b.Summa }
+func (b *Buyurtma) JamiP() int64 { return b.Summa }
+
+b := Buyurtma{Summa: 100}
+f := b.Jami
+g := b.JamiP
+b.Summa = 200
+fmt.Println("f():", f())
+fmt.Println("g():", g())
+```
+
+Что вернут `f()` и `g()`? **A)** `200`, `200` · **B)** `100`, `200` · **C)** `100`, `100`
+
+Подсказка: когда берётся receiver — в строке `f := …` или при вызове `f()`?
+
+<details>
+<summary>Ответ</summary>
+
+**B: `f()` — 100, `g()` — 200.** Спецификация (*Method values*): при создании method value receiver
+*"evaluated and saved"* — «вычисляется и сохраняется». `f` — value receiver: в этот момент сохранилась копия `b`
+(`Summa: 100`). `g` — pointer receiver: сохранился `&b`, а `Summa` прочитана в момент вызова — 200. Если вы выбрали
+«A», вы думали, что receiver берётся при вызове (так работает bound method в Python, см. ниже). Если выбрали «C»,
+вы думали, что `g` тоже хранит копию.
+
+</details>
+
+Полная программа, `savol/main.go`:
+
+```go filename="savol/main.go" showLineNumbers
+// savol: method value receiver'ni qachon oladi? Pauzadagi savol.
+package main
+
+import "fmt"
+
+type Buyurtma struct {
+	Summa int64
+}
+
+func (b Buyurtma) Jami() int64   { return b.Summa }
+func (b *Buyurtma) JamiP() int64 { return b.Summa }
+
+func main() {
+	b := Buyurtma{Summa: 100}
+	f := b.Jami  // value receiver: b ning nusxasi shu yerda olinadi
+	g := b.JamiP // pointer receiver: &b shu yerda olinadi
+	b.Summa = 200
+	fmt.Println("f():", f())
+	fmt.Println("g():", g())
+}
+```
+
+```console
+$ go run ./savol
+f(): 100
+g(): 200
+```
+
+| Строка | `b.Summa` | receiver, сохранённый в `f` | receiver, сохранённый в `g` |
+|---|---|---|---|
+| 14 | 100 | — | — |
+| 15 | 100 | копия `Buyurtma{100}` | — |
+| 16 | 100 | копия `Buyurtma{100}` | `&b` |
+| 17 | 200 | копия `Buyurtma{100}` (не изменилась) | `&b` → теперь 200 |
+
+Сравним с JS и Python (нет в папке курса). В JS, если сохранить `o.total` в переменную, `this` теряется; его нужно
+привязать через `bind`:
+
+```js
+class Order {
+  constructor(summa) { this.summa = summa; }
+  total() { return this.summa; }
+}
+
+const o = new Order(100);
+const f = o.total;
+const g = o.total.bind(o);
+o.summa = 200;
+try {
+  console.log("f():", f());
+} catch (e) {
+  console.log("f():", e.constructor.name + ":", e.message);
+}
+console.log("g():", g());
+```
+
+```console
+$ node methodvalue.js
+f(): TypeError: Cannot read properties of undefined (reading 'summa')
+g(): 200
+```
+
+В Python `o.total` — *bound method*: он хранит ссылку на объект.
+
+```python
+class Order:
+    def __init__(self, summa):
+        self.summa = summa
+
+    def total(self):
+        return self.summa
+
+o = Order(100)
+f = o.total
+o.summa = 200
+print("f():", f())
+```
+
+```console
+$ python3 methodvalue.py
+f(): 200
+```
+
+| Язык | Что хранит `f := b.Jami` | `f()` после `b.Summa = 200` |
+|---|---|---|
+| JS, без `bind` | ничего: `this` теряется | `TypeError` |
+| JS с `bind(o)` / bound method в Python | ссылку на объект | 200 |
+| Go, pointer receiver | `&b` | 200 |
+| Go, value receiver | копию `b` | **100** |
+
+`defer b.Chiqar()` тоже берёт receiver точно так же, в строке с `defer`. Это уровень «сложно» домашнего задания.
+
+## Мьютекс и смешанные receiver: deadlock
+
+Самый опасный случай смешивания receiver. `sync.Mutex` — замок: `Lock()` берёт замок, а если он занят, ждёт, пока
+освободится; `Unlock()` освобождает замок. Подробно в [GO-1.22](/lab/youtube/go#go-1-22). `myuteks/main.go`:
+
+```go filename="myuteks/main.go" showLineNumbers
+// myuteks: sync.Mutex bor struct'da value receiver — ATAYLAB xato. go vet ./myuteks buni ushlaydi.
+// Qosh (pointer receiver) lock'ni ushlab turib Balansi (value receiver) ni chaqiradi:
+// Balansi mutex'ning nusxasini oladi — nusxa ham qulflangan, Lock abadiy kutadi.
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Hisob struct {
+	mu     sync.Mutex
+	balans int64
+}
+
+func (h *Hisob) Qosh(n int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.balans += n
+	fmt.Println("yangi balans:", h.Balansi())
+}
+
+// Balansi: value receiver — mutex ham nusxalanadi.
+func (h Hisob) Balansi() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.balans
+}
+
+func main() {
+	var h Hisob
+	h.Qosh(100)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11–14 | `type Hisob struct {…}` | `Hisob` («счёт») — мьютекс и баланс |
+| 16 | `func (h *Hisob) Qosh(n int64)` | `Qosh` («добавить») — pointer receiver |
+| 17–18 | `h.mu.Lock()`, `defer h.mu.Unlock()` | берёт замок; `defer` (GO-1.09) отпустит его в конце функции |
+| 20 | `h.Balansi()` | замок ещё у `Qosh`, вызывается `Balansi` |
+| 24 | `func (h Hisob) Balansi() int64` | `Balansi` («баланс») — **value receiver**: копируется весь `Hisob`, включая `mu` |
+| 25 | `h.mu.Lock()` | пытается запереть мьютекс в копии |
+
+В момент копирования исходный мьютекс был заперт. Мьютекс — структура из обычных полей, поэтому копия тоже в
+состоянии «заперто». Её никто не отпирает, и `Lock` ждёт вечно. `2>&1 | head -1` забирает и поток ошибок и
+показывает только первую строку:
+
+```console
+$ go run ./myuteks 2>&1 | head -1
+fatal error: all goroutines are asleep - deadlock!
+```
+
+*all goroutines are asleep - deadlock!* — «все горутины уснули: **deadlock** (взаимная блокировка)». Горутина —
+лёгкий поток Go; в этой программе она одна (`main`), и она ждёт сама себя. Runtime это увидел и остановил программу
+с `fatal error` (GO-1.09). `yangi balans:` («новый баланс:») так и не вывелось.
+
+Эту ошибку ловит `go vet` (его проверка `copylocks`):
+
+```console
+$ go vet ./myuteks
+myuteks/main.go:24:9: Balansi passes lock by value: github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/myuteks.Hisob contains sync.Mutex
+```
+
+Строка 24: *Balansi passes lock by value: … Hisob contains sync.Mutex* — «`Balansi` передаёт замок по значению
+(копирует его): в `Hisob` есть `sync.Mutex`». В документации мьютекса тоже написано:
+
+```console
+$ go doc sync.Mutex | grep copied
+    A Mutex must not be copied after first use.
+```
+
+«Мьютекс нельзя копировать после первого использования.» **Исправление:** `func (h *Hisob) Balansi()`. Если бы все
+методы `Hisob` были с value receiver, deadlock не случился бы. Но тогда и `Qosh`, как `Tola`, писал бы в копию, и
+мьютекс ничего бы не защищал.
+
+## Какой receiver выбрать?
+
+Go FAQ (*Should I define methods on values or pointers?*) и Go wiki CodeReviewComments (*Receiver Type*) советуют
+так:
+
+| Случай | Receiver | Почему |
+|---|---|---|
+| метод меняет receiver | `*T` | value receiver меняет копию (`Tola`) |
+| в структуре есть `sync.Mutex` | `*T` | мьютекс нельзя копировать (`myuteks`) |
+| структура большая | `*T` | чтобы не копировать всю структуру при каждом вызове |
+| маленькое неизменяемое значение (как `time.Time`), простой тип | `T` | дёшево и понятно; FAQ: для простых типов, слайсов и маленьких структур value receiver *"very cheap"* |
+| тип — map, функция или channel ([GO-1.21](/lab/youtube/go#go-1-21)) | `T` | внутри у них уже есть ссылка, указатель не нужен |
+| для всего типа | один | выбирайте receiver для типа, а не для каждого метода, и не смешивайте |
+| если сомневаетесь | `*T` | wiki: *"when in doubt, use a pointer receiver"* |
+
+В стандартной библиотеке есть оба подхода. `time.Time` — маленькое значение (24 байта). Посчитаем его методы с
+value receiver (`grep -c` выводит число совпавших строк):
+
+```console
+$ go doc -all time | grep -cE '^func \(t Time\)'
+43
+$ go doc -all time | grep -E '^func \(t \*Time\)'
+func (t *Time) GobDecode(data []byte) error
+func (t *Time) UnmarshalBinary(data []byte) error
+func (t *Time) UnmarshalJSON(data []byte) error
+func (t *Time) UnmarshalText(data []byte) error
+```
+
+43 с value receiver и только 4 с pointer receiver. Эти четыре читают данные (JSON, текст, байты) и меняют само время.
+Значит, у правила «не смешивайте» есть и обоснованное исключение. `go doc time.Time` тоже говорит: время обычно
+хранят и передают как значение, а не как указатель.
+
+А в `strings.Builder` все методы с pointer receiver:
+
+```console
+$ go doc strings.Builder
+package strings // import "strings"
+
+type Builder struct {
+	// Has unexported fields.
+}
+    A Builder is used to efficiently build a string using Builder.Write methods.
+    It minimizes memory copying. The zero value is ready to use. Do not copy a
+    non-zero Builder.
+
+func (b *Builder) Cap() int
+func (b *Builder) Grow(n int)
+func (b *Builder) Len() int
+func (b *Builder) Reset()
+func (b *Builder) String() string
+func (b *Builder) Write(p []byte) (int, error)
+func (b *Builder) WriteByte(c byte) error
+func (b *Builder) WriteRune(r rune) (int, error)
+func (b *Builder) WriteString(s string) (int, error)
+```
+
+*Do not copy a non-zero Builder* — «не копируйте Builder, в который уже писали», как и мьютекс. Методы записи
+проверяют копию (`copyCheck` в `strings/builder.go`). Только читающий `Len` этого не проверяет, но и он с pointer
+receiver: единообразие по типу.
+
+## Частые ошибки
+
+**1. Ждать, что метод с value receiver изменит receiver.** Самое распространённое заблуждение этой темы, особенно у
+тех, кто пришёл из Python, JS или PHP: `self` / `this` — всегда ссылка, а `(b T)` в Go — копия. В разделе «Метод и
+receiver» мы видели: `Tola` вызван, `Tolandi` остался `false`, а компилятор и `go vet` молчат. **Исправление:**
+`func (b *Buyurtma) Tola()`. Такую ошибку ловит staticcheck (`SA4005`), добавьте его в CI.
+
+**2. Вызывать метод с указателем у элемента map.** `m["a1"].Tola()` → `cannot call pointer method Tola on Buyurtma`
+(раздел «Загадка»). Как читать: *pointer method* — receiver `*T`, *on Buyurtma* — а у вас значение `T`, и его адрес
+взять нельзя. Результат функции (`yarat().Tola()`) даёт ту же ошибку. **Исправление:** взять значение в переменную,
+изменить и записать обратно, или хранить в map указатели (`map[string]*Buyurtma`).
+
+**3. Написать `String()` с pointer receiver и печатать значение.** `fmt.Println(b)` выводит `{50000 false}`, и
+`go vet` молчит (раздел «Method set и `fmt.Stringer`»). С `Printf` же `go vet` ловит. Этого примера нет в папке
+курса, он запущен отдельно:
+
+```go
+package main
+
+import "fmt"
+
+type Buyurtma struct{ Summa int64 }
+
+func (b *Buyurtma) String() string { return fmt.Sprint(b.Summa) }
+
+func main() {
+	b := Buyurtma{Summa: 50_000}
+	fmt.Printf("%s\n", b)
+}
+```
+
+```console
+$ go run printfvet/main.go
+{%!s(int64=50000)}
+$ go vet printfvet/main.go
+printfvet/main.go:11:14: fmt.Printf format %s has arg b of wrong type command-line-arguments.Buyurtma
+```
+
+`{%!s(int64=50000)}` — пометка `fmt` «`%s` не подходит к этому значению». Сообщение vet: *format %s has arg b of
+wrong type* — «для формата `%s` передан аргумент `b` неверного типа». **Исправление:** написать `String` с value
+receiver (он не меняет receiver) или передать адрес: `fmt.Println(&b)`.
+
+**4. Value receiver у структуры с мьютексом.** Deadlock или незащищённая запись (раздел «Мьютекс и смешанные
+receiver»). **Исправление:** все методы с pointer receiver; всегда запускайте `go vet`, он ловит
+`passes lock by value`.
+
+**5. Вызывать метод с value receiver через указатель `nil`.** `p.Jami()` — это `(*p).Jami()`, и при `p == nil` будет
+panic (раздел «Go сам добавляет `&` и `*`»). **Исправление:** проверить указатель или написать метод с pointer
+receiver и проверять `nil` внутри метода (как `JamiP`).
+
+**6. Считать встраивание наследованием.** Receiver поднятого метода — вложенная структура (раздел «Встраивание»).
+`Kochir` не видит `Mijoz`, и его методы нельзя «переопределить» (override). **Исправление:** читайте встраивание
+как делегирование: `a.Kochir(…)` = `a.Manzil.Kochir(…)`.
+
+## Проверьте себя
+
+Сначала ответьте сами, потом откройте.
+
+**1.** Почему `s[0].Tola()` компилируется, а `m["a1"].Tola()` — нет (`Tola` с pointer receiver)?
+
+<details>
+<summary>Ответ</summary>
+
+`Tola` входит в method set `*Buyurtma`. `x.Tola()` Go превращает в `(&x).Tola()`, но только если `x` адресуемое.
+Элемент слайса адресуемый, а элемент map — нет: при росте map runtime переносит элементы в новую таблицу, и старый
+адрес указывал бы на устаревшую копию.
+
+</details>
+
+**2.** Какие методы входят в method set `T` и `*T`? Если `String()` объявлен у `*Buyurtma`, скомпилируется ли
+`var s fmt.Stringer = &b`?
+
+<details>
+<summary>Ответ</summary>
+
+У `T` — методы с receiver `T`; у `*T` — с receiver `T` и `*T`. Тип `&b` — `*Buyurtma`, в его method set есть
+`String`, значит, **да**, скомпилируется. А `= b` даёт ошибку `method String has pointer receiver`.
+
+</details>
+
+**3.** Что выведет этот код? **A)** `200 200` · **B)** `100 200` · **C)** `100 100`
+
+```go
+type Buyurtma struct{ Summa int64 }
+
+func (b Buyurtma) Jami() int64 { return b.Summa }
+
+b := Buyurtma{Summa: 100}
+p := &b
+f := p.Jami // Jami: value receiver
+b.Summa = 200
+fmt.Println(f(), p.Jami())
+```
+
+<details>
+<summary>Ответ</summary>
+
+**B: `100 200`.** `p.Jami` — это `(*p).Jami` (спецификация, *Method values*). При создании method value receiver
+вычисляется и сохраняется: `*p`, то есть копия `b` на этот момент (100). А `p.Jami()` читает `*p` в момент вызова:
+200. Если вы выбрали «A», вы думали, что `f` хранит указатель: даже если метод взят через указатель, value receiver
+хранит копию.
+
+Полная программа (нет в папке курса, запущена отдельно):
+
+```go
+package main
+
+import "fmt"
+
+type Buyurtma struct{ Summa int64 }
+
+func (b Buyurtma) Jami() int64 { return b.Summa }
+
+func main() {
+	b := Buyurtma{Summa: 100}
+	p := &b
+	f := p.Jami // Jami: value receiver
+	b.Summa = 200
+	fmt.Println(f(), p.Jami())
+}
+```
+
+```console
+$ go run ptrval/main.go
+100 200
+```
+
+</details>
+
+**4.** В структуре есть `sync.Mutex`. Какой receiver нужен методу `Balansi`, который только читает, и почему?
+
+<details>
+<summary>Ответ</summary>
+
+**Pointer receiver.** Value receiver копирует всю структуру, включая мьютекс. Копия, сделанная, пока замок занят,
+тоже будет заперта: в `myuteks` это дало deadlock. `go vet` ловит это как `passes lock by value`. Кроме того, в
+одном типе receiver не смешивают.
+
+</details>
+
+**5.** Из [GO-1.11](/lab/youtube/go/go-1-11/ru): `p := &s[0]`, потом `append`, которому не хватило ёмкости. Чему будет равен
+`s[0].Tolandi` после `p.Tolandi = true`, и как это связано с сегодняшним правилом для map?
+
+<details>
+<summary>Ответ</summary>
+
+`false`. `append` выделил новый массив, а `p` остался смотреть на старый. В map та же опасность (рост переносит
+элементы), поэтому Go запрещает брать адрес элемента map ещё при компиляции. А в слайсе эта ошибка тихо случается
+во время выполнения.
+
+</details>
+
+## Домашнее задание
+
+Задания четырёх уровней. Все файлы — в папке урока на GitHub:
+[lessons/012-methods-receivers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/012-methods-receivers).
+Ответы: папка [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/012-methods-receivers/homework)
+и README курса. Сначала попробуйте сами.
+
+🟢 **Легко:** почему выводится `0`, а не `3`? Найдите и исправьте.
+
+```go
+type Hisoblagich struct{ n int }
+func (h Hisoblagich) Oshir()     { h.n++ }
+func (h Hisoblagich) Qiymat() int { return h.n }
+// var h Hisoblagich; h.Oshir(); h.Oshir(); h.Oshir(); fmt.Println(h.Qiymat())
+```
+
+<details>
+<summary>Ответ</summary>
+
+`Oshir` («увеличить») — value receiver: при каждом вызове увеличивается копия, а `h` остаётся 0. Исправление —
+pointer receiver. Для единообразия `Qiymat` («значение») тоже с pointer receiver. staticcheck ловит ошибочный
+вариант как `SA4005`.
+
+```go filename="homework/oson/main.go" showLineNumbers
+// oson (javob): Hisoblagich nega 0 da qoladi? Value receiver nusxani oshiradi.
+// Tuzatish: pointer receiver. staticcheck xato variantni SA4005 bilan ushlaydi.
+package main
+
+import "fmt"
+
+type Hisoblagich struct{ n int }
+
+// Xato edi: func (h Hisoblagich) Oshir() { h.n++ }
+func (h *Hisoblagich) Oshir() { h.n++ }
+
+func (h *Hisoblagich) Qiymat() int { return h.n } // izchillik: hamma metod pointer receiver
+
+func main() {
+	var h Hisoblagich
+	h.Oshir()
+	h.Oshir()
+	h.Oshir()
+	fmt.Println(h.Qiymat()) // 3
+}
+```
+
+```console
+$ go run ./homework/oson
+3
+```
+
+</details>
+
+🟡 **Средне:** какие из строк с номерами 1–8 в `homework/orta/main.go` компилируются? Сначала ответьте сами, потом
+проверьте через `go build -o /dev/null ./homework/orta`.
+
+```go filename="homework/orta/main.go" showLineNumbers
+// orta: qaysi qatorlar kompilyatsiya boʻladi? Avval oʻzingiz javob bering, keyin tekshiring:
+//
+//	go build -o /dev/null ./homework/orta
+//
+// Bu papka ATAYLAB kompilyatsiya boʻlmaydi. Javob — README'da.
+package main
+
+type Nuqta struct{ X, Y int }
+
+func (n Nuqta) Uzunlik() int { return n.X*n.X + n.Y*n.Y }
+func (n *Nuqta) Sur(d int)   { n.X += d }
+
+func yangi() Nuqta   { return Nuqta{1, 2} }
+func ikki() [2]Nuqta { return [2]Nuqta{} }
+
+func main() {
+	nuqtalar := []Nuqta{{1, 2}}
+	m := map[string]Nuqta{"a": {}}
+	mp := map[string]*Nuqta{"a": {}}
+
+	nuqtalar[0].Sur(1)    // 1
+	mp["a"].Sur(1)        // 2
+	_ = yangi().Uzunlik() // 3
+	_ = m["a"].Uzunlik()  // 4
+	m["a"].X = 5          // 5
+	f := m["a"].Sur       // 6
+	ikki()[0].Sur(1)      // 7
+	mp["a"].X = 5         // 8
+	_ = f
+}
+```
+
+`Nuqta` («точка»), `Uzunlik` («длина») — value receiver, `Sur` («сдвинуть») — pointer receiver.
+
+<details>
+<summary>Ответ</summary>
+
+**1, 2, 3, 4, 8 — да; 5, 6, 7 — нет.**
+
+```console
+$ go build -o /dev/null ./homework/orta
+# github.com/abdurahmon27/go-backend-uz/lessons/012-methods-receivers/homework/orta
+homework/orta/main.go:25:2: cannot assign to struct field m["a"].X in map
+homework/orta/main.go:26:14: cannot call pointer method Sur on Nuqta
+homework/orta/main.go:27:12: cannot call pointer method Sur on Nuqta
+```
+
+- **5** (строка 25): *cannot assign to struct field m["a"].X in map* — в поле элемента map тоже нельзя писать.
+- **6** (строка 26): method value тоже берёт receiver, для метода с указателем нужен `&m["a"]`.
+- **7** (строка 27): массив, возвращённый функцией, не адресуемый, значит, и его элемент тоже.
+- **3** и **4**: для метода с value receiver адресуемость не нужна.
+- **2** и **8**: `mp["a"]` — указатель, значение за ним адресуемое.
+
+</details>
+
+🟠 **Сложно:** `b := Buyurtma{Summa: 100}; defer b.Chiqar(); defer func() { b.Chiqar() }(); b.Summa = 200`
+(`Chiqar` — value receiver). Что выведется и в каком порядке?
+
+<details>
+<summary>Ответ</summary>
+
+**`200`, потом `100`.** `defer` выполняются в обратном порядке (LIFO): сначала замыкание, потом method value.
+`defer b.Chiqar()` берёт receiver (копию, 100) в строке с `defer`, как `f := b.Jami` в разделе «Пауза». А замыкание
+читает `b` в конце функции, в момент вызова (200).
+
+```go filename="homework/qiyin/main.go" showLineNumbers
+// qiyin (javob): defer receiver'ni qachon oladi?
+// defer b.Chiqar()            — method value: receiver (b ning nusxasi) defer qatorida olinadi → 100
+// defer func() { b.Chiqar() }() — closure: b funksiya oxirida, chaqiruv paytida oʻqiladi → 200
+// Tartib: defer LIFO, shuning uchun avval closure (200), keyin method value (100).
+package main
+
+import "fmt"
+
+type Buyurtma struct{ Summa int64 }
+
+func (b Buyurtma) Chiqar() { fmt.Println(b.Summa) }
+
+func main() {
+	b := Buyurtma{Summa: 100}
+	defer b.Chiqar()
+	defer func() { b.Chiqar() }()
+	b.Summa = 200
+}
+```
+
+```console
+$ go run ./homework/qiyin
+200
+100
+```
+
+</details>
+
+🔴 **Гуру:** `type A struct{ Manzil }` и `type B struct{ *Manzil }`. `Kochir` — с pointer receiver. Какие из `A{}`,
+`&A{}`, `B{}`, `&B{}` удовлетворяют `interface{ Kochir(string) }`? Докажите компилятором.
+
+<details>
+<summary>Ответ</summary>
+
+**`&A{}`, `B{}`, `&B{}` — да; `A{}` — нет.** В `A` встроен `Manzil` (значение): `Kochir` с receiver `*Manzil`
+поднимается только в method set `*A`. В `B` встроен `*Manzil`: все методы поднимаются и в `B`, и в `*B`. Если
+раскомментировать строку `var _ Kochiruvchi = A{}`, компилятор выдаст ошибку, записанную в комментарии в начале
+файла: `A does not implement Kochiruvchi (method Kochir has pointer receiver)`. Если `*Manzil` внутри `B{}` равен
+`nil`, вызов `Kochir` даст panic.
+
+```go filename="homework/guru/main.go" showLineNumbers
+// guru (javob): embedding va method set. Kochiruvchi interface'ini kim qanoatlantiradi?
+//
+//	type A struct{ Manzil }   — A ning method set'ida Toliq bor, Kochir yoʻq; *A da ikkalasi bor.
+//	type B struct{ *Manzil }  — B va *B ning method set'ida ikkalasi ham bor.
+//
+// var _ Kochiruvchi = A{} kompilyatsiya boʻlmaydi:
+//
+//	cannot use A{} (value of struct type A) as Kochiruvchi value in variable declaration:
+//	A does not implement Kochiruvchi (method Kochir has pointer receiver)
+package main
+
+import "fmt"
+
+type Manzil struct{ Shahar string }
+
+func (m Manzil) Toliq() string         { return m.Shahar }
+func (m *Manzil) Kochir(shahar string) { m.Shahar = shahar }
+
+type Kochiruvchi interface{ Kochir(string) }
+
+type A struct{ Manzil }
+type B struct{ *Manzil }
+
+var (
+	_ Kochiruvchi = &A{} // ✅
+	_ Kochiruvchi = B{}  // ✅ (lekin B{}.Manzil == nil: Kochir chaqirilsa panic)
+	_ Kochiruvchi = &B{} // ✅
+	// _ Kochiruvchi = A{} // ❌ yuqoridagi xato
+)
+
+func main() {
+	b := B{Manzil: &Manzil{Shahar: "Toshkent"}}
+	var k Kochiruvchi = b // B nusxalanadi, lekin ichidagi pointer bitta Manzil'ga qaraydi
+	k.Kochir("Buxoro")
+	fmt.Println(b.Toliq()) // Buxoro
+}
+```
+
+`Kochiruvchi` («переселяющий») — любой тип с методом `Kochir`. `var _ Kochiruvchi = …` — способ нигде не
+использовать значение, а только дать компилятору его проверить.
+
+```console
+$ go run ./homework/guru
+Buxoro
+```
+
+`b` скопировался в `k`, но `*Manzil` в копии смотрит на тот же адрес. Поэтому `k.Kochir` изменил город и у `b`.
+
+</details>
+
+## Источники
+
+- Официальные правила Go (Go spec, go1.26): [Method declarations](https://go.dev/ref/spec#Method_declarations),
+  [Method sets](https://go.dev/ref/spec#Method_sets), [Calls](https://go.dev/ref/spec#Calls),
+  [Address operators](https://go.dev/ref/spec#Address_operators),
+  [Method expressions](https://go.dev/ref/spec#Method_expressions),
+  [Method values](https://go.dev/ref/spec#Method_values), [Struct types](https://go.dev/ref/spec#Struct_types)
+- [Go FAQ: Should I define methods on values or pointers?](https://go.dev/doc/faq#methods_on_values_or_pointers)
+- [Go FAQ: Why do T and \*T have different method sets?](https://go.dev/doc/faq#different_method_sets)
+- [Go wiki: CodeReviewComments — Receiver Type](https://go.dev/wiki/CodeReviewComments#receiver-type)
+- [Go wiki: MethodSets](https://go.dev/wiki/MethodSets)
+- [Effective Go: Embedding](https://go.dev/doc/effective_go#embedding)
+- Исходный код Go: [internal/runtime/maps/map.go — Growth](https://github.com/golang/go/blob/go1.26.8/src/internal/runtime/maps/map.go#L86-L102),
+  [fmt/print.go — handleMethods](https://github.com/golang/go/blob/go1.26.8/src/fmt/print.go#L622)
+- [staticcheck SA4005](https://staticcheck.dev/docs/checks/#SA4005),
+  [go vet copylocks](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/copylock),
+  [sync.Mutex](https://pkg.go.dev/sync#Mutex), [strings.Builder](https://pkg.go.dev/strings#Builder)
+- A. Donovan, B. Kernighan, *The Go Programming Language* (2015), §4.3 (адрес элемента map), §6.2
+- William Kennedy, [Methods, Interfaces and Embedded Types in Go](https://www.ardanlabs.com/blog/2014/05/methods-interfaces-and-embedded-types.html)
+  (Ardan Labs, 2014)
+- Сравнение с Python, JS и PHP: [Python Tutorial: Classes](https://docs.python.org/3/tutorial/classes.html)
+  (`self`, bound method), [MDN: Function.prototype.bind()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/bind),
+  [PHP: Objects and references](https://www.php.net/manual/en/language.oop5.references.php)
+- Все результаты получены на `go1.26.8 linux/amd64` и staticcheck 2026.2.1, 2026-11-26. Python 3.13.15,
+  Node.js 24.10.0, PHP 8.4.26.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/012-methods-receivers)
+
+---
+
+← Предыдущий урок: [GO-1.11](/lab/youtube/go/go-1-11/ru) · Следующий урок: [GO-1.13](/lab/youtube/go/go-1-13/ru) → · [Все уроки](/lab/youtube/go)
+
+</div>
