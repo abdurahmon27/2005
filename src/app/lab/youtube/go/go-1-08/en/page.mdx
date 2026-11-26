@@ -1,0 +1,1142 @@
+---
+title: "Slices: the append trap and the outdated 1024 rule"
+date: "2026/11/26"
+description: "What is inside a slice (pointer, len, cap), when append writes into the old array, how to fix the trap, and how to measure slice growth yourself."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-08/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-08"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-08"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-08) · [Русский](/lab/youtube/go/go-1-08/ru) · **English**  
+Lesson GO-1.08 · [Go: 0 → Guru](/lab/youtube/go#go-1-08) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/008-slices)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Two shopping baskets start from one shared list: bread, milk and water. Ali adds eggs to one basket, and Vali adds
+tea to the other. But the screen shows tea in both baskets, and the eggs are gone without a trace. The compiler is silent, and
+`go vet` says nothing either. This is the well-known `append` trap in Go. How can something added to one basket
+break the other one?
+
+At the end of the lesson we measure one more thing. Many articles on the internet state a "1024 rule": a slice
+doubles until 1024 elements, and after that it grows by a quarter. Is this still true in today's Go? We don't
+guess, we measure.
+
+**The one idea:** a slice is a small card with three fields (pointer, `len`, `cap`), and the elements themselves
+live separately, in an array. If the array has a free place, `append` does not create a new array, it writes into
+the same one. So slices taken from one list can break each other.
+
+By the end of the lesson you will be able to:
+
+- draw the three fields of a slice and its array;
+- say in advance when `append` writes into the old array and when it allocates a new one;
+- fix the trap with one line (a full slice expression or `slices.Clip`);
+- measure slice growth yourself, show why the "1024 rule" is outdated, and ask for space in advance with `make`.
+
+Three core new words today:
+
+| Word | Plain meaning | Term |
+|---|---|---|
+| array | a row of cells where the elements live; its size never changes (a shelf) | array (backing array) |
+| `len` (length) | how many elements the slice has now | length |
+| `cap` (capacity) | how many places there are from the start of the slice to the end of the array | capacity |
+
+Two helper words also come up on the way: **full slice expression** (`a[low:high:max]`, we set the capacity
+ourselves) and **allocation** (the program takes a piece of memory for a new array). We explain both where they
+are needed.
+
+## Before you start
+
+- [GO-1.07 · Don't guess, measure: your first test and benchmark](/lab/youtube/go/go-1-07/en): benchmarks, `-benchmem`, the
+  `B/op` and `allocs/op` columns, `b.Loop`, inlining (copying a function's body into the place where it is called).
+- [GO-1.06 · Functions: returning two values, closures and variadic functions](/lab/youtube/go/go-1-06/en): the `mediana`
+  function sorted the caller's slice. Today we see why.
+- [GO-1.05 · Go has no while: one for](/lab/youtube/go/go-1-05/en): slices (`[]int{100, 200, 300}`), element, index,
+  `append`, `range`, `var`, the address (`&d`) and the word **pointer** (a value that holds an address).
+- [GO-1.04 · len("oʻzbek") = 7?](/lab/youtube/go/go-1-04/en): bytes, slicing (`s[:2]`), `Printf` and `%d`.
+- [GO-1.03 · Constants and iota](/lab/youtube/go/go-1-03/en): bit shift (`>>`).
+- You can copy the single-file programs into [go.dev/play](https://go.dev/play) and run them with the **Run**
+  button. The Playground runs the newest Go, so the `cap` numbers can differ a little between Go versions. We took
+  all results with `go1.26.8`.
+- The benchmark (`oldindan/`), the homework test and the commands that read Go's own source code need Go and the
+  course code on your computer. Open a terminal in the lesson folder (`lessons/008-slices`): the commands below run
+  from there. `go run ./savat` runs the program in the `savat` ("basket") folder.
+
+First, let's recall the previous lesson. What does the `allocs/op` column in a benchmark result mean? When we
+compare two versions, why do we trust it more than the nanoseconds?
+
+<details>
+<summary>Answer</summary>
+
+`allocs/op` is how many times the program allocated memory during one call. The nanoseconds change a little every
+time, especially when the computer is busy with other work. The number of allocations is the same every time. Today
+we use exactly this column to measure how much memory `append` allocates.
+
+</details>
+
+## The trap: tea instead of eggs
+
+First a reminder from [GO-1.05](/lab/youtube/go/go-1-05/en): `append(s, x)` adds `x` to the end of the slice `s` and
+**returns** the result. So we usually write the result back into the same variable: `s = append(s, x)`.
+
+The code of the story is in the file `savat/main.go`. First we look at its most important lines. The command
+`sed -n 6,10p file` prints only lines 6–10 of a file:
+
+```console
+$ sed -n 6,10p savat/main.go
+	asos := []string{"non", "sut"}
+	asos = append(asos, "suv")
+
+	ali := append(asos, "tuxum")
+	vali := append(asos, "choy")
+```
+
+The words in the code are Uzbek: `non` is bread, `sut` milk, `suv` water, `tuxum` eggs, `choy` tea. Here is the
+whole file:
+
+```go filename="savat/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	asos := []string{"non", "sut"}
+	asos = append(asos, "suv")
+
+	ali := append(asos, "tuxum")
+	vali := append(asos, "choy")
+
+	fmt.Println("ali: ", ali)
+	fmt.Println("vali:", vali)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–5 | `package main` … `func main() {` | the familiar template: the program starts at `main` |
+| 6 | `asos := []string{"non", "sut"}` | the shared list: a slice of two strings. `asos` means "base": every basket starts from it |
+| 7 | `asos = append(asos, "suv")` | "water" is added to the end of the list. The result is written back into `asos`: now it has three elements |
+| 9 | `ali := append(asos, "tuxum")` | Ali's basket: the shared list + "eggs". The result goes into a new variable `ali` |
+| 10 | `vali := append(asos, "choy")` | Vali's basket: the shared list + "tea" |
+| 12 | `fmt.Println("ali: ", ali)` | prints Ali's basket. The extra space in `"ali: "` lines up the two rows |
+| 13 | `fmt.Println("vali:", vali)` | prints Vali's basket |
+
+Look at line 7 once more. `append` returns the result: `len` changes, and the array may stay the old one or become
+a new one (we open these words in the next section). That is why we write the result back into the same variable.
+
+Read the code. What do you think the screen shows?
+**A)** `ali:  [non sut suv tuxum]` and `vali: [non sut suv choy]` · **B)** `[non sut suv choy]` on both lines ·
+**C)** `[non sut suv tuxum]` on both lines
+
+<details>
+<summary>Answer</summary>
+
+**B: tea in both baskets.** If you chose "A", you are not alone: the code seems to promise exactly that. But Vali's
+`append` wrote into the place where Ali's eggs were. We take apart why, step by step, in the next three sections.
+Not "C": the eggs were written first, and the tea after them, into the same place.
+
+</details>
+
+```console
+$ go run ./savat
+ali:  [non sut suv choy]
+vali: [non sut suv choy]
+```
+
+What does `go vet`, which checks code without running it, say?
+
+```console
+$ go vet ./savat
+```
+
+Nothing. Neither the compiler nor `go vet` sees an error in this code: by Go's rules, everything is correct. The
+error is not in how the code is written, but in what happens in memory.
+
+## What is inside a slice
+
+To understand the cause, we have to look inside a slice. In [GO-1.05](/lab/youtube/go/go-1-05/en) we pictured a slice as a
+shelf with numbered cells. Now we draw a more exact picture: the shelf is one thing, and the card that looks at it
+is another.
+
+- **The shelf** is the row of cells where the elements themselves live. Its size is set when it is created and
+  never changes after that. In Go this is called an **array**.
+- **The card** is the slice itself. It holds only three notes.
+
+A slice is really a small structure with only three fields:
+
+| Field | What it holds | In the shelf picture |
+|---|---|---|
+| **pointer** | the address where the slice's first element lives | "start at cell 3" |
+| **`len`** (**length**) | how many elements the slice has now | "3 cells are used" |
+| **`cap`** (**capacity**) | how many places there are from the start of the slice to the end of the array | "4 cells to the end of the shelf" |
+
+`len(s)` and `cap(s)` are Go's built-in functions: they return these two fields. The pointer is the address from
+[GO-1.05](/lab/youtube/go/go-1-05/en): "where an element sits in memory". We cover pointers in detail in
+[GO-1.11](/lab/youtube/go#go-1-11).
+
+Careful: `cap` is not the whole size of the array. Go's official rules define it like this: *"the sum of the length
+of the slice and the length of the array beyond the slice"*. If a slice starts in the middle of an array, `cap`
+does not count the cells before it.
+
+```text
+         pointer ──┐
+                   ▼
+array:   [ non | sut | suv |     ]
+           └─── len = 3 ──┘
+           └───── cap = 4 ──────┘
+```
+
+The elements do not live inside the slice, they live separately, in an array. This has an important result. When
+you pass a slice to a function or write it into another variable, only the card is copied: three fields. The array
+stays one, shared.
+
+That is exactly why `mediana` from [GO-1.06](/lab/youtube/go/go-1-06/en) sorted the original slice. `vaqtlar` and `kechikish`
+were two separate cards, but both looked at one array. `slices.Sort` sorted the array, and both names saw it.
+
+## The cause: both baskets in one array
+
+Now we change the basket program a little and measure what is inside. This is `sabab/main.go` ("cause"):
+
+```go filename="sabab/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+func main() {
+	asos := []string{"non", "sut"}
+	asos = append(asos, "suv")
+	fmt.Println("len:", len(asos), "cap:", cap(asos))
+
+	ali := append(asos, "tuxum")
+	vali := append(asos, "choy")
+	fmt.Println("bitta massivmi?", &ali[0] == &vali[0])
+	fmt.Println("slice oʻzi:", unsafe.Sizeof(ali), "bayt")
+}
+```
+
+The new lines:
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( "fmt" "unsafe" )` | we import two packages, each on its own line inside the parentheses. `unsafe` is a low-level package that comes with Go; we use it only for measuring |
+| 11 | `fmt.Println("len:", len(asos), "cap:", cap(asos))` | prints the length and capacity of `asos` |
+| 15 | `&ali[0] == &vali[0]` | `ali[0]` is Ali's element 0, `&` gives its address. Are the first elements of both baskets at the same address? `true` or `false` |
+| 16 | `unsafe.Sizeof(ali)` | how many bytes the slice itself, the card, takes in memory |
+
+What will the second output line, "bitta massivmi?" ("one array?"), show?
+**A)** `true` · **B)** `false`
+
+<details>
+<summary>Answer</summary>
+
+**A: `true`.** Both baskets showed the same thing. If they were in two separate arrays, Vali could not have erased
+Ali's eggs. The first elements have the same address, so there is one array. If you chose "B", you thought `append`
+always makes a new list.
+
+</details>
+
+```console
+$ go run ./sabab
+len: 3 cap: 4
+bitta massivmi? true
+slice oʻzi: 24 bayt
+```
+
+We read the three lines (`slice oʻzi` means "the slice itself", `bayt` means "bytes"):
+
+1. **`len: 3 cap: 4`.** The shared list has three elements, but the array has four places. One place is free.
+2. **`bitta massivmi? true`.** The first elements of both baskets are at the same address: there is one array.
+3. **`slice oʻzi: 24 bayt`.** The card is 24 bytes: on this computer (64-bit, amd64) each of the three fields is
+   8 bytes. No matter how big the array is, the slice itself is always 24 bytes.
+
+Now we follow the `savat` program in memory, line by line. We call the arrays `M1` and `M2`, and `_` is a free place:
+
+| Line | Array | `asos` | `ali` | `vali` |
+|---|---|---|---|---|
+| 6 | `M1 = [non sut]` | `M1`, len 2, cap 2 | | |
+| 7 | no room → new `M2 = [non sut suv _]` | `M2`, len 3, cap 4 | | |
+| 9 | `M2 = [non sut suv tuxum]` | `M2`, len 3, cap 4 | `M2`, len 4, cap 4 | |
+| 10 | `M2 = [non sut suv choy]` | `M2`, len 3, cap 4 | `M2`, len 4, cap 4 | `M2`, len 4, cap 4 |
+
+If there is room, `append` does not create a new array, it writes into the free place. On line 9, Ali wrote the eggs
+into the fourth place of `M2`. On line 10, Vali also started from `asos`: the `len` of `asos` is still 3. So Vali's
+"next free place" is the fourth place too. Vali wrote the tea into exactly the same place and erased the eggs.
+
+```text
+asos ─┐  len 3
+ali  ─┼──►  M2: [ non | sut | suv | choy ]    one array, four places
+vali ─┘  len 4                        ▲
+                       first eggs, then tea
+```
+
+`ali` and `vali` are two separate cards, but both look at the same place in one array. That is why the screen shows
+`[non sut suv choy]` twice.
+
+## The append rule: is there room or not
+
+Go's official rules (the Go spec) say this about `append`. If the capacity is not enough (*"If the capacity of s is
+not large enough"*), `append` allocates a new, *"sufficiently large"* array and copies the elements into it.
+Otherwise (*"Otherwise, append re-uses the underlying array"*) it uses the old array itself.
+
+| Case | What `append` does | Which array the result looks at |
+|---|---|---|
+| no free place (`len == cap`) | allocates a new array, copies the old elements into it, adds the new one | the **new** array |
+| a free place exists (`len < cap`) | writes the new element into the free place of the same array | the **old** array |
+| how big is the new array? | Go's rules don't say: the runtime (Go's own code that runs inside your program) decides | |
+
+So where did the fourth free place come from? The list had two elements: `len 2, cap 2`. When we added water, there
+was no room. The runtime allocated a new array **twice** as big: 4 places. Go's rules do not require this, it is
+the runtime's choice. We measure it ourselves at the end of the lesson.
+
+## Pause: what if we write three elements right away?
+
+Now a question. We put the water into the literal directly, not with `append`. A literal is a value written right
+in the code: `[]string{…}` is a slice literal. All the other code stays the same:
+
+```go
+	asos := []string{"non", "sut", "suv"}
+```
+
+What will Ali's and Vali's baskets show? Think about `len` and `cap` before you open the answer.
+**A)** tea in both again · **B)** eggs for Ali, tea for Vali · **C)** eggs in both
+
+<details>
+<summary>Answer</summary>
+
+**B: this time everything is right.** A slice written as a literal has `len` and `cap` both equal to three: Go
+creates the array with exactly as many places as there are elements. There is no free place. So each `append`
+allocated its own new array: Ali's eggs went into one, Vali's tea into another. If you chose "A", you thought the fourth free place
+is always there. It only appeared because the earlier `append` made the array twice as big.
+
+</details>
+
+Here is the whole `pauza/main.go`:
+
+```go filename="pauza/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	asos := []string{"non", "sut", "suv"}
+
+	ali := append(asos, "tuxum")
+	vali := append(asos, "choy")
+
+	fmt.Println("ali: ", ali)
+	fmt.Println("vali:", vali)
+}
+```
+
+```console
+$ go run ./pauza
+ali:  [non sut suv tuxum]
+vali: [non sut suv choy]
+```
+
+| Line | Array | `asos` | `ali` | `vali` |
+|---|---|---|---|---|
+| 6 | `M1 = [non sut suv]` | `M1`, len 3, cap 3 | | |
+| 8 | no room → new `M2 = [non sut suv tuxum _ _]` | `M1`, len 3, cap 3 | `M2`, len 4, cap 6 | |
+| 9 | no room → new `M3 = [non sut suv choy _ _]` | `M1`, len 3, cap 3 | `M2`, len 4, cap 6 | `M3`, len 4, cap 6 |
+
+(The `cap` of `ali` and `vali` is 6: the runtime doubled again, 3 × 2. This program does not print it, but you can
+add `cap(ali)` and check it yourself.)
+
+So the same code sometimes works and sometimes breaks: it all depends on `cap`. And `cap` depends on how the list
+was created and on the Go version. This is exactly how a bug can pass the tests and then break in a running system.
+
+## The fix: the full slice expression
+
+One line is enough to fix it. First recall **slicing** from [GO-1.04](/lab/youtube/go/go-1-04/en): `s[:2]` means "from the start
+up to position 2". The general form is `a[low:high]`: starting at `low`, up to `high` (`high` itself is not
+included). If `low` is not written, it is 0. Slicing does not make a new array: the result is a new card that looks
+at the same array.
+
+Slicing also has a form with a third index: `a[low:high:max]`. This is the **full slice expression**. The third
+index sets `cap`: the capacity of the result becomes `max - low`.
+
+This is `tuzat/main.go` ("fix"); it differs from `savat/main.go` only in line 8:
+
+```console
+$ sed -n 8p tuzat/main.go
+	asos = asos[:len(asos):len(asos)] // yoki slices.Clip(asos)
+```
+
+```go filename="tuzat/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	asos := []string{"non", "sut"}
+	asos = append(asos, "suv")
+	asos = asos[:len(asos):len(asos)] // yoki slices.Clip(asos)
+
+	ali := append(asos, "tuxum")
+	vali := append(asos, "choy")
+
+	fmt.Println("ali: ", ali)
+	fmt.Println("vali:", vali)
+}
+```
+
+We read line 8 (the comment word `yoki` means "or"): `asos[:len(asos):len(asos)]` = `asos[0:3:3]`. `low` = 0,
+`high` = 3, `max` = 3.
+
+| | Array | `len` | `cap` |
+|---|---|---|---|
+| before line 8 | `M2 = [non sut suv _]` | 3 | 4 |
+| after line 8 | `M2` (the same array) | 3 | 3 − 0 = **3** |
+
+Here `max` equals `len`, so no free place is left. The array is the same; only the `cap` note on the card gets
+smaller. Now every `append` is forced to allocate a new array.
+
+As the comment on that line says, `slices.Clip(asos)` does exactly the same. Its documentation says: *"returning
+s[:len(s):len(s)]"*. The `slices` package was added in Go 1.21.
+
+What does it print now? **A)** tea in both again · **B)** eggs for Ali, tea for Vali · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B.** After line 8, `asos` has no free place (`len 3, cap 3`). For Ali and for Vali, `append` allocates a new
+array, so they no longer write into each other's place. Not "C": slicing with three indexes is an ordinary Go rule.
+
+</details>
+
+```console
+$ go run ./tuzat
+ali:  [non sut suv tuxum]
+vali: [non sut suv choy]
+```
+
+There is another way: let each basket get its own copy, for example with `slices.Clone`:
+`ali := append(slices.Clone(asos), "tuxum")`. `slices.Clone` copies the elements into a new array.
+
+Careful: if you clone `asos` **once** and `append` both baskets from that single clone, the trap can come back. The
+`slices.Clone` documentation says: *"The result may have additional unused capacity"*. The copy must be made
+**for each basket separately**.
+
+## Even the standard library fell into it: bytes.Split
+
+Go's standard library (the packages that come with Go) fell into this trap too. `bytes.Split` cuts a byte slice into
+pieces at a separator (for example, a comma). The pieces are not copied into a new array: each of them is a slice
+that looks at a part of the original array.
+
+In 2017, a developer on GitHub (a site where programmers keep code and report bugs) found this bug: if you
+`append` to one of the pieces returned by `bytes.Split`, the neighbouring piece could be damaged. A piece's `cap`
+reached to the end of the array. The new byte was first written over the separator, and a longer `append` reached
+into the next piece. Just like our baskets: the place that looked free actually belonged to the neighbour.
+
+The bug was fixed in Go 1.10. The Go 1.10 release notes (the list of changes that comes with each new version) say:
+*"each returned subslice to have capacity equal to its length, so that appending to one cannot overwrite adjacent
+data"*.
+
+Today's source code still has the same full slice expression there. `$(go env GOROOT)` is the folder where Go is
+installed, and `grep -n` finds the line with the given text in a file and shows its number:
+
+```console
+$ grep -n 'm+sepSave : m+sepSave' $(go env GOROOT)/src/bytes/bytes.go
+403:		a[i] = s[: m+sepSave : m+sepSave]
+```
+
+`s[: m+sepSave : m+sepSave]` is exactly our line 8: `high` and `max` are the same, so no free place is left in the
+piece. (In Go 1.27.4 this is line 393.)
+
+## The outdated 1024 rule: we measure growth
+
+Now we look at how a slice grows. Many old articles have this rule:
+
+| Old rule | |
+|---|---|
+| `cap` &lt; 1024 | ×2 every time (doubles) |
+| `cap` ≥ 1024 | ×1.25 every time (grows by a quarter) |
+| until when | until Go 1.18 |
+
+Before Go 1.18, the formula in the runtime was exactly this. Is it still the same in today's Go? We don't guess, we
+measure, as in [GO-1.07](/lab/youtube/go/go-1-07/en). This is `osish/main.go` ("growth"):
+
+```go filename="osish/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+// Bittalab append qilamiz va cap oʻzgargan joylarni chiqaramiz.
+func main() {
+	var s []int
+	eski := cap(s)
+	for i := range 2560 {
+		s = append(s, i)
+		if cap(s) != eski {
+			if eski >= 128 {
+				fmt.Printf("%5d → %5d  ×%.2f\n", eski, cap(s), float64(cap(s))/float64(eski))
+			}
+			eski = cap(s)
+		}
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `// Bittalab append …` | a comment: "we `append` one at a time and print the places where `cap` changed" |
+| 7 | `var s []int` | an empty slice of `int`. The zero value of a slice: `len` 0, `cap` 0, no array |
+| 8 | `eski := cap(s)` | `eski` ("old") is the last capacity we saw, 0 for now |
+| 9 | `for i := range 2560 {` | `i` goes from 0 to 2559: 2560 repetitions |
+| 10 | `s = append(s, i)` | on each step we add one number |
+| 11 | `if cap(s) != eski {` | `!=` means "not equal?": did the capacity change, that is, was a new array allocated? |
+| 12 | `if eski >= 128 {` | we print only from 128 on, so that the small steps don't fill the screen |
+| 13 | `fmt.Printf("%5d → %5d  ×%.2f\n", …)` | the old capacity, the new capacity and their ratio. `%5d` writes a number right-aligned in 5 characters; `→` and `×` are plain characters; `%.2f` is a floating-point number with 2 digits after the point |
+| 13 | `float64(cap(s))/float64(eski)` | we turn both numbers into floating-point numbers and divide; otherwise whole-number division would drop the fraction ([GO-0.03](/lab/youtube/go/go-0-03/en)) |
+| 15 | `eski = cap(s)` | we remember the new capacity |
+
+If the old rule is right, growth should change sharply around 1024. What will the program print?
+**A)** ×2 up to 1024, then suddenly ×1.25 · **B)** ×2 up to 256, then growth slowly goes down, with no sharp change
+at 1024 · **C)** always ×2
+
+<details>
+<summary>Answer</summary>
+
+**B.** Up to 256, the slice really doubles. But on the next step `cap` goes from 512 to 848, which is no longer
+double (×1.66). There is no sharp change around 1024. "A" is the rule from old articles, and it has not worked since
+Go 1.18. If you chose "C": doubling large slices would hold on to far too much extra memory.
+
+</details>
+
+```console
+$ go run ./osish
+  128 →   256  ×2.00
+  256 →   512  ×2.00
+  512 →   848  ×1.66
+  848 →  1280  ×1.51
+ 1280 →  1792  ×1.40
+ 1792 →  2560  ×1.43
+```
+
+| Step | Old `cap` | New `cap` | Times bigger |
+|---|---|---|---|
+| 1 | 128 | 256 | 2.00 |
+| 2 | 256 | 512 | 2.00 |
+| 3 | 512 | 848 | 1.66 |
+| 4 | 848 | 1280 | 1.51 |
+| 5 | 1280 | 1792 | 1.40 |
+| 6 | 1792 | 2560 | 1.43 |
+
+Growth slowly goes down, but it jumps a little: 1.40 on step 5, then 1.43 again on step 6. The reason for this jump
+is in the "Going deeper" section.
+
+## The formula: nextslicecap in the runtime
+
+The reason is in the runtime source code, in the `nextslicecap` function in the file `runtime/slice.go`. Here is its
+important part (`// ...` marks lines we left out):
+
+```go
+func nextslicecap(newLen, oldCap int) int {
+	newcap := oldCap
+	doublecap := newcap + newcap
+	// ...
+	const threshold = 256
+	if oldCap < threshold {
+		return doublecap
+	}
+	for {
+		newcap += (newcap + 3*threshold) >> 2
+		if uint(newcap) >= uint(newLen) {
+			break
+		}
+	}
+	// ...
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func nextslicecap(newLen, oldCap int) int {` | takes the length needed (`newLen`) and the old capacity (`oldCap`), returns the new capacity |
+| 3 | `doublecap := newcap + newcap` | twice the old capacity |
+| 5 | `const threshold = 256` | the threshold: not 1024, but **256** |
+| 6–8 | `if oldCap < threshold { return doublecap }` | a slice smaller than 256 doubles |
+| 10 | `newcap += (newcap + 3*threshold) >> 2` | `>> 2` is a bit shift right by 2, that is, division by 4. So: `newcap += newcap/4 + 192` |
+| 11–13 | `if uint(newcap) >= uint(newLen) { break }` | if it is enough, stop; if not, grow once more. `uint(…)` turns the value into an unsigned whole number (never negative) |
+
+A large slice gets a quarter of its old capacity plus another 192 (3 × 256 / 4). For a small slice these 192 are a
+big share, so growth is close to doubling. The bigger the slice, the smaller the share of 192, and growth slowly
+moves towards adding a quarter (×1.25). At 256 itself, the formula also gives doubling:
+256 + (256 + 768) / 4 = 256 + 256 = 512.
+
+| Old `cap` | Formula | Times bigger |
+|---|---|---|
+| 256 | 256 + 256 = 512 | 2.0 |
+| 512 | 512 + 320 = 832 | 1.63 |
+| 1024 | 1024 + 448 = 1472 | 1.44 |
+
+(The author of the formula gives this table in the message of the change to the Go code (a commit): 256 → 2.0;
+512 → 1.63; 1024 → 1.44; 2048 → 1.35; 4096 → 1.30.)
+
+Keith Randall wrote this formula. It came out in Go 1.18: the commit went in in September 2021, and its message says
+*"Instead of growing 2x for &lt; 1024 elements and 1.25x for >= 1024 elements"*. The Go 1.18 release notes also say
+that the formula is *"less prone to sudden transitions"*.
+
+One question is left. From 512 the formula gives **832**, but the measurement showed **848**. This difference and
+the 1.40 → 1.43 jump come from the ready-made sizes of the memory allocator. We go through it with numbers in the
+"Going deeper" section.
+
+## Asking for room in advance: make and a benchmark
+
+How does this knowledge help? Every time a slice grows, a new array is allocated and the old elements are copied into
+it. If we know in advance how many elements there will be, we can ask for the room right away. That is what `make`
+is for: `make([]int, 0, 1000)` means "create an `int` slice with `len` 0 and `cap` 1000". The array is created once,
+with 1000 places, and `append` fills it.
+
+We measure with a benchmark from [GO-1.07](/lab/youtube/go/go-1-07/en). This is `oldindan/yig.go` ("in advance", "collect"):
+
+```go filename="oldindan/yig.go" showLineNumbers
+package oldindan
+
+// Ikkala funksiya natijani chaqiruvchiga qaytaradi, shuning uchun slice heap'da yashaydi.
+// go:noinline kompilyatorga ularni benchmark ichiga koʻchirishni taqiqlaydi:
+// aks holda u slice'ni stekka joylashi mumkin va biz haqiqiy dasturdagi holatni oʻlchamaymiz.
+
+// yigNil: boʻsh slice'dan boshlaydi, append oʻzi oʻstiradi.
+//
+//go:noinline
+func yigNil(n int) []int {
+	var s []int
+	for i := range n {
+		s = append(s, i)
+	}
+	return s
+}
+
+// yigMake: kerakli sigʻimni oldindan soʻraydi.
+//
+//go:noinline
+func yigMake(n int) []int {
+	s := make([]int, 0, n)
+	for i := range n {
+		s = append(s, i)
+	}
+	return s
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package oldindan` | this is not `main` but an ordinary package: the test file calls it |
+| 3–5 | comment | why the functions return the result and why `go:noinline` is there |
+| 9, 20 | `//go:noinline` | an instruction to the compiler: don't copy this function into the place where it is called (don't inline it). There is no space after `//`: this is not an ordinary comment |
+| 10 | `func yigNil(n int) []int {` | collects `n` numbers and returns a slice |
+| 11 | `var s []int` | starts from an empty slice; `append` grows it by itself |
+| 21–22 | `func yigMake(…)`, `s := make([]int, 0, n)` | the same, but asks for the needed capacity in advance |
+| 12–15, 23–26 | `for i := range n { s = append(s, i) }`, `return s` | the same in both: add `n` numbers and return the result |
+
+Why `//go:noinline`? Without it, the compiler copies the function into the benchmark and puts the slice that asked
+for room in advance into the fast part of memory (on the stack): then it allocates 0 times. That is not what happens
+in a real program, where the result is returned from a function. The README also has the result without this
+instruction: 12 and 0 allocations.
+
+The benchmarks themselves are in the file `oldindan/bench_test.go`:
+
+```go filename="oldindan/bench_test.go" showLineNumbers
+package oldindan
+
+import "testing"
+
+func BenchmarkNil(b *testing.B) {
+	for b.Loop() {
+		yigNil(1000)
+	}
+}
+
+func BenchmarkMake(b *testing.B) {
+	for b.Loop() {
+		yigMake(1000)
+	}
+}
+```
+
+Both follow the template from [GO-1.07](/lab/youtube/go/go-1-07/en): 1000 numbers are collected inside `for b.Loop()`.
+`b *testing.B` is the value a benchmark receives (we explain the `*` sign in [GO-1.11](/lab/youtube/go#go-1-11)).
+
+Guess: how many times does each one allocate memory per call (`allocs/op`)?
+**A)** both 1 time · **B)** `Nil` 9 times, `Make` 1 time · **C)** `Nil` 1000 times, `Make` 1 time
+
+<details>
+<summary>Answer</summary>
+
+**B.** The empty slice gets a new array each time it grows: arrays with 8, 16, 32, 64, 128, 256, 512, 848 and 1280
+places, 9 in total. The slice that asked in advance allocated once and was then only filled. Not "C": `append` takes
+a new array not for every number, only when the room runs out, and each time a much bigger one. If you chose "A",
+you forgot that the empty slice grows. (Why the list starts at 8 is in the "Going deeper" section.)
+
+</details>
+
+```console
+$ go test -bench . -benchmem -count 3 ./oldindan | grep ns/op | column -t
+BenchmarkNil-12   173690  6980  ns/op  25152  B/op  9  allocs/op
+BenchmarkNil-12   168616  8553  ns/op  25152  B/op  9  allocs/op
+BenchmarkNil-12   162021  8619  ns/op  25152  B/op  9  allocs/op
+BenchmarkMake-12  479439  3365  ns/op  8192   B/op  1  allocs/op
+BenchmarkMake-12  392584  4322  ns/op  8192   B/op  1  allocs/op
+BenchmarkMake-12  366361  3556  ns/op  8192   B/op  1  allocs/op
+```
+
+`-count 3` runs each benchmark three times. The columns: the name, how many times the loop went round, nanoseconds
+per call, bytes allocated and the number of allocations.
+
+| | `ns/op` | `B/op` | `allocs/op` |
+|---|---|---|---|
+| `Nil` (from an empty slice) | 6980–8619 | 25152 | 9 |
+| `Make` (room asked in advance) | 3365–4322 | 8192 | 1 |
+
+This measurement was taken on a busy computer: the nanoseconds change every time, and yours will be different. But
+`B/op` and `allocs/op` are the same every time. On a quiet computer, the version with `make` was about twice as fast
+(≈1,400 vs ≈3,100–3,700 ns/op).
+
+The rule: if you know how many elements there will be, give the `cap` with `make`.
+
+## Going deeper (optional): why 848 and why 4
+
+This section is for readers who already know some programming. You don't need it for the main idea.
+
+### Why 848 and not 832?
+
+We apply the formula to 512: the result should be 832. On this computer each `int` takes 8 bytes. But Go does not
+hand out memory in any size: it gives blocks of ready-made sizes. These blocks are called **size classes**, and their
+list is in the file `sizeclasses.go` in Go's source code.
+
+The command below does two things. `echo` calculates and prints 832 × 8. And `grep … | awk …` finds the rows for
+classes 48 and 49 in `sizeclasses.go` and prints their number and size in bytes (`;` runs two commands one after the
+other on one line):
+
+```console
+$ echo "832 × 8 = $((832*8)) bayt"; grep -E '^//\s+4[89] ' $(go env GOROOT)/src/internal/runtime/gc/sizeclasses.go | awk '{print "class", $2 ":", $3, "bayt"}'
+832 × 8 = 6656 bayt
+class 48: 6528 bayt
+class 49: 6784 bayt
+```
+
+The formula asks for 6656 bytes. There is no block of that size: 6528 is too small, the next one is 6784. Go gives the
+next bigger block (on screen it is the last line). This block fits 6784 / 8 = **848** `int`s. `append` adds the extra
+room to `cap` as well: the `growslice` function rounds the capacity up with `roundupsize`.
+
+| Step | Formula | Bytes | Size class | Real `cap` |
+|---|---|---|---|---|
+| 512 → | 832 | 6656 | 6784 | **848** |
+| 848 → | 1252 | 10016 | 10240 | **1280** |
+| 1792 → | 2432 | 19456 | 20480 | **2560** |
+
+That is why the factor does not go down smoothly: at 1792 → 2560 the rounding added more, and we got ×1.43. The
+author of the formula wrote this too: *"the real growth factor … is somewhat larger because we round up to the next
+size class"*. With the old Go 1.17 rule, real `cap`s were also a bit larger than ×1.25, for the same reason.
+
+### Why is cap 4 after the first append?
+
+One more curious thing. After the first `append` to an empty slice, `cap` seems like it should be 1. This is
+`boshi/main.go` ("the start"):
+
+```go filename="boshi/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+// Boʻsh slice'ga bittadan beshta son qoʻshamiz va har safar cap'ni chiqaramiz.
+func main() {
+	var s []int
+	for i := range 5 {
+		s = append(s, i)
+		fmt.Print(cap(s), " ")
+	}
+	fmt.Println()
+}
+```
+
+- **Line 7:** an empty slice.
+- **Lines 8–11:** we add five numbers and print `cap` and a space each time (`Print` does not go to a new line).
+- **Line 12:** at the end we go to a new line.
+
+Guess: **A)** `1 2 4 4 8` · **B)** `4 4 4 4 8` · **C)** `1 2 3 4 5`
+
+<details>
+<summary>Answer</summary>
+
+**B: `4 4 4 4 8`.** In many cases Go 1.26 starts the first elements in a ready place on the stack. The stack is fast
+memory given to each function and freed as soon as the function ends. There is a 32-byte spare place there: 4 `int`s.
+"A" is the answer of older Go versions (and of the `qochish` program below). Not "C": `append` does not grow by one,
+it grows with room to spare.
+
+</details>
+
+```console
+$ go run ./boshi
+4 4 4 4 8 
+```
+
+This only works if the slice does not "escape" from the function. Escaping means: if someone may still use the slice
+after the function ends, the compiler keeps it not on the stack but on the **heap** (shared memory that lives as long
+as the program runs). `qochish/main.go` ("escaping") is the same program, but the slice itself is passed to
+`Println`:
+
+```go filename="qochish/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+// boshi/ bilan bir xil, lekin slice'ning oʻzi ham Println'ga beriladi:
+// endi u funksiyadan "qochadi" (heap'da yashaydi) va stekdagi zaxira joy ishlatilmaydi.
+func main() {
+	var s []int
+	for i := range 5 {
+		s = append(s, i)
+		fmt.Print(cap(s), " ")
+	}
+	fmt.Println(s)
+}
+```
+
+```console
+$ go run ./qochish
+1 2 4 4 8 [0 1 2 3 4]
+```
+
+If we pass the slice itself to `Println`, the old small steps come back: 1, 2, 4. So `cap` depends both on the Go
+version and on the code itself. Don't let your code rely on its exact value.
+
+This is new in Go 1.26. The Go 1.26 release notes say that the arrays of slices are now allocated *"on the stack in
+more situations"*. In detail: the article *Allocating on the Stack* on the Go blog (Keith Randall, 2026). A slice that
+is **returned** from a function also starts in the spare place on the stack: at the end, the compiler adds a call to
+`runtime.move2heap`, and the slice moves to the heap once.
+
+### Why exactly 9 allocations in the benchmark?
+
+Now we can count the 9 allocations of `yigNil`. The first 4 elements live in the spare place on the stack. Then
+arrays with 8, 16, 32, 64, 128, 256, 512, 848 and 1280 places are allocated on the heap: 9 of them. In total 3144
+places × 8 bytes = **25152** bytes, exactly the number in the `B/op` column. And `make([]int, 0, 1000)` asks for 8000
+bytes; the size class rounds it up to 8192: one allocation, 8192 bytes.
+
+We also checked on Go 1.27.4: `nextslicecap`, `growsliceBuf` and classes 48/49 have not changed.
+
+## Common mistakes
+
+**1. Thinking the result of `append` is an independent new list.** This is the main trap of the lesson; we saw it in
+the section "The trap: tea instead of eggs". There is no error message: `ali` and `vali` silently write into the same
+place of one array, because `asos` had a free place (`len 3, cap 4`). **Fix:** before you make several slices from one
+list, close the free room: `asos = asos[:len(asos):len(asos)]` or `asos = slices.Clip(asos)`. Or take a separate copy
+for each slice: `append(slices.Clone(asos), "tuxum")`.
+
+**2. Not storing the result of `append`.** (This example is not in the course folder; it was run separately.)
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	s := []int{1, 2, 3}
+	append(s, 4)
+	fmt.Println(s)
+}
+```
+
+```console
+$ go run natija/main.go
+# command-line-arguments
+natija/main.go:7:2: append(s, 4) (value of type []int) is not used
+```
+
+`natija/main.go`, line 7, character 2: *append(s, 4) (value of type []int) is not used*. `append` does not change the
+slice in place, it **returns** a new card. If you don't store it anywhere, Go gives an error. **Fix:**
+`s = append(s, 4)`.
+
+**3. Thinking an `append` inside a function is visible to the caller.** (Not in the course folder.)
+
+```go
+package main
+
+import "fmt"
+
+func qosh(s []int) {
+	s = append(s, 4)
+}
+
+func main() {
+	s := []int{1, 2, 3}
+	qosh(s)
+	fmt.Println(s, len(s))
+}
+```
+
+```console
+$ go run funksiya/main.go
+[1 2 3] 3
+```
+
+No error message, but the 4 is gone. `qosh` ("add") gets a **copy** of the card. It increased the `len` of its own
+copy, and the `len` of the card in `main` stayed 3. (Here `cap` was 3 as well, so `append` wrote into a new array
+anyway.) **Fix:** return the new slice and store it: `func qosh(s []int) []int { return append(s, 4) }`, and call it
+as `s = qosh(s)`. `append` itself works the same way.
+
+**4. Writing by index into the free room of `cap`.** (Not in the course folder.)
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	s := make([]int, 0, 5)
+	s[0] = 7
+	fmt.Println(s)
+}
+```
+
+```console
+$ go run -trimpath indeks/main.go
+panic: runtime error: index out of range [0] with length 0
+
+goroutine 1 [running]:
+main.main()
+	./main.go:7 +0x2a
+exit status 2
+```
+
+(`-trimpath` only shortens the file path in the message, so the full folder name on the computer is not printed.)
+
+This is not a compile error: the program started and crashed while running. A **panic** is an error that stops the
+program. *index out of range [0] with length 0* means index 0 is outside the allowed range, because the length is 0.
+The lines after `goroutine 1 [running]:` show which function was running at the time of the error: `main.main()`,
+`./main.go:7` is line 7. The array has 5 places, but `len` is 0: you can use an index only below `len`. The rest of
+the room in `cap` is only for `append`. **Fix:** `s = append(s, 7)`, or give the `len` from the start:
+`s := make([]int, 5)` (five zeros).
+
+**5. Relying on the exact value of `cap`.** There is no error message: code written on the idea that "after the first
+`append`, `cap` is 1" or "after 1024 it is ×1.25" works wrongly in another Go version or another situation. We saw it
+in the sections "The outdated 1024 rule" and "Going deeper": `cap` changed in Go 1.18 and in Go 1.26, and passing the
+slice to `Println` changes it too. **Fix:** use `cap` only for what the rules of `len` and `cap` guarantee. If you
+need room, ask for it yourself with `make`.
+
+## Check yourself
+
+Answer first, then open the answer.
+
+**1.** What are the three fields of a slice, and where do the elements live?
+
+<details>
+<summary>Answer</summary>
+
+The pointer (the address where the first element lives), `len` (how many elements there are) and `cap` (how many
+places from the start of the slice to the end of the array). The elements do not live inside the slice, they live
+separately, in an array. When a slice is copied, only these three fields are copied.
+
+</details>
+
+**2.** What does this code print? **A)** `[0 0 1] [0 0 2] 2 4` · **B)** `[0 0 2] [0 0 2] 2 4` · **C)** `[0 0 1] [0 0 2] 3 4`
+
+```go
+s := make([]int, 2, 4)
+a := append(s, 1)
+b := append(s, 2)
+fmt.Println(a, b, len(s), cap(s))
+```
+
+<details>
+<summary>Answer</summary>
+
+**B.** `make([]int, 2, 4)` gives two zeros and two free places. `s` has room, so both `append`s write into index 2 of
+the same array: first 1, then 2 over it. `s` itself does not change: `len` 2, `cap` 4. This is today's basket trap.
+
+```console
+$ go run savol1/main.go
+[0 0 2] [0 0 2] 2 4
+```
+
+</details>
+
+**3.** What does this code print? Before you answer, recall the rules `cap = max - low` and "from the start of the
+slice to the end of the array".
+
+```go
+s := []int{10, 20, 30, 40, 50}
+t := s[1:3]
+fmt.Println(t, len(t), cap(t))
+u := s[1:3:3]
+fmt.Println(u, len(u), cap(u))
+```
+
+<details>
+<summary>Answer</summary>
+
+`t` = `[20 30]`, `len` 2, `cap` 4: `t` starts at index 1, and there are 4 places to the end of the array (20, 30, 40,
+50). `u` has a third index: `cap` = 3 − 1 = 2. Now `append(t, …)` would write over 40, while `append(u, …)` allocates
+a new array.
+
+```console
+$ go run savol2/main.go
+[20 30] 2 4
+[20 30] 2 2
+```
+
+</details>
+
+**4.** "A slice doubles up to 1024 elements, then grows 1.25 times." Is this true in today's Go?
+
+<details>
+<summary>Answer</summary>
+
+No. That is the formula from before Go 1.18. Today the threshold is 256: a smaller slice doubles, a bigger one gets
+`newcap += newcap/4 + 192`, and growth slowly goes from 2 down to 1.25. On top of that, the real `cap` is rounded up
+to a size class (512 → 848). Don't rely on the exact value; measure it if you need to.
+
+</details>
+
+**5.** In a function that collects 1000 numbers, why is `make([]int, 0, 1000)` faster?
+
+<details>
+<summary>Answer</summary>
+
+The array is allocated once, and `append` only fills it. If you start from an empty slice, every time it grows a new
+array is allocated and the old elements are copied: in our measurement 9 allocations and 25152 bytes, while with
+`make` it is 1 allocation and 8192 bytes.
+
+</details>
+
+**6.** From [GO-1.05](/lab/youtube/go/go-1-05/en): `for _, n := range narxlar { n *= 2 }` does not change the slice, but
+`for i := range narxlar { narxlar[i] *= 2 }` does. Explain it with today's picture: where is the difference?
+
+<details>
+<summary>Answer</summary>
+
+`range` writes a **copy** of the element into `n`: `n` is a separate variable outside the array, and changing it does
+not touch the array. `narxlar[i]` ("prices") is the `i`-th cell of the array itself: through the pointer on the
+card we write into exactly that cell.
+
+</details>
+
+(The programs in questions 2 and 3 are not in the course folder: they were run separately, as complete programs with
+`package main` and `import "fmt"`.)
+
+## Homework
+
+Tasks at four levels. All files and answers are in the lesson folder on GitHub:
+[lessons/008-slices](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/008-slices).
+Answers: the [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/008-slices/homework)
+folder. Try it yourself first.
+
+🟢 **Easy:** say what it prints without running it, then check:
+`s := make([]int, 3, 5); t := append(s, 7); s[0] = 9; fmt.Println(t[0], len(t), cap(t))`.
+
+<details>
+<summary>Answer</summary>
+
+`homework/oson/main.go`. The `cap` of `s` is 5 and its `len` is 3: there is room, so `append` wrote into the same
+array. `t` and `s` look at one array, so `s[0] = 9` changes `t[0]` too. `t` has `len` 4 and `cap` 5.
+
+```console
+$ go run ./homework/oson
+9 4 5
+```
+
+</details>
+
+🟡 **Medium:** write `qosh(s []string, v string) []string` that never writes into the caller's array, and prove it
+with a test.
+
+<details>
+<summary>Answer</summary>
+
+`homework/orta/qosh.go`: `return append(s[:len(s):len(s)], v)`. The full slice expression makes `cap` equal to
+`len`, so `append` always allocates a new array. The test (`qosh_test.go`) checks it with a list where `cap > len`:
+both results are correct, and the fourth place of the original array stayed empty.
+
+```console
+$ go test ./homework/orta
+ok  	github.com/abdurahmon27/go-backend-uz/lessons/008-slices/homework/orta	0.005s
+```
+
+(The last number is the time the test took; it is a little different every time.)
+
+</details>
+
+🟠 **Hard:** measure how a `[]byte` grows and explain why its `cap`s differ from those of an `[]int`.
+
+<details>
+<summary>Answer</summary>
+
+`homework/qiyin/main.go` adds 2000 elements to each of the two slices and prints every new `cap`:
+
+```console
+$ go run ./homework/qiyin
+[]byte: 32 64 128 256 512 896 1408 2048
+[]int:  4 8 16 32 64 128 256 512 848 1280 1792 2560
+```
+
+The formula is the same, but the rounding to a size class happens **in bytes**. In a `[]byte` one element is 1 byte:
+512 → 832 bytes → size class 896; 896 → 1312 → 1408; 1408 → 1952 → 2048. The 32 at the start is the 32-byte spare
+place on the stack: for `[]byte` that is 32 elements, for `[]int` it is 4.
+
+</details>
+
+🔴 **Guru:** a function that returns a small piece of a big file keeps the whole file in memory. Fix it and prove it.
+
+<details>
+<summary>Answer</summary>
+
+`homework/guru/main.go`. `sarlavha` ("header") returns the first line of a 64 MB "file" with `fayl[:i]` (`fayl` means
+"file"). This is slicing: the piece looks at the whole 64 MB array. As long as the piece is alive, the array is alive
+too, and Go's garbage collector (GC) cannot free it. `slices.Clone` copies only the needed bytes into a new array, and
+the big array gets freed. This is the `FindDigits` example from the Go blog.
+
+```console
+$ go run ./homework/guru
+sarlavha:      "id,nom,narx", heap ≈ 64 MB
+sarlavhaNusxa: "id,nom,narx", heap ≈ 0 MB
+```
+
+</details>
+
+## Sources
+
+- Go spec: [Appending to and copying slices](https://go.dev/ref/spec#Appending_and_copying_slices),
+  [Slice expressions](https://go.dev/ref/spec#Slice_expressions),
+  [Length and capacity](https://go.dev/ref/spec#Length_and_capacity)
+- Andrew Gerrand, [Go Slices: usage and internals](https://go.dev/blog/slices-intro) (Go blog, 2011); Rob Pike,
+  [Arrays, slices (and strings): The mechanics of 'append'](https://go.dev/blog/slices) (Go blog, 2013)
+- [pkg.go.dev/slices](https://pkg.go.dev/slices): `Clip`, `Clone`; [Go 1.21 Release Notes](https://go.dev/doc/go1.21)
+  (the `slices` package)
+- [golang/go#21149](https://github.com/golang/go/issues/21149) (2017); [Go 1.10 Release Notes: bytes](https://go.dev/doc/go1.10#bytes)
+- The old formula in Go 1.17: [runtime/slice.go (go1.17)](https://github.com/golang/go/blob/go1.17/src/runtime/slice.go)
+- Keith Randall, [commit 2dda92f: runtime: make slice growth formula a bit smoother](https://go.googlesource.com/go/+/2dda92ff6f9f07eeb110ecbf0fc2d7a0ddd27f9d)
+  (2021); [Go 1.18 Release Notes](https://go.dev/doc/go1.18)
+- Go source code (go1.26.8): `runtime/slice.go` (`growslice`, `nextslicecap`, `growsliceBuf`),
+  [runtime/msize.go](https://go.dev/src/runtime/msize.go) (`roundupsize`), `internal/runtime/gc/sizeclasses.go`
+- Keith Randall, [Allocating on the Stack](https://go.dev/blog/allocation-optimizations) (Go blog, 2026);
+  [Go 1.26 Release Notes](https://go.dev/doc/go1.26)
+- [pkg.go.dev/testing: Benchmarks](https://pkg.go.dev/testing#hdr-Benchmarks)
+- Teiva Harsanyi, [100 Go Mistakes #25: Unexpected side effects using slice append](https://100go.co/#unexpected-side-effects-using-slice-append-25)
+- All results were taken with `go1.26.8 linux/amd64` on 2026-11-26.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/008-slices)
+
+---
+
+← Previous lesson: [GO-1.07](/lab/youtube/go/go-1-07/en) · Next lesson: [GO-1.09](/lab/youtube/go/go-1-09/en) → · [All lessons](/lab/youtube/go)
+
+</div>

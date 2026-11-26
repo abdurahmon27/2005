@@ -1,0 +1,1095 @@
+---
+title: "Maps: why the order is random and why recover does not save you"
+date: "2026/11/26"
+description: "Working with maps (comma ok, delete, nil map), why range order is random, and why concurrent map writes are a fatal error that recover cannot catch."
+tag: "youtube, go, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/go/go-1-09/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/go/go-1-09"
+    ru: "https://www.haywan.uz/lab/youtube/go/go-1-09/ru"
+    en: "https://www.haywan.uz/lab/youtube/go/go-1-09/en"
+    x-default: "https://www.haywan.uz/lab/youtube/go/go-1-09"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/go/go-1-09) · [Русский](/lab/youtube/go/go-1-09/ru) · **English**  
+Lesson GO-1.09 · [Go: 0 → Guru](/lab/youtube/go#go-1-09) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/009-maps)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Five words (non, sut, tuxum, choy, olma: "bread, milk, eggs, tea, apple") can be arranged in 120 orders:
+5 × 4 × 3 × 2 × 1 = 120. We asked Go to go through these five words 100 000 times and wrote down the order each
+time. Go gave only **5** different orders. And one of them came up in almost **half** of the loops. So the order
+is random, but it is not shuffled like a deck of playing cards. Why? Today we find the answer in Go's own source
+code. At the end of the lesson we will see an error that even the safety net (`recover`) cannot save you from.
+
+**The one idea:** a map links a key to a value: a missing key gives no error, it returns the zero value, and you
+cannot rely on the iteration order. If two goroutines write to a map at the same time, this is not a panic but a
+fatal error that `recover` cannot catch.
+
+By the end of this lesson you will be able to:
+
+- create a map, add a value, change it, delete it, and count the keys with `len`;
+- use comma ok to tell "the price is 0" from "there is no such product";
+- explain why the `range` order is random but not evenly spread, and sort the keys when you need an order;
+- tell a write to a nil map (a panic, `recover` catches it) from concurrent writes to a map (a fatal error, it
+  does not), and protect a map with `sync.Mutex`.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| map | a price board: each **key** (product name) is linked to one **value** (price) | map (key → value) |
+| comma ok | a second variable: the answer to "is there such a key?", `true` or `false` | comma ok idiom |
+| fatal error | an error where the runtime stops the program at once: `defer` does not run, `recover` does not catch it | fatal error |
+
+Two helper words also come up on the way: **panic** (the program crashing in an emergency; `recover` can catch
+it) and **goroutine** (a separate job that runs at the same time as other work). We explain both where they are
+needed; the details come in [GO-1.15](/lab/youtube/go#go-1-15) and [GO-1.21](/lab/youtube/go#go-1-21).
+
+## Before you start
+
+- [GO-1.08 · Slices: the append trap and the outdated 1024 rule](/lab/youtube/go/go-1-08/en): slice, `append`, a copy of a
+  slice looks at the same array.
+- [GO-1.05 · Go has no while: one for and all its forms](/lab/youtube/go/go-1-05/en): `for`, `range`, `_`, `range 3`. In that
+  lesson we said: "the order of `range` over a map is not guaranteed, we will open this in lesson nine". Today we
+  keep that promise.
+- [GO-1.06 · Functions: two return values, closure and variadic](/lab/youtube/go/go-1-06/en): writing your own function, the
+  **anonymous function** (`func() { … }`) and the closure.
+- [GO-1.02 · Types and overflow](/lab/youtube/go#go-1-02): the zero value (the starting value of a variable that got no
+  value: 0 for `int`, `""` for `string`, `false` for `bool`).
+- [GO-0.04 · if: the program makes a decision](/lab/youtube/go/go-0-04/en): `true`/`false` and `if`.
+- [GO-1.01 · Why does Go exist? What is inside go build](/lab/youtube/go#go-1-01): the **runtime** — helper code that Go
+  adds to every program. It manages memory, maps and goroutines.
+- You can copy the programs to [go.dev/play](https://go.dev/play) and run them with the **Run** button. Only the
+  command `bash ./poyga/demo.sh` needs the course folder: it is a helper script in that folder.
+- If you downloaded the course code, open a terminal in the lesson folder (`lessons/009-maps`). The commands below
+  run from there: `go run ./asos` runs the program in the `asos` folder.
+
+First, let's recall the previous lesson. What does this program print?
+
+```go
+	a := []int{1, 2, 3}
+	b := a
+	b[0] = 100
+	fmt.Println(a[0])
+```
+
+<details>
+<summary>Answer</summary>
+
+**`100`.** `b := a` makes a copy of the slice, but that copy looks at the **same** array. When we change `b[0]`,
+`a[0]` changes too. Today we will see something similar with maps. This example is not in the course folder; it
+was run separately (with `package main` and `import "fmt"`):
+
+```console
+$ go run eslash/main.go
+100
+```
+
+</details>
+
+## The puzzle from the start: 5 orders out of 120
+
+Here is the experiment from the start. The `tartib` ("order") program goes through five product names 100 000
+times. Each time it records the order the names came in, and at the end it shows what percentage each order got.
+We will open the program's code in the middle of the lesson, after we learn the tools it uses.
+
+```console
+$ go run ./tartib
+100000 ta sikl, 5 xil tartib:
+choy olma non sut tuxum   12.3%
+non sut tuxum choy olma   50.2%
+olma non sut tuxum choy   12.3%
+sut tuxum choy olma non   12.6%
+tuxum choy olma non sut   12.5%
+```
+
+(`100000 ta sikl, 5 xil tartib` means "100000 loops, 5 different orders".) The decimals of the percentages change a
+little on every run, but the five orders are always the same. Out of 120 possible orders, only 5 came up. The order
+`non sut tuxum choy olma` got almost 50 %, the other four about 12.5 % each.
+
+The lesson has three parts:
+
+1. the basics of working with maps;
+2. why the order is random (and why it is not even);
+3. what happens when two goroutines write to one map, and why `recover` is powerless.
+
+## Map: key → value
+
+We want to store shop prices: bread 5000 sum, milk 12000 sum. In a slice, values sit in cells numbered 0, 1, 2.
+But we want to look things up by **name**, not by number: "how much is bread?".
+
+Picture the price board in a shop. The left column has the product name, the right column its price. You find the
+name and read the price next to it. A name is never written on the board twice.
+
+| Key (name) | Value (price) |
+|---|---|
+| `"non"` | 5000 |
+| `"sut"` | 12000 |
+
+In Go such a board is called a **map**. The name in the left column is the **key**, the price in the right column
+is the **value**. A map links each key to one value. Its type is written `map[string]int`: "a map whose keys are
+`string` and whose values are `int`".
+
+This is `asos/main.go` ("basics") from the course folder:
+
+```go filename="asos/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	narx := map[string]int{"non": 5000, "sut": 12000}
+	narx["choy"] = 25000
+
+	fmt.Println(narx["olma"]) // bunday kalit yoʻq
+
+	n, bor := narx["olma"]
+	fmt.Println(n, bor)
+
+	delete(narx, "sut")
+	fmt.Println(len(narx))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–5 | `package main` … `func main() {` | the familiar template: the program starts in `main` |
+| 6 | `narx := map[string]int{"non": 5000, "sut": 12000}` | a new map named `narx` ("price"). Inside the curly braces are the starting pairs `key: value`, separated by commas |
+| 7 | `narx["choy"] = 25000` | a key in square brackets: "let the price of `choy` (tea) be 25000". If the key is missing, it is added; if it exists, the old value is replaced |
+| 9 | `fmt.Println(narx["olma"])` | asks for the price of `olma` (apple), which is not in the map. The comment says "there is no such key" |
+| 11 | `n, bor := narx["olma"]` | the same lookup, but with **two** variables: `n` is the price, `bor` ("exists") says whether the key is there (`true`/`false`) |
+| 12 | `fmt.Println(n, bor)` | prints both |
+| 14 | `delete(narx, "sut")` | `delete` is a built-in Go function: it removes the key `sut` (with its value) |
+| 15 | `fmt.Println(len(narx))` | `len` tells how many keys the map has |
+
+Think before you run it: what does line 9 print? **A)** the program crashes with an error · **B)** `0` ·
+**C)** an empty line
+
+<details>
+<summary>Answer</summary>
+
+**B: `0`.** A missing key is not an error. The map returns the **zero value** of the value type: the value type
+is `int`, so 0. If you chose "A", you expected the behaviour of other languages: in some of them a missing key
+gives an error, in Go it does not. "C" would be right if the value type were `string`: its zero value is the empty
+string `""`.
+
+</details>
+
+```console
+$ go run ./asos
+0
+0 false
+2
+```
+
+How the board changed after each line:
+
+| Line | Inside `narx` | Screen |
+|---|---|---|
+| 6 | non: 5000, sut: 12000 | |
+| 7 | non: 5000, sut: 12000, choy: 25000 | |
+| 9 | (unchanged) | `0` |
+| 11–12 | (unchanged; `n` = 0, `bor` = `false`) | `0 false` |
+| 14 | non: 5000, choy: 25000 | |
+| 15 | (unchanged) | `2` |
+
+Note: line 9 **added nothing** to the map. Reading a missing key does not change the map.
+
+## Comma ok: "0 sum" or "not there at all"?
+
+Now the problem. `narx["olma"]` returned 0. What does that mean: are apples free (price 0 sum), or does the shop
+have no apples at all? The first value alone cannot tell you.
+
+That is why line 11 has a second variable, `bor`. It answers the question "is there such a key in the map?".
+`0 false` means the price is 0, but `false`: **there is no such key**. For a free product it would print `0 true`.
+
+In Go this form is called **comma ok**: a comma and a second variable, which people usually name `ok`
+(`n, ok := narx["olma"]`). We named it `bor`. This pattern is very common in Go. It is usually written together
+with `if`:
+
+```go
+	if n, bor := narx["olma"]; bor {
+		fmt.Println("olma:", n)
+	} else {
+		fmt.Println("olma yoʻq")
+	}
+```
+
+In the `if` line, `n` and `bor` are created first, and after the semicolon (`;`) `bor` is checked. These two
+variables live only inside this `if`. (`"olma yoʻq"` means "no apples".)
+
+After `delete`, `len(narx)` gave 2: `non` and `choy` were left.
+
+## nil map: reading is fine, writing is a panic
+
+What happens if we declare a map with `var` instead of `:=`, without a value?
+
+```go
+	var narx map[string]int
+```
+
+Every type has a zero value. The zero value of a map type is **`nil`**, meaning "there is no map yet". Picture a
+price board that has not been hung up yet. If you look at it, you see nothing. But you cannot write a price on it
+either: the board itself is not there.
+
+You can create an empty map that is ready to use in two ways:
+
+```go
+	narx := map[string]int{}       // boʻsh map literal
+	narx2 := make(map[string]int)  // make bilan
+```
+
+(The comments say "empty map literal" and "with make".) `make` is a built-in Go function: it creates a new, empty,
+but ready map. A map that was "not made", that is, declared with `var`, is `nil`.
+
+This is `nilmap/main.go`. It contains a mistake **on purpose**:
+
+```go filename="nilmap/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	var narx map[string]int // nil map: make qilinmagan
+	fmt.Println(narx["non"], len(narx))
+	yoz(narx)
+	fmt.Println("dastur davom etdi")
+}
+
+func yoz(m map[string]int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("qutqarildi:", r)
+		}
+	}()
+	m["non"] = 5000 // ataylab xato: nil map'ga yozib boʻlmaydi
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `var narx map[string]int` | a map without a value: `narx` is `nil` (the comment: "nil map: not made") |
+| 7 | `fmt.Println(narx["non"], len(narx))` | reads from the nil map and counts its keys |
+| 8 | `yoz(narx)` | calls the function `yoz` ("write") and gives it the map |
+| 9 | `fmt.Println("dastur davom etdi")` | "the program continued": does the program get here after `yoz`? |
+| 12 | `func yoz(m map[string]int) {` | our own function that takes a map |
+| 13–17 | `defer func() { … }()` | **protection**: `defer` schedules work that runs when the function is finishing. Here it is an anonymous function; the `()` at the end calls it, and `defer` postpones that call to the end of the function |
+| 14 | `if r := recover(); r != nil {` | `recover` stops the crash and returns its reason. If there was no crash, it returns `nil`. `!=` means "is it not equal" |
+| 15 | `fmt.Println("qutqarildi:", r)` | prints "rescued:" and the reason for the crash |
+| 18 | `m["non"] = 5000` | a write to a nil map: the error happens here (the comment: "a mistake on purpose: you cannot write to a nil map") |
+
+Here comes a new helper word. When a program gets into a state where it cannot go on, Go does a **panic**: the
+function stops and the program starts to crash. `recover` is a safety net: when it is called inside a function
+deferred with `defer`, it stops the crash and the program goes on. We study `defer`, `panic` and `recover` in
+detail in [GO-1.15](/lab/youtube/go#go-1-15). For today these two sentences are enough.
+
+Guess: what does the program print? **A)** `0 0`, then `qutqarildi: …` and `dastur davom etdi` · **B)** `0 0`,
+then the program crashes · **C)** it crashes on the first line, because you cannot read from a nil map
+
+<details>
+<summary>Answer</summary>
+
+**A.** Reading from a nil map is fine: like an empty map, it returns the zero value (0), and `len` is 0. So not
+"C". Writing, however, causes a panic. But `yoz` has the `defer` + `recover` protection: it stops the crash, `yoz`
+finishes, and `main` moves on to line 9. "B" would be right without the protection (we will see that in "Common
+mistakes").
+
+</details>
+
+```console
+$ go run ./nilmap
+0 0
+qutqarildi: assignment to entry in nil map
+dastur davom etdi
+```
+
+The reason for the panic: *assignment to entry in nil map*. Go's official rules say the same thing: a nil map is
+the same as an empty map, except that no elements may be added to it.
+
+| Step | What happened | Screen |
+|---|---|---|
+| line 7 | read from the nil map: 0, `len` 0 | `0 0` |
+| line 18 | write to the nil map → panic | |
+| lines 13–17 | `defer` ran, `recover` caught the panic | `qutqarildi: assignment to entry in nil map` |
+| line 9 | `main` went on | `dastur davom etdi` |
+
+One more thing: on line 8 we gave the map to `yoz`. A map is like a slice here: its copy looks at the **same**
+table. So whatever the function writes to `m` is also visible in the map outside (here the map was `nil`, so the
+write failed). This matters at the end of the lesson, when two goroutines write to one map.
+
+Remember this program. At the end of the lesson we will see a case where exactly this protection does not work.
+
+## Order: what Go's official rules say
+
+Now to the order. Go's official rules (the Go specification) say it openly:
+
+> *"The iteration order over maps is not specified and is not guaranteed to be the same from one iteration to the
+> next."*
+
+The history of this rule:
+
+| Version | What happened |
+|---|---|
+| Go 1 | the order was made "unpredictable" on purpose, so that programmers would not rely on map order |
+| Go 1.1 | the new internal design of maps forgot to randomise the order for small maps (up to 8 keys) |
+| Go 1.3 | the bug was fixed: small maps have a random order again |
+| Go 1.24 | maps are stored in memory in a new way (**Swiss table**), but the order rules did not change |
+
+The Go 1 document states the goal clearly: *"Code should not assume that the elements are visited in any
+particular order"*.
+
+## How it works: a group of 8 slots and a random start
+
+So why exactly 5 orders and not 120? The answer is in Go's source code (go1.26.8,
+`internal/runtime/maps/table.go`). First in plain words.
+
+**1. The group.** In a map with up to eight keys, all keys sit in one **group**. A group is a row of 8 slots, like
+a round table for 8 people. If nothing was deleted, keys take the first empty slot in the order they were added.
+Our 5 keys take slots 0–4; slots 5, 6, 7 are empty:
+
+| Slot | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Key | non | sut | tuxum | choy | olma | — | — | — |
+
+**2. A random start.** At the start of every `range`, the runtime takes a random number and uses it to pick the
+start slot: 0 to 7, each with equal chance.
+
+**3. Round in a circle.** The loop starts at that slot and goes round the table: after slot 7 comes slot 0 again.
+Empty slots are skipped.
+
+Now let's write out all eight possible starts:
+
+| Start slot | Order you get |
+|---|---|
+| 0 | non sut tuxum choy olma |
+| 1 | sut tuxum choy olma non |
+| 2 | tuxum choy olma non sut |
+| 3 | choy olma non sut tuxum |
+| 4 | olma non sut tuxum choy |
+| 5 (empty) | → 6, 7 empty → 0: non sut tuxum choy olma |
+| 6 (empty) | → 7 empty → 0: non sut tuxum choy olma |
+| 7 (empty) | → 0: non sut tuxum choy olma |
+
+Four starts out of eight (0, 5, 6, 7) give the same order: `non sut tuxum choy olma`. 4/8 = 50 %. Each of the
+other four orders gets 1/8 = 12.5 %. That is exactly what the measurement at the start showed. The keys always
+come in the same circular sequence; only the start point changes. That is why there are 5 orders, not 120.
+
+Here is that place in the source code (`// ...` marks lines we left out). This is Go's internal code:
+`func (it *Iter) Init(…)` is a function that belongs to the `Iter` type (a method, [GO-1.12](/lab/youtube/go#go-1-12)), and `*`
+is a pointer ([GO-1.11](/lab/youtube/go#go-1-11)). You do not need to understand all of it; the lines in the table are enough.
+
+```go
+func (it *Iter) Init(typ *abi.MapType, m *Map) {
+	// ...
+	it.entryOffset = rand()
+	// ...
+}
+
+func (it *Iter) Next() {
+	// ...
+	if it.dirIdx < 0 {
+		// Map was small at Init.
+		for ; it.entryIdx < abi.MapGroupSlots; it.entryIdx++ {
+			k := uintptr(it.entryIdx+it.entryOffset) % abi.MapGroupSlots
+			if (it.group.ctrls().get(k) & ctrlEmpty) == ctrlEmpty {
+				// Empty or deleted.
+				continue
+			}
+```
+
+| Line | What it does |
+|---|---|
+| 1–5 | `Init` runs once, when the `range` starts. `it.entryOffset = rand()`: a random number; the start slot comes from it |
+| 7 | `Next` finds the next key at each step |
+| 9–10 | `if it.dirIdx < 0` — the comment says *Map was small at Init* (one group) |
+| 11 | the loop walks the group's `abi.MapGroupSlots` = 8 slots |
+| 12 | `k := … % abi.MapGroupSlots`: the random number is added to the step number and the remainder of dividing by 8 is taken (`%`, from [GO-1.05](/lab/youtube/go/go-1-05/en)). The remainder is always 0–7: after 7 comes 0 again. That is the circle. (`uintptr(…)` is a number type conversion; it does not matter here) |
+| 13–16 | if the slot is empty or deleted (*Empty or deleted*), `continue` skips it and moves to the next slot. (`&` here is an operation on bits: it picks the "empty" bit out of the slot's marker) |
+
+Conclusion: the order is **random** but **not shuffled**. Out of 120 possible orders, 5 come up, and they are not
+equally likely. So do not use `range` to pick a random element: the result is not evenly spread. Do not rely on
+this measurement either: it is Go's internal design and may change in the next version. There is one rule: the
+order is not guaranteed.
+
+## Pause: printing the map twice
+
+Now, instead of `range`, we print the whole map with `fmt.Println` twice. This is `chop/main.go` ("print"):
+
+```go filename="chop/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	narx := map[string]int{"non": 5000, "sut": 12000, "tuxum": 18000, "choy": 25000, "olma": 15000}
+	fmt.Println(narx)
+	fmt.Println(narx)
+}
+```
+
+- **Line 6:** the same five products and their prices.
+- **Lines 7–8:** print the whole map twice.
+
+Will the two lines come out in different orders? **A)** yes, like `range`, it can differ each time · **B)** no,
+both are the same and the keys are sorted · **C)** no, both are the same and the keys are in the order they were
+added
+
+<details>
+<summary>Answer</summary>
+
+**B.** Since Go 1.12, `fmt` sorts a map's keys before printing it. The Go team did this to make testing easier
+(*"to ease testing"*). If you chose "A", your logic was right: the map itself has no order. But `fmt` puts it in
+order before printing. Not "C": in the order of adding, `non` would be first, but the output starts with `choy`.
+
+</details>
+
+```console
+$ go run ./chop
+map[choy:25000 non:5000 olma:15000 sut:12000 tuxum:18000]
+map[choy:25000 non:5000 olma:15000 sut:12000 tuxum:18000]
+```
+
+`fmt` prints a map as `map[key:value key:value …]`. Here is the trap: on screen the map looks ordered, but `range`
+is still random. Do not trust the order you see while checking your program (while debugging).
+
+## If you need an order, sort the keys
+
+If you need an order, make it yourself: first collect and sort the keys, then read from the map in that order.
+This is `saralash/main.go` ("sorting"):
+
+```go filename="saralash/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+)
+
+func main() {
+	narx := map[string]int{"non": 5000, "sut": 12000, "tuxum": 18000, "choy": 25000, "olma": 15000}
+	for _, nom := range slices.Sorted(maps.Keys(narx)) {
+		fmt.Println(nom, narx[nom])
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–7 | `import ( … )` | three packages: `fmt`, `maps` (tools for maps), `slices` (tools for slices) |
+| 11 | `maps.Keys(narx)` | returns an **iterator** that hands out the map's keys one by one. An iterator is not a slice: it does not store the keys, it gives them one at a time when asked (details: [GO-1.18](/lab/youtube/go#go-1-18)) |
+| 11 | `slices.Sorted(…)` | collects all keys from the iterator into a **sorted slice** |
+| 11 | `for _, nom := range …` | walks the sorted slice: `nom` ("name") is the next key |
+| 12 | `fmt.Println(nom, narx[nom])` | prints the key and its price from the map |
+
+Both `maps.Keys` and `slices.Sorted` were added in Go 1.23.
+
+```console
+$ go run ./saralash
+choy 25000
+non 5000
+olma 15000
+sut 12000
+tuxum 18000
+```
+
+Now the output is the same every time, and sorted. Note: the sort goes by **letter codes** (bytes), not by the
+Uzbek alphabet. In the Uzbek alphabet `Ch` comes at the end, after `Z`, `Oʻ`, `Gʻ`, `Sh`. But for sorting, `choy` is
+just a word starting with the letter `c`, so it comes first.
+
+### The program from the start
+
+Now we can read the whole `tartib` program from the start of the lesson. It printed its results in exactly this
+way:
+
+```go filename="tartib/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+)
+
+func main() {
+	narx := map[string]int{"non": 5000, "sut": 12000, "tuxum": 18000, "choy": 25000, "olma": 15000}
+
+	const n = 100_000
+	sanoq := map[string]int{} // har bir tartib necha marta chiqdi
+	for range n {
+		var kalitlar []string
+		for nom := range narx {
+			kalitlar = append(kalitlar, nom)
+		}
+		sanoq[strings.Join(kalitlar, " ")]++
+	}
+	fmt.Printf("%d ta sikl, %d xil tartib:\n", n, len(sanoq))
+	for _, t := range slices.Sorted(maps.Keys(sanoq)) {
+		fmt.Printf("%-24s %5.1f%%\n", t, 100*float64(sanoq[t])/n)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–8 | `import ( … )` | one more package, `strings`: tools for working with strings |
+| 13 | `const n = 100_000` | the constant 100 000. The underscore only makes it easier to read; the number does not change |
+| 14 | `sanoq := map[string]int{}` | a second map (`sanoq`, "count"): the key is the order as a string, the value is how many times it came up (the comment says so) |
+| 15 | `for range n {` | repeats 100 000 times (no loop variable needed) |
+| 16 | `var kalitlar []string` | a new, empty slice `kalitlar` ("keys") on every lap |
+| 17–19 | `for nom := range narx { … append … }` | walks the `narx` map and adds the keys to the slice in the order they came |
+| 20 | `sanoq[strings.Join(kalitlar, " ")]++` | `strings.Join` joins the keys into one string with spaces: `"non sut tuxum choy olma"`. `++` adds 1 to that order's count. For a new order the map returns 0, so no separate check is needed |
+| 22 | `fmt.Printf("%d ta sikl, %d xil tartib:\n", …)` | `Printf` prints by a template: each `%d` is replaced by the next whole number; `\n` is a new line. `len(sanoq)` is how many different orders came up |
+| 23 | `for _, t := range slices.Sorted(maps.Keys(sanoq)) {` | sorts the orders and takes them one by one |
+| 24 | `fmt.Printf("%-24s %5.1f%%\n", …)` | `%-24s` writes a string left-aligned in a 24-character field; `%5.1f` a floating-point number with one decimal; `%%` the `%` sign itself. `100*float64(sanoq[t])/n` is the percentage; `float64(…)` converts the count to a floating-point number, otherwise dividing whole numbers would drop the fraction |
+
+## Concurrent writes: a fatal error
+
+Now the most dangerous trap. It needs one new helper word.
+
+So far our programs did one job, step by step. But a program can also do several jobs at the same time. For
+example, two cashiers work in a shop at the same time. In Go each separate job that runs at the same time as
+others is called a **goroutine**. `main` itself is a goroutine too. We study goroutines in detail in
+[GO-1.21](/lab/youtube/go#go-1-21).
+
+This is `poyga/main.go` ("poyga" means "race"). It contains a mistake **on purpose**:
+
+```go filename="poyga/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	m := map[int]int{}
+	var wg sync.WaitGroup
+	for g := range 2 {
+		wg.Go(func() { yoz(m, g) }) // ataylab xato: ikki goroutine bitta map'ga yozadi
+	}
+	wg.Wait()
+	fmt.Println("dastur davom etdi:", len(m))
+}
+
+func yoz(m map[int]int, g int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("qutqarildi:", r)
+		}
+	}()
+	for i := range 1_000_000 {
+		m[i] = g
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `"sync"` | a package of tools for goroutines that run at the same time |
+| 9 | `m := map[int]int{}` | an empty map: both key and value are `int` |
+| 10 | `var wg sync.WaitGroup` | a **WaitGroup** starts goroutines and waits until all of them finish (details in [GO-1.22](/lab/youtube/go#go-1-22)) |
+| 11 | `for g := range 2 {` | twice: `g` = 0, then 1 |
+| 12 | `wg.Go(func() { yoz(m, g) })` | runs the anonymous function in a **new goroutine**. It calls `yoz(m, g)`. `main` does not wait and moves to the next step. `wg.Go` was added in Go 1.25. The comment says "a mistake on purpose: two goroutines write to one map" |
+| 14 | `wg.Wait()` | waits here until both goroutines finish |
+| 15 | `fmt.Println("dastur davom etdi:", len(m))` | if the program gets here, it prints the number of keys |
+| 18 | `func yoz(m map[int]int, g int) {` | the function that writes to the map; `g` is the goroutine's number |
+| 19–23 | `defer func() { … recover … }()` | the same protection as in `nilmap` |
+| 24–26 | `for i := range 1_000_000 { m[i] = g }` | writes to the map a million times: key `i`, value `g` |
+
+Both goroutines got a copy of `m`, but a map is like a slice here: both copies look at **one** table. So two
+goroutines write to one map at the same time. Each of them has a `recover` inside.
+
+```text
+main ─┬─ wg.Go ──► goroutine 0:  m[0]=0  m[1]=0  m[2]=0  …
+      │                              ╲
+      │                               ►  one map  m  ◄──  two writers at the same time
+      │                              ╱
+      ├─ wg.Go ──► goroutine 1:  m[0]=1  m[1]=1  m[2]=1  …
+      └─ wg.Wait()  …waits until both finish
+```
+
+Guess: what happens? **A)** `qutqarildi: …` is printed and the program goes on · **B)** the program crashes, and
+there is no `qutqarildi` line · **C)** no error: `dastur davom etdi: 1000000`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The program crashes and `recover` catches nothing. This is not an ordinary panic but a **fatal error**. We
+look at it below. If you chose "A", you expected a panic like in `nilmap`. If you chose "C", you thought writing to
+a map at the same time is safe. Many programmers think so too (see the Uber example at the end of the lesson).
+
+</details>
+
+In the video and here we run the program through a helper script. The reason: Go detects this error on a "best
+effort" basis (explained below). In very rare cases the program crashes with a different message or finishes
+without crashing. `poyga/demo.sh` compiles the program once and reruns it until it gets the message
+`fatal error: concurrent map writes` and exit code 2 (at most 20 attempts). Then it prints the message line and the
+exit code taken from that real run. `bash` is the program that runs the script.
+
+```console
+$ bash ./poyga/demo.sh
+fatal error: concurrent map writes
+exit status 2
+```
+
+*fatal error: concurrent map writes* means "a fatal error: writes to a map at the same time". *exit status 2*: the
+program stopped with exit code 2 (0 means success, any other number an error). There is no `qutqarildi` line, and
+no `dastur davom etdi` either.
+
+A plain `go run ./poyga` prints the same first line. Below it comes a list of goroutines (a stack trace). In our
+run it contained `main.yoz` and `poyga/main.go:25`: line 25, `m[i] = g`. The video shortens this long list.
+
+## Why recover is powerless: panic and fatal
+
+The line `m[i] = g` actually calls one function in the runtime. Here is a shortened view of it (go1.26.8):
+
+```go
+// internal/runtime/maps/runtime_fast64.go
+func runtime_mapassign_fast64(...) unsafe.Pointer {
+	if m == nil {
+		panic(errNilAssign)
+	}
+	// ...
+	if m.writing != 0 {
+		fatal("concurrent map writes")
+	}
+	// ...
+	m.writing ^= 1 // toggle, see comment on writing
+	// ...
+}
+
+// runtime/panic.go
+// fatal is equivalent to throw, but is used when user code is expected to be
+// at fault for the failure, such as racing map writes.
+```
+
+| Line | What it does |
+|---|---|
+| 2 | the runtime function that writes to a map with an `int` key: our `m[i] = g` calls this one. `(...)` marks parameters we shortened; `unsafe.Pointer` is the type of the return value and does not matter here |
+| 3–5 | if the map is `nil`, an ordinary `panic`. That was the error in `nilmap`, and `recover` caught it |
+| 7–9 | `m.writing` is a flag: "is someone writing to this map right now?". If yes, not `panic` but `fatal` |
+| 11 | when a write starts, it flips the flag (`^= 1`: 0 becomes 1, 1 becomes 0) |
+| 15–16 | the comment on `fatal`: it is the same as `throw`, but used when the user's code is expected to be at fault, *"such as racing map writes"* |
+
+The runtime treats this as a programmer's mistake. `fatal` prints the message and stops the program with code 2
+without running the `defer`s. If `defer` does not run, the `recover` inside it does not run either. Logically (this
+is our explanation, not the source's words): going on with a map that may be corrupted is dangerous.
+
+| | `nilmap` | `poyga` |
+|---|---|---|
+| Error | writing to a nil map | two goroutines write at the same time |
+| What the runtime does | `panic(errNilAssign)` | `fatal("concurrent map writes")` |
+| Does `defer` run | yes | no |
+| `recover` | catches it: `qutqarildi: …` | cannot catch it |
+| The program | goes on | `exit status 2` |
+
+## Two important points: "best effort" and read-only
+
+**1. This check is not a guarantee.** Since Go 1.6 the runtime detects misuse of maps. Its documentation calls
+this *"best-effort detection"*: it detects what it can. So sometimes an error can slip through unnoticed.
+
+A much better tool is the **race detector** (a Go tool that finds data races). Run your tests with the `-race`
+flag: `go test -race`. But it too only checks code that actually ran: it will not find an error on a path that
+never ran. On Linux the race detector needs a C compiler (gcc). The course computer had no gcc, so we do not show
+its output here. We will see it in [GO-1.22](/lab/youtube/go#go-1-22).
+
+**2. Read-only is safe.** If several goroutines only **read** a map, that is safe. The Go FAQ: *"Map access is
+unsafe only when updates are occurring"*. The problem starts when someone writes.
+
+| Who does what | Is it safe |
+|---|---|
+| several goroutines only read | yes |
+| one goroutine writes, another reads or writes | no: protection needed |
+
+## The fix: sync.Mutex
+
+The fix: wrap every write to the map in a **mutex**. Picture a fitting room for one person. Whoever goes in locks
+the door from the inside; the others wait in line. On the way out they unlock it, and the next person goes in.
+`sync.Mutex` is that lock: `Lock` lets only one goroutine in at a time. When the work is done, `Unlock` opens the
+way for another.
+
+This is `mutex/main.go`:
+
+```go filename="mutex/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	m := map[int]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for g := range 2 {
+		wg.Go(func() {
+			for i := range 1_000_000 {
+				mu.Lock()
+				m[i] = g
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println("tugadi:", len(m))
+}
+```
+
+What is different from `poyga`:
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `var mu sync.Mutex` | the lock. Its zero value is ready to use: an open lock |
+| 13–19 | `wg.Go(func() { … })` | no `yoz` function and no `recover`: the loop is directly inside the anonymous function |
+| 15 | `mu.Lock()` | locks. If the lock is taken, the second goroutine waits here |
+| 16 | `m[i] = g` | the write to the map: now only one goroutine writes at a time |
+| 17 | `mu.Unlock()` | unlocks; the next goroutine may go in |
+| 22 | `fmt.Println("tugadi:", len(m))` | "done:" and the number of keys in the map |
+
+Guess: which number comes after `tugadi:`? **A)** `2000000` · **B)** `1000000` · **C)** different each time, less
+than 1000000
+
+<details>
+<summary>Answer</summary>
+
+**B: `1000000`.** Both goroutines write to the **same** keys: 0 to 999 999. Writing to a key a second time does
+not add a new key; it only replaces its value. So the map has one million keys. If you chose "A", you thought each
+write adds a new key. "C" is the mess you might expect without a mutex, but with the mutex all writes happen one
+after another.
+
+</details>
+
+```console
+$ go run ./mutex
+tugadi: 1000000
+```
+
+Now the program does not crash, and the map has one million keys. We look at `sync.Mutex` and `WaitGroup` more
+deeply in [GO-1.22](/lab/youtube/go#go-1-22).
+
+## The real world: Uber, 2022
+
+This is not a theoretical problem. In 2022 engineers at Uber studied the **data races** in their Go code. A data
+race is an error where two goroutines access the same memory at the same time and at least one of them writes.
+
+| Number | What |
+|---|---|
+| about 2000 | data races detected |
+| about 1100 | fixed and analysed (210 developers, six months) |
+
+Concurrent access to maps was one of the frequent causes. Developers thought that accessing different keys was
+safe. After all, the square brackets in `table[key]` look as if you were accessing a separate element. In fact,
+all keys live in one map, inside one shared structure.
+
+## Going deeper (optional): why the check is "best effort"
+
+Look at the runtime flag once more: `m.writing ^= 1`. It is a plain, **non-atomic** flip. Another goroutine cannot
+see an atomic operation half-done; this operation is not like that. If two writers flip the flag at the same time,
+the check may miss it.
+
+While the lesson was being prepared, the critic (a separate reviewer) ran `poyga` many times and measured:
+
+| Conditions | Result |
+|---|---|
+| 300 ordinary runs | 297 × `fatal error: concurrent map writes`, 2 × `small map with no empty slot (concurrent map writes?)`, 1 × `unexpected fault address` (access to a bad address in memory) |
+| 100 runs with `GOMAXPROCS=1` | 98 crashed, 2 finished without crashing |
+
+`GOMAXPROCS=1` is a setting that runs Go code on only one processor core at a time. Even then the program crashed
+almost every time. So the problem is not that two jobs run at exactly the same instant: it is enough for the second
+write to start before the first one has finished. That is why we say "at the same time" (concurrent), not "in
+parallel". And the one `unexpected fault address` shows that a corrupted map really is dangerous.
+
+One more number: the chance that two runs of `tartib` give the same order is about 31 %
+(0.5² + 4 · 0.125²). So "I ran it twice and the order was the same" proves nothing.
+
+## Common mistakes
+
+**1. Relying on map order.** The main trap of this lesson. The program gives no error, but the `range` order can be
+different each time (above, in "How it works"). `fmt.Println(map)` prints it sorted and so hides the problem (the
+"Pause" section). Using `range` to pick a random element is also a mistake: in our map one order came up 50 % of the
+time. **Fix:** if you need an order, sort with `slices.Sorted(maps.Keys(m))`; if you need a random element, pick it
+with a random number.
+
+**2. Taking zero to mean "missing".** `if narx["suv"] == 0 { … "yoʻq" … }` also treats a free product (`suv`,
+"water") as missing (`yoʻq`). Both a missing key and a key with value 0 return 0 (the "Comma ok" section).
+**Fix:** `n, bor := narx["suv"]` and check `bor`.
+
+**3. Writing to a nil map without protection.** This example is not in the course folder; it was run separately:
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	var narx map[string]int
+	narx["non"] = 5000
+	fmt.Println(narx)
+}
+```
+
+```console
+$ go run -trimpath nilyoz/main.go
+panic: assignment to entry in nil map
+
+goroutine 1 [running]:
+main.main()
+	./main.go:7 +0x28
+exit status 2
+```
+
+`-trimpath` only shortens the file path in the message; without it you see the full folder path on your computer.
+Let's read the message: *panic: assignment to entry in nil map*. *goroutine 1 [running]*: the error happened in
+goroutine 1, that is, in `main`. `main.main()` and `main.go:7`: the function `main`, line 7:
+`narx["non"] = 5000`. There is no `recover`, so the program crashed with code 2. **Fix:** create the map:
+`narx := map[string]int{}` or `narx := make(map[string]int)`.
+
+**4. Thinking `recover` also catches concurrent writes.** We saw it in `poyga`: the `recover` is there, but the
+program still crashes, because this is not a panic but a fatal error (the "Why recover is powerless" section).
+**Fix:** protect writes to the map with `sync.Mutex` (the "The fix: sync.Mutex" section), and run your tests with
+`go test -race`.
+
+**5. Thinking `maps.Keys` returns a slice.** (Not in the course folder; run separately.)
+
+```go
+package main
+
+import (
+	"fmt"
+	"maps"
+)
+
+func main() {
+	narx := map[string]int{"non": 5000, "sut": 12000}
+	kalitlar := maps.Keys(narx)
+	fmt.Println(len(kalitlar))
+}
+```
+
+```console
+$ go run kalitlar/main.go
+# command-line-arguments
+kalitlar/main.go:11:18: invalid argument: kalitlar (variable of func type iter.Seq[string]) for built-in len
+```
+
+Line 11, column 18: *invalid argument: kalitlar (variable of func type iter.Seq[string]) for built-in len*: the
+argument of the built-in `len` is wrong, `kalitlar` is a function variable of type `iter.Seq[string]`. In other
+words, `maps.Keys` returned an iterator, not a slice, and `len` cannot count an iterator. **Fix:** collect the keys
+into a slice first: `kalitlar := slices.Sorted(maps.Keys(narx))` (sorted) or `slices.Collect(maps.Keys(narx))`
+(not sorted). Then `len(kalitlar)` works.
+
+## Check yourself
+
+Answer first, then open the answer.
+
+**1.** What happens when you read a missing key from a map? How do you tell "the price is 0" from "there is no such
+key"?
+
+<details>
+<summary>Answer</summary>
+
+No error: the map returns the zero value of the value type (0 for `int`). To tell them apart, use comma ok:
+`n, bor := narx["olma"]`. If `bor` is `false`, the key is missing; if it is `true`, the key exists and the price is
+`n`.
+
+</details>
+
+**2.** You need to print a map's keys in the same order every time. What do you do?
+
+<details>
+<summary>Answer</summary>
+
+Do not rely on the `range` order. Sort the keys and walk them in that order:
+`for _, k := range slices.Sorted(maps.Keys(m)) { … m[k] … }`.
+
+</details>
+
+**3.** If two goroutines write to one map at the same time, does the `recover` inside each of them save the
+program?
+
+<details>
+<summary>Answer</summary>
+
+No. The runtime calls `fatal`, not `panic`: `fatal error: concurrent map writes`. It stops the program with code 2
+without running the `defer`s, so `recover` never gets a turn. The fix: `sync.Mutex`.
+
+</details>
+
+**4.** What does this program print? **A)** `2 0 false 2` · **B)** `2 0 false 1` · **C)** `1 0 true 1`
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	sanoq := map[string]int{}
+	sanoq["a"]++
+	sanoq["a"]++
+	n, bor := sanoq["b"]
+	fmt.Println(sanoq["a"], n, bor, len(sanoq))
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+**B: `2 0 false 1`.** `sanoq["a"]++` raises it from 0 to 1 the first time and to 2 the second time. The key `"b"`
+is missing: `n` = 0, `bor` = `false`. Reading a missing key adds nothing to the map, so `len` is 1. If you chose
+"A", you thought reading also adds a key. (This program is not in the course folder; it was run separately.)
+
+```console
+$ go run savol/main.go
+2 0 false 1
+```
+
+</details>
+
+**5.** If several goroutines only read a map (nobody writes), is protection needed?
+
+<details>
+<summary>Answer</summary>
+
+No: read-only is safe. The problem starts when someone writes.
+
+</details>
+
+**6.** From [GO-1.06](/lab/youtube/go/go-1-06/en): does a closure capture a copy of an outside variable, or the variable
+itself?
+
+<details>
+<summary>Answer</summary>
+
+The variable itself. If the variable changes after the closure is created, the closure sees the new value. The
+anonymous functions in today's `poyga` and `mutex` capture the outside `m`, `g` and `mu` in the same way.
+
+</details>
+
+## Homework
+
+Tasks at four levels. All files and answers are in the lesson folder on GitHub:
+[lessons/009-maps](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/009-maps).
+Answers: the [homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/009-maps/homework)
+folder. Try it yourself first.
+
+🟢 **Easy:** use comma ok to tell a product with price 0 ("free") from a missing product.
+
+<details>
+<summary>Answer</summary>
+
+`homework/oson/main.go`. The function `narxMatn` ("price text") reads with `n, bor := narx[nom]`, then a `switch`
+with no expression checks `!bor` first (`!` means "not": the key is missing), then `n == 0`. The order matters: if
+`!bor` is not first, a missing product also comes out as "free", because its `n` is 0 too. (In the output, `bepul`
+means "free" and `bunday mahsulot yoʻq` means "there is no such product".)
+
+```console
+$ go run ./homework/oson
+non: 5000 soʻm
+suv: bepul
+olma: bunday mahsulot yoʻq
+```
+
+</details>
+
+🟡 **Medium:** count the words in a text with a map and print the result sorted.
+
+<details>
+<summary>Answer</summary>
+
+`homework/orta/main.go`. `strings.Fields` splits the text into words at the spaces. `sanoq[soz]++`: a missing key
+returns 0, so no separate check is needed. The output uses `slices.Sorted(maps.Keys(sanoq))`.
+
+```console
+$ go run ./homework/orta
+choy 1
+non 3
+sut 2
+```
+
+</details>
+
+🟠 **Hard:** measure how many different orders a map with 9 keys gives, and explain the result.
+
+<details>
+<summary>Answer</summary>
+
+`homework/qiyin/main.go` goes through maps with 5, 8, 9 and 16 keys, 100 000 times each:
+
+```console
+$ go run ./homework/qiyin
+ 5 ta kalit: 5 xil tartib
+ 8 ta kalit: 8 xil tartib
+ 9 ta kalit: 9 xil tartib
+16 ta kalit: 16 xil tartib
+```
+
+(`ta kalit: … xil tartib` means "keys: … different orders".) The number of orders equals the number of keys, not
+`n!`. 9 keys no longer fit in one group, but the iterator still goes round the whole table from a random place. The
+circular sequence of keys stays the same; only the start point changes. With 8 or more keys there are few empty
+slots, so the 50 % bias we saw with 5 keys is not there. In large maps (several tables) a random choice of table is
+added as well (`dirOffset`).
+
+</details>
+
+🔴 **Guru:** fix the `poyga` program without a mutex. (Hint: let only one goroutine hold a map at a time.)
+
+<details>
+<summary>Answer</summary>
+
+`homework/guru/main.go`. Each goroutine fills **its own** map and stores it in its own element of a slice
+(`qismlar[g]`, "parts": different elements, so there is no data race). After `wg.Wait()`, `main` merges them into
+one map. A map is never in the hands of two goroutines at the same time.
+
+```console
+$ go run ./homework/guru
+tugadi: 1000000
+```
+
+</details>
+
+## Sources
+
+- Go's official rules (the Go spec): [Map types](https://go.dev/ref/spec#Map_types) (nil map),
+  [For statements](https://go.dev/ref/spec#For_statements) (map order),
+  [Handling panics](https://go.dev/ref/spec#Handling_panics) (`recover`)
+- Andrew Gerrand, [Go maps in action](https://go.dev/blog/maps) (Go blog, 2013): missing key → zero value, comma
+  ok, maps are not safe for concurrent use
+- Michael Pratt, [Faster Go maps with Swiss Tables](https://go.dev/blog/swisstable) (Go blog, 2025)
+- Release notes: [Go 1](https://go.dev/doc/go1#iteration) (order random on purpose),
+  [Go 1.3](https://go.dev/doc/go1.3) (small maps), [Go 1.6](https://go.dev/doc/go1.6#runtime) (best-effort
+  detection), [Go 1.12](https://go.dev/doc/go1.12#fmt) (`fmt` sorts maps), [Go 1.24](https://go.dev/doc/go1.24)
+  (Swiss table)
+- [pkg.go.dev/maps#Keys](https://pkg.go.dev/maps#Keys), [pkg.go.dev/slices#Sorted](https://pkg.go.dev/slices#Sorted)
+  (Go 1.23), [pkg.go.dev/sync#Mutex](https://pkg.go.dev/sync#Mutex),
+  [pkg.go.dev/sync#WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go) (Go 1.25)
+- Go source code (go1.26.8): [internal/runtime/maps/table.go](https://go.dev/src/internal/runtime/maps/table.go)
+  (`Iter.Init`, `Iter.Next`), `internal/runtime/maps/runtime_fast64.go` (`runtime_mapassign_fast64`),
+  [runtime/panic.go](https://go.dev/src/runtime/panic.go) (`fatal`)
+- [Go FAQ: atomic maps](https://go.dev/doc/faq#atomic_maps); [Data Race Detector](https://go.dev/doc/articles/race_detector)
+- Milind Chabbi, Murali Krishna Ramanathan, [Data Race Patterns in Go](https://www.uber.com/blog/data-race-patterns-in-go/)
+  (Uber Engineering, 2022)
+- All results from `go1.26.8 linux/amd64`, 2026-11-26 (the critic's `poyga` measurements: 2026-11-25).
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/009-maps)
+
+---
+
+← Previous lesson: [GO-1.08](/lab/youtube/go/go-1-08/en) · Next lesson: [GO-1.10](/lab/youtube/go#go-1-10) → · [All lessons](/lab/youtube/go)
+
+</div>
