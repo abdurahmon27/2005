@@ -1,0 +1,1192 @@
+---
+title: "What an LLM does: the next token, the context window and the confident mistake"
+date: "2026/11/26"
+description: "We run a small Go model to try tokens, the context window and temperature, and see why an LLM answer can be confident but wrong."
+tag: "youtube, claude, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/claude/cl-1-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/claude/cl-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/claude/cl-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/claude/cl-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/claude/cl-1-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/claude/cl-1-01) · [Русский](/lab/youtube/claude/cl-1-01/ru) · **English**  
+Lesson CL-1.01 · [Claude bilan muhandislik: AI'dan toʻgʻri foydalanish](/lab/youtube/claude#cl-1-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/cl-01-next-token)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+"Google created the Python language." A language model said this. It learned from only six true sentences, and one
+of them says "Guido created Python". The model chose Google with a probability of 50 percent, but the sentence shows
+no doubt. How does true data turn into a wrong but fluent answer? Today we follow it step by step in a 150-line Go
+program, and we check against Anthropic's documentation what is different in Claude.
+
+**One idea:** a language model (LLM) computes, at every step, the probabilities of the next token and picks one of
+them. So a fluent answer is not yet a correct answer: knowing the truth is not the model's job, checking it is yours.
+
+By the end of the lesson you will be able to:
+
+- run the small model in `main.go` and read each of its decisions: which context it saw, which candidates there were,
+  what it picked;
+- measure on an open tokenizer how many tokens the same text takes in English and in Uzbek;
+- show with an example what the context window and temperature can fix, and what they cannot;
+- check a Claude answer with the methods Anthropic recommends: give a document, ask for a quote, allow "I don't know".
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| token | a piece the model measures text in: a word, part of a word, a character or a byte | token |
+| context window | all the text the model can see while it writes an answer, including the answer itself | context window |
+| sampling | picking the next token among the probabilities; **temperature** changes the shape of those probabilities | sampling, temperature |
+
+Helper words get one sentence where they first appear: **n-gram** (a word-counting model), **BPE** (how a tokenizer
+works), **backoff** (falling back to a shorter context), **hallucination** (fluent invention where knowledge is
+missing).
+
+## Before you start
+
+This is the first lesson of the "Engineering with Claude" track; there is no earlier CL lesson. The model is written
+in Go, so these Go lessons from the first season help you read `main.go`:
+
+- [GO-1.08 · Slice'lar: `append` tuzogʻi va eskirgan 1024 qoidasi](/lab/youtube/go/go-1-08/en): `[]string`, `append`, slicing
+  `a[i:j]`.
+- [GO-1.09 · Map: tartib nega tasodifiy va `recover` nega qutqarmaydi](/lab/youtube/go/go-1-09/en): `map`, `v, ok := m[k]`.
+- [GO-1.10 · Struct'lar va xotira: bir xil maydonlar, 24 va 16 bayt](/lab/youtube/go/go-1-10/en) and
+  [GO-1.12 · Metodlar: value receiver yoki pointer receiver?](/lab/youtube/go/go-1-12/en): `type model struct`,
+  `func (m model) taqsimot(…)`.
+- [GO-1.04 · len("oʻzbek") = 7? Bayt, rune va UTF-8](/lab/youtube/go/go-1-04/en): bytes and the turned comma `ʻ` (needed in the
+  token section).
+- [SYS-0.01 · Terminal: pipe, `grep` va bitta qatorda yechiladigan ishlar](/lab/youtube/sys/sys-0-01/en): the pipe `|`, `grep -c`,
+  `head`. They appear in the commands written with a `for` loop.
+
+You can follow the lesson without knowing Go: next to every output we say in words what happened.
+
+**How to run the code.** The model reads the file `korpus.txt`, so go.dev/play is not enough. Download the course
+repository and go to the lesson folder (`cd` changes the terminal's current folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/cl-01-next-token
+```
+
+Every command on this page runs from that folder. You need:
+
+- Go 1.26 or newer (the `go.mod` in the repository requires it);
+- [uv](https://docs.astral.sh/uv/) for `tokenlar/tokenlar.py`: it installs the `tiktoken` library by itself;
+- Node and, once, `cd tokenlar && npm install` for `tokenlar/eski_claude.mjs`.
+
+Every output on this page comes from our computer. With the same `-seed` (default 1) the model prints the same result
+every time, and so do the tokenizers. So your output should match character for character. There are no Claude
+answers on this page at all: an AI answer cannot be reproduced exactly, and the lesson shows why.
+
+First, one question from GO-1.09. The model keeps its counts in a two-level map. What does this program do?
+
+```go
+package main
+
+func main() {
+	sanoq := map[string]map[string]int{}
+	sanoq["tilini"]["google"]++
+}
+```
+
+**A)** `sanoq["tilini"]["google"]` becomes 1 · **B)** a compile error · **C)** a panic at run time
+
+<details>
+<summary>Answer</summary>
+
+**C.** `sanoq["tilini"]` (`sanoq` = "count") does not exist yet, so instead of an inner map you get its zero value: a
+`nil` map. Reading from a `nil` map is fine (it returns 0), but writing to it panics:
+`panic: assignment to entry in nil map`. The compiler does not catch it, because the types are correct. If you chose
+"A", you thought a Go map creates the inner map by itself, like Python's `defaultdict`. That is why `main.go` creates
+the inner map first (lines 37–39, below).
+
+</details>
+
+## Six true sentences, one wrong answer
+
+We give the model the start of a sentence: `python tilini` ("the python language"). It writes the rest itself:
+
+```console
+$ go run . python tilini
+[tilini]           → google    google 0.50  guido 0.25  dennis 0.25
+[google]           → yaratgan  yaratgan 0.67  ochiq 0.33
+[yaratgan]         → .         . 1.00
+python tilini google yaratgan .
+```
+
+The last line is the model's answer: `python tilini google yaratgan .` ("google created the python language"). Wrong:
+Guido van Rossum created Python. The three lines before it are a log of what the model did at each step:
+
+| Part | Example | Meaning |
+|---|---|---|
+| `[tilini]` | in square brackets | the **context** the model looked at: the last word of the text |
+| `→ google` | after the arrow | the next word the model picked |
+| `google 0.50  guido 0.25  dennis 0.25` | at the end | all candidates and their probabilities |
+
+At the first step the model saw three candidates and picked Google, because its probability is the highest: 0.50. At
+the second step, after `[google]`, comes `yaratgan` ("created", 0.67) or `ochiq` ("open", 0.33). At the third, after
+`[yaratgan]`, only a full stop. When the full stop comes out, the sentence ends.
+
+What did the model learn from? Its whole "knowledge" is one file:
+
+```console
+$ cat korpus.txt
+go tilini google yaratgan .
+go tilini google ochiq kodli qilgan .
+gmail xizmatini google yaratgan .
+python tilini guido yaratgan .
+c tilini dennis yaratgan .
+linux yadrosini linus yaratgan .
+```
+
+Text like this, which a model learns from, is called a **corpus**. All six sentences are true: Go was created at
+Google and made open source in 2009, C was written by Dennis Ritchie, the Linux kernel by Linus Torvalds (sources at
+the end). Now count what comes after the word `tilini`:
+
+| Word after `tilini` | How many times | Probability |
+|---|---|---|
+| `google` | 2 (sentences 1 and 2) | 2 / 4 = 0.50 |
+| `guido` | 1 (sentence 4) | 1 / 4 = 0.25 |
+| `dennis` | 1 (sentence 5) | 1 / 4 = 0.25 |
+
+The model sees only the last word, `tilini`. The `python` before it is invisible to it. In the corpus, `google` came
+after `tilini` most often, so the model picked it. It did not lie: it counted and took the most frequent one. A
+curious detail: Guido van Rossum worked at Google from 2005 to 2012, which makes this mistake sound especially
+believable.
+
+Claude is also trained to predict the next word. Anthropic's glossary (*Pretraining*) says that autoregressive language
+models, such as Claude's underlying model, are trained "to predict the next word, given the previous context of text".
+Of course, Claude is far larger than our counter. But the shape of the output is the same, and the root of this
+mistake is here too.
+
+## Our model and Claude: one thing in common
+
+In this track we learn to work with Claude as engineers. AI writes code for you, but the responsibility for the result
+stays with you. The track has five modules, all on the course's bozor (market) project:
+
+| Module | What |
+|---|---|
+| CL-1 | working with AI correctly: chat, prompts, learning with AI, checking answers |
+| CL-2 | Claude Code: an AI colleague in the terminal |
+| CL-3 | calling the Claude API from Go |
+| CL-4 | our own agent and evals |
+| CL-5 | security |
+
+We check every AI answer with tests and measurements. For that, you first need to know what the model really does.
+
+Today we look at three concepts: token, context window and sampling. Our model is a simple **n-gram**, that is, a
+word counter: for each word in the corpus it counts which 1–3 words came before it (Jurafsky and Martin's textbook,
+chapter 3). Claude is different:
+
+| | Our model (`main.go`) | Claude |
+|---|---|---|
+| Token | one word, the full stop too | a word, part of a word, a character or a byte |
+| Knowledge | counts of the 6 sentences in `korpus.txt` | pretrained on huge amounts of text, a model "with many parameters" |
+| What it looks at | the last 1–3 words (`-oyna`) | the whole context |
+| Further training | none | further trained to be an assistant (fine-tuning, RLHF) |
+| At each step | probabilities for the next token, then one pick | the same |
+
+Anthropic's glossary says it plainly: "Claude is not a bare language model; it has already been fine-tuned to be a
+helpful assistant". **RLHF** is further training based on ratings given by people. We say "model", not "transformer":
+none of the Anthropic pages we read states the architecture.
+
+Note the last row. Everything in this lesson relies on that common point.
+
+## main.go line by line: the count table and the next word
+
+The whole model:
+
+```go filename="main.go" showLineNumbers
+// Kichik til modeli: korpusdagi soʻzlarni sanaydi va keyingi soʻzni bashorat qiladi.
+// Claude ham har qadamda bitta keyingi tokenni tanlaydi; bu dastur oʻsha gʻoyaning eng
+// kichik nusxasi: n-gram model. Token = soʻz, model = sanoq jadvali (korpusdan bir marta
+// oʻrganiladi), kontekst oynasi = javob paytida model koʻradigan oxirgi -oyna ta token.
+//
+//	go run . -oyna 1 -t 0 python tilini
+package main
+
+import (
+	"flag"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"os"
+	"sort"
+	"strings"
+)
+
+// maxOyna: model oʻrganadigan eng uzun kontekst. -oyna undan katta boʻlolmaydi.
+const maxOyna = 3
+
+// model: kontekst (oxirgi k ta token) → keyingi token → necha marta uchradi.
+type model struct {
+	sanoq  map[string]map[string]int
+	tartib map[string]int // token korpusda birinchi marta qayerda uchragan (teng holatda shu hal qiladi)
+}
+
+// oqit korpusdagi har bir oʻrin uchun 1..oyna uzunlikdagi kontekstlarni sanaydi.
+func oqit(tokenlar []string, oyna int) model {
+	m := model{sanoq: map[string]map[string]int{}, tartib: map[string]int{}}
+	for i, tok := range tokenlar {
+		if _, bor := m.tartib[tok]; !bor {
+			m.tartib[tok] = i
+		}
+		for k := 1; k <= oyna && k <= i; k++ {
+			kon := strings.Join(tokenlar[i-k:i], " ")
+			if m.sanoq[kon] == nil {
+				m.sanoq[kon] = map[string]int{}
+			}
+			m.sanoq[kon][tok]++
+		}
+	}
+	return m
+}
+
+type nomzod struct {
+	token string
+	soni  int
+	p     float64
+}
+
+// taqsimot: eng uzun tanish kontekstni topadi va temperature bilan ehtimolliklarni hisoblaydi.
+// p ~ soni^(1/t). t = 0 boʻlsa modelning oʻz ehtimolligi (t = 1) koʻrsatiladi,
+// tanlov esa har doim eng ehtimolli token (greedy).
+func (m model) taqsimot(matn []string, oyna int, t float64) (string, []nomzod) {
+	for k := min(oyna, len(matn)); k >= 1; k-- {
+		kon := strings.Join(matn[len(matn)-k:], " ")
+		keyingi, bor := m.sanoq[kon]
+		if !bor {
+			continue // bunday kontekst korpusda yoʻq: qisqaroq kontekstga oʻtamiz
+		}
+		var ns []nomzod
+		for tok, soni := range keyingi {
+			ns = append(ns, nomzod{token: tok, soni: soni})
+		}
+		sort.Slice(ns, func(i, j int) bool {
+			if ns[i].soni != ns[j].soni {
+				return ns[i].soni > ns[j].soni
+			}
+			return m.tartib[ns[i].token] < m.tartib[ns[j].token]
+		})
+		daraja := 1.0
+		if t > 0 {
+			daraja = 1 / t
+		}
+		var jami float64
+		for i := range ns {
+			ns[i].p = math.Pow(float64(ns[i].soni), daraja)
+			jami += ns[i].p
+		}
+		for i := range ns {
+			ns[i].p /= jami
+		}
+		return kon, ns
+	}
+	return "", nil
+}
+
+// tanla: ehtimollik boʻyicha bitta tokenni tasodifiy tanlaydi (sampling).
+func tanla(ns []nomzod, r *rand.Rand) string {
+	x := r.Float64()
+	for _, n := range ns {
+		if x < n.p {
+			return n.token
+		}
+		x -= n.p
+	}
+	return ns[len(ns)-1].token
+}
+
+func main() {
+	oyna := flag.Int("oyna", 1, "kontekst oynasi: model oxirgi nechta tokenni koʻradi")
+	t := flag.Float64("t", 0, "temperature: 0 = har doim eng ehtimolli token")
+	seed := flag.Uint64("seed", 1, "tasodif urugʻi (bir xil seed = bir xil natija)")
+	n := flag.Int("n", 1, "nechta javob yaratish (n > 1 boʻlsa faqat javoblar chiqadi)")
+	korpus := flag.String("korpus", "korpus.txt", "model oʻrganadigan matn")
+	flag.Parse()
+
+	matn, err := os.ReadFile(*korpus)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if *oyna < 1 || *oyna > maxOyna {
+		fmt.Fprintf(os.Stderr, "-oyna 1..%d boʻlishi kerak\n", maxOyna)
+		os.Exit(2)
+	}
+	m := oqit(strings.Fields(strings.ToLower(string(matn))), maxOyna)
+	boshi := strings.Fields(strings.ToLower(strings.Join(flag.Args(), " ")))
+	if len(boshi) == 0 {
+		fmt.Fprintln(os.Stderr, "boshlanish soʻzlarini bering, masalan: go run . python tilini")
+		os.Exit(2)
+	}
+	r := rand.New(rand.NewPCG(*seed, 0))
+
+	for j := 0; j < *n; j++ {
+		jumla := append([]string(nil), boshi...)
+		for len(jumla) < 20 && jumla[len(jumla)-1] != "." {
+			kon, ns := m.taqsimot(jumla, *oyna, *t)
+			if ns == nil {
+				fmt.Printf("%-18s → ?         korpusda yoʻq\n", "["+jumla[len(jumla)-1]+"]")
+				break
+			}
+			var tok string
+			if *t == 0 {
+				tok = ns[0].token
+			} else {
+				tok = tanla(ns, r)
+			}
+			if *n == 1 {
+				var qator []string
+				for _, x := range ns {
+					qator = append(qator, fmt.Sprintf("%s %.2f", x.token, x.p))
+				}
+				fmt.Printf("%-18s → %-9s %s\n", "["+kon+"]", tok, strings.Join(qator, "  "))
+			}
+			jumla = append(jumla, tok)
+		}
+		fmt.Println(strings.Join(jumla, " "))
+	}
+}
+```
+
+First, the counting part:
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–6 | comment | says what the program is and how to run it |
+| 9–17 | `import (…)` | `flag` (command-line flags), `fmt` (printing), `math` (power), `math/rand/v2` (random numbers, since Go 1.22), `os` (file, exit code), `sort`, `strings` |
+| 20 | `const maxOyna = 3` | the longest context the model learns: 3 words (`oyna` = "window") |
+| 23–26 | `type model struct` | the model is two maps: `sanoq` ("count") and `tartib` ("order") |
+| 24 | `sanoq map[string]map[string]int` | context → next word → how many times it occurred. For example `sanoq["tilini"]["google"] == 2` |
+| 25 | `tartib map[string]int` | where in the corpus each word first occurred; when counts are equal, the earlier word goes first |
+| 29 | `func oqit(tokenlar []string, oyna int) model` | training (`oqit` = "train"): builds the count table from a list of words |
+| 30 | `m := model{sanoq: …, tartib: …}` | creates both maps empty |
+| 31 | `for i, tok := range tokenlar` | every word of the corpus (`tok`) and its position (`i`) |
+| 32–34 | `if _, bor := m.tartib[tok]; !bor` | if the word appears for the first time, records its position (`bor` = "is the key there?", GO-1.09) |
+| 35 | `for k := 1; k <= oyna && k <= i; k++` | contexts of 1, 2 and 3 words before `tok` (fewer at the start of the corpus) |
+| 36 | `kon := strings.Join(tokenlar[i-k:i], " ")` | joins the `k` words before `tok` into one string with spaces: `"python tilini"` |
+| 37–39 | `if m.sanoq[kon] == nil { … }` | creates the inner map if it does not exist yet (otherwise, the panic from the question above) |
+| 40 | `m.sanoq[kon][tok]++` | adds one to the count "after `kon` came `tok`" |
+| 46–50 | `type nomzod struct` | one candidate (`nomzod`): the word, its count and its probability `p` |
+
+Training happens only once, on line 118. `strings.ToLower` makes every letter lowercase, and `strings.Fields` splits
+the text into words on spaces and line breaks. So the full stop also becomes a separate word (token), and the
+sentences join into one long list. In Python the same count takes a few lines (this file is not in the lesson
+folder; save it in the lesson folder as `bigram.py` and run it yourself):
+
+```python
+from collections import Counter, defaultdict
+
+tokenlar = open("korpus.txt", encoding="utf-8").read().lower().split()
+sanoq = defaultdict(Counter)
+for oldingi, keyingi in zip(tokenlar, tokenlar[1:]):
+    sanoq[oldingi][keyingi] += 1
+print(sanoq["tilini"])
+```
+
+```console
+$ python3 bigram.py
+Counter({'google': 2, 'guido': 1, 'dennis': 1})
+```
+
+The Python version counts only one-word contexts, and `defaultdict` creates the inner `Counter` by itself. In Go we
+create the inner map by hand (lines 37–39). In JS it would be a `Map` inside a `Map`. Part of the table:
+
+| `sanoq` key (context) | Next words and counts |
+|---|---|
+| `"tilini"` | `google: 2`, `guido: 1`, `dennis: 1` |
+| `"python tilini"` | `guido: 1` |
+| `"go tilini"` | `google: 2` |
+| `"google"` | `yaratgan: 2`, `ochiq: 1` |
+| `"tilini google"` | `yaratgan: 1`, `ochiq: 1` |
+| `"yaratgan"` | `.: 5` |
+
+Now the answering part. The `taqsimot` ("distribution") method finds the candidates for a given text:
+
+| Line | Code | What it does |
+|---|---|---|
+| 55 | `func (m model) taqsimot(matn []string, oyna int, t float64) (string, []nomzod)` | input: the current text, the window and the temperature; output: the context it used and the candidates |
+| 56 | `for k := min(oyna, len(matn)); k >= 1; k--` | tries the longest context first, then shorter ones (`min` is a built-in function since Go 1.21) |
+| 57 | `kon := strings.Join(matn[len(matn)-k:], " ")` | the last `k` words of the text |
+| 58–61 | `keyingi, bor := m.sanoq[kon]` … `continue` | if the corpus has no such context, moves to a shorter one |
+| 62–65 | `for tok, soni := range keyingi` | every word that followed the context goes into the candidate list |
+| 66–71 | `sort.Slice(…)` | the most frequent first; on a tie, the one seen earlier in the corpus first |
+| 72–83 | `daraja`, `math.Pow`, `jami` | turns counts into probabilities; this is where temperature works (section "Sampling and temperature") |
+| 84 | `return kon, ns` | the context found and the candidates |
+| 86 | `return "", nil` | not even a one-word context was found: no candidates |
+| 90–99 | `func tanla(…)` | a weighted lottery (`tanla` = "pick", section "Sampling and temperature") |
+
+And `main`:
+
+| Line | Code | What it does |
+|---|---|---|
+| 102–106 | `flag.Int("oyna", 1, …)` and the others | flags and their defaults: `-oyna 1`, `-t 0`, `-seed 1`, `-n 1`, `-korpus korpus.txt` |
+| 107 | `flag.Parse()` | reads the flags; the remaining words are in `flag.Args()` |
+| 109–113 | `os.ReadFile(*korpus)` | reads the corpus; on error, a message and exit code 1 |
+| 114–117 | `if *oyna < 1 \|\| *oyna > maxOyna` | if the window is outside 1..3, exit code 2 |
+| 118 | `m := oqit(…, maxOyna)` | training: always with contexts of up to 3 words |
+| 119–123 | `boshi := …` | the start of the sentence (`boshi` = "beginning", `python tilini`), in lowercase; empty means an error |
+| 124 | `r := rand.New(rand.NewPCG(*seed, 0))` | a seeded random number generator: same seed, same result |
+| 126 | `for j := 0; j < *n; j++` | produces `-n` answers |
+| 127 | `jumla := append([]string(nil), boshi...)` | a fresh copy of `boshi` for each answer (GO-1.08: so we never write into a shared array) |
+| 128 | `for len(jumla) < 20 && jumla[len(jumla)-1] != "."` | continues until a full stop comes out, or up to 20 words |
+| 129 | `kon, ns := m.taqsimot(jumla, *oyna, *t)` | the candidates for the next word |
+| 130–133 | `if ns == nil` | no candidates: prints `→ ?  korpusda yoʻq` ("not in the corpus") and stops |
+| 134–139 | `if *t == 0 { tok = ns[0].token } else { tok = tanla(ns, r) }` | `t = 0`: the most probable one; otherwise a lottery |
+| 140–146 | `if *n == 1 { … fmt.Printf("%-18s → %-9s %s\n", …) }` | for a single answer, prints the log line; `%-18s` left-aligns text and pads it with spaces to 18 characters |
+| 147 | `jumla = append(jumla, tok)` | the chosen word is added to the sentence and becomes part of the context at the next step |
+| 149 | `fmt.Println(strings.Join(jumla, " "))` | the finished sentence |
+
+Line 147 is the most important. The word the model picks immediately becomes its context. This is called
+**autoregressive** generation: Anthropic's glossary describes Claude's underlying model this way. One wrong pick
+steers the following steps too: once `google` is chosen, the model builds the continuation "google ... created".
+
+```text
+step 1:  python tilini             → window: [tilini]    → google
+step 2:  python tilini google      → window: [google]    → yaratgan
+step 3:  python tilini google yaratgan → window: [yaratgan] → .
+                                                          sentence ends
+```
+
+## Token: what the model measures text in
+
+A model reads text not in letters or words but in **tokens**. In our model one token is one word. According to
+Anthropic's glossary, in Claude a token can be a word, part of a word, a character or even a byte. How many characters
+one token covers depends on the model and the language. The glossary adds: Claude 4.7 and later models use a new
+**tokenizer** (the program that splits text into tokens). For the same text it produces about 30 percent more tokens
+than earlier models. The Opus 5.5 migration guide is more exact: 1 to 1.35 times as many.
+
+The current Claude tokenizer is not published. So we look at one word on OpenAI's **open** `o200k_base` tokenizer.
+This is not Claude's number, only a trend. `uv run --quiet` runs the script quietly with the library it needs.
+
+English `we are learning` (3 words) and its Uzbek equivalent `oʻrganmoqdamiz` (1 word). Which one has more tokens?
+
+**A)** the English one, it has more words · **B)** equal, the meaning is the same · **C)** the Uzbek one, by a lot
+
+<details>
+<summary>Answer</summary>
+
+**C.** The English is 3 tokens; the Uzbek is 8 tokens with the turned comma `ʻ` and 7 with a plain keyboard
+apostrophe. If you chose "A", you thought a token = a word. That is true only in our small model.
+
+</details>
+
+```console
+$ uv run --quiet tokenlar/tokenlar.py soz
+we are learning  3 token: we |  are |  learning
+oʻrganmoqdamiz   8 token: o | ʻ | r | gan | mo | q | dam | iz
+o'rganmoqdamiz   7 token: o | 'r | gan | mo | q | dam | iz
+```
+
+The `|` sign marks the token boundaries. `we`, ` are` and ` learning` are three whole words (the space before a word is
+part of the token). But `oʻrganmoqdamiz` split into eight pieces: `o | ʻ | r | gan | mo | q | dam | iz`. The turned
+comma `ʻ` (U+02BB) is 2 bytes in UTF-8 (GO-1.04), and here it became a token of its own. With the keyboard apostrophe,
+`'r` merged into one token, 7 in total.
+
+Such tokenizers are built with **BPE** (byte pair encoding). It merges frequent character sequences into one token
+(Sennrich et al., 2016). English ` learning` is frequent, so it became one token. Probably the texts this tokenizer
+was trained on contained little Uzbek. This is our inference, not a measurement.
+
+One word is not enough. Now a large text: the Universal Declaration of Human Rights in English and in Uzbek (a
+parallel text, the same meaning). The first rows come from `tokenlar.py`, the last from `eski_claude.mjs`; `&&` runs
+the second command only if the first one succeeded:
+
+```console
+$ uv run --quiet tokenlar/tokenlar.py til && node tokenlar/eski_claude.mjs
+Inson huquqlari deklaratsiyasi     inglizcha oʻzbekcha   farq
+belgilar                               10638     12241  1.15x
+tokenlar: o200k_base (OpenAI)           2011      3911  1.94x
+tokenlar: Claude 3 gacha                2068      5249  2.54x
+```
+
+| Row | English | Uzbek | Ratio | What it is |
+|---|---|---|---|---|
+| `belgilar` | 10638 | 12241 | 1.15x | almost the same number of characters: the Uzbek text is only 15 percent longer |
+| `o200k_base (OpenAI)` | 2011 | 3911 | 1.94x | but almost twice as many tokens |
+| `Claude 3 gacha` | 2068 | 5249 | 2.54x | Anthropic's open tokenizer for models before Claude 3 |
+
+(`belgilar` = "characters", `tokenlar` = "tokens", `gacha` = "up to".) Be careful with the third row. The README of the
+`@anthropic-ai/tokenizer` package says: "As of the Claude 3 models, this algorithm is no longer accurate, but can be
+used as a very rough approximation." Only the API gives the exact number for the current Claude: the `usage` field of
+every response says how many tokens the request used (`input_tokens`, `output_tokens`). We measure it in
+[CL-3.01](/lab/youtube/claude#cl-3-01).
+
+Why does this matter? Both price and the context window are measured in tokens. Anthropic's prices are given as
+"$ per million input tokens" and "$ per million output tokens". So Uzbek text with the same meaning may take more
+tokens: it costs more and less of it fits in the window. We did not measure the exact difference for Claude. On open
+tokenizers it is 1.94 and 2.54 times.
+
+The kind of apostrophe barely matters over the whole text: `tokenlar.py apostrof` gives 3911 tokens with the turned
+comma, 3892 with the keyboard apostrophe and 3938 with `‘`. How BPE cuts Uzbek text is in [ML-4.01](/lab/youtube/ml#ml-4-01).
+
+## Context window: the text visible while answering
+
+The second concept is the **context window**. Anthropic's definition: all the text the model can reference while it
+generates a response, including the response itself. It is the model's "working memory", not the huge data it was
+trained on. In a chat, that is your messages, Claude's replies and the files you added.
+
+The numbers (Anthropic, *Context windows* and *Models overview*):
+
+| Fact | Value |
+|---|---|
+| current Claude models, through the API | 1,000,000 tokens |
+| that is roughly | 555,000 words (on the new tokenizer) |
+| as the token count grows | accuracy and recall degrade: **context rot** |
+| in a very long chat conversation | chat apps (such as claude.ai) may drop old messages out of the window |
+
+In our model the window is the `-oyna` flag. It does not retrain the model: the model is always trained with contexts
+of up to 3 words (line 118). The flag only sets how many of the last words of the text the model looks at while
+answering (line 56).
+
+```text
+-oyna 1:   python [tilini]          the model sees only "tilini"
+-oyna 2:   [python tilini]          the model sees the pair "python tilini"
+```
+
+`-oyna 1` is the default. So the output is the same as at the start of the lesson:
+
+```console
+$ go run . -oyna 1 python tilini
+[tilini]           → google    google 0.50  guido 0.25  dennis 0.25
+[google]           → yaratgan  yaratgan 0.67  ochiq 0.33
+[yaratgan]         → .         . 1.00
+python tilini google yaratgan .
+```
+
+`python` stayed outside the window. What happens if we make the window two words?
+
+**A)** `google` again: Google is still more frequent in the corpus · **B)** `guido`, probability 1.00 · **C)** `→ ?`, no such context
+
+<details>
+<summary>Answer</summary>
+
+**B.** The context is now `python tilini`. In the corpus only one word followed this pair: `guido`. If you chose "A",
+you thought the model takes the most frequent word of the whole corpus: in fact it counts only the words that came
+after this context. "C" would happen if `python tilini` were not in the corpus.
+
+</details>
+
+```console
+$ go run . -oyna 2 python tilini
+[python tilini]    → guido     guido 1.00
+[tilini guido]     → yaratgan  yaratgan 1.00
+[guido yaratgan]   → .         . 1.00
+python tilini guido yaratgan .
+```
+
+The answer is correct. At the second step the context is `[tilini guido]`, at the third `[guido yaratgan]`: the window
+is always the last two words.
+
+But do not conclude "Claude makes mistakes because its window is small". Claude's window is a million tokens; a
+question this short never falls out of it. Its mistakes come from somewhere else. We see where, starting with the
+next section.
+
+## Where knowledge is missing: rust, backoff and hallucination
+
+Now we ask about a language that is not in the corpus at all: Rust. First, a single word:
+
+```console
+$ go run . rust
+[rust]             → ?         korpusda yoʻq
+rust
+```
+
+`→ ?  korpusda yoʻq` ("not in the corpus"): the model stayed silent, because it has never seen what comes after
+`rust` (lines 130–133). Now we say `rust tilini`, window 2:
+
+```console
+$ go run . -oyna 2 rust tilini
+[tilini]           → google    google 0.50  guido 0.25  dennis 0.25
+[tilini google]    → yaratgan  yaratgan 0.50  ochiq 0.50
+[google yaratgan]  → .         . 1.00
+rust tilini google yaratgan .
+```
+
+`[rust tilini]` is not in the corpus. The model did not stay silent: it dropped the unknown `rust` and relied on the
+familiar `[tilini]` (lines 56–61, `continue`). Moving to a shorter context like this is called **backoff**. This very
+decision made the model guess instead of staying silent. At the second step, after `[tilini google]`, `yaratgan` and
+`ochiq` are tied (0.50), and the model took `yaratgan`, which appears earlier in the corpus (lines 66–71).
+
+Google again. In fact, Rust was started by Graydon Hoare: in 2006 as a personal project, sponsored by Mozilla from
+2009. Building fluent sentences where knowledge is missing is called **hallucination**. A bigger window does not help
+here: `rust` is in the window, but the model has no knowledge about it.
+
+Tell the two mistakes apart:
+
+| Case | Cause | What fixes it |
+|---|---|---|
+| `python tilini` → google | the needed word is outside the window | a bigger window (`-oyna 2`) |
+| `rust tilini` → google | no knowledge at all, backoff guessed | not the window: knowledge or "I don't know" |
+
+## Sampling and temperature
+
+The third concept is **sampling**, that is, picking the next token. At every step the model gives each candidate a
+probability. Then one of them has to be taken. **Temperature** (`-t`) decides two things.
+
+The first is how to pick. With `t = 0` the most probable one is always taken. This is the **greedy** pick:
+
+```go
+			var tok string
+			if *t == 0 {
+				tok = ns[0].token
+			} else {
+				tok = tanla(ns, r)
+			}
+```
+
+`ns` is sorted, so `ns[0]` is the most probable candidate (lines 134–139). With `t > 0` a weighted lottery is drawn:
+a large probability wins more often, but a small one sometimes comes out too. `tanla` does this:
+
+```go
+func tanla(ns []nomzod, r *rand.Rand) string {
+	x := r.Float64()
+	for _, n := range ns {
+		if x < n.p {
+			return n.token
+		}
+		x -= n.p
+	}
+	return ns[len(ns)-1].token
+}
+```
+
+`r.Float64()` returns a random number from 0 up to (but not including) 1. Lay the candidates one after another on the
+segment 0..1: whichever piece `x` falls into is picked. In the loop: if `x < n.p`, take this candidate; otherwise
+subtract `n.p` from `x` and move on. The last `return` is a fallback for rounding error. In JS you write the same
+thing with `Math.random()`.
+
+```text
+t = 1,  [tilini]:
+0                     0.50          0.75          1
+|-------- google -------|--- guido ---|-- dennis --|
+x = 0.62  →  0.62 ≥ 0.50, x = 0.12  →  0.12 < 0.25  →  guido
+```
+
+The second is the shape of the probabilities. Lines 72–83 raise each count to a power and divide by the sum:
+`p ~ soni^(1/t)` (`soni` = "count", `daraja` = "power", `jami` = "total").
+
+```go
+		daraja := 1.0
+		if t > 0 {
+			daraja = 1 / t
+		}
+		var jami float64
+		for i := range ns {
+			ns[i].p = math.Pow(float64(ns[i].soni), daraja)
+			jami += ns[i].p
+		}
+		for i := range ns {
+			ns[i].p /= jami
+		}
+```
+
+For `[tilini]` the counts are 2, 1, 1. Let us compute:
+
+| `t` | `1/t` | google | guido | dennis | total | p(google) |
+|---|---|---|---|---|---|---|
+| 0.5 | 2 (square) | 2² = 4 | 1 | 1 | 6 | 4 / 6 = 0.67 |
+| 1 | 1 (as is) | 2 | 1 | 1 | 4 | 2 / 4 = 0.50 |
+| 2 | 0.5 (square root) | √2 ≈ 1.41 | 1 | 1 | 3.41 | 1.41 / 3.41 = 0.41 |
+
+A small temperature strengthens the favourite; a large one flattens the distribution. With `t = 0` the log shows the
+model's own probability (the `t = 1` one) (the comment on lines 53–54). For those who know the maths: normalised
+`soni^(1/t)` is the softmax of `log(soni) / t`, the standard definition of temperature.
+
+Now three temperatures in one command. `for t in 0.5 1 2; do … done` gives `t` three values in turn and runs the same
+command three times. `$(…)` takes the output of the command inside it, `head -1` keeps only the first line, and
+`printf 't=%-4s %s\n'` prints `t` in a 4-character column:
+
+```console
+$ for t in 0.5 1 2; do printf 't=%-4s %s\n' $t "$(go run . -t $t python tilini | head -1)"; done
+t=0.5  [tilini]           → google    google 0.67  guido 0.17  dennis 0.17
+t=1    [tilini]           → google    google 0.50  guido 0.25  dennis 0.25
+t=2    [tilini]           → google    google 0.41  guido 0.29  dennis 0.29
+```
+
+The same as in the table: 0.67, 0.50, 0.41.
+
+Now we generate the sentence `python tilini` 10,000 times (`-n 10000`) and count how often the correct answer, Guido,
+comes out. `grep -c guido` is the number of lines that contain `guido`:
+
+```console
+$ for t in 0 1 2; do echo "t=$t: $(go run . -t $t -n 10000 python tilini | grep -c guido) / 10000 guido"; done
+t=0: 0 / 10000 guido
+t=1: 2418 / 10000 guido
+t=2: 2891 / 10000 guido
+```
+
+| `t` | Expected | Got |
+|---|---|---|
+| 0 | 0 (always google) | 0 |
+| 1 | 0.25 × 10,000 = 2500 | 2418 (about a quarter) |
+| 2 | 0.29 × 10,000 ≈ 2929 | 2891 (almost 29 percent) |
+
+The gap between expected and actual is chance. With another seed (`-seed 2` … `-seed 5`) you get 2413–2513 at
+`t = 1` and 2854–2934 at `t = 2`. The conclusion does not change.
+
+So if we raise the temperature, do we get more correct answers? Answer the question in the next section.
+
+## Temperature does not know the truth
+
+The video's pause question. We run the same experiment with `go tilini` ("the go language"). Here the correct answer
+is Google. How does the number of correct answers change when temperature goes from 0 to 2? Hint: what does the
+model see with window 1?
+
+**A)** it goes up, as with `python tilini` · **B)** it goes down · **C)** it does not change
+
+<details>
+<summary>Answer</summary>
+
+**B.** With window 1 the model sees only `[tilini]` for `go tilini` too: the context is the same as for
+`python tilini`, and so are the candidates (google 2, guido 1, dennis 1). Only this time the correct answer is the
+favourite. Temperature flattens the distribution, so the favourite comes out less often. If you chose "A", you thought
+temperature improves the correct answer. With `python tilini` it only "helped" because the favourite was wrong.
+
+</details>
+
+```console
+$ for t in 0 1 2; do echo "t=$t: $(go run . -t $t -n 10000 go tilini | grep -c google) / 10000 google"; done
+t=0: 10000 / 10000 google
+t=1: 5027 / 10000 google
+t=2: 4105 / 10000 google
+```
+
+At `t = 0` all 10,000 answers are correct, at `t = 1` half (5000 expected), at `t = 2` 41 percent (4142 expected).
+Same context, same distribution, only the truth differs:
+
+| Question | Context (window 1) | Correct answer | `t = 0` | `t = 1` | `t = 2` |
+|---|---|---|---|---|---|
+| `python tilini` | `[tilini]` | guido | 0 | 2418 | 2891 |
+| `go tilini` | `[tilini]` | google | 10 000 | 5027 | 4105 |
+
+Temperature does not know the truth. It only changes the shape of the distribution: it shrinks a wrong favourite, and
+a correct favourite too.
+
+## Temperature in Claude
+
+How does this work in Claude? Three facts:
+
+1. Anthropic's glossary (*Temperature*): even with temperature set to 0, the results are not fully deterministic, and
+   identical inputs can produce different outputs across API calls.
+2. The Opus 5.5 migration guide: Opus 5.5 removed `temperature`, `top_p` and `top_k`, and in the newest API version
+   no model has them. If you send these parameters, the API returns an error.
+3. The same guide: prompting is the recommended way to guide the model's behaviour.
+
+The practical conclusion: the same question can get different answers. There is no "freeze everything" button like
+`-seed` in our model. That is why this page shows not a single Claude answer: you could not repeat it exactly.
+
+## Why confident, but wrong?
+
+Now the main question: why does an answer sound confident but turn out wrong? Three reasons:
+
+| # | Reason | In our model | Source |
+|---|---|---|---|
+| 1 | the model must always guess the next word, and training pushes it to | backoff dropped `rust` and answered anyway | Anthropic, *Tracing the thoughts…* (2025) |
+| 2 | the probability is not visible in the text | google was picked at 0.50, and the sentence has no "maybe" | `go run . python tilini` |
+| 3 | evaluation also rewards guessing | — | Kalai et al., *Why Language Models Hallucinate* (2025) |
+
+The paper's authors explain the third with an exam. If wrong answers cost no points, a student who guesses scores more
+than one who says "I don't know". Training and evaluating language models often works the same way: guessing pays
+better than admitting uncertainty.
+
+Unlike our model, Claude is also trained to say "I don't know". Anthropic calls this training "relatively successful
+(though imperfect)". Looking inside **Claude 3.5 Haiku** (2025), they found this:
+
+```text
+default state:        "can't answer" circuit ON             → "I can't answer"
+familiar name:        Michael Jordan → "known entity" feature → circuit OFF → correct answer
+unfamiliar name:      Michael Batkin → no feature          → circuit on   → "I don't know"
+name familiar, no knowledge: "known entity" fires by mistake → circuit OFF → plausible but untrue answer
+```
+
+The last row is the most dangerous. If a name seems familiar but there is no knowledge behind it, the circuit can
+switch off by mistake. Then the model makes up a plausible but untrue answer. The study was done on Claude 3.5
+Haiku. It says nothing definite about other Claude models.
+
+## What to do against the confident mistake
+
+The methods from Anthropic's *Reduce hallucinations* document:
+
+1. **Explicitly allow "I don't know".** Write in the prompt: if the information is not enough, answer "I don't know".
+2. **Give the document and ask for answers only from it.** Put the needed document (API spec, README, log) into the
+   prompt and say "rely only on this document".
+3. **For every claim, ask for a word-for-word quote from the document.** If no quote is found, the claim is removed.
+   Do not ask for a "source" from memory: the model can make up the source too. The quote must come from the
+   document you gave.
+4. **Ask the same question several times and compare.** If the answers contradict each other, that is a warning sign.
+   But an identical answer is not proof: our model repeated the same mistake 10,000 times at `t = 0`.
+5. **Always run and test code.** We do this in detail in [CL-1.05](/lab/youtube/claude#cl-1-05).
+
+The document itself warns: these methods reduce mistakes but do not remove them completely.
+
+The first three methods in one prompt could look like this (prompt structure is in [CL-1.03](/lab/youtube/claude#cl-1-03)):
+
+```text
+<document>
+… the text of a README or API documentation goes here …
+</document>
+
+Answer the question using only the document above.
+If the answer is not in the document, write "I don't know".
+For every claim, give a word-for-word quote from the document.
+Remove from the answer any claim you could not find a quote for.
+```
+
+Applied to our model: "I don't know" is the 🟠 level of the homework, and "give the document" is the 🟢 level (add the
+needed sentence to the corpus).
+
+In short: the model predicts the next token, its window is limited, and there is chance in the pick. So a fluent
+answer is not yet a correct answer. In the next lesson we learn to use Claude.ai properly: choosing a model, Projects
+and files ([CL-1.02](/lab/youtube/claude#cl-1-02)).
+
+## Common mistakes
+
+### 1. "If I raise the temperature, I get more correct answers"
+
+The classic misconception of this lesson. With `python tilini`, `t = 2` raised correct answers from 0 to 2891, but
+only because the favourite was wrong. With `go tilini` the same temperature cut correct answers from 10,000 to 4105
+(section "Temperature does not know the truth"). Temperature flattens the distribution and does not know the truth.
+Fix: raise correctness with context (a document) and checking, not with temperature.
+
+### 2. "I asked five times and got the same answer five times, so it is correct"
+
+```console
+$ go run . -t 0 -n 5 python tilini
+python tilini google yaratgan .
+python tilini google yaratgan .
+python tilini google yaratgan .
+python tilini google yaratgan .
+python tilini google yaratgan .
+```
+
+Five times the same and five times wrong. Sameness only shows the model's confidence in this answer, not the truth.
+Contradicting answers are a warning sign; identical answers are not yet proof. Fix: check the claim against a
+document or code you actually ran.
+
+### 3. "With `temperature: 0`, Claude always gives the same answer"
+
+Wrong for two reasons (section "Temperature in Claude"). First, Anthropic's glossary does not guarantee full
+determinism even at 0. Second, Opus 5.5 (and, in the newest API version, every model) has no `temperature` at all: if
+you send `temperature`, `top_p` or `top_k` left over from old code, the request comes back with an error. We did not
+call the API for this page, so we do not show the error text. Fix: remove the parameter and describe the behaviour
+you want in the prompt.
+
+### 4. "1 token ≈ 4 characters, and the same in Uzbek"
+
+That rule is quoted for English text and other tokenizers. According to Anthropic's glossary, the characters-per-token
+ratio depends on the model and the language. In the declaration, the Uzbek text took 1.94 times as many tokens as the
+English on `o200k_base` and 2.54 times on the old Anthropic tokenizer, although it has only 1.15 times as many
+characters (section "Token"). Fix: compute price and window use from the `usage` field, not by guessing.
+
+### 5. "A bigger context window fixes the mistake"
+
+`-oyna 2` fixed `python tilini` but not `rust tilini`: `rust` is in the window, the knowledge is not. Claude's window
+is a million tokens; a short question never falls out of it. And a very long context lowers accuracy (context rot).
+Fix: give the needed document and do not fill the window with text you do not need.
+
+### 6. "Asking Claude for a source is enough"
+
+A "source" asked for from memory can be made up too: the model writes it as next tokens like everything else.
+Anthropic's advice is different: the quote must come from a document **you gave**, and if there is none, the claim is
+removed. Fix: the prompt in the section "What to do against the confident mistake".
+
+### 7. Program errors: `-oyna 4` and another folder
+
+A window outside 1..3:
+
+```console
+$ go run . -oyna 4 python tilini
+-oyna 1..3 boʻlishi kerak
+exit status 2
+```
+
+The program wrote the first line (lines 114–117): "-oyna must be 1..3". `go run` adds `exit status 2`: the program
+ended with exit code 2. The model learned contexts of only up to 3 words (`maxOyna = 3`), so a larger window has no
+meaning. Fix: `-oyna 1`, `2` or `3`.
+
+If you run the program outside the lesson folder:
+
+```console
+$ cd .. && go run ./cl-01-next-token python tilini
+open korpus.txt: no such file or directory
+exit status 1
+```
+
+`open korpus.txt: no such file or directory`: the program could not open `korpus.txt`. It looks for the corpus in the
+current folder (line 106, default `-korpus korpus.txt`). Fix: `cd` into the lesson folder or give the path:
+`-korpus cl-01-next-token/korpus.txt`.
+
+If you run `tokenlar.py` without `uv`, as `python3 tokenlar/tokenlar.py soz`, and `tiktoken` is not installed, the
+last line says `ModuleNotFoundError: No module named 'tiktoken'`. Fix: `uv run --quiet tokenlar/tokenlar.py soz`. The
+`# /// script` block at the top of the script names the library and its version, and `uv` installs it by itself.
+
+## Check yourself
+
+1. What does this command print? (Window 2, `t = 0`.)
+
+```text
+go run . -oyna 2 go tilini
+```
+
+**A)** `go tilini google yaratgan .` · **B)** `go tilini google ochiq kodli qilgan .` · **C)** `go tilini → ?`
+
+<details>
+<summary>Answer</summary>
+
+**A.** Only `google` followed `[go tilini]` (1.00). Then `[tilini google]`: `yaratgan` and `ochiq` once each, 0.50 and
+0.50. On a tie, the word seen earlier in the corpus goes first (line 25 and the sort), and `yaratgan` first appears in
+sentence 1. If you chose "B", you thought a tie is broken randomly or by the last one: at `t = 0` there is no chance.
+
+```console
+$ go run . -oyna 2 go tilini
+[go tilini]        → google    google 1.00
+[tilini google]    → yaratgan  yaratgan 0.50  ochiq 0.50
+[google yaratgan]  → .         . 1.00
+go tilini google yaratgan .
+```
+
+</details>
+
+2. What goes into the context window? Does the data the model was trained on go in too?
+
+<details>
+<summary>Answer</summary>
+
+All the text the model can see while writing the answer: your messages, earlier replies, added files and the answer
+being written. The training data does not: Anthropic calls the window "working memory". For current Claude models
+through the API it is a million tokens.
+
+</details>
+
+3. Why did `-oyna 2` fix `python tilini` but not `rust tilini`?
+
+<details>
+<summary>Answer</summary>
+
+For `python tilini` the knowledge was there, but `python` was outside the window: window 2 made it visible.
+`rust tilini` is not in the corpus at all. Backoff dropped `rust`, relied on `[tilini]` and guessed Google. A window
+does not add knowledge.
+
+</details>
+
+4. After `[google]` the counts are `yaratgan` 2, `ochiq` 1. What is the probability of `yaratgan` at `t = 0.5`?
+
+**A)** 0.67 · **B)** 0.80 · **C)** 0.59
+
+<details>
+<summary>Answer</summary>
+
+**B.** `1/t = 2`: the counts are squared, 2² = 4 and 1² = 1, total 5, so 4 / 5 = 0.80. "A" is the value at `t = 1`
+(2 / 3). "C" is the value at `t = 2`: √2 / (√2 + 1) ≈ 0.59.
+
+</details>
+
+5. From GO-1.04: what does this program print, and how is it related to the tokens of `oʻrganmoqdamiz`?
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(len("ʻ"), len("'"))
+	fmt.Printf("% x\n", "oʻ")
+}
+```
+
+<details>
+<summary>Answer</summary>
+
+In Go, `len` counts bytes. The turned comma `ʻ` (U+02BB) is 2 bytes in UTF-8 (`ca bb`), the keyboard apostrophe 1
+byte. `"% x"` prints each byte in hexadecimal, separated by spaces:
+
+```console
+$ go run main.go
+2 1
+6f ca bb
+```
+
+BPE tokenizers work on bytes and merge frequent sequences. In `o200k_base`, `ʻ` did not merge with anything and became
+a separate token (`o | ʻ | r`), while the ASCII `'` merged with `r` into one token (`'r`). Hence 8 and 7 tokens.
+
+</details>
+
+6. Name three methods Anthropic recommends against Claude's confident mistakes. Which one has a limit?
+
+<details>
+<summary>Answer</summary>
+
+Allow "I don't know"; give the document and ask for answers only from it; ask for a word-for-word quote from that
+document for every claim; ask the question several times and compare. The last one has a limit: contradicting
+answers are a warning sign, but identical answers are not proof (at `t = 0`, the same mistake 10,000 times). And code
+must always be run and tested.
+
+</details>
+
+## Homework
+
+Course folder: [lessons/cl-01-next-token](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/cl-01-next-token).
+The answers are in the `homework/` folder: `korpus_rust.txt` and `homework/main.go` with two new flags (`-chegara` =
+"threshold", `-k`). The README's "Javoblar" ("Answers") part explains them. Try it yourself first.
+
+1. 🟢 **Easy.** Add the sentence `rust tilini graydon yaratgan .` to the corpus. What do `-oyna 2 rust tilini` and
+   `-oyna 1 python tilini` say now?
+2. 🟡 **Medium.** Put a paragraph you wrote, in two languages, into the `tokenlar/` folder and measure it with
+   `tokenlar.py`.
+3. 🟠 **Hard.** Teach the model to say "I don't know": if the highest probability is below a threshold, it does not
+   answer.
+4. 🔴 **Guru.** Add top-k sampling (pick only among the `k` most probable candidates) and compare it with temperature
+   on 100 samples.
+
+<details>
+<summary>Answer</summary>
+
+🟢 The ready corpus is `homework/korpus_rust.txt` (the new sentence is the last line). The `-korpus` flag selects
+another file:
+
+```console
+$ go run . -korpus homework/korpus_rust.txt -oyna 2 rust tilini
+[rust tilini]      → graydon   graydon 1.00
+[tilini graydon]   → yaratgan  yaratgan 1.00
+[graydon yaratgan] → .         . 1.00
+rust tilini graydon yaratgan .
+```
+
+```console
+$ go run . -korpus homework/korpus_rust.txt python tilini
+[tilini]           → google    google 0.40  guido 0.20  dennis 0.20  graydon 0.20
+[google]           → yaratgan  yaratgan 0.67  ochiq 0.33
+[yaratgan]         → .         . 1.00
+python tilini google yaratgan .
+```
+
+Rust is now correct. But `python tilini` with window 1 says Google again: after `[tilini]` there are now four
+candidates, and google at 0.40 is still the favourite. Knowledge was added, but `python` is not visible in the window.
+You need both knowledge and context. You do not give Claude new knowledge through a corpus: you put the needed
+document into the prompt.
+
+🟡 Put your two files in place of `udhr_eng.txt` and `udhr_uzn_latn.txt` (or change the file names in the script) and
+run `uv run --quiet tokenlar/tokenlar.py til`. Uzbek text usually takes more tokens; in the declaration, 1.94 times as
+many on `o200k_base`. Your numbers will differ with the text. To check apostrophes:
+
+```console
+$ uv run --quiet tokenlar/tokenlar.py apostrof
+oʻzbekcha matn, o200k_base, apostrof turi boʻyicha
+  ʻ  U+02BB   3911 token
+  '  ASCII    3892 token
+  ‘  U+2018   3938 token
+```
+
+🟠 The `-chegara` flag in `homework/main.go`: if the highest probability (the model's own, at `t = 1`) is below the
+threshold, the model says `bilmayman` ("I don't know"). `go run ./homework` runs the program in the `homework` folder:
+
+```console
+$ go run ./homework -chegara 0.6 python tilini
+[tilini]           → bilmayman eng yuqorisi google 0.50 < 0.60
+python tilini (bilmayman)
+```
+
+```console
+$ go run ./homework -chegara 0.6 -oyna 2 python tilini
+[python tilini]    → guido     guido 1.00
+[tilini guido]     → yaratgan  yaratgan 1.00
+[guido yaratgan]   → .         . 1.00
+python tilini guido yaratgan .
+```
+
+With window 2, `guido` has 1.00 and the model answers. But there is a cost:
+
+```console
+$ go run ./homework -chegara 0.6 go tilini
+[tilini]           → bilmayman eng yuqorisi google 0.50 < 0.60
+go tilini (bilmayman)
+```
+
+Here the most probable answer (`google`) was correct, and the model still stayed silent. Silence reduces mistakes but
+also loses correct answers.
+
+🔴 The `-k` flag in `homework/main.go`: only the first `k` sorted candidates are kept (`ns = ns[:topk]`).
+`sort | uniq -c | sort -rn` counts identical answers and sorts them from most to least frequent:
+
+```console
+$ go run ./homework -t 1 -k 2 -n 100 python tilini | sort | uniq -c | sort -rn
+     40 python tilini google yaratgan .
+     33 python tilini guido yaratgan .
+     27 python tilini google ochiq kodli qilgan .
+```
+
+`dennis` is gone: with `k = 2` only google and guido remain. For comparison, `-k 1` = greedy and `-k 0` = plain
+sampling:
+
+```console
+$ go run ./homework -t 1 -k 1 -n 100 python tilini | sort | uniq -c | sort -rn
+    100 python tilini google yaratgan .
+```
+
+```console
+$ go run ./homework -t 1 -k 0 -n 100 python tilini | sort | uniq -c | sort -rn
+     33 python tilini google yaratgan .
+     24 python tilini dennis yaratgan .
+     22 python tilini google ochiq kodli qilgan .
+     21 python tilini guido yaratgan .
+```
+
+Temperature changes the shape of the distribution (every candidate stays), while top-k cuts off the tail (unlikely
+candidates never come out). 100 samples is a small number: the counts move by a few percent from seed to seed.
+
+</details>
+
+## Sources
+
+- Anthropic: [Glossary](https://platform.claude.com/docs/en/about-claude/glossary) (Tokens, Temperature, Pretraining,
+  LLM, Fine-tuning, RLHF) · [Context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows) ·
+  [Models overview](https://platform.claude.com/docs/en/models/overview) (1M tokens ≈ 555k words, prices in tokens) ·
+  [Claude Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide) (tokenizer
+  1–1.35×, temperature/top_p/top_k removed) ·
+  [Reduce hallucinations](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations)
+- Anthropic: [Tracing the thoughts of a large language model](https://www.anthropic.com/research/tracing-thoughts-language-model)
+  (2025-03-27, Claude 3.5 Haiku, the "Hallucinations" part)
+- A. T. Kalai, O. Nachum, S. S. Vempala, E. Zhang: [Why Language Models Hallucinate](https://arxiv.org/abs/2509.04664) (2025)
+- R. Sennrich, B. Haddow, A. Birch: [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909)
+  (2016, BPE)
+- D. Jurafsky, J. H. Martin: [Speech and Language Processing](https://web.stanford.edu/~jurafsky/slp3/), chapter 3
+  "N-gram Language Models" (n-gram, backoff)
+- [tiktoken](https://github.com/openai/tiktoken) (`o200k_base`, `cl100k_base`) ·
+  [anthropic-tokenizer-typescript](https://github.com/anthropics/anthropic-tokenizer-typescript) (before Claude 3;
+  "no longer accurate") · declaration text: [eric-muller/udhr](https://github.com/eric-muller/udhr)
+- Corpus facts: [Go FAQ, history](https://go.dev/doc/faq#history) ·
+  [Python History and License](https://docs.python.org/3/license.html) ·
+  [D. Ritchie, The Development of the C Language](https://www.bell-labs.com/usr/dmr/www/chist.html) ·
+  [Linux README](https://www.kernel.org/doc/html/latest/admin-guide/README.html) ·
+  [Google, "Google Gets the Message, Launches Gmail" (2004)](http://googlepress.blogspot.com/2004/04/google-gets-message-launches-gmail.html)
+- Rust and Guido: [Rust (programming language)](https://en.wikipedia.org/wiki/Rust_(programming_language)) ·
+  [Guido van Rossum](https://en.wikipedia.org/wiki/Guido_van_Rossum) (Wikipedia, a secondary source)
+- Go: [Go 1.21 release notes](https://go.dev/doc/go1.21) (`min`) · [Go 1.22 release notes](https://go.dev/doc/go1.22)
+  (`math/rand/v2`) · [uv](https://docs.astral.sh/uv/)
+- Course folder and README: [lessons/cl-01-next-token](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/cl-01-next-token)
+- All outputs come from `go1.26.8 linux/amd64`, tiktoken 0.14.0 (uv 0.11.21), `@anthropic-ai/tokenizer` 0.0.4
+  (Node 24.10.0) and Python 3.13.15, on Linux, on 2026-11-26. The Claude API was not called: everything said about
+  Claude comes from Anthropic's documentation.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/cl-01-next-token)
+
+---
+
+Next lesson: [CL-1.02](/lab/youtube/claude#cl-1-02) → · [All lessons](/lab/youtube/claude)
+
+</div>

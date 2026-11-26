@@ -1,0 +1,923 @@
+---
+title: "Запушили .env? Ключ больше не только ваш"
+date: "2026/11/26"
+description: "Запушенный ключ остаётся в истории: находим его через git show, сначала делаем rotate, при необходимости чистим filter-repo и разбираем ловушку .gitignore."
+tag: "youtube, git, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/git/git-1-02/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/git/git-1-02"
+    ru: "https://www.haywan.uz/lab/youtube/git/git-1-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/git/git-1-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/git/git-1-02"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/git/git-1-02) · **Русский** · [English](/lab/youtube/git/git-1-02/en)  
+Урок GIT-1.02 · [Git va GitHub: 0 → Pro](/lab/youtube/git#git-1-02) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Вы запушили на GitHub файл `.env` с ключом. Через минуту заметили ошибку, удалили файл и запушили снова. В папке
+`.env` нет, сообщение последнего коммита — «удалил ключ». Вопрос: ключ теперь в безопасности?
+Ответ: нет. Одна команда достаёт его из истории. Когда исследователи пушили тестовую строку, их сканер обычно
+находил её за 20 секунд: минута — это очень долго.
+
+**Одна идея:** удалить — не значит забыть. Каждый коммит — снимок всего проекта, старые снимки остаются в истории,
+поэтому запушенный ключ теперь считается открытым. Первый шаг — заменить ключ (rotate), а чистить историю — потом
+и только если это нужно. Лучше всего — написать `.gitignore` до первого коммита.
+
+К концу урока вы:
+
+- найдёте «удалённый» ключ в истории с помощью `git show`, `git log -- .env` и `git grep`;
+- будете знать правильный порядок действий при утечке: сначала rotate, потом журналы, при необходимости
+  `git filter-repo` и force push — и ограничения каждого шага;
+- выведете отслеживаемый `.env` из-под контроля git через `git rm --cached` и напишете `.gitignore` с `.env*` и
+  `!.env.example`;
+- сможете объяснить, что делают и чего не делают защиты GitHub: secret scanning и push protection.
+
+Три главных новых слова урока:
+
+| Слово | Простое значение | По-английски |
+|---|---|---|
+| секрет | значение, которое не должен знать посторонний: API-ключ, пароль от базы данных, токен | secret |
+| замена ключа (rotate) | создать у провайдера новый ключ, отдать его приложению и отозвать старый | rotate (revoke) |
+| отслеживаемый файл | файл, который git уже взял в коммит и видит каждое его изменение | tracked file |
+
+Вспомогательные слова объясняются одной фразой там, где встречаются впервые: **force push** (push, который заменяет
+историю на сервере вашей), **push protection** (защита GitHub, которая останавливает push с ключом).
+
+## Что нужно знать заранее
+
+- [GIT-1.01 · git: коммит — это снимок (snapshot), ветка — один хеш в файле](/lab/youtube/git/git-1-01/ru): коммит — снимок всего проекта
+  и хеш **parent** (предыдущего коммита); хеш считается из содержимого; `HEAD~1` — parent коммита HEAD;
+  `HEAD:main.go` — файл в этом коммите. Весь сегодняшний урок стоит на этой модели.
+- [SYS-0.02 · Процесс и окружение: `ps`, `kill`, `$PATH` и переменные окружения](/lab/youtube/sys/sys-0-02/ru): программа читает
+  ключ из **переменной окружения**, `export` и `. файл` (выполнение в текущем shell).
+- [SYS-0.01 · Терминал: pipe, `grep` и задачи, которые решаются одной строкой](/lab/youtube/sys/sys-0-01/ru): вертикальная черта `|` и `grep`.
+  Файлы env в истории найдём через `git log … | grep -E … | sort -u`.
+
+**Как запускать код.** Нужны `git` 2.29 или новее и `bash`. В Windows используйте **Git Bash**. Для части про
+очистку истории нужен ещё `git-filter-repo` 2.47 или новее (он не входит в git). В пакете `apt` Ubuntu 24.04 версия
+2.38, поэтому ставьте `pip install git-filter-repo`. Скачайте репозиторий курса и перейдите в папку урока (`cd` —
+меняет текущую папку терминала):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/git-02-env-leak
+```
+
+Команды на странице записаны как в видео и README: каждая начинается **из папки урока**, поэтому большинство из них
+начинается с `cd loyiha && …` или `cd tuzoq && …`. Если вы уже внутри `loyiha`, часть `cd loyiha && ` не пишите.
+Выполняйте команды в порядке страницы. Чтобы начать заново, снова запустите `./qur.sh`.
+
+`qur.sh` фиксирует автора и время, поэтому все хеши на странице совпадут у вас буква в букву. Ключ **фальшивый**
+(`soxta_9f2c7a41e8b3`, *soxta* — «фальшивый»): он нигде не работает и не похож на формат ни одного провайдера.
+
+Сначала один вопрос из GIT-1.01. В третьем коммите вы удалили файл. Изменится ли tree второго коммита?
+
+**A)** да, файл удалится и оттуда · **B)** нет, старый коммит не меняется, новый коммит добавляет новый снимок ·
+**C)** второй коммит полностью исчезнет
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Объект коммита назван хешем своего содержимого. Если его изменить, изменились бы и хеш, и сам коммит.
+`git rm` + коммит лишь не берёт файл в *следующий* снимок. Предыдущий снимок и файл в нём (blob) остаются на месте.
+Если вы выбрали «A», вы решили, что коммит можно править на месте. «C» — это переписывание истории, `git rm` его не
+делает.
+
+</details>
+
+## Ключ «удалён», но лежит в истории
+
+Сначала соберём учебные репозитории. `qur.sh` создаёт два: `loyiha` («проект»: ключ запушен, потом «удалён») и
+`tuzoq` («ловушка»: `.env` отслеживается с первого коммита; он понадобится позже). Содержимое скрипта разберём в
+следующем разделе.
+
+```console
+$ ./qur.sh
+tayyor: loyiha/ va tuzoq/
+```
+
+История и папка `loyiha` (`ls -A` — показывает и скрытые файлы, кроме `.` и `..`):
+
+```console
+$ cd loyiha && git log --oneline && ls -A
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+4590f4e to'lov: kalit muhitdan
+.git
+main.go
+```
+
+Три коммита, новейший сверху. Сообщение последнего — `kalitni o'chirdim` («удалил ключ»), а в папке только `.git` и
+`main.go`. `.env` нет. Теперь пишем `git show HEAD~1:.env`: «покажи файл `.env` из коммита на один раньше HEAD».
+Что выведется?
+
+**A)** ошибка: такого файла нет · **B)** строка с ключом · **C)** пустая строка
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `HEAD~1` — это `cdd4176`, то есть коммит, который добавил `.env`. В его снимке `.env` есть, и этот снимок не
+меняется. Если вы выбрали «A», вы решили, что git смотрит на папку на диске: `<коммит>:<файл>` смотрит не на диск, а
+на tree внутри коммита.
+
+</details>
+
+```console
+$ cd loyiha && git show HEAD~1:.env
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+Ключ вернулся. История на картинке:
+
+```text
+ main ──► 36288b8 "kalitni o'chirdim"        снимок: main.go
+             │ parent
+             ▼
+          cdd4176 "lokal sozlamalar"         снимок: main.go, .env   ◄── ключ здесь
+             │ parent
+             ▼
+          4590f4e "to'lov: kalit muhitdan"   снимок: main.go
+```
+
+Репозиторий на GitHub хранит ровно те же коммиты. Любой, у кого есть доступ к репозиторию, может открыть `cdd4176` и
+прочитать `.env`. Когда исследователи пушили на GitHub тестовую строку, их сканер находил её с медианой
+**20 секунд** (от половины секунды до более чем 4 минут; NDSS 2019). Значит, «удалил через минуту» — слишком поздно.
+
+А код написан правильно: ключа в коде нет. Проблема в другом — в коммит попал сам файл `.env`.
+
+## Как собран учебный репозиторий: `qur.sh`
+
+Сначала приложение. `main.go` читает ключ из окружения, как `process.env.TOLOV_KALIT` в Node,
+`os.environ["TOLOV_KALIT"]` в Python или `getenv('TOLOV_KALIT')` в PHP:
+
+```go filename="fayllar/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+// Kalit koddan emas, muhitdan o'qiladi (SYS-0.02). Lekin .env fayli ham git'ga tushmasligi kerak.
+func main() {
+	kalit := os.Getenv("TOLOV_KALIT")
+	if kalit == "" {
+		fmt.Println("TOLOV_KALIT berilmagan")
+		os.Exit(1)
+	}
+	fmt.Println("to'lov tizimiga ulandik, kalit uzunligi:", len(kalit))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10 | `kalit := os.Getenv("TOLOV_KALIT")` | читает переменную окружения; `kalit` («ключ») — новая переменная; если переменной нет — пустая строка |
+| 11–14 | `if kalit == "" { … os.Exit(1) }` | если ключ не задан, печатает сообщение и выходит с кодом 1 |
+| 15 | `fmt.Println(…, len(kalit))` | выводит не сам ключ, а только его длину |
+
+В этом уроке программу на Go не запускаем: `main.go` лишь показывает, что «ключ вне кода». `.env` — обычный текстовый
+файл, который хранит эти переменные окружения локально (копия `fayllar/env.txt`), в нём одна строка:
+`TOLOV_KALIT=soxta_9f2c7a41e8b3`.
+
+Теперь сам скрипт:
+
+```bash filename="qur.sh" showLineNumbers
+#!/usr/bin/env bash
+# Ikkita mashq repo'sini noldan quradi. Muallif va vaqt qat'iy (vaqt.sh). git >= 2.29.
+#   loyiha/: .env commit qilingan, keyingi commit'da "o'chirilgan"
+#   tuzoq/:  .env birinchi commit'dayoq kuzatila boshlagan
+# Kalit soxta: soxta_... hech qayerda ishlamaydi.
+set -e; cd "$(dirname "$0")"
+rf=--ref-format=files; git init -h 2>&1 | grep -q ref-format || rf=   # eski git'da bu bayroq yo'q
+yangi() { rm -rf "$1"; mkdir "$1"; cd "$1"; git init -q --template= -b main --object-format=sha1 $rf
+  git config user.name Lola; git config user.email lola@example.com; git config commit.gpgsign false
+  git config core.hooksPath /dev/null
+git config core.pager cat; git config color.ui false; git config core.abbrev 7
+git config core.autocrlf false; git config core.excludesFile /dev/null; git config core.attributesFile /dev/null
+git config log.decorate false; git config branch.sort refname
+git config merge.ff true; git config merge.stat true; }
+
+yangi loyiha
+cp ../fayllar/main.go .
+git add main.go; . ../vaqt.sh; git commit -q -m "to'lov: kalit muhitdan"
+cp ../fayllar/env.txt .env
+git add .; . ../vaqt.sh; git commit -q -m "lokal sozlamalar"
+git rm -q .env; . ../vaqt.sh; git commit -q -m "kalitni o'chirdim"
+cd ..
+
+yangi tuzoq
+cp ../fayllar/main.go .; cp ../fayllar/env.txt .env
+git add .; . ../vaqt.sh; git commit -q -m "birinchi commit"
+cd ..
+echo "tayyor: loyiha/ va tuzoq/"
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 6 | `set -e; cd "$(dirname "$0")"` | останавливается на первой ошибке; переходит в папку скрипта |
+| 7 | `rf=--ref-format=files … \|\| rf=` | в новом git ссылки хранятся в обычных файлах; если старый git не знает этот флаг, `rf` пуст |
+| 8–14 | `yangi() { … }` | функция (*yangi* — «новый»): создаёт папку с нуля, `git init` (первая ветка `main`, хеш SHA-1), имя `Lola`, подпись и хуки выключены, вид вывода зафиксирован. Всё как в GIT-1.01: чтобы ваши глобальные настройки не меняли результат |
+| 16–18 | `yangi loyiha`, `cp …main.go .`, `git add main.go; … git commit` | 1-й коммит: только `main.go` |
+| 19–20 | `cp ../fayllar/env.txt .env`, `git add .; … git commit` | 2-й коммит: `git add .` взял все новые файлы, попал и `.env`. Это и есть ошибка |
+| 21 | `git rm -q .env; … git commit -q -m "kalitni o'chirdim"` | 3-й коммит: `.env` удаляется с диска и из следующего снимка |
+| 24–26 | `yangi tuzoq`, копирование обоих файлов, `git add .`, коммит | `tuzoq`: `.env` отслеживается с первого коммита |
+| 28 | `echo "tayyor: …"` | единственная строка вывода выше (*tayyor* — «готово») |
+
+Время фиксирует `vaqt.sh` (такой же, как в GIT-1.01, только дата другая):
+
+```bash filename="vaqt.sh" showLineNumbers
+# Manba qiling: `. ../vaqt.sh` (repo ichidan). Commit vaqtini qat'iy qiladi:
+# 2026-02-02 09:00 (+05:00) va har bir mavjud commit uchun +10 daqiqa.
+# Shuning uchun commit hash'lari sizda ham, bizda ham bir xil chiqadi.
+# muallif repo sozlamasidan olinsin (user.name/email), muhitdagi qiymatdan emas
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+n=$(git rev-list --all --count 2>/dev/null || echo 0)
+t=$((1770004800 + n * 600))
+export GIT_AUTHOR_DATE="@$t +0500" GIT_COMMITTER_DATE="@$t +0500"
+```
+
+`n` — число коммитов в репозитории, `1770004800` — 2026-02-02 09:00 по Ташкенту в секундах Unix, +600 секунд на
+каждый коммит. `. ../vaqt.sh` выполняет скрипт в текущем shell, поэтому экспортированное через `export` время
+доходит до следующего `git commit` (SYS-0.02). В своём репозитории это не нужно.
+
+## Поиск по истории: `git log -- .env` и `git grep`
+
+Атакующий смотрит не только на последний коммит. В исследовании Unit 42 компании Palo Alto Networks ключ был именно
+«спрятан за прошлым коммитом», и его всё равно нашли. Мы тоже поищем двумя способами.
+
+Первый: если дать `git log` путь к файлу после `--`, выводятся только коммиты, которые касались этого файла. Сколько
+их?
+
+**A)** 0: `.env` сейчас нет · **B)** 1: только коммит, который его добавил · **C)** 2: коммиты, которые добавили и
+удалили
+
+<details>
+<summary>Ответ</summary>
+
+**C.** И добавление, и удаление файла — это изменения, которые его касаются. Если вы выбрали «A», вы решили, что
+`git log` смотрит на диск: он читает историю.
+
+</details>
+
+```console
+$ cd loyiha && git log --oneline -- .env
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+```
+
+Второй способ работает, даже если имя файла неизвестно. `git rev-list --all` выводит полный хеш каждого коммита,
+достижимого из всех ссылок. `$(…)` передаёт их аргументами в `git grep`, а `git grep` ищет текст `TOLOV_KALIT=` в
+снимке каждого коммита:
+
+```console
+$ cd loyiha && git grep TOLOV_KALIT= $(git rev-list --all)
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+Вывод в виде `<коммит>:<файл>:<строка>`: хеш коммита, имя файла и сам ключ. Одна команда — вся история.
+
+В большом репозитории `$(git rev-list --all)` может превысить лимит аргументов команды (`ARG_MAX`). Тогда используйте
+`git log --all -p -S 'TOLOV_KALIT='` (ниже, в домашнем задании) или `git rev-list --all | xargs git grep 'TOLOV_KALIT='`.
+
+## Это не теория: три числа
+
+| Число | Что | Источник |
+|---|---|---|
+| **81 %** | такая доля найденных ключей не была удалена из репозитория за время наблюдения (около 16 дней). **Ни один** из удаливших не переписал историю, то есть ключ оставался в истории открытым | NDSS 2019 (Meli и др.); данные собраны с 31 октября 2017 по 20 апреля 2018 |
+| **5 минут** | за это время атакующие нашли и уже использовали AWS-ключ, который Unit 42 намеренно оставил открытым | Unit 42, Palo Alto Networks, 2023 |
+| более **64 %** | столько утёкших ключей, работоспособность которых подтвердили в 2022 году, всё ещё работали в январе 2026 | GitGuardian, The State of Secrets Sprawl 2026 |
+
+«Не удалён из репозитория» значит, что ключ остался в файле, а не «не отозван». Число GitGuardian показывает другое:
+многие ключи не отзывают и спустя годы.
+
+## Шаг 1: заменить ключ (rotate)
+
+Вопрос для паузы из видео. Если сделать репозиторий закрытым (private) или удалить его совсем, ключ будет в
+безопасности?
+
+**A)** да, в закрытом репозитории его никто не увидит · **B)** да, если ещё и почистить историю · **C)** нет, копии
+ключа уже в других местах
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Сразу после push копии ключа расходятся: у сканеров, в форках, в клонах на компьютерах коллег. Закрытие,
+удаление репозитория или очистка истории до этих копий не дотягиваются. Toyota закрыла код 15 сентября 2022 года, а
+ключ заменила 17 сентября: эти два дня ключ ещё работал. «A» и «B» — это считать копию на сервере единственной.
+
+</details>
+
+Поэтому первый шаг — заменить **секрет** (secret). Это называется **rotate**: вы создаёте у провайдера новый ключ,
+отдаёте его приложению, потом отзываете старый (**revoke**). Документация GitHub говорит то же: «as a first step you
+need to revoke and/or rotate that secret» («первым шагом вам нужно отозвать и/или заменить этот секрет»).
+
+| # | Шаг | Зачем |
+|---|---|---|
+| 1 | Составьте список **всех** секретов в файле | в `.env` обычно несколько: пароль БД, секрет JWT, API-ключи. Заменить один недостаточно |
+| 2 | В панели провайдера создайте новый ключ, отдайте его приложению, потом отзовите старый | пока старый ключ не отозван, он работает |
+| 2a | Если быстро заменить не получается, отзовите старый **сразу** | простой приложения дешевле кражи: в случае Unit 42 атакующим хватило 5 минут |
+| 3 | Проверьте журналы провайдера (AWS CloudTrail, логи БД) **с момента первого push** | с какого времени ключ открыт и кто им пользовался с тех пор |
+| 4 | Найдите и удалите то, что создал посторонний (серверы, пользователи, новые ключи), проверьте счёт | в эксперименте Unit 42 атакующие запустили серверы EC2 в нескольких регионах и майнили криптовалюту |
+| 5 | После этого, если нужно, почистите историю | следующий раздел |
+
+Одно уточнение про Unit 42: AWS ограничил ключ карантинной политикой, а серверы появились после того, как
+исследователи намеренно заменили эту политику. Вывод: уведомление провайдера не означает, что ключ отозван.
+
+## Шаг 2 (если нужно): очистка истории
+
+Очистка истории — следующий шаг, и он нужен не всегда. Он нужен, когда утекло то, что нельзя заменить: список
+клиентов, персональные данные, ключ, который трудно заменить. Документация GitHub рекомендует для этого свежую версию
+инструмента **git-filter-repo**. В видео это показано карточкой с кодом (отдельного файла в репозитории нет, есть в
+README):
+
+```bash
+# git-filter-repo >= 2.47 kerak; yangi clone'da ishlang
+git clone git@github.com:SIZ/loyiha.git && cd loyiha
+git log --all --name-only --format= | grep -E '(^|/)\.env' | sort -u
+git filter-repo --sensitive-data-removal --invert-paths --path .env --path api/.env
+git log --all -p -S 'SIR_QIYMATI'   # har bir sir uchun boʻsh chiqishi kerak
+# jamoa push'ni toʻxtatsin: force push keyingi ishlarni oʻchiradi
+git push --force --mirror origin    # refs/pull xatolari kutilgan
+```
+
+Комментарии в карточке: строка 1 — «нужен git-filter-repo >= 2.47; работайте в свежем клоне», строка 5 — «для
+каждого секрета должно быть пусто», строка 6 — «пусть команда остановит push: force push удалит последующую
+работу», строка 7 — «ошибки refs/pull ожидаемы».
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `git clone … && cd loyiha` | **свежий** клон с сервера (`SIZ` — ваше имя на GitHub). Из осторожности filter-repo обычно работает только в свежем клоне |
+| 3 | `git log --all --name-only --format= \| grep -E '(^\|/)\.env' \| sort -u` | пути файлов во всех коммитах (`--format=` — без заголовков коммитов), из них те, чьё имя начинается с `.env` (в корне или в любой папке), каждый по одному разу |
+| 4 | `git filter-repo --sensitive-data-removal --invert-paths --path .env --path api/.env` | убирает файлы, переданные через `--path`, из **всех** коммитов (`--invert-paths` — «оставь всё, кроме этих путей»). Передавайте каждый файл **полным путём**: `--path .env` берёт только `.env` в корне |
+| 5 | `git log --all -p -S 'SIR_QIYMATI'` | `-S` ищет коммиты, где изменилось число вхождений текста, `-p` показывает их diff. Для значения каждого секрета вывод должен быть **пустым**. Проверяйте содержимое, а не путь |
+| 7 | `git push --force --mirror origin` | **force push**: принудительно заменяет ссылки на сервере вашими (`--mirror` — все ссылки). `refs/pull/…` GitHub не принимает, эти ошибки ожидаемы |
+
+Если ключ перекочевал и в другие файлы (`config.yaml`, тесты), `--path` не хватит: документация GitHub показывает
+`git filter-repo --sensitive-data-removal --replace-text ../kalitlar.txt`.
+
+Сервера GitHub у нас нет, поэтому запустим filter-repo в локальном клоне `loyiha` (это команда из части Guru
+домашнего задания). Какие коммиты изменятся?
+
+**A)** все три · **B)** два, которые касались `.env` (`cdd4176`, `36288b8`), а `4590f4e` останется · **C)** ни один,
+удалится только файл `.env`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Вспомните цепочку из GIT-1.01: хеш коммита считается из снимка и parent. Если из снимка `cdd4176` убрать
+`.env`, это будет другой коммит, и у следующего за ним `36288b8` тоже меняется parent. `4590f4e` не касался `.env`, и
+до него ничего нет, поэтому его хеш остаётся. Если вы выбрали «C», вы решили, что файл существует отдельно от
+коммита: файл — часть снимка.
+
+</details>
+
+```console
+$ git clone -q loyiha toza && cd toza && git filter-repo --sensitive-data-removal --invert-paths --path .env
+NOTICE: Fetching all refs from origin to make sure we rewrite
+        all history that may reference the sensitive data, via
+      git fetch -q --prune --update-head-ok --refmap "" origin +refs/*:refs/*
+Parsed 3 commitsHEAD is now at 4590f4e to'lov: kalit muhitdan
+
+New history written in 0.04 seconds; now repacking/cleaning...
+You rewrote 2 (of 3) commits.
+
+NOTE: First Changed Commit(s) is/are:
+  cdd41765c96056540bd26de63175c88de2e570da
+NOTE: LFS object orphaning not checked (LFS not in use)
+
+Repacking your repo and cleaning out old unneeded objects
+Completely finished after 0.07 seconds.
+
+NEXT STEPS FOR YOUR SENSITIVE DATA REMOVAL:
+  * If you are doing your rewrite in multiple steps, ignore these next steps
+    until you have completed all your invocations of git-filter-repo.
+  * See the "Sensitive Data Removal" subsection of the "DISCUSSION" section
+    of the manual for more details about any of the steps below.
+  * Inspect this repository and verify that the sensitive data is indeed
+    completely removed from all commits.
+  * Force push the rewritten history to the server:
+      git push --force --mirror origin
+  * Contact the server admins for additional steps they need to take; the
+    First Changed Commit(s) may come in handy here.
+  * Have other colleagues with a clone either discard their clone and reclone
+    OR follow the detailed steps in the manual to repeatedly rebase and
+    purge the sensitive data from their copy.  Again, the First Changed
+    Commit(s) may come in handy.
+  * See the "Prevent repeats and avoid future sensitive data spills" section
+    of the manual.
+```
+
+Как это читать (секунды каждый раз другие, остальное совпадает):
+
+- `NOTICE: Fetching all refs from origin…` — «забираю все ссылки с сервера, чтобы переписать историю полностью».
+  Это делает `--sensitive-data-removal`: переписываются все ссылки сервера, включая ветки, которых нет в вашем клоне;
+- `You rewrote 2 (of 3) commits.` — «вы переписали 2 коммита из 3»;
+- `First Changed Commit(s) is/are: cdd4176…` — «первый изменённый коммит». Нужен администратору сервера и коллегам;
+- `NEXT STEPS…` — следующие шаги: проверьте, сделайте force push, напишите администраторам сервера, пусть коллеги
+  заново склонируют. Это тот же порядок, что в документации GitHub.
+
+Проверяем:
+
+```console
+$ cd toza && git log --oneline
+4590f4e to'lov: kalit muhitdan
+```
+
+Остался один коммит. Два коммита, которые добавили и удалили `.env`, стали пустыми и выпали из истории.
+
+```text
+ до:     4590f4e ◄── cdd4176 (+ .env) ◄── 36288b8 (− .env) ◄── main
+ после:  4590f4e ◄── main
+```
+
+Теперь ищем по содержимому, по самому значению ключа:
+
+```console
+$ cd toza && git log --all -p -S soxta_9f2c7a41e8b3
+```
+
+Ничего не вывелось: ни в одном коммите истории этого значения нет. В настоящем репозитории после этого по
+договорённости с командой делают `git push --force --mirror origin`. Этот force push **удалит** работу, которую команда
+запушила после вашего клона (новые коммиты, новые ветки), поэтому сначала все должны остановить push. Если на `main`
+включена branch protection, её придётся временно выключить.
+
+## Очистка тоже чистит не всё
+
+Force push заменяет историю только **на сервере**. Места, где ключ остаётся и после него:
+
+| Где | Что происходит | Кто может почистить |
+|---|---|---|
+| старый клон коллеги | даже обычный push возвращает ключ на сервер (опыт ниже) | только сам коллега: все клонируют заново |
+| форки | старые коммиты остаются в них | владелец форка |
+| ссылки pull request, кеш GitHub | старые коммиты продолжают открываться | только GitHub Support, и обычно лишь когда ключ нельзя заменить |
+| по хешу | исследователи NDSS открывали с GitHub по хешу даже коммит с переписанной историей | — |
+
+Поэтому документация GitHub прямо говорит: если ключ заменён, переписывать историю «may not be warranted» — «может
+быть не обязательно».
+
+Первую строку мы проверили сами. Скрипт ниже **отсутствует в папке курса**: мы написали его отдельно и запустили
+дважды (результат одинаковый). Вместо GitHub — локальный **bare**-репозиторий (без рабочих файлов, только содержимое
+`.git`) `server.git`. `men` («я») — вы, `hamkasb` («коллега») — коллега, который клонировал до очистки ключа.
+
+```bash
+#!/usr/bin/env bash
+# Force push'dan keyin hamkasbning eski nusxasi kalitni serverga qaytaradi.
+# Dars papkasiga saqlang va ./qur.sh dan keyin ishga tushiring: bash qayta.sh
+# git-filter-repo >= 2.47 kerak. server.git — GitHub o'rnidagi bare repo.
+set -e; cd "$(dirname "$0")"
+rm -rf server.git hamkasb men
+git clone -q --bare loyiha server.git
+git clone -q server.git hamkasb; git -C hamkasb remote set-url origin ../server.git
+git clone -q server.git men; git -C men remote set-url origin ../server.git
+
+cd men
+git filter-repo --sensitive-data-removal --invert-paths --path .env >/dev/null 2>&1
+git push -q --force --mirror origin
+echo "== server, force push'dan keyin:"; git -C ../server.git log --oneline
+
+cd ../hamkasb
+echo "== hamkasb pull qildi:"; git pull -q; git status -sb | head -1
+echo "== hamkasb oddiy push qildi:"; git push origin main 2>&1
+echo "== serverda kalit:"; git -C ../server.git grep TOLOV_KALIT= $(git -C ../server.git rev-list --all)
+```
+
+Сохраните его в папку урока как `qayta.sh`. `git -C <папка>` выполняет команду в этой папке.
+`remote set-url origin ../server.git` делает адрес сервера относительным путём, чтобы в выводе не появился полный
+путь на вашем компьютере. `git status -sb` — краткий статус, в первой строке ветка и на сколько коммитов она впереди
+сервера. Строки `echo` подписывают вывод: «сервер после force push», «коллега сделал pull», «коллега сделал обычный
+push», «ключ на сервере».
+
+Коллега делает `pull`, потом обычный (не force) push. Вернётся ли ключ на сервер?
+
+**A)** нет, `pull` делает его историю такой же, как на сервере · **B)** да, `pull` не удаляет старые коммиты, а push
+их возвращает
+
+<details>
+<summary>Ответ</summary>
+
+**B.** У коллеги в `main` лежит `4590f4e ◄ cdd4176 ◄ 36288b8`. `4590f4e` на сервере — его предок, поэтому `pull`
+ничего не меняет: git говорит «вы впереди на 2 коммита». А push — обычный fast-forward: `main` на сервере сдвигается
+на `36288b8` и возвращается вместе с `.env` внутри `cdd4176`. «A» — думать, что `pull` копирует сервер: он только
+добавляет недостающее.
+
+</details>
+
+```console
+$ bash qayta.sh
+== server, force push'dan keyin:
+4590f4e to'lov: kalit muhitdan
+== hamkasb pull qildi:
+## main...origin/main [ahead 2]
+== hamkasb oddiy push qildi:
+To ../server.git
+   4590f4e..36288b8  main -> main
+== serverda kalit:
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+`[ahead 2]` — «впереди сервера на 2 коммита». `4590f4e..36288b8  main -> main` — `main` на сервере сдвинулся
+обычным push. Последняя строка: ключ снова на сервере. Именно поэтому после очистки все обязаны клонировать заново.
+
+## Ловушка `.gitignore`: отслеживаемый файл
+
+Теперь не дадим ключу попасть в коммит снова. Многие пишут `.env` в `.gitignore`, как пишут `node_modules/`, и
+считают, что дело сделано. В репозитории `tuzoq` файл `.env` **отслеживается** с первого коммита: git уже взял его в
+коммит и видит каждое его изменение. Такой файл называется **отслеживаемым файлом** (tracked file).
+
+Пишем `.env` в `.gitignore` и добавляем в `.env` одну настройку без ключа (`>>` — дописать в конец файла).
+Что покажет `git status --short`?
+
+**A)** `.env` вообще не видно: теперь он игнорируется · **B)** ` M .env` — изменён · **C)** `!! .env` — игнорируется
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `.gitignore` действует только на ещё не отслеживаемые файлы. Документация gitignore: «Files already tracked by
+Git are not affected» («на файлы, которые git уже отслеживает, это не влияет»). Если вы выбрали «A» или «C», вы
+решили, что `.gitignore` — фильтр для всех файлов: он лишь прячет от `git add` новые, неотслеживаемые файлы.
+
+</details>
+
+```console
+$ cd tuzoq && echo .env > .gitignore && echo DEBUG=1 >> .env && git status --short
+ M .env
+?? .gitignore
+```
+
+` M .env` — файл изменён, git это увидел. `?? .gitignore` — новый, ещё не отслеживаемый файл. Следующий
+`git commit -a` или `git add .` снова возьмёт `.env` в коммит.
+
+Чтобы вывести файл из-под отслеживания, даём `git rm` с флагом `--cached`: он удаляет файл из **index** (список,
+подготовленный к следующему коммиту, подробно в GIT-2.02) и не трогает диск. Потом делаем коммит (сообщение
+`.env kuzatuvdan chiqdi` — «`.env` больше не отслеживается»). `--ignored` — пусть `git status` показывает и
+игнорируемые файлы:
+
+```console
+$ cd tuzoq && git rm -q --cached .env && git add .gitignore && . ../vaqt.sh && git commit -qm ".env kuzatuvdan chiqdi" && git status --short --ignored && ls -A
+!! .env
+.env
+.git
+.gitignore
+main.go
+```
+
+`!! .env` — файл теперь **игнорируется** (ignored), но `ls -A` его показывает: он остался на диске. Какое правило его
+прячет, говорит `git check-ignore -v`:
+
+```console
+$ cd tuzoq && git check-ignore -v .env
+.gitignore:1:.env	.env
+```
+
+Формат `<файл>:<строка>:<правило>`, затем табуляция и путь: правило `.env` в 1-й строке `.gitignore` прячет `.env`.
+
+| Состояние | `.env` отслеживается | `git status` | На диске |
+|---|---|---|---|
+| после `qur.sh` | да | чисто | есть |
+| `.gitignore` + `DEBUG=1` | да | ` M .env` | есть |
+| `git rm --cached` + коммит | нет | `!! .env` (с `--ignored`) | есть |
+
+Два предупреждения:
+
+1. **Записывайте новый ключ в `.env` только после этого.** Если записать его, пока файл ещё отслеживается, следующий
+   `git commit -a` сольёт и новый ключ («Частые ошибки», пункт 3).
+2. **Ключ из старого коммита остаётся в истории:**
+
+```console
+$ cd tuzoq && git show HEAD~1:.env
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+Ещё один побочный эффект: когда коллеги сделают `pull` этого коммита, их файл `.env` **удалится** (для git это
+изменение «файл удалён»). Пусть заранее сделают копию.
+
+## Правильная привычка: `.gitignore` до первого коммита
+
+Секреты бывают не только в `.env`: SSH-ключи, пароли от базы данных и токены утекают точно так же. Правильная
+привычка простая: `.gitignore` пишется **до первого коммита**. Добавьте в него все файлы, начинающиеся с `.env`, а
+`.env.example` сделайте исключением с помощью символа `!` (восклицательный знак):
+
+```text
+.env*
+!.env.example
+```
+
+`.env*` — это `.env`, `.env.local`, `.env.production` и другие. `!.env.example` — «этот файл не прятать». В
+репозиторий попадает только `.env.example`: в нём есть имена переменных, но нет значений (как в `fayllar/env.example`,
+одна строка `TOLOV_KALIT=`). Настоящие значения лежат на вашем компьютере или в секретных настройках сервера и CI
+(например, GitHub Actions secrets). Для файлов ключей полезны ещё правила `*.pem` и `id_*`.
+
+Чаще всего причина — команда `git add .`: она добавляет всё, что не игнорируется. Ровно так было в 20-й строке
+`qur.sh`. Перед коммитом читайте вывод `git status` (или `git diff --cached`). Сканер, который ищет ключи перед
+коммитом, установим в пятом модуле:
+[GIT-5.04 · Git-хуки: `gofmt`, линтер и сканер секретов перед коммитом](/lab/youtube/git#git-5-04).
+
+## Что делает GitHub: secret scanning и push protection
+
+| Защита | Что делает | Ограничение |
+|---|---|---|
+| **secret scanning** | в открытых репозиториях работает бесплатно и автоматически; если найден ключ провайдера-партнёра (например, AWS), уведомление получает и провайдер | уведомление — не значит, что ключ отозван |
+| **push protection** (для пользователей) | останавливает ключ известного формата прямо при push: `git push` выдаёт ошибку и показывает, в каком коммите, файле и строке ключ | в аккаунте обычно включена, но работает только при push в **открытые** репозитории |
+| закрытые репозитории | те же защиты | только на платных тарифах для организаций (GitHub Team или Enterprise Cloud + GitHub Secret Protection) |
+
+Push protection можно обойти, указав причину («используется в тестах», «ложное срабатывание», «исправлю позже»), и
+обход на уровне пользователя не создаёт оповещения. Она распознаёт известные форматы (префиксы вроде `ghp_`,
+`AKIA…`). А обычную строку вроде нашей `soxta_…` может не распознать: поэтому репозиторий курса пушится, хотя он
+открытый. Главная защита — всё равно ваша привычка. Глубже эти защиты настроим в
+[GIT-6.03 · Secret scanning и push protection: ключ не должен дойти до репозитория](/lab/youtube/git#git-6-03).
+
+## Два случая: Uber и Toyota
+
+Закрытый репозиторий тоже не безопасен.
+
+| | Uber, 2016 | Toyota T-Connect, 2022 |
+|---|---|---|
+| Где был ключ | AWS-ключ открытым текстом в коде в **закрытом** репозитории GitHub | подрядчик в декабре 2017 года выложил исходный код в **открытый** репозиторий GitHub |
+| Как | по словам атакующих, они вошли в GitHub с паролями из других утечек; Uber не требовал от инженеров двухфакторной аутентификации | код был открыт до 15 сентября 2022 года, почти пять лет; ключ заменили 17 сентября |
+| Итог | украдены примерно 25,6 млн имён и адресов email | могли утечь 296 019 адресов email и номеров клиентов |
+| Источник | жалоба FTC (2018) | заявление Toyota (2022-10-07) |
+
+Вывод: включите двухфакторную аутентификацию (2FA) в аккаунте GitHub и не храните ключ ни в коде, ни в репозитории.
+
+## Частые ошибки
+
+Примеры 3–6 в этом разделе в видео нет: мы запускали их в чистом состоянии после `./qur.sh`.
+
+### 1. «Удалил файл — ключ ушёл»
+
+Главное заблуждение темы. `git rm .env` + коммит (или `git revert` из GIT-1.01) лишь убирают файл из следующего
+снимка, в старом коммите ключ остаётся, и `git show HEAD~1:.env` его возвращает (раздел «Ключ «удалён», но лежит в
+истории»). Исправление: делайте rotate ключа, а не файла.
+
+### 2. «Закрыл (или удалил) репозиторий — опасности нет»
+
+Копии остаются у сканеров, в форках и клонах. В случае Toyota между закрытием и заменой ключа прошло два дня, и всё
+это время ключ работал (ответ в разделе «Шаг 1»). Исправление: сначала rotate.
+
+### 3. `.gitignore` написан, но `.env` всё ещё отслеживается
+
+В `tuzoq` пишем `.env` в `.gitignore`, записываем в `.env` новый ключ и, как обычно, делаем `git commit -a`
+(`-a` — берёт все изменённые отслеживаемые файлы):
+
+```console
+$ cd tuzoq && echo .env > .gitignore && echo TOLOV_KALIT=soxta_yangi > .env && . ../vaqt.sh && git commit -qam "kalit almashtirildi" && git show HEAD:.env
+TOLOV_KALIT=soxta_yangi
+```
+
+Сообщения об ошибке нет — это тихая ошибка. Новый ключ тоже попал в коммит, `.gitignore` его не остановил.
+Исправление: сначала `git rm --cached .env` + коммит, потом новый ключ.
+
+### 4. `git rm` без `--cached`
+
+```console
+$ cd tuzoq && git rm -q .env && ls -A
+.git
+main.go
+```
+
+`.env` удалился и с диска: `git rm` убирает файл из index **и** из рабочих файлов. Ваши локальные настройки пропали.
+Исправление: чтобы вывести файл из-под отслеживания — `git rm --cached .env`.
+
+### 5. В `.gitignore` только `.env`
+
+Создаём `.env.local` и делаем `git add .`:
+
+```console
+$ cd tuzoq && echo .env > .gitignore && git rm -q --cached .env && touch .env.local && git add . && git status --short
+D  .env
+A  .env.local
+A  .gitignore
+```
+
+`D  .env` — `.env` выходит из-под отслеживания, но `A  .env.local` — новый файл **добавляется** в коммит. Правило
+`.env` совпадает ровно с именем `.env`, а не с `.env.local`. `check-ignore` это подтверждает:
+
+```console
+$ cd tuzoq && git check-ignore -v .env.local
+```
+
+Ничего не вывелось (код выхода 1): ни одно правило этот файл не прячет. Исправление: `.env*` и `!.env.example`
+(раздел «Правильная привычка»).
+
+### 6. filter-repo в старом репозитории
+
+Если попробовать чистить в самом `loyiha` (а не в свежем клоне):
+
+```console
+$ cd loyiha && git filter-repo --sensitive-data-removal --invert-paths --path .env
+Aborting: Refusing to destructively overwrite repo history since
+this does not look like a fresh clone.
+  (expected at most one entry in the reflog for HEAD)
+Please operate on a fresh clone instead.  If you want to proceed
+anyway, use --force.
+```
+
+«Прервано: это не похоже на свежий клон, поэтому не стану необратимо переписывать историю репозитория». В скобках
+причина: в журнале reflog для HEAD (GIT-1.01) больше одной записи, то есть в этом репозитории уже работали.
+Исправление: не `--force`, а свежий клон (`git clone -q loyiha toza`).
+
+### 7. `git log -S TOLOV_KALIT` — лишний коммит
+
+`-S` выдаёт коммиты, где изменилось *число* вхождений текста. Без `=` совпадает и `os.Getenv("TOLOV_KALIT")` в
+`main.go`:
+
+```console
+$ cd loyiha && git log --oneline -S TOLOV_KALIT
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+4590f4e to'lov: kalit muhitdan
+```
+
+В `4590f4e` ключа нет. Надёжнее всего искать по самому значению ключа:
+
+```console
+$ cd loyiha && git log --oneline -S soxta_9f2c7a41e8b3
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+```
+
+### 8. «Всё вычищено» через `--path .env`
+
+Тихая ошибка. `--path .env` удаляет только `.env` в корне: `api/.env`, `.env.local` или переименованный файл
+останутся (документация GitHub: передавайте полный путь, а не имя файла). Исправление: сначала составьте список всех
+файлов env в истории (строка 3 в разделе «Шаг 2»), передайте каждый через `--path`, потом проверьте значение каждого
+секрета через `git log --all -p -S`.
+
+## Проверьте себя
+
+1. Почему удаление `.env` в следующем коммите не убирает ключ из истории?
+
+<details>
+<summary>Ответ</summary>
+
+Каждый коммит — неизменяемый снимок всего проекта. `git rm` + коммит добавляет новый снимок, а старый (`cdd4176`) и
+blob `.env` в нём остаются на месте. `git show HEAD~1:.env` или `git grep … $(git rev-list --all)` его находят.
+
+</details>
+
+2. Ключ запушен. Какой правильный порядок?
+
+<details>
+<summary>Ответ</summary>
+
+Сначала rotate: для всех секретов в файле новый ключ → приложению, старый отозвать (если быстро заменить нельзя —
+отозвать сразу). Потом журналы провайдера с момента первого push, удалить созданное посторонними. После этого, если
+нужно, `git filter-repo` в свежем клоне, проверка по содержимому, force push по договорённости с командой, и все
+клонируют заново.
+
+</details>
+
+3. Вы заново собрали `tuzoq` через `./qur.sh`. Что выведет эта команда?
+
+```text
+cd tuzoq && echo .env > .gitignore && git status --short --ignored
+```
+
+<details>
+<summary>Ответ</summary>
+
+Только `?? .gitignore`. `.env` всё ещё отслеживается и не изменён, поэтому не выводится ни как ` M`, ни как `!!`:
+отслеживаемый файл `.gitignore` игнорировать не может.
+
+```console
+$ cd tuzoq && echo .env > .gitignore && git status --short --ignored
+?? .gitignore
+```
+
+</details>
+
+4. Из GIT-1.01: почему после filter-repo хеш `4590f4e` не изменился, а `cdd4176` исчез?
+
+<details>
+<summary>Ответ</summary>
+
+Хеш коммита считается из его содержимого: tree (снимок), parent, автор, время, сообщение. У `4590f4e` не изменились
+ни снимок, ни parent (его нет), значит и хеш тот же. После удаления `.env` из снимка `cdd4176` стал пустым коммитом,
+который ничего не меняет, а filter-repo такие коммиты отбрасывает. С `36288b8` то же самое. У любого оставшегося
+следующего коммита хеш изменился бы через parent.
+
+</details>
+
+5. Push protection включена. Значит ли это, что ключ никогда не утечёт?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Она распознаёт только ключи известных форматов, для пользователей работает только в открытых репозиториях, и
+её можно обойти, указав причину. Обычная строка (`soxta_…`) или пароль могут пройти. Главная защита — `.gitignore`
+до первого коммита и чтение `git status` вместо `git add .`.
+
+</details>
+
+## Домашнее задание
+
+Папка курса: [lessons/git-02-env-leak](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak).
+
+1. 🟢 **Легко.** `./qur.sh`, затем сами найдите ключ в истории `loyiha`.
+2. 🟡 **Средне.** В `tuzoq` напишите `.gitignore` так, чтобы все файлы, начинающиеся с `.env`, были скрыты, а
+   `.env.example` был виден. Проверьте на `.env.local` и `.env.production`.
+3. 🟠 **Сложно.** Найдите через `git log -S 'TOLOV_KALIT='`, в каком коммите появился ключ.
+4. 🔴 **Гуру.** Склонируйте `loyiha`, почистите `.env` через `git filter-repo` и проверьте, что ключа не осталось.
+
+Скрипт с ответами:
+[homework/javoblar.sh](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/git-02-env-leak/homework/javoblar.sh)
+(`bash homework/javoblar.sh`, из папки урока). Он собирает репозитории с нуля и показывает каждый ответ. Для части
+Гуру нужен `git-filter-repo` 2.47+: без него скрипт печатает ссылку на установку и останавливается. Сначала
+попробуйте сами.
+
+<details>
+<summary>Ответ</summary>
+
+```console
+$ bash homework/javoblar.sh
+== Oson: kalit tarixda
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+
+== O'rta: .env* yashirin, .env.example ko'rinadi (+ videodagi tuzoq qadamlari)
+!! .env
+!! .env.local
+!! .env.production
+.env.example
+.gitignore
+main.go
+HEAD~1:.env -> TOLOV_KALIT=soxta_9f2c7a41e8b3
+
+== Qiyin: git log -S (kalit qatori qo'shilgan va o'chirilgan commit'lar)
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+birinchi paydo bo'lgan: cdd4176 lokal sozlamalar
+
+== Guru: yangi clone + filter-repo
+4590f4e to'lov: kalit muhitdan
+.env tegib o'tgan commit'lar: 0
+tarixda kalit (mazmun bo'yicha): 0 qator
+```
+
+Заголовки вывода: *Oson* — «легко», *O'rta* — «средне», *Qiyin* — «сложно»; последние две строки: «коммитов,
+касавшихся `.env`: 0» и «ключ в истории (по содержимому): 0 строк».
+
+🟢 `git show HEAD~1:.env` или `git grep TOLOV_KALIT= $(git rev-list --all)` →
+`cdd4176…:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3`.
+
+🟡 `.gitignore`: `.env*` и `!.env.example`. Скрипт сначала делает `git rm --cached .env`, добавляет `.env.example` и
+делает коммит. `git status --short --ignored` показывает все три файла env с `!!`, а `git ls-files` (список
+отслеживаемых файлов) — `.env.example`, `.gitignore`, `main.go`. `git show HEAD~1:.env` всё ещё выводит ключ:
+история не изменилась.
+
+🟠 `git log --oneline -S TOLOV_KALIT=` даёт два коммита, где изменилось число вхождений: `36288b8` (удалил) и
+`cdd4176` (добавил). Первый берём через `--reverse` (от старых к новым) и `head -1`: `cdd4176 lokal sozlamalar`.
+Почему важен `=` — «Частые ошибки», пункт 7.
+
+🔴 `git clone -q loyiha toza && cd toza && git filter-repo --sensitive-data-removal --invert-paths --path .env`.
+В истории остаётся только `4590f4e`, коммитов, касавшихся `.env`, нет, `git log --all -p -S soxta_9f2c7a41e8b3`
+пуст. В настоящем репозитории после этого по договорённости с командой `git push --force --mirror origin`, все
+клонируют заново. А ключ всё равно делают **rotate**: это был первый шаг.
+
+</details>
+
+## Источники
+
+- GitHub Docs: [Removing sensitive data from a repository](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+  (сначала revoke/rotate, filter-repo ≥ 2.47, полный путь, побочные эффекты, GitHub Support) ·
+  [Best practices for preventing data leaks](https://docs.github.com/en/code-security/getting-started/best-practices-for-preventing-data-leaks-in-your-organization)
+- GitHub Docs: [About secret scanning](https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning) ·
+  [Secret scanning partner program](https://docs.github.com/en/code-security/secret-scanning/secret-scanning-partnership-program/secret-scanning-partner-program) ·
+  [About push protection](https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection) ·
+  [Push protection from the command line](https://docs.github.com/en/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line)
+- Meli, McNiece, Reaves. [How Bad Can It Git? Characterizing Secret Leakage in Public GitHub Repositories](https://www.ndss-symposium.org/ndss-paper/how-bad-can-it-git-characterizing-secret-leakage-in-public-github-repositories/),
+  NDSS 2019 ([PDF](https://www.ndss-symposium.org/wp-content/uploads/2019/02/ndss2019_04B-3_Meli_paper.pdf)): 20 секунд, 81 %, история не переписана, открытие по хешу
+- Unit 42 (Palo Alto Networks): [EleKtra-Leak — exposed IAM keys on GitHub](https://unit42.paloaltonetworks.com/malicious-operations-of-exposed-iam-keys-cryptojacking/) (2023): 5 минут, EC2, карантинная политика
+- GitGuardian: [The State of Secrets Sprawl 2026](https://blog.gitguardian.com/the-state-of-secrets-sprawl-2026/): 64 %
+- FTC: [Uber revised complaint (2018)](https://www.ftc.gov/system/files/documents/cases/1523054_uber_technologies_revised_complaint_0.pdf) ·
+  Toyota: [заявление, 2022-10-07 (на японском)](https://global.toyota/jp/newsroom/corporate/38095972.html) ·
+  [BleepingComputer: Toyota discloses data leak after access key exposed on GitHub](https://www.bleepingcomputer.com/news/security/toyota-discloses-data-leak-after-access-key-exposed-on-github/)
+- Руководство git: [gitignore](https://git-scm.com/docs/gitignore), [git-rm](https://git-scm.com/docs/git-rm),
+  [git-check-ignore](https://git-scm.com/docs/git-check-ignore), [git-log (`-S`)](https://git-scm.com/docs/git-log),
+  [git-grep](https://git-scm.com/docs/git-grep), [git-rev-list](https://git-scm.com/docs/git-rev-list) ·
+  [git-filter-repo](https://github.com/newren/git-filter-repo)
+- Папка курса и README: [lessons/git-02-env-leak](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+- Все результаты получены в git 2.54.0, GNU bash 5.3.9 и git-filter-repo 2.47.0, в Linux, 2026-11-26 (секунды в
+  выводе filter-repo каждый раз другие).
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+
+---
+
+← Предыдущий урок: [GIT-1.01](/lab/youtube/git/git-1-01/ru) · Следующий урок: [GIT-1.03](/lab/youtube/git/git-1-03/ru) → · [Все уроки](/lab/youtube/git)
+
+</div>

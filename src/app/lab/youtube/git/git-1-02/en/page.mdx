@@ -1,0 +1,925 @@
+---
+title: "Did you push .env? The key is no longer only yours"
+date: "2026/11/26"
+description: "A pushed key stays in history: we find it with git show, rotate it first, clean history with filter-repo only if needed, and look at the .gitignore trap."
+tag: "youtube, git, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/git/git-1-02/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/git/git-1-02"
+    ru: "https://www.haywan.uz/lab/youtube/git/git-1-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/git/git-1-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/git/git-1-02"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/git/git-1-02) · [Русский](/lab/youtube/git/git-1-02/ru) · **English**  
+Lesson GIT-1.02 · [Git va GitHub: 0 → Pro](/lab/youtube/git#git-1-02) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+You pushed a `.env` file with a key to GitHub. A minute later you saw the mistake, deleted the file and pushed again.
+There is no `.env` in the folder, and the last commit message says "deleted the key". Question: is the key safe now?
+The answer: no. One command brings it back from history. When researchers pushed a test string, their scanner
+usually found it in 20 seconds: one minute is a very long time.
+
+**One idea:** deleting is not forgetting. Every commit is a snapshot of the whole project, and old snapshots stay in
+history, so a pushed key now counts as public. The first step is to replace the key (rotate). Cleaning history comes
+later, and only if it is needed. Best of all: write `.gitignore` before the first commit.
+
+By the end of the lesson you will be able to:
+
+- find a "deleted" key in history with `git show`, `git log -- .env` and `git grep`;
+- know the right order after a leak: rotate first, then logs, then, if needed, `git filter-repo` and force push —
+  with the limits of each step;
+- take a tracked `.env` out of git with `git rm --cached`, and write `.gitignore` with `.env*` and `!.env.example`;
+- explain what GitHub's secret scanning and push protection do and what they do not do.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| secret | a value no outsider should know: an API key, a database password, a token | secret |
+| replacing the key (rotate) | creating a new key at the provider, giving it to the app, and revoking the old one | rotate (revoke) |
+| tracked file | a file git has already taken into a commit and whose every change it sees | tracked file |
+
+Helper words get one sentence where they first appear: **force push** (a push that replaces the history on the
+server with yours), **push protection** (GitHub's protection that stops a push with a key in it).
+
+## Before you start
+
+- [GIT-1.01 · git: a commit is a snapshot, a branch is one hash in a file](/lab/youtube/git/git-1-01/en): a commit is a snapshot
+  of the whole project plus the hash of its **parent** (the previous commit); the hash is computed from the content;
+  `HEAD~1` is the parent of HEAD; `HEAD:main.go` is the file in that commit. Today's whole lesson rests on this model.
+- [SYS-0.02 · Processes and the environment: `ps`, `kill`, `$PATH` and env variables](/lab/youtube/sys/sys-0-02/en): the program
+  reads the key from an **environment variable**, plus `export` and `. file` (running a file in the current shell).
+- [SYS-0.01 · Terminal: pipes, `grep` and jobs you solve in one line](/lab/youtube/sys/sys-0-01/en): the vertical bar `|` and
+  `grep`. We find the env files in history with `git log … | grep -E … | sort -u`.
+
+**How to run the code.** You need `git` 2.29 or newer and `bash`. On Windows use **Git Bash**. For the history
+cleaning part you also need `git-filter-repo` 2.47 or newer (it does not come with git). Ubuntu 24.04's `apt` package
+has 2.38, so use `pip install git-filter-repo`. Download the course repository and go to the lesson folder (`cd`
+changes the terminal's current folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/git-02-env-leak
+```
+
+The commands on this page are written as in the video and the README: each one starts **from the lesson folder**, so
+most of them start with `cd loyiha && …` or `cd tuzoq && …`. If you are already inside `loyiha`, leave out the
+`cd loyiha && ` part. Run the commands in the order of the page. To start over, run `./qur.sh` again.
+
+`qur.sh` fixes the author and the time, so every hash on this page will match yours letter for letter. The key is
+**fake** (`soxta_9f2c7a41e8b3`, *soxta* means "fake"): it works nowhere and looks like no provider's format.
+
+First, one question from GIT-1.01. You deleted a file in the third commit. Does the tree of the second commit change?
+
+**A)** yes, the file is deleted from there too · **B)** no, the old commit does not change; the new commit adds a new
+snapshot · **C)** the second commit disappears completely
+
+<details>
+<summary>Answer</summary>
+
+**B.** A commit object is named by the hash of its content. If you changed it, the hash would change, and so it would
+be a different commit. `git rm` + commit only leaves the file out of the *next* snapshot. The previous snapshot and
+the file in it (the blob) stay where they are. If you chose "A", you thought a commit can be edited in place. "C" is
+rewriting history, and `git rm` does not do that.
+
+</details>
+
+## The key was "deleted", but it is still in history
+
+First we build the practice repositories. `qur.sh` makes two: `loyiha` ("project": the key was pushed, then
+"deleted") and `tuzoq` ("trap": `.env` is tracked from the first commit; we use it later). We open the script in the
+next section.
+
+```console
+$ ./qur.sh
+tayyor: loyiha/ va tuzoq/
+```
+
+The history and the folder of `loyiha` (`ls -A` also shows hidden files, except `.` and `..`):
+
+```console
+$ cd loyiha && git log --oneline && ls -A
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+4590f4e to'lov: kalit muhitdan
+.git
+main.go
+```
+
+Three commits, the newest on top. The last one's message is `kalitni o'chirdim` ("deleted the key"), and the folder
+holds only `.git` and `main.go`. No `.env`. Now we type `git show HEAD~1:.env`: "show the `.env` file from the commit
+one before HEAD". What is printed?
+
+**A)** an error: no such file · **B)** the key line · **C)** an empty line
+
+<details>
+<summary>Answer</summary>
+
+**B.** `HEAD~1` is `cdd4176`, that is, the commit that added `.env`. Its snapshot contains `.env`, and that snapshot
+does not change. If you chose "A", you thought git looks at the folder on disk: `<commit>:<file>` does not look at the
+disk, it looks at the tree inside the commit.
+
+</details>
+
+```console
+$ cd loyiha && git show HEAD~1:.env
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+The key is back. The history as a picture:
+
+```text
+ main ──► 36288b8 "kalitni o'chirdim"        snapshot: main.go
+             │ parent
+             ▼
+          cdd4176 "lokal sozlamalar"         snapshot: main.go, .env   ◄── the key is here
+             │ parent
+             ▼
+          4590f4e "to'lov: kalit muhitdan"   snapshot: main.go
+```
+
+The repository on GitHub stores exactly the same commits. Anyone who can access the repository can open `cdd4176`
+and read `.env`. When researchers pushed a test string to GitHub, their scanner found it with a median of
+**20 seconds** (from half a second to more than 4 minutes; NDSS 2019). So "I deleted it after a minute" is too late.
+
+The code itself is written correctly: the key is not in the code. The problem is elsewhere: the `.env` file itself
+went into a commit.
+
+## How the practice repository is built: `qur.sh`
+
+The app first. `main.go` reads the key from the environment, just like `process.env.TOLOV_KALIT` in Node,
+`os.environ["TOLOV_KALIT"]` in Python or `getenv('TOLOV_KALIT')` in PHP:
+
+```go filename="fayllar/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+// Kalit koddan emas, muhitdan o'qiladi (SYS-0.02). Lekin .env fayli ham git'ga tushmasligi kerak.
+func main() {
+	kalit := os.Getenv("TOLOV_KALIT")
+	if kalit == "" {
+		fmt.Println("TOLOV_KALIT berilmagan")
+		os.Exit(1)
+	}
+	fmt.Println("to'lov tizimiga ulandik, kalit uzunligi:", len(kalit))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `kalit := os.Getenv("TOLOV_KALIT")` | reads the environment variable; `kalit` ("key") is a new variable; if the variable is missing, an empty string |
+| 11–14 | `if kalit == "" { … os.Exit(1) }` | if no key was given, prints a message and exits with code 1 |
+| 15 | `fmt.Println(…, len(kalit))` | prints only the length of the key, not the key itself |
+
+We do not run the Go program in this lesson: `main.go` only shows that "the key is outside the code". `.env` is a
+plain text file that keeps these environment variables locally (a copy of `fayllar/env.txt`), with one line:
+`TOLOV_KALIT=soxta_9f2c7a41e8b3`.
+
+Now the script itself:
+
+```bash filename="qur.sh" showLineNumbers
+#!/usr/bin/env bash
+# Ikkita mashq repo'sini noldan quradi. Muallif va vaqt qat'iy (vaqt.sh). git >= 2.29.
+#   loyiha/: .env commit qilingan, keyingi commit'da "o'chirilgan"
+#   tuzoq/:  .env birinchi commit'dayoq kuzatila boshlagan
+# Kalit soxta: soxta_... hech qayerda ishlamaydi.
+set -e; cd "$(dirname "$0")"
+rf=--ref-format=files; git init -h 2>&1 | grep -q ref-format || rf=   # eski git'da bu bayroq yo'q
+yangi() { rm -rf "$1"; mkdir "$1"; cd "$1"; git init -q --template= -b main --object-format=sha1 $rf
+  git config user.name Lola; git config user.email lola@example.com; git config commit.gpgsign false
+  git config core.hooksPath /dev/null
+git config core.pager cat; git config color.ui false; git config core.abbrev 7
+git config core.autocrlf false; git config core.excludesFile /dev/null; git config core.attributesFile /dev/null
+git config log.decorate false; git config branch.sort refname
+git config merge.ff true; git config merge.stat true; }
+
+yangi loyiha
+cp ../fayllar/main.go .
+git add main.go; . ../vaqt.sh; git commit -q -m "to'lov: kalit muhitdan"
+cp ../fayllar/env.txt .env
+git add .; . ../vaqt.sh; git commit -q -m "lokal sozlamalar"
+git rm -q .env; . ../vaqt.sh; git commit -q -m "kalitni o'chirdim"
+cd ..
+
+yangi tuzoq
+cp ../fayllar/main.go .; cp ../fayllar/env.txt .env
+git add .; . ../vaqt.sh; git commit -q -m "birinchi commit"
+cd ..
+echo "tayyor: loyiha/ va tuzoq/"
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `set -e; cd "$(dirname "$0")"` | stops at the first error; moves to the script's folder |
+| 7 | `rf=--ref-format=files … \|\| rf=` | in a new git, refs are kept in plain files; if an old git does not know this flag, `rf` is empty |
+| 8–14 | `yangi() { … }` | a function (*yangi* means "new"): creates the folder from scratch, `git init` (first branch `main`, SHA-1 hash), name `Lola`, signing and hooks off, output format fixed. All as in GIT-1.01: so that your global settings do not change the result |
+| 16–18 | `yangi loyiha`, `cp …main.go .`, `git add main.go; … git commit` | commit 1: only `main.go` |
+| 19–20 | `cp ../fayllar/env.txt .env`, `git add .; … git commit` | commit 2: `git add .` took every new file, so `.env` went in too. This is the mistake itself |
+| 21 | `git rm -q .env; … git commit -q -m "kalitni o'chirdim"` | commit 3: `.env` is removed from the disk and from the next snapshot |
+| 24–26 | `yangi tuzoq`, copying both files, `git add .`, commit | `tuzoq`: `.env` is tracked from the first commit |
+| 28 | `echo "tayyor: …"` | the only output line above (*tayyor* means "ready") |
+
+`vaqt.sh` fixes the time (the same as in GIT-1.01, only the date differs):
+
+```bash filename="vaqt.sh" showLineNumbers
+# Manba qiling: `. ../vaqt.sh` (repo ichidan). Commit vaqtini qat'iy qiladi:
+# 2026-02-02 09:00 (+05:00) va har bir mavjud commit uchun +10 daqiqa.
+# Shuning uchun commit hash'lari sizda ham, bizda ham bir xil chiqadi.
+# muallif repo sozlamasidan olinsin (user.name/email), muhitdagi qiymatdan emas
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+n=$(git rev-list --all --count 2>/dev/null || echo 0)
+t=$((1770004800 + n * 600))
+export GIT_AUTHOR_DATE="@$t +0500" GIT_COMMITTER_DATE="@$t +0500"
+```
+
+`n` is the number of commits in the repository, `1770004800` is 2026-02-02 09:00 Tashkent time in Unix seconds, plus
+600 seconds per commit. `. ../vaqt.sh` runs the script in the current shell, so the time set with `export` reaches the
+next `git commit` (SYS-0.02). In your own repository you do not need this.
+
+## Searching history: `git log -- .env` and `git grep`
+
+An attacker does not look only at the last commit. In the Unit 42 study by Palo Alto Networks, the key was exactly
+"hidden behind a past commit", and it was found anyway. We search in two ways too.
+
+The first: if we give `git log` a file path after `--`, it prints only the commits that touched that file. How many?
+
+**A)** 0: there is no `.env` now · **B)** 1: only the commit that added it · **C)** 2: the commits that added and
+deleted it
+
+<details>
+<summary>Answer</summary>
+
+**C.** Adding a file and deleting it are both changes that touch it. If you chose "A", you thought `git log` looks
+at the disk: it reads history.
+
+</details>
+
+```console
+$ cd loyiha && git log --oneline -- .env
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+```
+
+The second way works even if you do not know the file name. `git rev-list --all` prints the full hash of every commit
+reachable from all refs. `$(…)` passes them to `git grep` as arguments, and `git grep` searches for the text
+`TOLOV_KALIT=` in the snapshot of every commit:
+
+```console
+$ cd loyiha && git grep TOLOV_KALIT= $(git rev-list --all)
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+The output has the form `<commit>:<file>:<line>`: the commit hash, the file name and the key itself. One command,
+the whole history.
+
+In a big repository, `$(git rev-list --all)` can go over the limit for command arguments (`ARG_MAX`). Then use
+`git log --all -p -S 'TOLOV_KALIT='` (below, in the homework) or `git rev-list --all | xargs git grep 'TOLOV_KALIT='`.
+
+## This is not theory: three numbers
+
+| Number | What | Source |
+|---|---|---|
+| **81 %** | this share of the keys found was not removed from the repository during the monitoring period (about 16 days). **None** of those who removed them rewrote history, that is, the key stayed public in history | NDSS 2019 (Meli et al.); data collected from 31 October 2017 to 20 April 2018 |
+| **5 minutes** | within this time, attackers found and already used an AWS key that Unit 42 left exposed on purpose | Unit 42, Palo Alto Networks, 2023 |
+| more than **64 %** | this share of leaked keys confirmed as working in 2022 still worked in January 2026 | GitGuardian, The State of Secrets Sprawl 2026 |
+
+"Not removed from the repository" means the key stayed in the file, not "not revoked". The GitGuardian number shows
+something else: many keys are not revoked even years later.
+
+## Step 1: replace the key (rotate)
+
+The pause question from the video. If we make the repository private, or delete it completely, is the key safe?
+
+**A)** yes, nobody sees it in a private repository · **B)** yes, if we also clean the history · **C)** no, copies of
+the key are already elsewhere
+
+<details>
+<summary>Answer</summary>
+
+**C.** As soon as you push, copies of the key spread: to scanners, to forks, to clones on colleagues' computers.
+Making the repository private, deleting it, or cleaning history does not reach those copies. Toyota made its code
+private on 15 September 2022 and replaced the key on 17 September: for those two days the key still worked. "A" and
+"B" both treat the copy on the server as the only copy.
+
+</details>
+
+So the first step is to replace the **secret**. This is called **rotate**: you create a new key at the provider, give
+it to the app, then revoke the old one (**revoke**). GitHub's documentation says the same: "as a first step you need to
+revoke and/or rotate that secret".
+
+| # | Step | Why |
+|---|---|---|
+| 1 | List **all** the secrets in the file | a `.env` usually holds several: the DB password, the JWT secret, API keys. Replacing one is not enough |
+| 2 | Create a new key in the provider's console, give it to the app, then revoke the old one | until the old key is revoked, it works |
+| 2a | If you cannot replace it quickly, revoke the old one **at once** | some downtime is cheaper than theft: in the Unit 42 case the attackers needed 5 minutes |
+| 3 | Check the provider's logs (AWS CloudTrail, DB logs) **from the time of the first push** | since when the key has been public, and who used it since then |
+| 4 | Find and delete what an outsider created (servers, users, new keys), check the bill | in the Unit 42 experiment, the attackers launched EC2 servers in several regions and mined cryptocurrency |
+| 5 | After that, if needed, clean the history | the next section |
+
+One clarification about Unit 42: AWS restricted the key with a quarantine policy, and the servers were launched after
+the researchers replaced that policy on purpose. The lesson: a notice to the provider does not mean the key was revoked.
+
+## Step 2 (if needed): cleaning history
+
+Cleaning history is the next step, and it is not always needed. You need it when something that cannot be replaced
+leaked: a customer list, personal data, a key that is hard to replace. GitHub's documentation recommends a recent
+version of the **git-filter-repo** tool for this. The video shows it as a code card (it is not a separate file in the
+repository; it is in the README):
+
+```bash
+# git-filter-repo >= 2.47 kerak; yangi clone'da ishlang
+git clone git@github.com:SIZ/loyiha.git && cd loyiha
+git log --all --name-only --format= | grep -E '(^|/)\.env' | sort -u
+git filter-repo --sensitive-data-removal --invert-paths --path .env --path api/.env
+git log --all -p -S 'SIR_QIYMATI'   # har bir sir uchun boʻsh chiqishi kerak
+# jamoa push'ni toʻxtatsin: force push keyingi ishlarni oʻchiradi
+git push --force --mirror origin    # refs/pull xatolari kutilgan
+```
+
+The comments in the card: line 1 "git-filter-repo >= 2.47 needed; work in a fresh clone", line 5 "must be empty for
+every secret", line 6 "the team should stop pushing: force push deletes later work", line 7 "refs/pull errors are
+expected".
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `git clone … && cd loyiha` | a **fresh** clone from the server (`SIZ` is your GitHub name). As a safety measure, filter-repo usually works only in a fresh clone |
+| 3 | `git log --all --name-only --format= \| grep -E '(^\|/)\.env' \| sort -u` | file paths in all commits (`--format=` means without commit headers), of those the ones whose name starts with `.env` (at the root or in any folder), each one once |
+| 4 | `git filter-repo --sensitive-data-removal --invert-paths --path .env --path api/.env` | removes the files given with `--path` from **all** commits (`--invert-paths` means "keep everything except these paths"). Give each file with its **full path**: `--path .env` takes only the `.env` at the root |
+| 5 | `git log --all -p -S 'SIR_QIYMATI'` | `-S` finds commits where the number of occurrences of a text changed, `-p` shows their diff. For the value of each secret the output must be **empty**. Check the content, not the path |
+| 7 | `git push --force --mirror origin` | **force push**: forcibly replaces the refs on the server with yours (`--mirror` means all refs). GitHub does not accept `refs/pull/…`, these errors are expected |
+
+If the key also moved into other files (`config.yaml`, tests), `--path` is not enough: GitHub's documentation shows
+`git filter-repo --sensitive-data-removal --replace-text ../kalitlar.txt`.
+
+We have no GitHub server, so we run filter-repo in a local clone of `loyiha` (this is the command from the Guru part
+of the homework). Which commits change?
+
+**A)** all three · **B)** the two that touched `.env` (`cdd4176`, `36288b8`), while `4590f4e` stays · **C)** none,
+only the `.env` file is removed
+
+<details>
+<summary>Answer</summary>
+
+**B.** Remember the chain from GIT-1.01: a commit hash is computed from the snapshot and the parent. If `.env` is
+taken out of the snapshot of `cdd4176`, it becomes a different commit, and the parent of the next commit, `36288b8`,
+changes too. `4590f4e` did not touch `.env` and nothing comes before it, so its hash stays. If you chose "C", you
+thought the file exists apart from the commit: the file is part of the snapshot.
+
+</details>
+
+```console
+$ git clone -q loyiha toza && cd toza && git filter-repo --sensitive-data-removal --invert-paths --path .env
+NOTICE: Fetching all refs from origin to make sure we rewrite
+        all history that may reference the sensitive data, via
+      git fetch -q --prune --update-head-ok --refmap "" origin +refs/*:refs/*
+Parsed 3 commitsHEAD is now at 4590f4e to'lov: kalit muhitdan
+
+New history written in 0.04 seconds; now repacking/cleaning...
+You rewrote 2 (of 3) commits.
+
+NOTE: First Changed Commit(s) is/are:
+  cdd41765c96056540bd26de63175c88de2e570da
+NOTE: LFS object orphaning not checked (LFS not in use)
+
+Repacking your repo and cleaning out old unneeded objects
+Completely finished after 0.07 seconds.
+
+NEXT STEPS FOR YOUR SENSITIVE DATA REMOVAL:
+  * If you are doing your rewrite in multiple steps, ignore these next steps
+    until you have completed all your invocations of git-filter-repo.
+  * See the "Sensitive Data Removal" subsection of the "DISCUSSION" section
+    of the manual for more details about any of the steps below.
+  * Inspect this repository and verify that the sensitive data is indeed
+    completely removed from all commits.
+  * Force push the rewritten history to the server:
+      git push --force --mirror origin
+  * Contact the server admins for additional steps they need to take; the
+    First Changed Commit(s) may come in handy here.
+  * Have other colleagues with a clone either discard their clone and reclone
+    OR follow the detailed steps in the manual to repeatedly rebase and
+    purge the sensitive data from their copy.  Again, the First Changed
+    Commit(s) may come in handy.
+  * See the "Prevent repeats and avoid future sensitive data spills" section
+    of the manual.
+```
+
+How to read it (the seconds differ on every run, the rest is the same):
+
+- `NOTICE: Fetching all refs from origin…`: filter-repo fetches every ref from the server to rewrite the whole
+  history. This is what `--sensitive-data-removal` does: all refs on the server are rewritten, including branches
+  that are not in your clone;
+- `You rewrote 2 (of 3) commits.`: two of the three commits were rewritten;
+- `First Changed Commit(s) is/are: cdd4176…`: the first commit that changed. The server admin and your colleagues
+  need it;
+- `NEXT STEPS…`: the next steps: check, force push, write to the server admins, colleagues clone again. They are the
+  same as the order in GitHub's documentation.
+
+Let us check:
+
+```console
+$ cd toza && git log --oneline
+4590f4e to'lov: kalit muhitdan
+```
+
+One commit is left. The two commits that added and deleted `.env` became empty and dropped out of history.
+
+```text
+ before:  4590f4e ◄── cdd4176 (+ .env) ◄── 36288b8 (− .env) ◄── main
+ after:   4590f4e ◄── main
+```
+
+Now we search by content, with the key's value itself:
+
+```console
+$ cd toza && git log --all -p -S soxta_9f2c7a41e8b3
+```
+
+Nothing was printed: no commit in the history contains this value. In a real repository the next step is
+`git push --force --mirror origin`, agreed with the team. This force push **deletes** the work the team pushed after
+your clone (new commits, new branches), so everyone must stop pushing first. If branch protection is on for `main`,
+you will have to turn it off for a while.
+
+## Cleaning does not clean everything either
+
+Force push replaces history only **on the server**. Places where the key stays even after it:
+
+| Where | What happens | Who can clean it |
+|---|---|---|
+| a colleague's old clone | even a plain push brings the key **back** to the server (experiment below) | only the colleague: everyone clones again |
+| forks | the old commits stay in them | the fork's owner |
+| pull request references, GitHub's cache | the old commits can still be opened | only GitHub Support, and usually only when the key cannot be replaced |
+| by hash | the NDSS researchers opened a commit from GitHub by its hash even after its history was rewritten | — |
+
+That is why GitHub's documentation says it plainly: if the key was replaced, rewriting history "may not be warranted".
+
+We checked the first row ourselves. The script below **is not in the course folder**: we wrote it separately and ran
+it twice (same result). A local **bare** repository (one without working files, only the contents of `.git`),
+`server.git`, stands in for GitHub. `men` ("me") is you, `hamkasb` ("colleague") is a colleague who cloned before the
+key was cleaned.
+
+```bash
+#!/usr/bin/env bash
+# Force push'dan keyin hamkasbning eski nusxasi kalitni serverga qaytaradi.
+# Dars papkasiga saqlang va ./qur.sh dan keyin ishga tushiring: bash qayta.sh
+# git-filter-repo >= 2.47 kerak. server.git — GitHub o'rnidagi bare repo.
+set -e; cd "$(dirname "$0")"
+rm -rf server.git hamkasb men
+git clone -q --bare loyiha server.git
+git clone -q server.git hamkasb; git -C hamkasb remote set-url origin ../server.git
+git clone -q server.git men; git -C men remote set-url origin ../server.git
+
+cd men
+git filter-repo --sensitive-data-removal --invert-paths --path .env >/dev/null 2>&1
+git push -q --force --mirror origin
+echo "== server, force push'dan keyin:"; git -C ../server.git log --oneline
+
+cd ../hamkasb
+echo "== hamkasb pull qildi:"; git pull -q; git status -sb | head -1
+echo "== hamkasb oddiy push qildi:"; git push origin main 2>&1
+echo "== serverda kalit:"; git -C ../server.git grep TOLOV_KALIT= $(git -C ../server.git rev-list --all)
+```
+
+Save it in the lesson folder as `qayta.sh`. `git -C <folder>` runs the command in that folder.
+`remote set-url origin ../server.git` makes the server address a relative path, so the output does not show the full
+path on your computer. `git status -sb` is the short status; its first line shows the branch and how many commits it
+is ahead of the server. The `echo` lines label the output: "server after force push", "colleague pulled", "colleague
+did a plain push", "key on the server".
+
+The colleague runs `pull`, then a plain (not force) push. Does the key come back to the server?
+
+**A)** no, `pull` makes their history the same as the server's · **B)** yes, `pull` does not delete old commits, and
+push brings them back
+
+<details>
+<summary>Answer</summary>
+
+**B.** The colleague's `main` has `4590f4e ◄ cdd4176 ◄ 36288b8`. `4590f4e` on the server is its ancestor, so `pull`
+changes nothing: git says "you are 2 commits ahead". And the push is a normal fast-forward: the server's `main` moves
+to `36288b8` and comes back together with the `.env` inside `cdd4176`. "A" is thinking that `pull` copies the server:
+it only adds what is missing.
+
+</details>
+
+```console
+$ bash qayta.sh
+== server, force push'dan keyin:
+4590f4e to'lov: kalit muhitdan
+== hamkasb pull qildi:
+## main...origin/main [ahead 2]
+== hamkasb oddiy push qildi:
+To ../server.git
+   4590f4e..36288b8  main -> main
+== serverda kalit:
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+`[ahead 2]` means "2 commits ahead of the server". `4590f4e..36288b8  main -> main`: the server's `main` moved with a
+plain push. The last line: the key is on the server again. That is why everyone must clone again after a cleanup.
+
+## The `.gitignore` trap: a tracked file
+
+Now we stop the key from getting in again. Many people write `.env` into `.gitignore`, as they write
+`node_modules/`, and think the job is done. In the `tuzoq` repository, `.env` is **tracked** from the first commit:
+git has already taken it into a commit and sees every change to it. Such a file is called a **tracked file**.
+
+We write `.env` into `.gitignore` and add one setting without a key to `.env` (`>>` appends to the end of a file).
+What does `git status --short` show?
+
+**A)** `.env` is not shown at all: it is ignored now · **B)** ` M .env`: modified · **C)** `!! .env`: ignored
+
+<details>
+<summary>Answer</summary>
+
+**B.** `.gitignore` only affects files that are not tracked yet. The gitignore documentation: "Files already tracked
+by Git are not affected". If you chose "A" or "C", you thought `.gitignore` is a filter for all files: it only hides
+new, untracked files from `git add`.
+
+</details>
+
+```console
+$ cd tuzoq && echo .env > .gitignore && echo DEBUG=1 >> .env && git status --short
+ M .env
+?? .gitignore
+```
+
+` M .env`: the file changed, and git saw it. `?? .gitignore`: a new file that is not tracked yet. The next
+`git commit -a` or `git add .` takes `.env` into a commit again.
+
+To stop tracking the file, we give `git rm` the `--cached` flag: it removes the file from the **index** (the list
+prepared for the next commit, more in GIT-2.02) and does not touch the disk. Then we commit (the message
+`.env kuzatuvdan chiqdi` means "`.env` is no longer tracked"). `--ignored` makes `git status` show ignored files too:
+
+```console
+$ cd tuzoq && git rm -q --cached .env && git add .gitignore && . ../vaqt.sh && git commit -qm ".env kuzatuvdan chiqdi" && git status --short --ignored && ls -A
+!! .env
+.env
+.git
+.gitignore
+main.go
+```
+
+`!! .env`: the file is now **ignored**, but `ls -A` shows it: it stayed on the disk. `git check-ignore -v` tells
+which rule hides it:
+
+```console
+$ cd tuzoq && git check-ignore -v .env
+.gitignore:1:.env	.env
+```
+
+The form is `<file>:<line>:<rule>`, then a tab and the path: the `.env` rule on line 1 of `.gitignore` hides `.env`.
+
+| State | Is `.env` tracked | `git status` | On disk |
+|---|---|---|---|
+| after `qur.sh` | yes | clean | yes |
+| `.gitignore` + `DEBUG=1` | yes | ` M .env` | yes |
+| `git rm --cached` + commit | no | `!! .env` (with `--ignored`) | yes |
+
+Two warnings:
+
+1. **Write the new key into `.env` only after this.** If you write it while the file is still tracked, the next
+   `git commit -a` leaks the new key too ("Common mistakes", item 3).
+2. **The key in the old commit stays in history:**
+
+```console
+$ cd tuzoq && git show HEAD~1:.env
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+```
+
+One more side effect: when colleagues `pull` this commit, their `.env` file is **deleted** (for git this is a "file
+deleted" change). They should make a copy first.
+
+## The right habit: `.gitignore` before the first commit
+
+Secrets are not only in `.env`: SSH keys, database passwords and tokens leak in exactly the same way. The right habit
+is simple: `.gitignore` is written **before the first commit**. Add every file that starts with `.env`, and make
+`.env.example` an exception with the exclamation mark `!`:
+
+```text
+.env*
+!.env.example
+```
+
+`.env*` covers `.env`, `.env.local`, `.env.production` and the others. `!.env.example` means "do not hide this file".
+Only `.env.example` goes into the repository: it has the variable names but no values (like `fayllar/env.example`,
+one line `TOLOV_KALIT=`). The real values live on your computer or in the secret settings of the server and CI (for
+example, GitHub Actions secrets). The rules `*.pem` and `id_*` are also useful for key files.
+
+Most of the time the cause is `git add .`: it adds everything that is not ignored. Line 20 of `qur.sh` did exactly
+that. Before committing, read the output of `git status` (or `git diff --cached`). We will install a scanner that
+looks for keys before each commit in module five:
+[GIT-5.04 · Git hooks: `gofmt`, a linter and a secret scanner before each commit](/lab/youtube/git#git-5-04).
+
+## What GitHub does: secret scanning and push protection
+
+| Protection | What it does | Limit |
+|---|---|---|
+| **secret scanning** | runs for free and automatically on public repositories; if it finds a key of a partner provider (for example AWS), the provider is notified too | a notice does not mean the key was revoked |
+| **push protection** (for users) | stops a key of a known format right at push time: `git push` fails and shows the commit, file and line of the key | usually on in your account, but works only when you push to **public** repositories |
+| private repositories | the same protections | only on paid organization plans (GitHub Team or Enterprise Cloud + GitHub Secret Protection) |
+
+You can bypass push protection by giving a reason ("it's used in tests", "it's a false positive", "I'll fix it
+later"), and a bypass at the user level creates no alert. It recognises known formats (prefixes such as `ghp_`,
+`AKIA…`). A plain string like our `soxta_…` it may not recognise: that is why the course repository can be pushed
+even though it is public. Your habit is still the main protection. We set these protections up in depth in
+[GIT-6.03 · Secret scanning and push protection: keep the key from reaching the repository](/lab/youtube/git#git-6-03).
+
+## Two incidents: Uber and Toyota
+
+A private repository is not safe either.
+
+| | Uber, 2016 | Toyota T-Connect, 2022 |
+|---|---|---|
+| Where the key was | an AWS key in plain text in code in a **private** GitHub repository | a subcontractor uploaded the source code to a **public** GitHub repository in December 2017 |
+| How | the attackers said they logged in to GitHub with passwords from other breaches; Uber did not require two-factor authentication from its engineers | the code stayed public until 15 September 2022, almost five years; the key was replaced on 17 September |
+| Result | about 25.6 million names and email addresses stolen | 296,019 email addresses and customer numbers may have leaked |
+| Source | FTC complaint (2018) | Toyota statement (2022-10-07) |
+
+The lesson: turn on two-factor authentication (2FA) for your GitHub account, and keep keys out of both the code and
+the repository.
+
+## Common mistakes
+
+Examples 3–6 in this section are not in the video: we ran them in a clean state after `./qur.sh`.
+
+### 1. "I deleted the file, so the key is gone"
+
+The main misconception of this topic. `git rm .env` + commit (or `git revert` from GIT-1.01) only leaves the file out
+of the next snapshot; the key stays in the old commit, and `git show HEAD~1:.env` brings it back (section "The key was
+"deleted", but it is still in history"). Fix: rotate the key, not the file.
+
+### 2. "I made the repository private (or deleted it), so there is no risk"
+
+Copies stay with scanners, in forks and in clones. In Toyota's case two days passed between making the code private
+and replacing the key, and the key worked all that time (the answer in the "Step 1" section). Fix: rotate first.
+
+### 3. `.gitignore` is written, but `.env` is still tracked
+
+In `tuzoq` we write `.env` into `.gitignore`, write a new key into `.env`, and run `git commit -a` as usual (`-a`
+takes every changed tracked file):
+
+```console
+$ cd tuzoq && echo .env > .gitignore && echo TOLOV_KALIT=soxta_yangi > .env && . ../vaqt.sh && git commit -qam "kalit almashtirildi" && git show HEAD:.env
+TOLOV_KALIT=soxta_yangi
+```
+
+No error message: this is a silent bug. The new key went into the commit too, and `.gitignore` did not stop it. Fix:
+first `git rm --cached .env` + commit, then the new key.
+
+### 4. `git rm` without `--cached`
+
+```console
+$ cd tuzoq && git rm -q .env && ls -A
+.git
+main.go
+```
+
+`.env` was deleted from the disk too: `git rm` removes the file from the index **and** from the working tree. Your
+local settings are gone. Fix: to stop tracking a file, use `git rm --cached .env`.
+
+### 5. Only `.env` in `.gitignore`
+
+We create `.env.local` and run `git add .`:
+
+```console
+$ cd tuzoq && echo .env > .gitignore && git rm -q --cached .env && touch .env.local && git add . && git status --short
+D  .env
+A  .env.local
+A  .gitignore
+```
+
+`D  .env`: `.env` stops being tracked, but `A  .env.local`: a new file **is being added** to the commit. The rule
+`.env` matches exactly the name `.env`, not `.env.local`. `check-ignore` confirms it:
+
+```console
+$ cd tuzoq && git check-ignore -v .env.local
+```
+
+Nothing was printed (exit code 1): no rule hides this file. Fix: `.env*` and `!.env.example` (section "The right
+habit").
+
+### 6. filter-repo in an old repository
+
+If we try to clean `loyiha` itself (not a fresh clone):
+
+```console
+$ cd loyiha && git filter-repo --sensitive-data-removal --invert-paths --path .env
+Aborting: Refusing to destructively overwrite repo history since
+this does not look like a fresh clone.
+  (expected at most one entry in the reflog for HEAD)
+Please operate on a fresh clone instead.  If you want to proceed
+anyway, use --force.
+```
+
+filter-repo refuses to rewrite the history for good because the repository does not look like a fresh clone. The
+reason is in parentheses: the reflog of HEAD (GIT-1.01) has more than one entry, so someone has worked in this
+repository. Fix: not `--force`, but a fresh clone (`git clone -q loyiha toza`).
+
+### 7. `git log -S TOLOV_KALIT`: one commit too many
+
+`-S` gives the commits where the *number* of occurrences of a text changed. Without `=`, `os.Getenv("TOLOV_KALIT")`
+in `main.go` matches too:
+
+```console
+$ cd loyiha && git log --oneline -S TOLOV_KALIT
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+4590f4e to'lov: kalit muhitdan
+```
+
+`4590f4e` has no key. The most reliable way is to search with the key's value itself:
+
+```console
+$ cd loyiha && git log --oneline -S soxta_9f2c7a41e8b3
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+```
+
+### 8. "Everything is clean" after `--path .env`
+
+A silent bug. `--path .env` removes only the `.env` at the root: `api/.env`, `.env.local` or a renamed file stay
+(GitHub's documentation: give the full path, not the file name). Fix: first list every env file in history (line 3 in
+the "Step 2" section), pass each one with `--path`, then check the value of each secret with `git log --all -p -S`.
+
+## Check yourself
+
+1. Why does deleting `.env` in the next commit not remove the key from history?
+
+<details>
+<summary>Answer</summary>
+
+Every commit is an unchangeable snapshot of the whole project. `git rm` + commit adds a new snapshot; the old one
+(`cdd4176`) and the `.env` blob in it stay where they are. `git show HEAD~1:.env` or
+`git grep … $(git rev-list --all)` finds it.
+
+</details>
+
+2. A key was pushed. What is the right order?
+
+<details>
+<summary>Answer</summary>
+
+Rotate first: for every secret in the file, a new key goes to the app and the old one is revoked (if you cannot
+replace it quickly, revoke it at once). Then the provider's logs from the time of the first push, and deleting what an
+outsider created. After that, if needed, `git filter-repo` in a fresh clone, a check by content, a force push agreed
+with the team, and everyone clones again.
+
+</details>
+
+3. You rebuilt `tuzoq` with `./qur.sh`. What does this print?
+
+```text
+cd tuzoq && echo .env > .gitignore && git status --short --ignored
+```
+
+<details>
+<summary>Answer</summary>
+
+Only `?? .gitignore`. `.env` is still tracked and unchanged, so it shows up neither as ` M` nor as `!!`: `.gitignore`
+cannot ignore a tracked file.
+
+```console
+$ cd tuzoq && echo .env > .gitignore && git status --short --ignored
+?? .gitignore
+```
+
+</details>
+
+4. From GIT-1.01: after filter-repo, why did the hash of `4590f4e` not change, while `cdd4176` disappeared?
+
+<details>
+<summary>Answer</summary>
+
+A commit hash is computed from its content: the tree (snapshot), the parent, the author, the time, the message.
+Neither the snapshot of `4590f4e` nor its parent (it has none) changed, so the hash is the same. Once `.env` was
+taken out of its snapshot, `cdd4176` became an empty commit that changes nothing, and filter-repo drops such commits.
+The same goes for `36288b8`. Any later commit that remained would have got a new hash through its parent.
+
+</details>
+
+5. Push protection is on. Does that mean the key can never leak?
+
+<details>
+<summary>Answer</summary>
+
+No. It recognises only keys of known formats, for users it works only on public repositories, and it can be bypassed
+by giving a reason. A plain string (`soxta_…`) or a password can get through. The main protection is `.gitignore`
+before the first commit and reading `git status` instead of `git add .`.
+
+</details>
+
+## Homework
+
+Course folder: [lessons/git-02-env-leak](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak).
+
+1. 🟢 **Easy.** `./qur.sh`, then find the key in the history of `loyiha` yourself.
+2. 🟡 **Medium.** In `tuzoq`, write `.gitignore` so that every file starting with `.env` is hidden while
+   `.env.example` stays visible. Test it with `.env.local` and `.env.production`.
+3. 🟠 **Hard.** Find with `git log -S 'TOLOV_KALIT='` which commit the key appeared in.
+4. 🔴 **Guru.** Clone `loyiha`, clean `.env` out with `git filter-repo`, and check that no key is left.
+
+The answers script:
+[homework/javoblar.sh](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/git-02-env-leak/homework/javoblar.sh)
+(`bash homework/javoblar.sh`, from the lesson folder). It builds the repositories from scratch and shows each answer.
+The Guru part needs `git-filter-repo` 2.47+: without it, the script prints the install link and stops. Try it yourself
+first.
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ bash homework/javoblar.sh
+== Oson: kalit tarixda
+TOLOV_KALIT=soxta_9f2c7a41e8b3
+cdd41765c96056540bd26de63175c88de2e570da:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3
+
+== O'rta: .env* yashirin, .env.example ko'rinadi (+ videodagi tuzoq qadamlari)
+!! .env
+!! .env.local
+!! .env.production
+.env.example
+.gitignore
+main.go
+HEAD~1:.env -> TOLOV_KALIT=soxta_9f2c7a41e8b3
+
+== Qiyin: git log -S (kalit qatori qo'shilgan va o'chirilgan commit'lar)
+36288b8 kalitni o'chirdim
+cdd4176 lokal sozlamalar
+birinchi paydo bo'lgan: cdd4176 lokal sozlamalar
+
+== Guru: yangi clone + filter-repo
+4590f4e to'lov: kalit muhitdan
+.env tegib o'tgan commit'lar: 0
+tarixda kalit (mazmun bo'yicha): 0 qator
+```
+
+Output headings: *Oson* is "easy", *O'rta* is "medium", *Qiyin* is "hard"; the last two lines read "commits that
+touched `.env`: 0" and "key in history (by content): 0 lines".
+
+🟢 `git show HEAD~1:.env` or `git grep TOLOV_KALIT= $(git rev-list --all)` →
+`cdd4176…:.env:TOLOV_KALIT=soxta_9f2c7a41e8b3`.
+
+🟡 `.gitignore`: `.env*` and `!.env.example`. The script first runs `git rm --cached .env`, adds `.env.example` and
+commits. `git status --short --ignored` shows all three env files with `!!`, and `git ls-files` (the list of tracked
+files) shows `.env.example`, `.gitignore`, `main.go`. `git show HEAD~1:.env` still prints the key: history did not
+change.
+
+🟠 `git log --oneline -S TOLOV_KALIT=` gives the two commits where the number of occurrences changed: `36288b8`
+(deleted it) and `cdd4176` (added it). We take the first with `--reverse` (oldest to newest) and `head -1`:
+`cdd4176 lokal sozlamalar`. Why `=` matters: "Common mistakes", item 7.
+
+🔴 `git clone -q loyiha toza && cd toza && git filter-repo --sensitive-data-removal --invert-paths --path .env`.
+Only `4590f4e` is left in history, no commit touches `.env`, and `git log --all -p -S soxta_9f2c7a41e8b3` is empty.
+In a real repository the next step is `git push --force --mirror origin`, agreed with the team, and everyone clones
+again. And the key is **rotated** anyway: that was the first step.
+
+</details>
+
+## Sources
+
+- GitHub Docs: [Removing sensitive data from a repository](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+  (revoke/rotate first, filter-repo ≥ 2.47, full path, side effects, GitHub Support) ·
+  [Best practices for preventing data leaks](https://docs.github.com/en/code-security/getting-started/best-practices-for-preventing-data-leaks-in-your-organization)
+- GitHub Docs: [About secret scanning](https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning) ·
+  [Secret scanning partner program](https://docs.github.com/en/code-security/secret-scanning/secret-scanning-partnership-program/secret-scanning-partner-program) ·
+  [About push protection](https://docs.github.com/en/code-security/secret-scanning/introduction/about-push-protection) ·
+  [Push protection from the command line](https://docs.github.com/en/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line)
+- Meli, McNiece, Reaves. [How Bad Can It Git? Characterizing Secret Leakage in Public GitHub Repositories](https://www.ndss-symposium.org/ndss-paper/how-bad-can-it-git-characterizing-secret-leakage-in-public-github-repositories/),
+  NDSS 2019 ([PDF](https://www.ndss-symposium.org/wp-content/uploads/2019/02/ndss2019_04B-3_Meli_paper.pdf)): 20 seconds, 81 %, history not rewritten, opening by hash
+- Unit 42 (Palo Alto Networks): [EleKtra-Leak — exposed IAM keys on GitHub](https://unit42.paloaltonetworks.com/malicious-operations-of-exposed-iam-keys-cryptojacking/) (2023): 5 minutes, EC2, quarantine policy
+- GitGuardian: [The State of Secrets Sprawl 2026](https://blog.gitguardian.com/the-state-of-secrets-sprawl-2026/): 64 %
+- FTC: [Uber revised complaint (2018)](https://www.ftc.gov/system/files/documents/cases/1523054_uber_technologies_revised_complaint_0.pdf) ·
+  Toyota: [statement, 2022-10-07 (in Japanese)](https://global.toyota/jp/newsroom/corporate/38095972.html) ·
+  [BleepingComputer: Toyota discloses data leak after access key exposed on GitHub](https://www.bleepingcomputer.com/news/security/toyota-discloses-data-leak-after-access-key-exposed-on-github/)
+- Git manual: [gitignore](https://git-scm.com/docs/gitignore), [git-rm](https://git-scm.com/docs/git-rm),
+  [git-check-ignore](https://git-scm.com/docs/git-check-ignore), [git-log (`-S`)](https://git-scm.com/docs/git-log),
+  [git-grep](https://git-scm.com/docs/git-grep), [git-rev-list](https://git-scm.com/docs/git-rev-list) ·
+  [git-filter-repo](https://github.com/newren/git-filter-repo)
+- Course folder and README: [lessons/git-02-env-leak](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+- All results from git 2.54.0, GNU bash 5.3.9 and git-filter-repo 2.47.0, on Linux, 2026-11-26 (the seconds in the
+  filter-repo output differ on every run).
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/git-02-env-leak)
+
+---
+
+← Previous lesson: [GIT-1.01](/lab/youtube/git/git-1-01/en) · Next lesson: [GIT-1.03](/lab/youtube/git/git-1-03/en) → · [All lessons](/lab/youtube/git)
+
+</div>
