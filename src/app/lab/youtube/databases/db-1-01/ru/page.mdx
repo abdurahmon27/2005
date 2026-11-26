@@ -1,0 +1,1264 @@
+---
+title: "Почему не JSON-файл, а база? Два Go-процесса ломают один файл"
+date: "2026/11/26"
+description: "Измеряем, как два Go-процесса ломают JSON-файл, kill -9 и lost update, а потом делаем то же самое в PostgreSQL с INSERT и WAL."
+tag: "youtube, databases, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/databases/db-1-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+    ru: "https://www.haywan.uz/lab/youtube/databases/db-1-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/databases/db-1-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/databases/db-1-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/databases/db-1-01) · **Русский** · [English](/lab/youtube/databases/db-1-01/en)  
+Урок DB-1.01 · [Maʼlumotlar bazasi: 0 → Guru](/lab/youtube/databases#db-1-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Что будет, если две программы одновременно пишут в один файл? В этом уроке две Go-программы пишут заказы в один
+JSON-файл. Каждая должна записать по 1000 заказов. Результат: файл больше не JSON. В начале несколько сотен целых
+заказов, а за ними — «хвост» старой записи длиной ~70 байт. `sync.Mutex` из Go здесь не помогает: это два отдельных
+процесса.
+
+**Одна идея:** файл только хранит байты. Защиту от одновременной записи, от падений и для запросов кто-то должен
+написать сам. База данных делает это внутри себя: изменение выполняется внутри базы и сначала записывается в журнал.
+
+К концу урока вы:
+
+- сможете показать на своём компьютере, как два процесса ломают один JSON-файл и как `kill -9` оставляет его пустым;
+- будете знать, что исправляют `rename` и `flock`, а что нет;
+- узнаете ошибку **lost update** (потерянное обновление) в коде: цикл «прочитать, добавить, записать» теряет заказы
+  и в Postgres;
+- объясните, почему `INSERT` в Postgres сохраняет 2000 из 2000 и как после падения база восстанавливается с
+  помощью **WAL**.
+
+Три главных новых слова сегодня:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| потерянное обновление | два процесса читают одно и то же старое состояние; тот, кто пишет позже, молча стирает изменение того, кто писал раньше | lost update |
+| атомарный | не делится пополам: другой процесс видит либо старое, либо новое состояние, но никогда промежуточное | atomic |
+| журнал упреждающей записи | база сначала дописывает каждое изменение в конец журнала, а файлы таблиц обновляет позже | write-ahead log (WAL) |
+
+Вспомогательные слова объясняются одной фразой там, где появляются: **падение** (crash, процесс неожиданно
+умирает), **блокировка** (lock, `flock`), **fsync**, **транзакция** (transaction) и **коммит** (commit).
+
+## Что нужно знать заранее
+
+Это первый урок трека о базах данных. Он опирается на:
+
+- [SYS-0.02 · Jarayon va muhit: ps, kill, $PATH va env oʻzgaruvchilar](/lab/youtube/sys/sys-0-02/ru): что такое **процесс**
+  (process), запуск в фоне с `&`, `$!`, `wait`, `kill -9` и то, что SIGKILL нельзя перехватить.
+- [SYS-0.05 · Docker: «mening kompyuterimda ishlaydi» muammosiga yechim](/lab/youtube/sys/sys-0-05/ru): контейнер; сервер
+  `mehmon` («гость») писал гостей в файл и защищал файл с помощью `sync.Mutex`.
+- [SYS-0.06 · docker compose: Postgres va Go ilovasi bitta buyruq bilan](/lab/youtube/sys/sys-0-06/ru): `compose.yaml`, пароль в
+  `.env`, healthcheck, подключение через `pgx` по `DATABASE_URL`. Сегодня та же настройка Postgres.
+- Основы Go: [GO-1.05 · for](/lab/youtube/go/go-1-05/ru), [GO-1.06 · функции, два возвращаемых значения](/lab/youtube/go/go-1-06/ru),
+  [GO-1.08 · слайсы и append](/lab/youtube/go/go-1-08/ru), [GO-1.09 · map](/lab/youtube/go/go-1-09/ru),
+  [GO-1.10 · struct](/lab/youtube/go/go-1-10/ru), [GO-1.14 · ошибка — тоже значение, errors.Is](/lab/youtube/go/go-1-14/ru).
+  Чтение и запись JSON ([GO-1.20](/lab/youtube/go#go-1-20)) и `sync.Mutex` ([GO-1.22](/lab/youtube/go#go-1-22)) ещё не пройдены:
+  сегодня достаточно знать, что они делают, ниже это сказано одной фразой.
+
+**Как запускать код.** go.dev/play для этого урока не подходит: программы пишут на диск, убивают друг друга через
+`kill` и подключаются к Postgres в Docker. Нужны: Linux (на macOS тоже компилируется, но мы не измеряли; на Windows
+программа `fayl` не компилируется, причина — в разделе «Частые ошибки»), Go 1.26, Docker и Compose. Возьмите
+репозиторий курса и перейдите в папку урока (`cd` — команда перехода в папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz
+cd go-backend-uz/lessons/db-01-why-database
+```
+
+Все команды запускаются из этой папки. Скрипты (`poyga.sh` — «гонка», race; `qulash.sh` — «падение», crash;
+`baza.sh` — «база», database) сами собирают Go-программы в папку `bin/`. На нашем компьютере нет компилятора C,
+поэтому мы работали с `CGO_ENABLED=0`; в части с Postgres скрипты ставят его сами. В конце уборка:
+
+```bash
+docker compose down -v; rm -rf bin buyurtmalar.json*
+```
+
+**Числа в видео и наши.** Испытания в этом уроке — гонки: результат меняется при каждом запуске. Видео показывает
+запуск, записанный 2026-11-26 (таблица в README курса — оттуда же). Все выводы терминала на этой странице получены
+вечером того же дня (22:30–22:45) на том же ноутбуке. Компьютер тогда был занят и другой работой (load average
+1–1,7). Поэтому точные числа другие. Важны **соотношение и направление**: ломается ли файл, какая доля заказов
+теряется, получается ли ноль. Они совпали в обоих измерениях. Рядом с каждым результатом указано число из видео;
+таблица сравнения — в разделе «Все измерения в одной таблице».
+
+Вопрос из SYS-0.02. Процессу отправили `kill -9`. Успеет ли он дописать файл перед смертью?
+
+**A)** да, Go успеет выполнить отложенные через `defer` функции · **B)** только если программа перехватила сигнал
+через `signal.NotifyContext` · **C)** нет: SIGKILL нельзя перехватить, процесс останавливается немедленно
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `kill -9` отправляет процессу SIGKILL (сигнал 9). signal(7): *"The signals SIGKILL and SIGSTOP cannot be
+caught, blocked, or ignored."* Ядро останавливает процесс сразу: не работают ни `defer`, ни обработчик сигнала.
+«B» верно только для SIGTERM (обычный `kill`): так работала корректная остановка в SYS-0.02. Сегодня именно этим
+свойством мы имитируем падение: программа умирает посреди записи, ничего не закончив.
+
+</details>
+
+## Три проблемы: одновременная запись, падение и запрос
+
+В этом треке мы научимся писать SQL, подключаться к Postgres из Go, разберём индексы и транзакции. А в конце сами
+построим на Go storage engine (часть базы, которая хранит данные на диске). Но сначала самый простой вопрос: почему
+не хватает файла?
+
+Курс баз данных Университета Карнеги — Меллона (CMU 15-445/645) задаёт именно этот вопрос на первой же лекции. На
+слайдах данные хранятся в обычных CSV-файлах, а потом идут вопросы: *"What if two threads try to write to the same
+file at the same time?"*, *"What if the machine crashes while our program is updating a record?"*. В курсе эти вопросы
+остаются риторическими. Мы их запустим и посчитаем.
+
+Сегодня мы своими глазами увидим три проблемы:
+
+| # | Проблема | Вопрос | Сегодняшний тест |
+|---|---|---|---|
+| 1 | одновременная запись | что, если два процесса пишут в один файл? | `poyga.sh` |
+| 2 | падение (crash) | что, если процесс умрёт посреди записи? | `qulash.sh`, `qulash-baza.sh` |
+| 3 | запрос (query) | как ответить на вопрос «кто сколько заказов сделал»? | цикл на Go и один SQL |
+
+Это и наша проблема. Сервер `mehmon` из SYS-0.05 писал число гостей в файл. В Node
+`fs.writeFileSync('db.json', JSON.stringify(data))`, в Python `json.dump(data, open('db.json', 'w'))`, в PHP
+`file_put_contents('db.json', json_encode($data))` — в маленьких проектах все мы писали такую «базу». Сегодня
+измерим её пределы.
+
+## «База» в файле: `fayl/main.go`
+
+Программа хранит заказы в одном JSON-файле (`buyurtmalar.json`, «заказы»). Для каждого заказа она читает файл,
+добавляет один заказ в конец списка и переписывает всё целиком. Код состоит только из основ Go. Файл целиком:
+
+```go filename="fayl/main.go" showLineNumbers
+// fayl: buyurtmalarni bitta JSON faylda saqlaydigan "baza" (DB-1.01).
+// Har bir buyurtma: faylni oʻqi → roʻyxatga qoʻsh → faylni qayta yoz.
+//
+//	./bin/fayl -mijoz A -n 1000              A mijozdan 1000 ta buyurtma yozadi
+//	./bin/fayl -usul rename -mijoz A         vaqtinchalik fayl + rename bilan
+//	./bin/fayl -usul qulf -mijoz A           flock + rename bilan
+//	./bin/fayl -sana                         faylda nechta buyurtma borligini sanaydi
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"os"
+	"syscall"
+)
+
+type Buyurtma struct {
+	ID    int    `json:"id"`
+	Mijoz string `json:"mijoz"`
+	Summa int    `json:"summa"`
+}
+
+type Ombor struct {
+	Buyurtmalar []Buyurtma `json:"buyurtmalar"`
+}
+
+func oqi(fayl string) (Ombor, error) {
+	var o Ombor
+	b, err := os.ReadFile(fayl)
+	if errors.Is(err, fs.ErrNotExist) {
+		return o, nil // fayl yoʻq: ombor boʻsh
+	}
+	if err != nil {
+		return o, err
+	}
+	err = json.Unmarshal(b, &o)
+	return o, err
+}
+
+func yoz(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fayl, b, 0o644) // avval faylni boʻshatadi, keyin yozadi
+}
+
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
+// tashxis: buzuq faylning boshidagi butun JSON qismini topadi va ortida nima qolganini aytadi.
+func tashxis(fayl string) {
+	b, _ := os.ReadFile(fayl)
+	if len(b) == 0 {
+		fmt.Println("fayl 0 bayt: hamma buyurtma yoʻq")
+		return
+	}
+	var o Ombor
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if dec.Decode(&o) != nil {
+		fmt.Printf("fayl %d bayt, oxiri yozilmay qolgan\n", len(b))
+		return
+	}
+	qoldi := len(b) - int(dec.InputOffset())
+	fmt.Printf("boshida %d ta buyurtma, ortida yana %d bayt eski yozuv\n", len(o.Buyurtmalar), qoldi)
+}
+
+func main() {
+	fayl := flag.String("fayl", "buyurtmalar.json", "ombor fayli")
+	mijoz := flag.String("mijoz", "A", "kim buyurtma beryapti")
+	n := flag.Int("n", 1000, "nechta buyurtma (0 = toʻxtatilguncha)")
+	sana := flag.Bool("sana", false, "faqat sanash")
+	usul := flag.String("usul", "oddiy", "oddiy | rename | qulf")
+	flag.Parse()
+
+	if *sana {
+		o, err := oqi(*fayl)
+		if err != nil {
+			fmt.Println("fayl buzuq:", err)
+			tashxis(*fayl)
+			os.Exit(1)
+		}
+		jami := map[string]int{}
+		for _, b := range o.Buyurtmalar {
+			jami[b.Mijoz]++
+		}
+		fmt.Printf("faylda: %d ta buyurtma (A: %d, B: %d)\n", len(o.Buyurtmalar), jami["A"], jami["B"])
+		return
+	}
+
+	saqla := yoz
+	if *usul != "oddiy" {
+		saqla = yozRename
+	}
+	buzuq := 0
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+	fmt.Printf("%s: %d ta yozdim, %d marta buzuq faylni oʻqidim\n", *mijoz, *n, buzuq)
+}
+```
+
+Читаем по частям. Идентификаторы узбекские: `Buyurtma` — заказ, `Ombor` — склад (хранилище), `mijoz` — клиент,
+`summa` — сумма, `oqi` — прочитать, `yoz` — записать.
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–7 | комментарий | что делает программа и с какими флагами запускается |
+| 10–19 | `import (…)` | пакеты стандартной библиотеки; `syscall` — системные вызовы Linux (сегодня для `flock`) |
+| 21–25 | `type Buyurtma struct` | один заказ: номер, клиент, сумма (GO-1.10). `` `json:"id"` `` — тег: имя ключа в JSON (GO-1.02) |
+| 27–29 | `type Ombor struct` | список всех заказов (слайс). JSON в файле: `{"buyurtmalar": [ … ]}` |
+| 31–42 | `func oqi` | читает файл целиком (`os.ReadFile`) и превращает JSON в структуру (`json.Unmarshal`; `&o` — адрес `o`, чтобы функция могла её заполнить, GO-1.11). Возвращает два значения: хранилище и ошибку (GO-1.06) |
+| 34–36 | `errors.Is(err, fs.ErrNotExist)` | если файла ещё нет — это не ошибка, хранилище пустое (GO-1.14) |
+| 44–50 | `func yoz` | превращает структуру в красивый JSON (`json.MarshalIndent`, 2 пробела на уровень) и пишет через `os.WriteFile`. `0o644` — права нового файла (`rw-r--r--`) |
+| 52–64 | `func yozRename` | первое исправление (отдельный раздел ниже) |
+| 66–73 | `func qulfla` | второе исправление, блокировка (ниже) |
+| 75–90 | `func tashxis` | «диагноз»: находит целую JSON-часть в начале сломанного файла и говорит, сколько байт осталось за ней (раздел «Глубже») |
+| 93–98 | `flag.String`, `flag.Int`, `flag.Bool` | флаги командной строки (как `argparse` в Python): `-fayl`, `-mijoz A`, `-n 1000`, `-sana`, `-usul`. Они возвращают указатель, поэтому значение читается как `*mijoz` |
+| 100–113 | `if *sana` | «посчитать»: читает файл и считает заказы по клиентам через `map` (GO-1.09). Если файл сломан — `tashxis` и код выхода 1 |
+| 115–118 | `saqla := yoz` | «сохранить»: выбирает, какой функцией писать. Функция — тоже значение (GO-1.06) |
+| 120 | `for i := 0; *n == 0 \|\| i < *n; {` | главный цикл. При `-n 0` — пока не остановят. `i` растёт только после успешной записи (строка 145) |
+| 121–128 | `var q *os.File` … | берёт блокировку только при `-usul qulf` (ниже) |
+| 129–138 | `o, err := oqi(*fayl)` | **прочитать**. Если файл сломан, увеличивает счётчик `buzuq` («сломан») и пробует снова. После 100 000 попыток сдаётся: «fayl tiklanmadi» («файл не восстановился») |
+| 139 | `append(… Buyurtma{ID: len(…) + 1, …})` | **добавить**. Новый номер = длина списка + 1 |
+| 140–143 | `saqla(*fayl, o)` | **записать**: весь список заново пишется в файл |
+| 144 | `q.Close()` | снимает блокировку. Безопасно и при `q == nil`: `Close` вернёт ошибку, а не panic |
+| 147 | `fmt.Printf` | «записал 1000, N раз читал сломанный файл» |
+
+Самая важная строка — 49. Документация Go прямо пишет об `os.WriteFile`: *"otherwise WriteFile truncates it before
+writing"* и *"Since WriteFile requires multiple system calls to complete, a failure mid-operation can leave the file in
+a partially written state."* То есть `os.WriteFile` — не одна операция, а несколько **системных вызовов** (system
+call, обращение программы к ядру Linux):
+
+| Шаг | Системный вызов | Состояние файла |
+|---|---|---|
+| 1 | `open(…, O_TRUNC)` | файл открыт и **очищен**: 0 байт |
+| 2 | `write(…)` | пишется новый JSON: от 0 до N байт |
+| 3 | `close(…)` | готово |
+
+`fs.writeFileSync` в Node (флаг по умолчанию `'w'`), `open(path, 'w')` в Python и `file_put_contents` в PHP тоже
+сначала очищают файл, а потом пишут. Проблема не в Go, а в способе «переписать файл на месте».
+
+## Два процесса, один файл
+
+`poyga.sh` запускает два процесса одновременно. Его сердце — одна строка:
+
+```bash
+./bin/fayl -usul "$usul" -mijoz A & ./bin/fayl -usul "$usul" -mijoz B & wait
+```
+
+`&` запускает программу в фоне и сразу переходит к следующей команде (SYS-0.02). Так A и B стартуют почти в один
+момент. `wait` ждёт, пока оба закончат. Затем скрипт считает файл через `./bin/fayl -sana`. Каждый процесс пишет по
+1000 заказов, всего должно быть 2000. Предскажите до запуска:
+
+**A)** в файле 2000 заказов · **B)** файл цел, но заказов меньше · **C)** файл сломается и перестанет быть JSON
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Оба процесса очищают файл и пишут с начала. Один попадает поверх недописанной записи другого, и в файле
+слипаются два JSON. Следующий `oqi` не может его прочитать, программа пробует снова и снова и в итоге сдаётся. «B»
+получится в версии, исправленной через rename (ниже). «A» — то, чего мы ждали, но чего обычный файл не даёт.
+
+</details>
+
+```console
+$ ./poyga.sh
+B: fayl tiklanmadi: invalid character '{' after top-level value
+A: fayl tiklanmadi: invalid character '{' after top-level value
+fayl buzuq: invalid character '{' after top-level value
+boshida 504 ta buyurtma, ortida yana 71 bayt eski yozuv
+```
+
+Оба процесса остановились со словами «fayl tiklanmadi»: за 100 000 попыток чтения они ни разу не увидели целый JSON.
+Файл сломан навсегда, а не временно. Последние две строки вывел `-sana`: ошибка `encoding/json` *invalid character
+'\{' after top-level value* («недопустимый символ `{` после значения верхнего уровня») и результат `tashxis`
+(«в начале 504 заказа, за ними ещё 71 байт старой записи»). У нас в начале 504 целых заказа и 71 байт хвоста. В
+видео: 67 и 70 байт. Число каждый раз другое, картина та же.
+
+Почему не помогает `sync.Mutex`? Mutex — объект в памяти одного процесса. Он ставит в очередь горутины этого процесса
+(отдельные задачи, которые выполняются одновременно внутри процесса, GO-1.21). Сервер из SYS-0.05 был одним
+процессом, а запросы — его горутинами. A и B же — два отдельных процесса: у каждого своя память и свой Mutex. Они не
+видят блокировок друг друга.
+
+## Почему именно `}{`: хвост длинной записи
+
+Смотрим конец файла (`tail -n 9` — последние 9 строк):
+
+```console
+$ tail -n 9 buyurtmalar.json
+    }
+  ]
+}{
+      "id": 505,
+      "mijoz": "B",
+      "summa": 25000
+    }
+  ]
+}
+```
+
+Сразу после закрывающей `}` идёт новая `{`. Вот что произошло:
+
+```text
+время процесс A                          процесс B                          файл
+ 1    open(O_TRUNC)                                                         0 байт
+ 2                                       open(O_TRUNC)                      0 байт
+ 3    write: 505 заказов (длиннее)                                          [ 505 заказов .......... ]}
+ 4                                       write: 504 (на 71 байт короче)    [ 504 заказа .......]}{"id": 505 …]}
+                                         с 0-го байта файла, поверх         └── B ──────────────┘└ хвост A ┘
+```
+
+Оба процесса почти одновременно открыли и очистили файл (`O_TRUNC`, open(2)). Потом оба писали с начала файла. Один
+записал JSON длиннее, другой — короче, поверх первого. После места, где закончилась короткая запись, остался хвост
+длинной. Хвост длиной в один заказ: в формате `MarshalIndent` один заказ с двузначным номером занимает 70 байт, с
+трёхзначным — 71 байт (мы посчитали сами). Причина: два процесса обычно отличаются на один заказ.
+
+Может, просто не повезло? Повторим двадцать раз:
+
+```console
+$ ./poyga.sh oddiy 20
+20 urinish (oddiy): fayl buzildi 20 marta, butun qoldi 0 marta
+buzilganda faylning butun boshida 2–558 ta buyurtma bor edi (2000 dan)
+```
+
+Файл сломался в 20 попытках из 20. В сломанном файле в начале было от 2 до 558 целых заказов. В видео тоже 20/20,
+диапазон 1–289: иногда файл ломается уже на первом заказе. В исследовании курса есть и другие серии: всего файл
+сломался в 53 попытках из 53.
+
+## `kill -9` посреди записи
+
+Теперь уберём соперника: в файл пишет только один процесс. На этот раз опасность — **падение** (crash), то есть
+неожиданная смерть процесса (компьютер продолжает работать, умирает только программа). `qulash.sh` делает это 100 раз:
+
+```bash
+./bin/fayl -usul "$usul" -n 0 >/dev/null &
+sleep "0.$((RANDOM % 9 + 1))"                     # 0.1–0.9 s yozsin
+kill -9 $! ; wait $! 2>/dev/null
+```
+
+Строка 1 запускает программу в фоне писать без остановки (`-n 0`). Строка 2 ждёт случайные 0,1–0,9 секунды
+(`$RANDOM` — случайное число bash; комментарий: «пусть пишет 0.1–0.9 s»). Строка 3 отправляет SIGKILL последнему
+фоновому процессу (`$!`) и ждёт его завершения. Затем скрипт проверяет файл: целый, совсем пустой (0 байт) или
+записан наполовину. Если процесс умер до первой записи (файла ещё нет), попытка не считается и повторяется.
+
+Предскажите: сколько из 100 kill сломают файл? **A)** ни один — если писатель один, опасности нет ·
+**B)** несколько · **C)** все
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Kill приходит в случайный момент. Чаще всего программа умирает, когда файл уже дописан, а следующий ещё не
+начат: файл цел. Но иногда kill попадает между `open(O_TRUNC)` и `write` — файл 0 байт. Изредка — в середину
+`write` — половина файла. Если вы выбрали «A», вы думали, что опасность только в одновременной записи: для падения
+хватит и одного писателя.
+
+</details>
+
+```console
+$ ./qulash.sh oddiy 100
+100 marta kill -9 (oddiy): fayl butun 93, boʻm-boʻsh 6, yarim yozilgan 1
+```
+
+У нас сломались 7 из 100: 6 раз файл остался 0 байт, то есть пропали все заказы, 1 раз записался наполовину. В
+видео: 10 (9 пустых, 1 половина). В других сотнях из README курса — от 2 до 19. Пустой файл встречается чаще всего,
+потому что промежуток между шагом 1 (очистка) и шагом 2 (запись) длинный: запись копирует больше 70 КБ JSON.
+
+Внимание: мы убили только **процесс**. Записанные байты остаются в копии Linux в памяти (page cache) и, пока
+компьютер работает, всё равно попадут на диск. Отключение питания — другой, более жёсткий тест: его мы разберём в
+модуле DB-6 ([DB-6.01](/lab/youtube/databases#db-6-01)).
+
+## Первое исправление: временный файл и `rename`
+
+Идея: не меняем файл на месте. Новый JSON сначала пишется во временный файл рядом, потом `rename` ставит его на
+место старого:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, fayl)
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| `tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())` | имя временного файла: `buyurtmalar.json.12345.tmp`. Число в середине — номер процесса (PID), поэтому временные файлы A и B разные |
+| `os.WriteFile(tmp, b, 0o644)` | новый JSON пишется во временный файл. Если здесь случится падение, недописанным останется только `.tmp`, основной файл не тронут |
+| `os.Rename(tmp, fayl)` | переименовывает временный файл в основное имя и заменяет старый |
+
+В Linux rename **атомарный**. rename(2): *"If newpath already exists, it will be atomically replaced, so that there is
+no point at which another process attempting to access newpath will find it missing."* Другой процесс, открывший
+`buyurtmalar.json`, увидит либо старый файл, либо новый. Половину файла он не увидит никогда. Документация
+`os.Rename` в Go предупреждает: *"on non-Unix platforms Rename is not an atomic operation"*. Поэтому мы говорим
+«в Linux». В Python то же самое — `os.replace(tmp, path)`, в Node — `fs.renameSync(tmp, path)`.
+
+Теперь 100 раз kill:
+
+```console
+$ ./qulash.sh rename 100
+100 marta kill -9 (rename): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+```
+
+100 из 100 целы — и в видео тоже. Куда бы ни попал kill, в основном файле лежит целый JSON: либо старый, либо новый.
+
+## Файл цел, заказов нет: lost update
+
+С rename снова устраиваем гонку двух процессов. Предскажите, сколько заказов будет в файле?
+
+**A)** 2000 — файл больше не ломается · **B)** ~1000 · **C)** файл снова сломается
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Rename делает атомарной только *замену файла*, а не цикл «прочитать → добавить → записать». Два процесса
+читают один и тот же старый файл, каждый ставит свою версию, и следующий стирает предыдущий. Цикл каждого процесса
+почти целиком перекрывается с циклом другого, поэтому теряется примерно каждый второй заказ. Если вы выбрали «A», вы
+приняли отсутствие поломки за отсутствие ошибки.
+
+</details>
+
+```console
+$ ./poyga.sh rename
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 1001 ta buyurtma (A: 39, B: 962)
+```
+
+Оба процесса говорят «записал 1000, 0 раз читал сломанный файл». Ошибки нет. Но считаем: в файле всего 1001 заказ. В
+видео было 1013. У нас больше выиграл B (962 против 39), в видео — A (701 против 312): кто выиграет — случайность.
+Двадцать попыток:
+
+```console
+$ ./poyga.sh rename 20
+20 urinish (rename): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 997, eng kami 986, eng koʻpi 1009 (2000 dan)
+```
+
+Файл не сломался ни разу. Но в каждой попытке из 2000 терялось в среднем 997 заказов (в видео 983, диапазон
+964–999). В одной попытке потерялось 1009, то есть в файле осталось 991. Это меньше, чем если бы один процесс писал
+в одиночку: побеждает последний `rename`, и в файле остаётся только то состояние, которое прочитал последний
+писатель, плюс его один заказ.
+
+Эта ошибка называется **lost update**, то есть потерянное обновление (термин из 7-й главы книги М. Клеппмана
+*Designing Data-Intensive Applications*). По шагам:
+
+| Шаг | A | B | Заказов в файле |
+|---|---|---|---|
+| 1 | прочитал файл: 100 | | 100 |
+| 2 | | прочитал тот же файл: 100 | 100 |
+| 3 | добавил свой, записал 101 (+A) | | 101 (+A) |
+| 4 | | добавил свой, записал *свои* 101 (+B) | 101 (+B, **заказа A нет**) |
+
+Файл цел, ошибки нет, а заказа нет. Это опаснее сломанного файла: сломанный файл программа заметит сразу, а
+пропавший заказ не заметит никто. Пока клиент не позвонит с вопросом «где мой заказ?».
+
+## Второе исправление: блокировка `flock`
+
+Чтобы остановить lost update, цикл «прочитать → добавить → записать» должен в каждый момент выполняться только в
+одном процессе. Для этого все процессы берут одну общую **блокировку** (lock). В Linux это `flock(2)`:
+
+```go
+// qulfla: hamma jarayonlar uchun umumiy qulf (flock). Qulf faylni ushlab turadi, ombor faylini emas.
+func qulfla(fayl string) (*os.File, error) {
+	f, err := os.OpenFile(fayl+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+```
+
+`os.OpenFile` открывает соседний файл `buyurtmalar.json.lock` (создаёт, если его нет). `syscall.Flock(…, LOCK_EX)`
+ставит на него эксклюзивную блокировку: если другой процесс уже заблокировал, вызов **ждёт**, пока тот не отпустит.
+`int(f.Fd())` — файловый дескриптор, то есть номер открытого файла в процессе. Блокировка держит не файл хранилища,
+а отдельный файл `.lock`: файл хранилища каждый раз заменяется через rename, а блокировка должна стоять на одном
+месте.
+
+В главном цикле блокировка используется так:
+
+```go
+	for i := 0; *n == 0 || i < *n; {
+		var q *os.File
+		if *usul == "qulf" {
+			var err error
+			if q, err = qulfla(*fayl); err != nil {
+				fmt.Println(*mijoz+":", err)
+				os.Exit(1)
+			}
+		}
+		o, err := oqi(*fayl)
+		if err != nil {
+			q.Close() // nil boʻlsa ham xavfsiz: qulfni boʻshatadi
+			buzuq++   // yarim yozilgan faylni oʻqidik: qayta urinamiz
+			if buzuq > 100000 {
+				fmt.Println(*mijoz+":", "fayl tiklanmadi:", err)
+				os.Exit(1)
+			}
+			continue
+		}
+		o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: *mijoz, Summa: 25000})
+		if err := saqla(*fayl, o); err != nil {
+			fmt.Println(*mijoz+":", err)
+			os.Exit(1)
+		}
+		q.Close() // qulf boʻshaydi
+		i++
+	}
+```
+
+Блокировка берётся в строке 124. Чтение (129), добавление (139) и запись (140) выполняются под блокировкой. В строке
+144 она снимается. Запись по-прежнему идёт через rename (строки 115–118: `qulf` тоже выбирает `yozRename`). В PHP
+это `flock($fp, LOCK_EX)`, в Python `fcntl.flock(f, fcntl.LOCK_EX)`. Внутри тот же системный вызов.
+
+```console
+$ ./poyga.sh qulf 20
+20 urinish (qulf): fayl buzildi 0 marta, butun qoldi 20 marta
+butun qolganida yoʻqolgan buyurtma: oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+20 попыток, потерь ноль — и в видео тоже. Цена: процессы теперь пишут по очереди. 20 попыток заняли у нас 47 секунд,
+а rename без блокировки — 16 секунд (время вокруг команды мы мерили отдельно).
+
+## Блокировка сработала, но это только начало
+
+Файл + rename + flock сработали правильно. Но посчитаем, что ещё нужно в реальном проекте:
+
+| Проблема | Что происходит |
+|---|---|
+| `flock` — рекомендательная блокировка (advisory lock) | flock(2): *"flock() places advisory locks only; given suitable permissions on a file, a process is free to ignore the use of flock()"*. Программа, которая не берёт блокировку (ручная правка, старый скрипт), спокойно пишет в файл |
+| отключение питания | переименованный новый файл может быть ещё не на диске, а в памяти. Нужно сделать **fsync** и файла, и папки (fsync — сказать Linux «подожди, пока данные дойдут до диска»). fsync(2): для записи в папке нужен отдельный fsync |
+| на каждый заказ — весь файл | при 1000 заказах файл ~71 КБ. Для 2000 заказов в сумме переписывается ~142 МБ (мы посчитали) |
+| найти один заказ | чтобы найти `id = 1500`, нужно прочитать весь файл и разобрать JSON |
+| несколько файлов | если «заказ + остаток на складе» лежат в двух файлах, способа атомарно изменить оба вместе нет |
+
+Если вы решите всё это, вы сами напишете базу данных. Страница «Atomic Commit» в документации SQLite подробно
+объясняет, как база делает запись атомарной и устойчивой к отключению питания.
+
+## Вопрос: а если положить JSON в колонку Postgres?
+
+Теперь попробуем простое решение. Уберём JSON из файла и положим его в одну колонку таблицы Postgres. Код на Go тот
+же: прочитать, добавить, записать. Только вместо файла — одна строка таблицы:
+
+```go
+// jsonUsul: fayldagi kod bilan bir xil, faqat fayl oʻrnida jadvaldagi bitta qator.
+func jsonUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	return 0, jsonYoz(ctx, db, mijoz)
+}
+
+func jsonYoz(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	var b []byte
+	if err := db.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	b, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b)
+	return err
+}
+```
+
+| Код | Что делает |
+|---|---|
+| `db.QueryRow` + `SELECT doc FROM ombor WHERE id = 1` + `.Scan(&b)` | **прочитать**: берёт колонку `doc` (JSON) из строки 1 таблицы `ombor` как байты (`pgx`, SYS-0.06). `ctx` — контекст (`context.Background()`), в GO-1.23; сегодня на него можно не обращать внимания |
+| `json.Unmarshal`, `append`, `json.Marshal` | **добавить**: так же, как с файлом, на Go |
+| `db.Exec` + `UPDATE ombor SET doc = $1 WHERE id = 1` | **записать**: переписывает весь JSON. `$1` — параметр, вместо него подставляется `b` |
+
+Таблицы создаёт `baza -tayyorla` («подготовить»): колонка `doc` типа `jsonb` (двоичный JSON-тип Postgres):
+
+```go
+const sxema = `
+CREATE TABLE IF NOT EXISTS ombor (id int PRIMARY KEY, doc jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS buyurtmalar (
+	id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	mijoz text   NOT NULL,
+	summa bigint NOT NULL
+);
+TRUNCATE ombor, buyurtmalar RESTART IDENTITY;
+INSERT INTO ombor VALUES (1, '{"buyurtmalar": []}');`
+```
+
+Поднимаем Postgres через compose, как в SYS-0.06. Разница: на этот раз Go-процессы работают не в контейнере, а на
+хосте (на нашем компьютере). Поэтому порт открыт только на `127.0.0.1:5440`:
+
+```bash
+cp .env.example .env          # keyin .env dagi DB_PASSWORD= qatoriga oʻz parolingizni yozing
+docker compose up -d --wait   # Postgres 18 healthy boʻlguncha kutadi
+```
+
+(Комментарии в коде: «потом впишите свой пароль в строку DB_PASSWORD= в .env» и «ждёт, пока Postgres 18 станет
+healthy».) В видео здесь просят поставить паузу. Предскажите: сохранит ли Postgres две тысячи заказов?
+
+**A)** да, 2000: база сама упорядочивает одновременные записи · **B)** нет, ~1000: как с файлом ·
+**C)** второй процесс получит ошибку
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `SELECT` и `UPDATE` — две отдельные команды. Каждая выполняется в своей автоматической **транзакции**
+(transaction — группа команд в базе, которая выполняется по принципу «всё или ничего»). Уровень изоляции в Postgres
+по умолчанию — Read Committed: каждая команда видит данные, закоммиченные к моменту её начала. Промежуток между
+чтением и записью остаётся в вашем Go-коде: база его не видит. A и B читают один и тот же старый JSON, потом
+пишущий позже стирает предыдущего — тот же lost update, что с файлом. «A» — самое распространённое заблуждение:
+база защищает только *ту операцию, которую ей дали*. «C» не будет: оба `UPDATE` законны, Postgres выполняет их по
+очереди.
+
+</details>
+
+```console
+$ ./baza.sh json
+A: 1000 ta yozdim
+B: 1000 ta yozdim
+json ustunida: 1000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+```
+
+`json ustunida` («в колонке json») из 2000 всего 1000 (в видео 1002). Двадцать попыток:
+
+```console
+$ ./baza.sh json 20
+20 urinish (json): yoʻqolgan buyurtma oʻrtacha 1000, eng kami 1000, eng koʻpi 1000 (2000 dan)
+```
+
+У нас в каждой попытке терялось ровно 1000. В видео в среднем 999, диапазон 994–1000. Вывод в обоих случаях один:
+**база не волшебная**. Она защищает только ту операцию, которую ей дали. Мы сказали Postgres «вот новый JSON, замени
+старый», и он сделал ровно это.
+
+## Правильный путь: каждый заказ — один `INSERT`
+
+Правильный путь: отдаём изменение самой базе. Каждый заказ — один `INSERT`, то есть одна новая строка в таблице
+`buyurtmalar`. Заранее ничего не читается:
+
+```go
+// insertUsul: oʻqish yoʻq — oʻzgarishni bazaning oʻziga beramiz. Baza yangi qatorning id'sini qaytaradi.
+func insertUsul(ctx context.Context, db *pgx.Conn, mijoz string) (int64, error) {
+	var id int64
+	err := db.QueryRow(ctx, `INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000) RETURNING id`, mijoz).Scan(&id)
+	return id, err
+}
+```
+
+`INSERT INTO buyurtmalar (mijoz, summa) VALUES ($1, 25000)` добавляет новую строку. `id` база выдаёт сама
+(`GENERATED ALWAYS AS IDENTITY` в схеме — автоматически растущий номер). `RETURNING id` просит базу вернуть номер
+новой строки, `.Scan(&id)` его забирает. Go ничего не читает и не добавляет, поэтому промежутка между «прочитать» и
+«записать» тоже нет.
+
+```console
+$ ./baza.sh insert 20
+20 urinish (insert): yoʻqolgan buyurtma oʻrtacha 0, eng kami 0, eng koʻpi 0 (2000 dan)
+```
+
+Двадцать попыток, каждый раз две тысячи, потерь ноль — и в видео тоже.
+
+Третья проблема — **запрос** (query). «Кто сколько заказов сделал и на какую сумму?» В файловой программе для этого мы
+читали весь файл и писали цикл на Go (`fayl/main.go`, строки 107–111: `map` и `for range`). В Postgres достаточно
+одной команды SQL. `docker compose exec db` запускает команду внутри контейнера сервиса `db`, `psql` — терминальный
+клиент Postgres:
+
+```console
+$ docker compose exec db psql -U ombor -c 'SELECT mijoz, count(*), sum(summa) FROM buyurtmalar GROUP BY mijoz ORDER BY mijoz'
+ mijoz | count |   sum    
+-------+-------+----------
+ A     |  1000 | 25000000
+ B     |  1000 | 25000000
+(2 rows)
+```
+
+`GROUP BY mijoz` группирует строки по клиенту, `count(*)` считает строки в каждой группе, `sum(summa)` складывает
+суммы, `ORDER BY` сортирует. У A и у B по 1000, у каждого 25 000 000. SQL мы будем разбирать построчно в следующих
+уроках.
+
+## Тест на падение: `kill -9` для Postgres
+
+Теперь проведём с базой тот же тест на падение, что и с файлом. A и B без остановки делают `INSERT`, а мы убиваем
+контейнер Postgres через `kill -9` (`docker compose kill db` — SIGKILL главному процессу контейнера). Главные строки
+`qulash-baza.sh`:
+
+```bash
+./bin/baza -mijoz A -n 0 -tasdiq bin/A.ids >bin/A.log & ./bin/baza -mijoz B -n 0 -tasdiq bin/B.ids >bin/B.log &
+sleep "1.$((RANDOM % 9))"
+docker compose kill db >/dev/null 2>&1
+```
+
+Проверка идёт не по количеству, а **по каждому номеру**. Клиент записывает новый `id` в файл только после того, как
+`INSERT` вернулся без ошибки, то есть после ответа базы «готово» (`-tasdiq` — «подтверждение», acknowledgement):
+
+```go
+	i := 0
+	for ; *n == 0 || i < *n; i++ {
+		id, err := yoz(ctx, db, *mijoz)
+		if err != nil {
+			fmt.Printf("%s: %d ta tasdiqlandi, keyin xato: %v\n", *mijoz, i, err)
+			if idlar != nil {
+				idlar.Flush() // os.Exit defer'larni bajarmaydi
+			}
+			os.Exit(1)
+		}
+		if idlar != nil {
+			fmt.Fprintln(idlar, id) // faqat baza "tayyor" degandan keyin
+		}
+	}
+```
+
+`idlar` («номера») — `bufio.Writer`, который пишет в файл через буфер (GO-1.20). `fmt.Fprintln(idlar, id)`
+выполняется только после того, как `yoz` вернулся без ошибки. При ошибке программа сначала делает `Flush`
+(сбрасывает буфер в файл), потому что `os.Exit` не выполняет `defer` (GO-1.15).
+
+После перезапуска базы `baza -tekshir A.ids B.ids` («проверить») проверяет, есть ли в таблице каждый подтверждённый
+`id`. Предскажите: сколько подтверждённых заказов пропадёт после kill?
+
+**A)** несколько последних: они были ещё в памяти · **B)** ни одного · **C)** все: файлы базы сломались
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Postgres возвращает ответ на коммит (ответ об успехе) только после того, как изменение попало в журнал на
+диске. Поэтому каждый заказ, по которому клиент получил подтверждение, после падения восстанавливается из журнала.
+«A» было верно для файловой программы: там «записал» ≠ «сохранено». В следующем разделе посмотрим, как работает WAL.
+
+</details>
+
+```console
+$ ./qulash-baza.sh
+A: 363 ta tasdiqlandi, keyin xato: unexpected EOF
+B: 364 ta tasdiqlandi, keyin xato: unexpected EOF
+database system was not properly shut down; automatic recovery in progress
+redo starts
+redo done
+database system is ready to accept connections
+tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0
+```
+
+Читаем результат:
+
+| Строка | Смысл |
+|---|---|
+| `A: 363 ta tasdiqlandi, keyin xato: unexpected EOF` | A получил 363 подтверждения, потом соединение оборвалось (*unexpected EOF* — «неожиданный конец потока»: сервер исчез посреди ответа) |
+| `database system was not properly shut down; automatic recovery in progress` | лог перезапущенного Postgres: «база не была корректно остановлена; идёт автоматическое восстановление» |
+| `redo starts` / `redo done` | **redo**, то есть повторное выполнение: изменения из журнала заново применяются к таблице / закончено |
+| `database system is ready to accept connections` | база принимает подключения |
+| `tasdiqlangan: 727 · bazada: 728 · tasdiqlanib yoʻqolgan: 0` | «подтверждено: 727 · в базе: 728 · подтверждено и пропало: 0»: все 363 + 364 = 727 подтверждённых `id` на месте; в таблице 728 строк |
+
+В видео было 569 + 570 = 1139 подтверждённых и 1140 строк. У нас меньше: kill приходит через случайные 1,0–1,8
+секунды, и компьютер был занят. Главное совпадает: подтверждённых и пропавших — 0.
+
+Одна лишняя строка в базе — это заказ, который закоммитился, но ответ о котором не дошёл до программы. База его
+сохранила, а клиент решил, что была ошибка. Поскольку в каждом процессе одновременно выполняется только один
+`INSERT`, лишних строк может быть 0, 1 или 2. Двадцать раз:
+
+```console
+$ ./qulash-baza.sh 20 | tail -1
+20 marta kill -9: 20 marta tasdiqlangan har bir id joyida (yoʻqolgan jami 0), tasdiqsiz ortiqcha qator jami 17
+```
+
+В 20 попытках из 20 каждый подтверждённый `id` на месте. Неподтверждённых лишних строк всего 17 — то же число, что в
+видео (совпадение: попытки другие). Если клиент отправит такой «ошибочный» заказ повторно, появится дубликат; это тема
+идемпотентности, в следующих модулях.
+
+## WAL: сначала в журнал, потом в таблицу
+
+Базу спас **write-ahead log**, сокращённо **WAL**, — журнал упреждающей записи. Документация PostgreSQL 18 (28.3):
+*"changes to data files (where tables and indexes reside) must be written only after those changes have been logged,
+that is, after WAL records describing the changes have been flushed to permanent storage."* Порядок:
+
+| Шаг | Что происходит | Где |
+|---|---|---|
+| 1 | пришёл `INSERT` | память Postgres |
+| 2 | запись об изменении дописывается в конец журнала | файл WAL |
+| 3 | `COMMIT`: ждёт, пока журнал попадёт на диск (`synchronous_commit = on`, по умолчанию) | диск |
+| 4 | только после этого клиенту уходит ответ «готово» | сеть |
+| 5 | файлы таблиц обновляются позже, не спеша | диск |
+| падение | база читает журнал и заново выполняет изменения, не дошедшие до таблицы, — `redo` в логе | WAL → таблица |
+
+Документация: *"any changes that have not been applied to the data pages can be redone from the WAL records. (This
+is roll-forward recovery, also known as REDO.)"* Запись в журнал дешёвая: она только дописывает в конец маленькую
+запись. Переписывать всю таблицу каждый раз не нужно. Наша файловая программа делала наоборот: на каждый заказ
+переписывала весь файл на месте.
+
+Помните: мы убили только **процесс**. Что будет при отключении питания, и fsync подробно разберём в модуле DB-6
+([DB-6.01](/lab/youtube/databases#db-6-01)). Цена fsync измерена в SYS-1.01:
+[SYS-1.01 · таблица задержек](/lab/youtube/sys/sys-1-01/ru).
+
+## Когда файл, когда SQLite, когда Postgres
+
+Значит, файл никогда не нужен? Нужен, но на своём месте:
+
+| Ситуация | Чего достаточно |
+|---|---|
+| файл настроек, который пишет только одна программа | JSON + rename + fsync |
+| приложение на одном компьютере, в каждый момент один писатель | SQLite |
+| много писателей, много клиентов по сети | серверная база вроде Postgres |
+
+Сайт SQLite сравнивает его не с серверными базами, а с обычной функцией открытия файла: *"SQLite does not compete with
+client/server databases. SQLite competes with fopen()."* (`fopen` — функция открытия файла в C.) Там же: SQLite *"will
+only allow one writer at any instant in time"*. Если писателей много и клиенты в сети, нужна серверная база. В этом
+треке мы работаем с Postgres.
+
+В следующем уроке — реляционная модель: почему таблица на самом деле множество
+([DB-1.02 · Relyatsion model: jadval — bu toʻplam](/lab/youtube/databases#db-1-02)).
+
+## Все измерения в одной таблице
+
+| Тест | В видео (README) | У нас (вечером) | Что важно |
+|---|---|---|---|
+| `./poyga.sh` | сломан: 67 заказов + 70 байт | сломан: 504 заказа + 71 байт | файл ломается, хвост = 1 заказ |
+| `./poyga.sh oddiy 20` | 20/20 сломаны, 1–289 | 20/20 сломаны, 2–558 | ломается каждый раз |
+| `./qulash.sh oddiy 100` | 10 сломаны (9 пустых, 1 половина) | 7 сломаны (6 пустых, 1 половина) | и один писатель теряет файл при падении |
+| `./qulash.sh rename 100` | 100/100 целы | 100/100 целы | rename останавливает поломку |
+| `./poyga.sh rename` | 1013 (A 701, B 312) | 1001 (A 39, B 962) | теряется ~половина |
+| `./poyga.sh rename 20` | в среднем потеряно 983 | в среднем потеряно 997 | lost update без ошибки |
+| `./poyga.sh qulf 20` | потеряно 0 | потеряно 0 | блокировка исправляет |
+| `./baza.sh json` | 1002 | 1000 | база не волшебная |
+| `./baza.sh json 20` | в среднем 999 | в среднем 1000 | ~половина |
+| `./baza.sh insert 20` | потеряно 0 | потеряно 0 | изменение внутри базы |
+| `./qulash-baza.sh` | 1139 подтв., 1140 строк, потеряно 0 | 727 подтв., 728 строк, потеряно 0 | подтверждённое не пропадает |
+| `./qulash-baza.sh 20` | 20/20, лишних 17 | 20/20, лишних 17 | WAL |
+
+## Глубже (необязательно): `tashxis`, почему теряется половина и SIGKILL для Postgres
+
+**Как измеряется хвост.** `tashxis` (строки 75–90) читает через `json.Decoder` одно JSON-значение с начала файла.
+`Decode` останавливается на первой закрывающей `}` и не смотрит дальше. `dec.InputOffset()` говорит, до какого места
+он дочитал. Если вычесть это из длины файла, получится число оставшихся байт. `json.Unmarshal` же ждёт, что весь файл
+— одно значение, поэтому выдаёт ошибку на лишней `{`. Автор курса проверил результат и через
+`json.JSONDecoder.raw_decode` в Python (исследование курса).
+
+**Почему теряется именно половина.** Каждый цикл читает весь файл, разбирает JSON, собирает новый и пишет. При 1000
+заказов это ~71 КБ. Циклы A и B почти целиком перекрываются. Если два процесса прочитали одно состояние и оба
+записали, из двух заказов остаётся один. Поэтому результат ~1000. Это объяснение из исследования курса, отдельно не
+измерялось.
+
+**Когда файл 0 байт, а когда половина.** `os.WriteFile` = `open(O_WRONLY|O_CREATE|O_TRUNC)` + `write` + `close`.
+Если kill попал между `open` и `write` — 0 байт. Если в середину большого `write` — половина файла (исследование
+курса: при смертельном сигнале ядро останавливает буферизованную запись на границе страницы).
+
+**SIGKILL для Postgres.** `docker compose kill db` отправляет SIGKILL процессу 1 контейнера (postmaster).
+Документация PostgreSQL («Server Shutdown») не советует останавливать настоящий сервер через SIGKILL: дочерние
+процессы и общая память остаются неубранными. Мы сделали так нарочно, чтобы имитировать падение. Правильная «быстрая»
+остановка — SIGQUIT (immediate shutdown): по документации она тоже *"will lead to recovery (by replaying the WAL log)
+upon next start-up"*.
+
+**Почему помогает `jsonb_set`.** В задании среднего уровня «прочитать, добавить, записать» переезжает внутрь одного
+`UPDATE`. Postgres блокирует обновляемую строку. Второй `UPDATE` ждёт, а потом в Read Committed перечитывает *новую*
+версию строки и добавляет поверх неё (PostgreSQL 13.2.1). Это *atomic write operation* из DDIA.
+
+## Частые ошибки
+
+**1. «Раз есть база, заказы не потеряются».** Самое распространённое заблуждение, его часто пишут и в блогах.
+Сообщения об ошибке нет, результат молча неверный. В разделе «Вопрос: а если положить JSON в колонку Postgres?» мы
+видели: когда JSON лежит в колонке `jsonb` и Go читает, добавляет и пишет, Postgres теряет ~1000 из 2000. Причина:
+чтение и запись — две отдельные команды, промежуток в Go-коде. Исправление: отдайте изменение базе — каждый заказ
+одним `INSERT`, или одним `UPDATE … jsonb_set`, или `SELECT … FOR UPDATE` внутри транзакции (домашнее задание).
+
+**2. «`sync.Mutex` защищает файл».** В одном процессе — да (сервер из SYS-0.05). В двух процессах — нет: у каждого
+процесса своя память и свой Mutex, и сообщения об ошибке тоже не будет. Если сервер запущен в двух экземплярах (два
+контейнера или момент замены старой версии новой), файл сломается. Исправление: блокировка между процессами (`flock`)
+или база.
+
+**3. «Сделал rename — файл в безопасности».** Rename останавливает только поломку. Остаются две вещи: lost update
+(одновременные писатели, раздел «Файл цел, заказов нет») и отключение питания (без fsync нового файла может не
+оказаться на диске). Исправление: блокировка + fsync временного файла + fsync папки после rename (задание Guru).
+
+**4. «Есть файл `.lock` — значит, блокировка занята».** Некоторые скрипты проверяют блокировку вопросом «есть ли
+lock-файл?». Если процесс умер от `kill -9`, файл остаётся, и все ждут вечно. `flock` же — не наличие файла, а
+блокировка, привязанная к открытому дескриптору: когда процесс умирает, ядро закрывает его файлы, и блокировка
+снимается сама. Наш файл `.lock` тоже остаётся на диске — это нормально, это лишь место, на которое ставится
+блокировка.
+
+**5. На Windows `fayl` не компилируется.** Соберём для другой системы (`GOOS=windows` — сказать Go «собери для
+Windows»):
+
+```console
+$ GOOS=windows go build ./fayl
+# github.com/abdurahmon27/go-backend-uz/lessons/db-01-why-database/fayl
+fayl/main.go:72:20: undefined: syscall.Flock
+fayl/main.go:72:47: undefined: syscall.LOCK_EX
+```
+
+Читаем: `fayl/main.go:72:20` — файл, строка 72, символ 20. *undefined: syscall.Flock* — «`syscall.Flock` не
+определён». Пакет `syscall` в каждой системе свой: `Flock` есть только в Unix-системах (Linux, macOS). Исправление:
+выполняйте урок в Linux или в WSL на Windows. На Windows и `os.Rename` в Go не атомарен (документация Go).
+
+**6. В `.env` нет пароля.** Если вы сделали `cp .env.example .env` и забыли вписать пароль:
+
+```console
+$ cp .env.example .env
+$ docker compose up -d --wait
+error while interpolating services.db.environment.POSTGRES_PASSWORD: required variable DB_PASSWORD is missing a value: .env faylida DB_PASSWORD yoʻq
+```
+
+Этот вывод получен в копии папки урока (чтобы не трогать настоящий `.env`), файлы те же. Читаем: *error while
+interpolating services.db.environment.POSTGRES_PASSWORD* — «ошибка при подстановке значения в
+`services → db → environment → POSTGRES_PASSWORD`». *required variable DB_PASSWORD is missing a value* — «у
+обязательной переменной `DB_PASSWORD` нет значения». Последняя часть — собственное сообщение защиты
+`${DB_PASSWORD:?…}` из `compose.yaml` (SYS-0.06): «в файле .env нет DB_PASSWORD». Compose ничего не запустил.
+Исправление: впишите пароль после `DB_PASSWORD=` в `.env`.
+
+**7. «`kill -9` = отключение питания».** Сегодняшние падения — падения процесса: записанные байты остаются в памяти
+Linux и, если компьютер работает, попадают на диск. При отключении питания могут пропасть и данные без fsync. Из
+сегодняшних результатов не следует, что «файл + rename переживёт отключение питания». Это мы проверим в модуле DB-6.
+
+## Проверьте себя
+
+**1.** Почему `sync.Mutex` из SYS-0.05 не может упорядочить процессы A и B?
+
+<details>
+<summary>Ответ</summary>
+
+Mutex — объект в памяти одного процесса, он ставит в очередь горутины этого процесса. A и B — два отдельных процесса,
+у каждого свой Mutex. Они не видят блокировок друг друга. Если нужна блокировка между процессами — `flock`
+(блокировка на уровне ядра) или база.
+
+</details>
+
+**2.** Что исправил rename, а что нет?
+
+<details>
+<summary>Ответ</summary>
+
+Исправил: файл больше никогда не виден наполовину или со слипшимися двумя JSON (`qulash.sh rename 100` — 100/100
+целы, в гонке 0 поломок). Не исправил: lost update — два процесса читают один и тот же старый файл, и следующий
+стирает предыдущий (из 2000 пропало ~1000). Защиты от отключения питания он тоже не даёт: для этого нужен fsync.
+
+</details>
+
+**3.** Что выведет `./poyga.sh qulf` (одна попытка)? Предскажите, потом откройте ответ.
+
+<details>
+<summary>Ответ</summary>
+
+```console
+$ ./poyga.sh qulf
+A: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+B: 1000 ta yozdim, 0 marta buzuq faylni oʻqidim
+faylda: 2000 ta buyurtma (A: 1000, B: 1000)
+```
+
+Каждый процесс записал по 1000, сломанных чтений нет, в файле 2000: у A и B по 1000. Блокировка поставила цикл
+«прочитать, добавить, записать» в очередь, а rename сохранил файл целым. Порядок первых двух строк может меняться от
+запуска к запуску: процессы работали по очереди.
+
+</details>
+
+**4.** Когда Postgres возвращает клиенту ответ «закоммичено»? Откуда взялась лишняя строка в базе?
+
+<details>
+<summary>Ответ</summary>
+
+После того как изменение записано в WAL и журнал попал на диск (`synchronous_commit = on`, по умолчанию). Файлы
+таблиц обновляются позже, а после падения изменения заново выполняются из журнала (`redo`). Лишняя строка — заказ,
+коммит которого в базе случился, но ответ до клиента не дошёл: база его сохранила, а клиент получил ошибку и не
+записал его в список подтверждённых.
+
+</details>
+
+**5.** Из SYS-0.02: какое число выведет `sleep 9 & kill -9 $!; wait $!; echo $?` и почему?
+
+<details>
+<summary>Ответ</summary>
+
+`137`. Код выхода процесса, убитого сигналом, = 128 + номер сигнала; SIGKILL — 9, значит 128 + 9 = 137. Эта команда
+запускалась в SYS-0.02. Сегодняшний `qulash.sh` тоже делает `kill -9 $!; wait $!`, только не показывает код выхода
+(`2>/dev/null`).
+
+</details>
+
+## Домашнее задание
+
+Условия и ответы — в папке урока на GitHub:
+[lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database).
+Код ответов —
+[homework/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database/homework), всё запускает
+`bash homework/javoblar.sh` (нужны `.env` и `docker compose up -d --wait`). Сначала попробуйте сами.
+
+- 🟢 **Легко:** `./qulash.sh qulf 100` — останется ли файл целым? Почему? Если процесс умрёт, держа блокировку,
+  будет ли второй процесс ждать вечно?
+- 🟡 **Средне:** исправьте `-usul json` в Postgres одним `UPDATE`, без чтения в Go (`jsonb_set`, `||`,
+  `jsonb_array_length`).
+- 🟠 **Сложно:** исправьте, не меняя Go-код «прочитать-добавить-записать»: возьмите чтение и запись в одну
+  транзакцию и заблокируйте строку через `SELECT … FOR UPDATE`.
+- 🔴 **Гуру:** добавьте в способ `rename` `fsync` временного файла и `fsync` папки после rename. Насколько
+  замедлилось? Почему нужна и папка?
+
+<details>
+<summary>Ответ</summary>
+
+Наш запуск:
+
+```console
+$ bash homework/javoblar.sh
+== Oson: qulf usulini 100 marta kill -9
+100 marta kill -9 (qulf): fayl butun 100, boʻm-boʻsh 0, yarim yozilgan 0
+== Oʻrta: Postgres, usul sql
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Qiyin: Postgres, usul forupdate
+B: 1000 ta yozdim
+A: 1000 ta yozdim
+json ustunida: 2000 ta · buyurtmalar jadvalida: 0 ta (A: 0, B: 0)
+== Guru: qulf (fsync'siz) va qulf + fsync, ikki jarayon × 1000
+fayl: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 2443 ms
+fsync: faylda: 2000 ta buyurtma (A: 1000, B: 1000), 9777 ms
+```
+
+🟢 100/100 целы. Способ `qulf` тоже пишет через rename (строки 115–118), поэтому куда бы ни попал kill, на месте лежит
+целый файл: либо старый, либо новый. Вечно никто не ждёт: `flock` привязан к открытому файлу процесса, когда процесс
+умирает, ядро закрывает его дескрипторы, и блокировка снимается сама. В схеме «есть ли lock-файл?» блокировка бы
+осталась.
+
+🟡 Чтение, добавление и запись — внутри одного `UPDATE`, Go ничего не читает (из `homework/baza-tuzat/main.go`):
+
+```go
+// sqlUsul: Go hech narsani oʻqimaydi. Oʻqish, qoʻshish va yozish bitta UPDATE ichida:
+// Postgres qatorni yangilash paytida qulflaydi, ikkinchi UPDATE birinchisi tugashini kutadi
+// va yangi qiymatning ustiga qoʻshadi (Read Committed, PostgreSQL docs 13.2.1).
+func sqlUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE ombor
+		SET doc = jsonb_set(doc, '{buyurtmalar}', doc->'buyurtmalar' || jsonb_build_object(
+			'id', jsonb_array_length(doc->'buyurtmalar') + 1, 'mijoz', $1::text, 'summa', 25000))
+		WHERE id = 1`, mijoz)
+	return err
+}
+```
+
+`doc->'buyurtmalar'` — массив внутри JSON, `||` добавляет к нему новый объект, `jsonb_array_length(…) + 1` — новый
+номер, `jsonb_set` кладёт обновлённый массив обратно в `doc`. Postgres блокирует обновляемую строку: второй `UPDATE`
+ждёт и добавляет поверх новой версии строки. Результат: `json ustunida: 2000 ta`.
+
+🟠 Код на Go тот же, но внутри одной транзакции: `Begin` её начинает, `Commit` подтверждает:
+
+```go
+// forUpdateUsul: Go kodi oʻzgarmaydi, lekin oʻqish va yozish bitta transaction'da,
+// SELECT … FOR UPDATE esa qatorni commit'gacha qulflaydi — ikkinchi jarayon kutadi.
+func forUpdateUsul(ctx context.Context, db *pgx.Conn, mijoz string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // commit'dan keyin hech narsa qilmaydi
+	var b []byte
+	if err := tx.QueryRow(ctx, `SELECT doc FROM ombor WHERE id = 1 FOR UPDATE`).Scan(&b); err != nil {
+		return err
+	}
+	var o Ombor
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	o.Buyurtmalar = append(o.Buyurtmalar, Buyurtma{ID: len(o.Buyurtmalar) + 1, Mijoz: mijoz, Summa: 25000})
+	if b, err = json.Marshal(o); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ombor SET doc = $1 WHERE id = 1`, b); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+`FOR UPDATE` блокирует прочитанную строку до коммита. `SELECT … FOR UPDATE` второго процесса ждёт, пока первый не
+закоммитит, а потом читает *новый* JSON → 2000. `defer tx.Rollback(ctx)` — при ошибке транзакция отменяется, а после
+коммита ничего не делает. Это *explicit locking* из DDIA. Lost update и четыре его решения: [DB-5.02](/lab/youtube/databases#db-5-02).
+
+🔴 `homework/fsync/main.go` — копия `fayl/main.go`, отличается только `yozRename`:
+
+```go
+// yozRename: avval yonidagi vaqtinchalik faylga yozadi, keyin rename bilan almashtiradi.
+// rename atomik: oʻquvchi eski yoki yangi faylni koʻradi, yarimini emas.
+func yozRename(fayl string, o Ombor) error {
+	b, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", fayl, os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil { // 1) maʼlumot diskda
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, fayl); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(fayl)) // 2) yangi nom ham diskda: papkani fsync qilamiz
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+```
+
+`f.Sync()` — данные временного файла на диске. `d.Sync()` — сама папка: имя файла хранится в записи папки, и rename
+меняет именно эту запись. fsync(2): *"Calling fsync() does not necessarily ensure that the entry in the directory
+containing the file has also reached disk. For that an explicit fsync() on a file descriptor for the directory is also
+needed."* Если без fsync папки отключится питание, rename может пропасть.
+
+Цена: у нас 2,4 с → 9,8 с (~в 4 раза). В README курса два измерения: 6,1 → 15,4 с и 7,0 → 13,6 с (~в 2–2,5 раза).
+Точное число зависит от диска и загрузки компьютера, но направление одно: два fsync на каждый заказ замедляют в
+несколько раз. Для сравнения: Postgres записал 2000 `INSERT` с WAL flush на каждом коммите за 1,9 с (исследование
+курса). Это не сравнение в равных условиях: в файле каждый раз весь файл и два fsync, в Postgres — маленькая запись в
+журнал. Причина отдельно не измерялась.
+
+</details>
+
+## Источники
+
+- CMU 15-445/645 Fall 2024, Lecture 01 (A. Pavlo), слайды 10–14 «Flat file strawman»:
+  [01-relationalmodel.pdf](https://15445.courses.cs.cmu.edu/fall2024/slides/01-relationalmodel.pdf)
+- M. Kleppmann, *Designing Data-Intensive Applications*, глава 7 «Transactions», «Preventing Lost Updates»:
+  [dataintensive.net](https://dataintensive.net/)
+- Go: [os.WriteFile (go1.26.8, file.go:927–931)](https://github.com/golang/go/blob/go1.26.8/src/os/file.go#L927-L931) ·
+  [os.Rename](https://pkg.go.dev/os#Rename) · [syscall.Flock](https://pkg.go.dev/syscall#Flock)
+- Linux: [open(2) O_TRUNC](https://man7.org/linux/man-pages/man2/open.2.html) ·
+  [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) ·
+  [flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html) ·
+  [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html) ·
+  [signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html)
+- PostgreSQL 18: [WAL Introduction](https://www.postgresql.org/docs/18/wal-intro.html) ·
+  [synchronous_commit](https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT) ·
+  [Server Shutdown](https://www.postgresql.org/docs/18/server-shutdown.html) ·
+  [Transaction Isolation (Read Committed)](https://www.postgresql.org/docs/18/transaction-iso.html) ·
+  [INSERT](https://www.postgresql.org/docs/18/sql-insert.html) ·
+  [SELECT … FOR UPDATE](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE) ·
+  [jsonb_set](https://www.postgresql.org/docs/18/functions-json.html)
+- SQLite: [Appropriate Uses For SQLite](https://www.sqlite.org/whentouse.html) ·
+  [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html)
+- В других языках: [Node fs flags](https://nodejs.org/api/fs.html#file-system-flags) ·
+  [Python open](https://docs.python.org/3/library/functions.html#open) ·
+  [Python os.replace](https://docs.python.org/3/library/os.html#os.replace) ·
+  [Python fcntl.flock](https://docs.python.org/3/library/fcntl.html#fcntl.flock) ·
+  [PHP file_put_contents](https://www.php.net/manual/en/function.file-put-contents.php) ·
+  [PHP flock](https://www.php.net/manual/en/function.flock.php)
+- pgx: [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)
+- Папка курса и README (все измерения):
+  [lessons/db-01-why-database](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+- Результаты `go1.26.8 linux/amd64` (`CGO_ENABLED=0`), Linux 6.18 (NixOS), ext4 NVMe, Intel Core i5-12450H, Docker
+  Engine 29.8.1, Compose 5.4.0, `postgres:18-alpine` (PostgreSQL 18.7), pgx v5.13.0, 2026-11-26. Результаты видео — из
+  README курса (тот же день, цитата, заново не запускались). Выводы терминала на этой странице: тот же день,
+  22:30–22:45, load average 1–1,7. «Один заказ 70/71 байт» и «всего ~142 МБ» — наш подсчёт; 1,9 с у Postgres и
+  объяснение «почему теряется половина» — из исследования курса, заново не измерялись.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/db-01-why-database)
+
+---
+
+Следующий урок: [DB-1.02](/lab/youtube/databases#db-1-02) → · [Все уроки](/lab/youtube/databases)
+
+</div>
