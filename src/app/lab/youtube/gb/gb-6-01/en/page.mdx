@@ -1,0 +1,788 @@
+---
+title: "Middleware: wrap a handler to add logging and recovery"
+date: "2026/11/27"
+description: "Build net/http middleware for access logs, panic recovery and request IDs, and verify why their order matters."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-01) · [Русский](/lab/youtube/gb/gb-6-01/ru) · **English**  
+Lesson GB-6.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-01-middleware)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+A handler panics before writing a response. The client receives a closed connection, and the server log makes the request hard to identify. How can every request get an ID, a status and an access log entry?
+
+**The one idea:** middleware takes an `http.Handler` and returns another `http.Handler`. Its returned function remembers `next`; code before and after `next.ServeHTTP` surrounds the wrapped handler. Code after `next` runs only if that call returns normally.
+
+By the end, you will:
+
+- write a handler wrapper and record method, path, status and duration;
+- recover a handler panic into a 500 JSON response before the response starts;
+- add a request ID and build the chain in the order that preserves the access log.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| middleware | a function that adds work around another handler | middleware |
+| panic recovery | stopping a panic in the current request and producing a controlled response | panic recovery |
+| chain order | which wrapper runs before which handler, and where normal execution resumes | middleware chain |
+
+Two helper terms appear when needed: **embedding** is a field declared using its type without a separate name. A **request ID** identifies one request in the response and server log.
+
+## Before you start
+
+The track builds on [GB-5.10 · API tests with Postgres](/lab/youtube/gb/gb-5-10/en), [GB-4.04 · http.Server and ServeMux](/lab/youtube/gb/gb-4-04/en), and [GB-2.09 · defer, panic, recover and closures](/lab/youtube/gb/gb-2-09/en).
+
+We also use [GB-4.08 · catalog API](/lab/youtube/gb/gb-4-08/en), [GB-4.03 · Handler and ResponseWriter](/lab/youtube/gb/gb-4-03/en), [GB-4.01 · HTTP status codes](/lab/youtube/gb/gb-4-01/en). Requests and output: [GB-4.07 · goroutines](/lab/youtube/gb/gb-4-07/en), [GB-4.06 · JSON responses](/lab/youtube/gb/gb-4-06/en). Timing and the earlier review question: [GB-5.05 · time.Now and time.Since](/lab/youtube/gb/gb-5-05/en), and [GB-5.08 · conditional UPDATE](/lab/youtube/gb/gb-5-08/en).
+
+For the Go syntax: [GB-1.02 · zero values](/lab/youtube/gb/gb-1-02/en), [GB-1.04 · formatting](/lab/youtube/gb/gb-1-04/en), [GB-1.05 · if and conditions](/lab/youtube/gb/gb-1-05/en), [GB-1.07 · functions](/lab/youtube/gb/gb-1-07/en), [GB-1.08 · tests](/lab/youtube/gb/gb-1-08/en). Types: [GB-2.02 · map](/lab/youtube/gb/gb-2-02/en), [GB-2.03 · struct](/lab/youtube/gb/gb-2-03/en), [GB-2.04 · pointers](/lab/youtube/gb/gb-2-04/en), [GB-2.05 · methods](/lab/youtube/gb/gb-2-05/en). Packages and contracts: [GB-2.06 · packages](/lab/youtube/gb/gb-2-06/en), [GB-2.07 · interfaces and Write](/lab/youtube/gb/gb-2-07/en), and [GB-2.08 · error values](/lab/youtube/gb/gb-2-08/en).
+
+Use the course folder `lessons/gb-6-01-middleware/`: this is a multi-file server, so the Playground is insufficient. The store is the in-memory catalog from GB-4.08, loaded from `bozor.json`. Middleware needs only an `http.Handler`; no database is required here.
+
+The starter contains `cmd/api/`, tests, `TASK.md`, and `solution/`. Historical steps are in `_video/`. The runner copies the lesson into temporary folders, selects each middleware version, inserts the temporary panic where needed, builds the server, runs curl, and stops the server. It uses port 8765: check that it is free first.
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+bash _video/run.sh
+```
+
+`export` selects Go 1.27.4 and disables cgo for this terminal. `bash` runs the demonstration script. Its curl helper adds `-sS`: hide the progress meter, show errors. `-i` includes response headers; `-s` alone hides the progress meter and errors. The blocks below retain the flags actually executed. Dates, IDs, client ports and durations vary. Server logs are fresh excerpts; `…` marks omitted stack frames, never omitted console output. The runner's `[exit N]` annotations are described in prose.
+
+**Recall from GB-5.10:** two packages rebuild the same `public` schema while their tests run in parallel. What happens? **A)** always passes · **B)** intermittent failures · **C)** always fails.
+
+<details>
+<summary>Answer</summary>
+
+**B.** One package can remove tables another package is using. Give each test its own schema. Here we isolate HTTP wrapper behaviour, without Postgres.
+
+</details>
+
+## A panic before the response
+
+For the demonstration only, insert this after `pathID` succeeds in `getProduct` in `cmd/api/handlers.go`. `id == 13` selects the test request; `panic` interrupts normal execution. The runner does this in a copy.
+
+```go
+	if id == 13 { // vaqtincha: bug oʻrnida
+		panic("sinov: 13-mahsulotda bug")
+	}
+```
+
+Without our recovery layer, `net/http` recovers a panic from `ServeHTTP`, writes a **stack trace** showing the active function calls, and closes an HTTP/1 connection. HTTP/2 resets the stream. This does not mean the entire server process stops. See the [Handler contract](https://pkg.go.dev/net/http#Handler).
+
+Predict `/products/13`, then `/products/1`: **A)** 500 JSON, then a product · **B)** empty reply, then a product · **C)** both connections fail.
+
+<details>
+<summary>Answer</summary>
+
+**B.** There is no application recovery yet. The server handles the failed request, but it does not invent our JSON error response. **A** assumes that recovery already writes it; **C** confuses the active request with the server process.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/products/13
+curl: (52) Empty reply from server
+```
+
+```console
+$ curl -sS -s localhost:8765/products/1
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+The first curl exits with code 52: “Empty reply from server”. The second succeeds. `olma` means “apple”; price `1200000` is in tiyin, and `stock` is 40 units. Fresh server log, shortened:
+
+```text
+2026/11/27 22:04:40 http: panic serving [::1]:53774: sinov: 13-mahsulotda bug
+goroutine 18 [running]:
+net/http.(*conn).serve.func1()
+…
+main.(*api).getProduct(…)
+…
+net/http.(*ServeMux).ServeHTTP(…)
+…
+```
+
+The standard logger adds the local date and time. `[::1]:53774` is the IPv6 loopback client address and its temporary port. `goroutine 18 [running]` identifies the running goroutine. `Server.Serve` starts a service goroutine per connection. `main.(*api).getProduct` is the handler; `ServeMux.ServeHTTP` called it. These numbers are from this run.
+
+## The middleware shape and a closure
+
+We need the same request logging around every route. This first version is the complete `_video/v1-log/middleware.go` file. To inspect it manually, use it as `cmd/api/middleware.go` in a copy of the course folder. The runner already makes that copy.
+
+```go filename="_video/v1-log/middleware.go" showLineNumbers
+package main
+
+// _video/v1-log: birinchi logRequests — status hali yoʻq (video: shakl-kod).
+
+import (
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func newHandler(st *store.Store) http.Handler {
+	return logRequests(newMux(st))
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %q %s", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1, 3 | `package main`, `// …` | joins the executable's package; the comment names the demonstration step |
+| 5–11 | `import (…)` | imports logging, HTTP, time and the existing internal store package |
+| 13–15 | `newHandler(st *store.Store)` | receives the store pointer, builds a mux, returns the wrapped handler |
+| 17 | `func logRequests(next http.Handler) http.Handler` | receives the wrapped handler as `next`; returns a handler |
+| 18 | `return http.HandlerFunc(func(…) {` | converts the anonymous function to `HandlerFunc`, whose `ServeHTTP` method satisfies `http.Handler`; `w` writes the response and `r` points to the request |
+| 19 | `start := time.Now()` | creates a local variable holding this request's start time |
+| 20 | `next.ServeHTTP(w, r)` | runs the wrapped handler synchronously, with this writer and request |
+| 21 | `log.Printf(…)` | writes method (`%s`), quoted path (`%q`) and elapsed duration (`%s`); `time.Since(start)` measures the interval |
+| 22–23 | `})`, `}` | closes the anonymous function, conversion call and outer function |
+
+The anonymous function is a **closure**: it keeps access to `next` after `logRequests` returns. Building a wrapper and serving a request happen at different times.
+
+| Moment | State | Action |
+|---|---|---|
+| server construction | `next = mux` | `logRequests(mux)` returns a handler once |
+| first request | a new local `start` | returned handler runs `start → next → log` |
+| next request | another local `start`, same `next` | returned handler runs again |
+
+`newServer` assigns `Handler: newHandler(st)` in `cmd/api/main.go`. Merely defining middleware does not connect it to the server.
+
+Predict the log for `/products/99`, which returns 404: **A)** method, path, duration · **B)** those plus 404 · **C)** no entry because it is an error.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The format string has only three fields. `ResponseWriter` has no method for asking which status was sent. **B** requires recording it ourselves; **C** is wrong because a 404 handler returns normally.
+
+</details>
+
+```console
+$ curl -sS -s localhost:8765/products/99
+{"error":{"code":"not_found","message":"mahsulot 99: mahsulot topilmadi"}}
+```
+
+Fresh server log:
+
+```text
+2026/11/27 22:04:41 GET "/products/1" 32.281µs
+2026/11/27 22:04:41 GET "/products/99" 236.985µs
+```
+
+`mahsulot topilmadi` means “product not found”. `µs` means microseconds. The log records the request, but still cannot distinguish a 200 response from a 404 response by status.
+
+## Recording status and the zero trap
+
+The video starts with this simpler writer wrapper:
+
+```go
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	rec.status = code
+	rec.ResponseWriter.WriteHeader(code)
+}
+```
+
+`http.ResponseWriter` is an embedded field. Its field name is `ResponseWriter`; methods such as `Header` and `Write` are promoted to the outer type. Our own `WriteHeader` takes precedence. Its pointer receiver `rec *statusRecorder` modifies the same struct, so we pass `&statusRecorder{…}`. The resulting `*statusRecorder` satisfies `http.ResponseWriter`.
+
+`rec.status = code` remembers the status. `rec.ResponseWriter.WriteHeader(code)` calls the inner writer's method and sends the status onward. Calling `rec.WriteHeader(code)` there would recurse into the same method.
+
+The first attempt leaves `status` at its zero value:
+
+```go
+rec := &statusRecorder{ResponseWriter: w}
+next.ServeHTTP(rec, r)
+log.Printf("%s %q %d %s", r.Method, r.URL.Path, rec.status, time.Since(start))
+```
+
+Predict the access-log status for `/health`, whose handler only calls `Fprintln`: **A)** 200 · **B)** 0 · **C)** 404.
+
+<details>
+<summary>Answer</summary>
+
+**B: 0 in this historical wrapper.** The promoted `Write` calls the inner writer. That writer supplies an implicit 200; it never calls our outer `WriteHeader`. **A** is the client's status, but not the saved field; **C** would mean a missing route.
+
+</details>
+
+```console
+$ curl -sS -s localhost:8765/health
+ok
+```
+
+Fresh logs from `_video/v3-nol`:
+
+```text
+2026/11/27 22:04:42 GET "/health" 0 14.466µs
+2026/11/27 22:04:42 GET "/products/99" 404 155.427µs
+```
+
+| Step in the simple wrapper | `rec.status` | Client response |
+|---|---|---|
+| create `rec` | 0 | not started |
+| `/health` calls promoted `Write` | still 0 | inner writer selects 200 |
+| `/products/99` calls our `WriteHeader(404)` | 404 | inner writer sends 404 |
+
+The video's fix sets the expected default explicitly:
+
+```go
+rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+```
+
+Fresh logs from `_video/v2-status` confirm 200 for `/health`, and 404 both for a missing product and an unknown route:
+
+```text
+2026/11/27 22:04:42 GET "/products/99" 404 115.584µs
+2026/11/27 22:04:42 GET "/health" 200 5.34µs
+2026/11/27 22:04:42 GET "/narsalar" 404 20.211µs
+```
+
+The folder version shown below also remembers whether a response has started, including the implicit 200 from `Write`. The video's simpler recorder overwrites its field on every `WriteHeader`. A real HTTP rerun of `WriteHeader(201); WriteHeader(500)` sent 201 but logged 500; `Write("ok\n"); WriteHeader(500)` sent 200 but logged 500. The folder now logs 201 and 200 respectively, preserving the first status. It still forwards duplicate calls so `net/http` can issue its usual warning. The historical video variants retain their simpler code.
+
+## Panic recovery and the wrong order
+
+This is the recovery function from `_video/v4-tartib`, before the folder's additional guards:
+
+```go
+func recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("panic: %v\n%s", v, debug.Stack())
+				writeError(w, http.StatusInternalServerError, apiError{Code: "internal", Message: "ichki xato"})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+Line 1 keeps the middleware shape. Line 2 returns the request handler. Line 3 registers a deferred anonymous function. Line 4 calls `recover` directly inside it and assigns the panic value to `v`; without a panic, `v` is `nil`. Lines 5–6 log the value and write a generic 500 JSON error. `%v` formats the panic value, `\n` inserts a newline, and `debug.Stack()` from `runtime/debug` returns this goroutine's stack trace. `ichki xato` means “internal error”. The final `}()` calls the deferred function when unwinding; `next.ServeHTTP` runs the inner handler.
+
+The panic text stays in the server log. The client gets the existing `apiError` shape, not the stack. Recovery applies to the current goroutine: it cannot catch a panic in a goroutine started by the handler.
+
+First try the wrong order:
+
+```go
+return recoverPanic(logRequests(newMux(st)))
+```
+
+`recoverPanic` is outside `logRequests`. The logger writes its access entry after `next` returns normally. Predict `/products/13`: **A)** panic trace and access entry · **B)** panic trace only · **C)** access entry only.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Panic unwinds through the logger before the outer recovery stops it. Execution does not return to the line after `next` inside the unwound logger. **A** needs recovery inside logging; **C** ignores our explicit panic log.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/products/13
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 17:04:43 GMT
+Content-Length: 53
+
+{"error":{"code":"internal","message":"ichki xato"}}
+```
+
+Fresh shortened log, with no access entry:
+
+```text
+2026/11/27 22:04:43 panic: sinov: 13-mahsulotda bug
+goroutine 21 [running]:
+…
+main.logRequests.func1(…)
+…
+main.recoverPanic.func1(…)
+…
+```
+
+| Order | Panic path | Code after the logger's `next` |
+|---|---|---|
+| `recoverPanic(logRequests(mux))` | handler → mux → logger → recovery | skipped |
+| `logRequests(recoverPanic(mux))` | handler → mux → recovery; recovery returns to logger | runs, records 500 |
+
+`main.logRequests.func1` is the anonymous function created inside `logRequests`. A stack trace shows active calls; read the caller relationship from the inner frame toward the outer one.
+
+## One request ID across the response and logs
+
+To find both entries for one failed request, add an ID before running the other middleware:
+
+```go
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", rand.Text())
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+Line 3 generates a new value with `crypto/rand.Text()` and sets the response header. Line 4 calls `next`. In Go 1.27.4 the generated text has 26 base32 characters; the API guarantees at least 128 bits of randomness and permits longer output in future versions. `Text` was added in Go 1.24. This is a correlation ID, not an authentication credential. See [rand.Text](https://pkg.go.dev/crypto/rand#Text).
+
+The server generates the ID instead of trusting an incoming client value. Both logging functions read `w.Header().Get("X-Request-Id")`. The wrapper's promoted `Header()` accesses the same header map as the inner writer.
+
+| Stage | Header map | Use |
+|---|---|---|
+| `requestID` | sets `X-Request-Id` | creates the request's ID |
+| `recoverPanic` | reads the same map | prefixes the panic entry |
+| `logRequests` | reads the same map | prefixes the access entry |
+| response | sends that header | client can report the same ID |
+
+Keep the header stable in downstream handlers. Passing the ID into handler logs through `context` is taught in [GB-8.02 · structured logs and request IDs](/lab/youtube/gb#gb-8-02).
+
+## Build the chain, then serve requests
+
+```go
+func newHandler(st *store.Store) http.Handler {
+	return requestID(logRequests(recoverPanic(newMux(st))))
+}
+```
+
+During construction, Go evaluates the inner calls before invoking the outer functions. Predict which runs first during construction and during a request: **A)** `requestID` / its handler · **B)** `newMux` / the handler returned by `requestID` · **C)** `newMux` / mux.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Construction is `newMux → recoverPanic → logRequests → requestID`. A request enters from the outside: `requestID → logRequests → recoverPanic → mux → route handler`. **A** mixes construction with serving; **C** skips the wrappers.
+
+</details>
+
+For a panic before any response bytes, recovery writes 500, returns normally to logging, and the logger records 500. Fresh final-variant request:
+
+```console
+$ curl -sS -i localhost:8765/products/13
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/json
+X-Request-Id: MAOQBQTEGOUTSSQMUITMOFMQJG
+Date: Fri, 27 Nov 2026 17:10:53 GMT
+Content-Length: 53
+
+{"error":{"code":"internal","message":"ichki xato"}}
+```
+
+The `Date` header uses GMT; the logger uses local time. `Content-Length: 53` counts body bytes. The ID matches in both fresh log entries; the stack excerpt is shortened:
+
+```text
+2026/11/27 22:10:53 MAOQBQTEGOUTSSQMUITMOFMQJG panic: sinov: 13-mahsulotda bug
+…
+main.recoverPanic.func1(…)
+…
+main.logRequests.func1(…)
+…
+main.requestID.func1(…)
+…
+2026/11/27 22:10:53 MAOQBQTEGOUTSSQMUITMOFMQJG GET "/products/13" 500 303.086µs
+```
+
+The temporary `id == 13` panic is removed from the starter and solution. An ordinary `/products/13` then returns a normal missing-product response. To repeat the panic experiment, use the runner.
+
+The following is the complete current `cmd/api/middleware.go`, including the folder guards and homework placeholders. Keep the surrounding course files; `main.go` already connects `newHandler`.
+
+```go filename="cmd/api/middleware.go" showLineNumbers
+package main
+
+// Middleware (GB-6.01). Har biri bitta shaklda: http.Handler oladi (next) va uni oʻragan yangi
+// http.Handler qaytaradi. Qaytgan handler oʻz ishini qiladi va next.ServeHTTP'ni chaqiradi:
+// chaqiruvdan oldingi kod soʻrov handler'ga yetguncha, keyingi kod javob yozilgandan keyin ishlaydi.
+
+import (
+	"crypto/rand"
+	"log"
+	"net/http"
+	"runtime/debug"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// newHandler — server'ga beriladigan butun zanjir. Tashqaridan ichkariga:
+// requestID → logRequests → recoverPanic → mux → handler.
+// Tartib muhim: recoverPanic logRequests'ning ichida boʻlsin, aks holda panic boʻlgan soʻrov
+// log'ga tushmaydi (panic logRequests'ning log qatoridan oʻtib ketadi).
+func newHandler(st *store.Store) http.Handler {
+	// VAZIFA (TASK.md, 1-qadam): requireJSON'ni shu zanjirga qoʻshing.
+	return requestID(logRequests(recoverPanic(newMux(st))))
+}
+
+// requestID har soʻrovga tasodifiy ID beradi va uni javobning X-Request-Id sarlavhasiga yozadi.
+// Mijoz xato haqida shu ID bilan xabar beradi, biz log'dan aynan shu soʻrovni topamiz.
+// Mijoz yuborgan X-Request-Id'ga ishonmaymiz: ID'ni har doim server oʻzi yasaydi.
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", rand.Text())
+		next.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder — ResponseWriter'ni oʻrab, handler yozgan status kodni eslab qoladi.
+// http.ResponseWriter maydon nomisiz (embedding): Header ichkaridagi writer'niki.
+// Birinchi yakuniy status esda qoladi: WriteHeader orqali yoki Write'dagi yashirin 200.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	if rec.wroteHeader {
+		// net/http ortiqcha WriteHeader haqida oʻzi ogohlantiradi; status oʻzgarmaydi.
+		rec.ResponseWriter.WriteHeader(code)
+		return
+	}
+	rec.ResponseWriter.WriteHeader(code)
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		return // 1xx vaqtinchalik javob; yakuniy status hali keladi.
+	}
+	rec.status = code
+	rec.wroteHeader = true
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if !rec.wroteHeader {
+		rec.status = http.StatusOK
+		rec.wroteHeader = true
+	}
+	return rec.ResponseWriter.Write(b) // ichki Write 200 va Content-Type'ni oʻzi tanlaydi.
+}
+
+// Unwrap ichkaridagi asl writer'ni qaytaradi: http.ResponseController (Flush va boshqalar)
+// oʻralgan writer orqali ham ishlashi uchun (go doc net/http.NewResponseController).
+func (rec *statusRecorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
+}
+
+// logRequests har soʻrovdan keyin bitta qator yozadi: ID, metod, yoʻl, status, vaqt.
+// status 200'dan boshlanadi: handler WriteHeader'ni chaqirmay Write qilsa, javob 200 boʻladi (GB-4.03),
+// Write birinchi yashirin 200'ni ham eslab qoladi (videodagi soddaroq variantdan farqi).
+// Yoʻl %q bilan: mijoz yoʻlga yangi qator (%0A) yashirib, log'ga soxta qator qoʻsha olmaydi.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Printf("%s %s %q %d %s", w.Header().Get("X-Request-Id"),
+			r.Method, r.URL.Path, rec.status, time.Since(start))
+	})
+}
+
+// recoverPanic — GB-2.09'dagi safely, har soʻrov uchun: handler'dagi panic'ni toʻxtatadi,
+// stack'ni log'ga yozadi va mijozga 500 + bizning JSON xato shaklini qaytaradi.
+// Videodagidan ikki farq (README, «recoverPanic: videodan tashqari ikki himoya»):
+//   - http.ErrAbortHandler — "javobni ataylab uz" degan panic (go doc net/http.ErrAbortHandler):
+//     uni toʻxtatmaymiz, net/http'ning oʻziga qaytaramiz;
+//   - handler javobni yozishni boshlagan boʻlsa (status yoki body ketgan), 500'ni yuborib boʻlmaydi:
+//     yarim javob oxiriga JSON qoʻshilib qoladi. Shunda panic'ni log'ga yozib, javobni ErrAbortHandler
+//     bilan uzamiz: mijoz buzuq 200 emas, uzilgan javob oladi. Bu holda logRequests qatori yozilmaydi,
+//     panic qatori esa ID bilan logda bor.
+//
+// Eslatma: handler oʻzi ishga tushirgan goroutine'dagi panic'ni bu middleware ushlamaydi (u boshqa
+// goroutine'ning stack'ida; recover faqat panic qilgan goroutine'da ishlaydi) — bunday panic butun serverni yiqitadi.
+func recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &startWriter{ResponseWriter: w}
+		defer func() {
+			if v := recover(); v != nil {
+				if v == http.ErrAbortHandler {
+					panic(v)
+				}
+				log.Printf("%s panic: %v\n%s", w.Header().Get("X-Request-Id"), v, debug.Stack())
+				if sw.started {
+					panic(http.ErrAbortHandler)
+				}
+				writeError(w, http.StatusInternalServerError, apiError{Code: "internal", Message: "ichki xato"})
+			}
+		}()
+		next.ServeHTTP(sw, r)
+	})
+}
+
+// startWriter javob boshlanganini (WriteHeader yoki Write chaqirilganini) eslab qoladi: recoverPanic uchun.
+type startWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (sw *startWriter) WriteHeader(code int) {
+	sw.started = true
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *startWriter) Write(b []byte) (int, error) {
+	sw.started = true
+	return sw.ResponseWriter.Write(b)
+}
+
+func (sw *startWriter) Unwrap() http.ResponseWriter {
+	return sw.ResponseWriter
+}
+
+// requireJSON — VAZIFA (TASK.md, 1-qadam): POST soʻrovida Content-Type application/json
+// boʻlmasa — 415 va bizning xato shaklimiz. Hozircha hech narsa tekshirmaydi.
+func requireJSON(next http.Handler) http.Handler {
+	return next
+}
+
+// muxErrors — 🟡 ixtiyoriy (TASK.md, 2-qadam): mux'ning oʻz 404/405 javoblarini JSON qilish.
+// Hozircha mux'ni oʻzgarishsiz qaytaradi.
+func muxErrors(mux *http.ServeMux) http.Handler {
+	return mux
+}
+```
+
+Only the additions to the earlier examples need explanation:
+
+| Lines | What changes |
+|---|---|
+| 8, 11 | import `crypto/rand` and `runtime/debug` for IDs and stack traces |
+| 21–34 | connect the full chain; set the ID before `next` |
+| 39–64 | `wroteHeader` is a boolean recording the first final status. `WriteHeader` forwards but does not replace an existing status. `Write` records an implicit 200, then delegates directly so content detection still works |
+| 52–54 | 100–199 are informational responses, so they do not finish status recording; 101 switches protocols and is treated as committed |
+| 69–70 | `Unwrap` exposes the inner writer to `http.NewResponseController` |
+| 79–83 | create a fresh recorder per request, pass it to `next`, log ID, method, quoted path, status and elapsed time |
+| 101–114 | `sw` is a `startWriter`; `defer` recovers, preserves `ErrAbortHandler`, logs the panic, checks whether writing started, then writes 500 only when possible |
+| 119–135 | `started` begins as `false`; `WriteHeader` and `Write` set it to `true` and delegate. `[]byte`, `(int, error)` and the returned pair follow the writer contract |
+| 140–147 | `requireJSON` and `muxErrors` currently return their inputs unchanged; implementing and connecting them is the task |
+
+`http.ErrAbortHandler` is the special panic value that tells `net/http` to abort the response without another stack log. If a response already started, a new 500 cannot replace its status or body. The folder logs the panic and aborts instead of appending error JSON to a partial response. On that path, and on a deliberate abort, the access-log line is skipped. The normal 500-and-access-log result above applies to a panic before the response starts.
+
+`Unwrap` supports `ResponseController` operations such as flushing; embedding the `ResponseWriter` interface does not automatically preserve optional interfaces such as `http.Flusher`.
+
+## Going deeper (optional): one path, one log line
+
+A client controls the URL path. `%0A` decodes to a newline in `r.URL.Path`; `%20` is a space. Predict a logger using `%s`: **A)** a second physical log line · **B)** an escaped `\n` · **C)** the server rejects the URL before logging.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `%s` writes the decoded text directly. **B** describes `%q`; **C** confuses a route not matching with a request never reaching the logger.
+
+</details>
+
+```console
+$ curl -sS -s localhost:8765/products/1%0A2026/11/27%2021:00:00%20soxta-qator
+404 page not found
+```
+
+The mux returns 404. With only `%q` changed to `%s` in the final logger (`_video/v7-s`), the fresh log contains a forged second line:
+
+```text
+2026/11/27 22:10:54 V66GVMVEMUTD6H3B7K2UJLCTEX GET /products/1
+2026/11/27 21:00:00 soxta-qator 404 20.629µs
+```
+
+With the folder's `%q`, the fresh log keeps the newline as `\n` inside quotes:
+
+```text
+2026/11/27 22:10:53 XRXTRRQ7JCM7YONKYJUTOS3B4P GET "/products/1\n2026/11/27 21:00:00 soxta-qator" 404 33.162µs
+```
+
+This is **log injection**: input creates text that looks like a separate log entry. OWASP, the open web security project, recommends encoding or sanitizing line breaks in untrusted log input. `%q` protects this path field; it does not protect other fields automatically. If a panic value contains client text, format `fmt.Sprint(v)` with `%q` as well.
+
+The video's timings below are quoted from `lesson.yaml`; the second column is the fresh run on this page. They are individual request durations, not a benchmark of wrapper overhead.
+
+| Request / variant | Video, µs | This run, µs | This run / video |
+|---|---|---|---|
+| v1 `/products/1` | 18.905 | 32.281 | 1.71× |
+| v1 `/products/99` | 142.38 | 236.985 | 1.66× |
+| v3 `/health`, logged 0 | 12.269 | 14.466 | 1.18× |
+| v2 `/health`, logged 200 | 5.993 | 5.34 | 0.89× |
+| final panic, logged 500 | 225.507 | 303.086 | 1.34× |
+| injected path, `%s` | 13.918 | 20.629 | 1.48× |
+| injected path, `%q` | 33.138 | 33.162 | 1.00× |
+
+Load and scheduling change the timings. Ratios show their variation: these reruns range from 0.89× to 1.71× the recorded values. They do not establish a performance ranking for the wrappers. The important stable results are the status, matching IDs, presence of the access entry and number of physical log lines. README timings also differ from the video's frozen scene values.
+
+## Common mistakes
+
+**Assuming a writer's status field follows the network automatically.** The zero-status run above is a silent logging bug: HTTP succeeds with 200, but the saved field is 0. Initialize the default and record the first explicit or implicit status, as in the full folder file. Repeated `WriteHeader` does not change the first status already sent.
+
+**Putting recovery outside logging.** The wrong-order experiment above returns 500 but loses the access entry. Put `recoverPanic` inside `logRequests` so normal execution returns to the logger.
+
+**Calling the request header field as a method.** This complete extra program is outside the course folder. Save it as `header-error.go` in a separate scratch folder:
+
+```go
+package main
+
+import "net/http"
+
+func main() {
+	r, _ := http.NewRequest("GET", "http://localhost/health", nil)
+	_ = r.Header().Get("Content-Type")
+}
+```
+
+```console
+$ go run header-error.go
+# command-line-arguments
+./header-error.go:7:6: invalid operation: cannot call r.Header (variable of map type http.Header): http.Header is not a function
+```
+
+`./header-error.go:7:6` identifies file, line and column. “Cannot call” means that `r.Header` is a map field, not a function. `# command-line-arguments` labels the temporary package built from the named file. Fix line 7 to `_ = r.Header.Get("Content-Type")`. `w.Header()` is a method on a response writer; `r.Header` is a request field. `_` discards a value; the successful request construction here does not require using its error result.
+
+**Writing an error, then continuing.** In `requireJSON`, return after writing 415. Otherwise the inner handler also writes a response; the first status stays, and `net/http` can report `superfluous response.WriteHeader call` (“an extra call”). Do not try to repair a response that already started by appending a second JSON object.
+
+## Check yourself
+
+1. What is the middleware signature, and what is `next`?
+
+<details>
+<summary>Answer</summary>
+
+`func(next http.Handler) http.Handler`. `next` is the wrapped handler, kept by the returned closure.
+
+</details>
+
+2. Why is recovery inside logging?
+
+<details>
+<summary>Answer</summary>
+
+It stops the panic before it unwinds the logger. The recovery handler returns normally, so the logger's code after `next` runs. This applies while a 500 response can still be written.
+
+</details>
+
+3. Predict the folder recorder: `WriteHeader(201)`, then `WriteHeader(500)`. Which status reaches the client and the access log?
+
+<details>
+<summary>Answer</summary>
+
+Both show 201. The original video recorder saved the later 500; the folder regression test now checks the actual HTTP response and the log together.
+
+</details>
+
+4. From GB-5.08: two customers compete for the last unit. How many rows does the losing conditional UPDATE change?
+
+<details>
+<summary>Answer</summary>
+
+Zero: the stock condition no longer holds. `RowsAffected() == 0` tells the application the update did not happen; for this known product, stock was insufficient.
+
+</details>
+
+## Homework
+
+Work in the [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-01-middleware), following [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-01-middleware/TASK.md). Leave `tekshiruv_test.go` unchanged.
+
+- 🟢 Implement `requireJSON`: on POST, missing, invalid or non-JSON `Content-Type` produces 415 and `apiError{Code: "unsupported_media_type", …}`, then returns. Accept `application/json; charset=utf-8`. GET, DELETE and valid POST continue to `next`.
+- 🟢 Connect it so the 415 response also receives `X-Request-Id` and an access entry. You can place it inside ID and logging in the main chain, or wrap only `POST /products` and `POST /orders` in `newMux`. A whole-chain check also turns non-JSON `POST /health` or unknown paths into 415 before the mux can produce 405/404; route-level wrapping preserves those routing responses.
+- 🟡 Optional: implement `muxErrors` for mux-generated 404/405 JSON errors, with codes `not_found` and `method_not_allowed`. Keep the 405 `Allow` header and normal routes. The optional test is skipped until this is implemented.
+
+Predict the unmodified starter tests: **A)** all pass · **B)** two task failures · **C)** the middleware does not compile.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The middleware works, but `requireJSON` is still a pass-through. The two failures name the missing rule and connection. **A** assumes the task is already done; **C** confuses an assertion failure with a compile error.
+
+</details>
+
+```console
+$ go test ./...
+--- FAIL: TestVazifaRequireJSON (0.00s)
+    tekshiruv_test.go:33: requireJSON: POST, Content-Type "" → status 204 (soʻrov next'ga oʻtib ketdi), kutilgan 415 (http.StatusUnsupportedMediaType). requireJSON hali yozilmagan boʻlishi mumkin: TASK.md, 1-qadam
+--- FAIL: TestVazifaZanjir (0.00s)
+    tekshiruv_test.go:57: newHandler: POST /products, Content-Type text/plain → 201, kutilgan 415: requireJSON'ni ulang — newHandler zanjiriga yoki newMux'dagi POST route'larga (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.004s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	(cached)
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+FAIL
+```
+
+`FAIL: TestVazifaRequireJSON` names the rule test; line 33 expected 415 but received 204 from its test handler. `TestVazifaZanjir` at line 57 expected the same rejection in the full chain but received 201. Exit status is 1. The rest are existing package checks. Cached results mean those unchanged tests were reused.
+
+```console
+$ go vet ./...
+```
+
+`go vet ./...` prints nothing: there were no findings. `./...` selects the module's packages recursively. Run the tests until the task passes. `cd` changes the current folder; the reference answer can be checked independently:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	(cached)
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	(cached)
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+```
+
+The [reference answer](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-01-middleware/solution) is explained below.
+
+<details>
+<summary>Answer</summary>
+
+`mime.ParseMediaType(r.Header.Get("Content-Type"))` extracts the media type and parameters. Reject a parsing error or a type other than `application/json`, write 415, and return. The reference solution wraps the two POST routes using `mux.Handle(pattern, requireJSON(http.HandlerFunc(handler)))`, inside the existing ID/logging/recovery chain.
+
+For the optional task, `mux.Handler(r)` finds the matching pattern without running the handler. A nonempty pattern follows the ordinary path. For mux errors, `jsonErrorWriter` replaces 404/405 through `writeError` and discards the mux's subsequent text body. Its `Write` reports `len(b), nil` for discarded text. The mux sets `Allow` before `WriteHeader`, so the header survives. `Unwrap` exposes the underlying writer.
+
+</details>
+
+## Sources
+
+- [net/http: Handler](https://pkg.go.dev/net/http#Handler)
+- [net/http: Server.Serve](https://pkg.go.dev/net/http#Server.Serve)
+- [net/http: HandlerFunc](https://pkg.go.dev/net/http#HandlerFunc)
+- [net/http: ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter)
+- [net/http: Header](https://pkg.go.dev/net/http#Header)
+- [net/http: ErrAbortHandler](https://pkg.go.dev/net/http#ErrAbortHandler)
+- [net/http: NewResponseController](https://pkg.go.dev/net/http#NewResponseController)
+- [net/http: ServeMux.Handler](https://pkg.go.dev/net/http#ServeMux.Handler)
+- [net/http: ServeMux.Handle](https://pkg.go.dev/net/http#ServeMux.Handle)
+- [crypto/rand: Text](https://pkg.go.dev/crypto/rand#Text)
+- [Go 1.24: crypto/rand](https://go.dev/doc/go1.24#cryptorandpkgcryptorand)
+- [runtime/debug: Stack](https://pkg.go.dev/runtime/debug#Stack)
+- [log: Printf](https://pkg.go.dev/log#Printf)
+- [log: LstdFlags](https://pkg.go.dev/log#pkg-constants)
+- [mime: ParseMediaType](https://pkg.go.dev/mime#ParseMediaType)
+- [net/url: URL.Path](https://pkg.go.dev/net/url#URL)
+- [Go: Run-time panics](https://go.dev/ref/spec#Run_time_panics)
+- [Go: Handling panics](https://go.dev/ref/spec#Handling_panics)
+- [Go: Function literals](https://go.dev/ref/spec#Function_literals)
+- [Go: Struct types](https://go.dev/ref/spec#Struct_types)
+- [Go: The zero value](https://go.dev/ref/spec#The_zero_value)
+- [Go: Calls](https://go.dev/ref/spec#Calls)
+- [Effective Go: Embedding](https://go.dev/doc/effective_go#embedding)
+- [go: Compile packages and dependencies](https://pkg.go.dev/cmd/go#hdr-Compile_packages_and_dependencies)
+- [PostgreSQL: UPDATE](https://www.postgresql.org/docs/current/sql-update.html)
+- [RFC 9110: 415 Unsupported Media Type](https://www.rfc-editor.org/rfc/rfc9110#name-415-unsupported-media-type)
+- [curl: exit codes](https://curl.se/libcurl/c/libcurl-errors.html)
+- [curl: -i, -s, -S, -d](https://curl.se/docs/manpage.html)
+- [OWASP: Log Injection](https://owasp.org/www-community/attacks/Log_Injection)
+- [OWASP: Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [_video/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-01-middleware/_video)
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, 2026-11-27. All shown commands and fresh measurements were rerun; video numbers are explicitly marked as quotations. All demonstration servers were stopped.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-01-middleware)
+
+---
+
+← Previous lesson: [GB-5.10](/lab/youtube/gb/gb-5-10/en) · Next lesson: [GB-6.02](/lab/youtube/gb/gb-6-02/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

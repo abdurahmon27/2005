@@ -1,0 +1,831 @@
+---
+title: "Единые ошибки API: безопасно для клиента, подробно в логах"
+date: "2026/11/27"
+description: "Преобразуйте ошибки Go в ответы RFC 9457 в одном месте, сохраняйте внутренние детали в логах и связывайте их с ответом по ID запроса."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-02/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-02"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-02"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-02) · **Русский** · [English](/lab/youtube/gb/gb-6-02/en)  
+Урок GB-6.02 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-02) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Клиент передал цену товара строкой. Почему ответ раскрывает `productInput.price of type int64` — внутренний тип Go?
+
+**Главная идея:** у одной ошибки два получателя. Сервер пишет полный текст в лог; `problemFor` выбирает статус и публичное сообщение. ID запроса связывает их.
+
+После урока вы сможете:
+
+- заменить старый формат ошибки на problem details из RFC 9457;
+- распознавать обёрнутые ошибки через `errors.Is` и `errors.As`, не раскрывая внутренний текст в ответе;
+- связать ответ с записями в логе и найти пропущенный `return`;
+- добавить недостающие случаи 422 и 413 и пройти тесты задания.
+
+| Термин | Простое объяснение | Английский термин |
+|---|---|---|
+| публичная ошибка | специально выбранное сообщение, которое разрешено читать клиенту | public error |
+| problem details | стандартный JSON-формат описания ошибки HTTP API | problem details |
+| преобразование ошибки в ответ | одна функция выбирает публичный ответ по значению ошибки | error mapping |
+
+Два вспомогательных понятия: несколько `%w` сохраняют несколько обёрнутых ошибок; `fieldErrors` — тип map с методом `Error() string`.
+
+## Что нужно знать заранее
+
+- [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/ru): `requestID`, `logRequests`, `recoverPanic`, `muxErrors` и их порядок.
+- [GB-4.06 · Чтение и запись JSON](/lab/youtube/gb/gb-4-06/ru): строгое чтение, валидация, лимит тела, различие 400 и 422.
+- [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru): sentinel-ошибки, `%w`, `errors.Is` и `errors.As`.
+- [GB-4.08 · API каталога](/lab/youtube/gb/gb-4-08/ru), [GB-4.05 · Маршруты](/lab/youtube/gb/gb-4-05/ru), [GB-4.03 · Обработчик](/lab/youtube/gb/gb-4-03/ru), [GB-4.01 · HTTP](/lab/youtube/gb/gb-4-01/ru): обработчики, `curl`, заголовки и статусы.
+- [GB-3.02 · Теги JSON](/lab/youtube/gb/gb-3-02/ru), [GB-3.06 · Контрольная точка CLI](/lab/youtube/gb/gb-3-06/ru): `omitempty`, ошибки хранилища и `StockError`.
+- [GB-2.07 · Интерфейсы](/lab/youtube/gb/gb-2-07/ru), [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru), [GB-2.04 · Указатели](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структуры](/lab/youtube/gb/gb-2-03/ru), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/ru): типы в коде ниже.
+- [GB-1.05 · switch](/lab/youtube/gb/gb-1-05/ru), [GB-1.04 · Форматирование](/lab/youtube/gb/gb-1-04/ru), [GB-1.08 · Тесты](/lab/youtube/gb/gb-1-08/ru); [GB-5.09 · sqlc](/lab/youtube/gb/gb-5-09/ru) для итогового вопроса на повторение.
+
+Используйте [папку урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar) с собственным `go.mod` (`go 1.27`). Это полный проект на основе решения GB-6.01. API загружает `bozor.json` в каталог в памяти. База данных здесь не нужна. Playground не воспроизведёт эти команды локального сервера.
+
+Установите `CGO_ENABLED=0` и `GOTOOLCHAIN=go1.27.4` в оболочке. Выполняйте команды из папки урока. Откройте два терминала в этой папке: в первом запустите сервер, во втором отправляйте запросы. Убедитесь, что порт 8765 свободен; перед запуском следующего сервера остановите предыдущий сочетанием Ctrl+C.
+
+Для старой и сломанной версий `bash _video/run.sh oldin` и `bash _video/run.sh unutgan` готовят полные временные копии и выводят пути к ним. Перейдите в выведенную папку командой `cd` — сменой текущей папки. Затем запустите её той же командой `go run ./cmd/api`. Эти скрипты готовят копии; сервер они не запускают. Для итоговой версии и тестов вернитесь в папку урока.
+
+Вспомните: допустим, `recoverPanic` оборачивает `logRequests`. Обработчик вызывает panic до записи ответа. Что запишет `logRequests` из этого урока?
+
+**A)** 500 · **B)** записи о запросе не будет · **C)** 200
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Вызов логирования расположен после `next.ServeHTTP`; panic пропускает эту строку. A и C предполагают, что выполнение до неё дойдёт. Рабочий порядок: `requestID → logRequests → recoverPanic → muxErrors → mux`. Recovery возвращает управление внешнему логированию. POST-обработчики также используют `requireJSON`.
+
+</details>
+
+## Внутренний текст попадает в ответ при записи
+
+Раньше `writeDecodeError` копировал `err.Error()` в `message` этим вызовом:
+
+```go
+writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+```
+
+Это прежняя сигнатура помощника из GB-4.06. Предскажите: что раскроет строковая цена?
+
+**A)** только публичное поле · **B)** информацию о внутреннем типе Go · **C)** ответ не придёт
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Старый код сериализует внутреннее сообщение декодера. Для A нужен специально выбранный публичный текст; C потребовал бы прервать ответ.
+
+</details>
+
+Команда повторно выполнена в копии `oldin`:
+
+```console
+$ curl -s localhost:8765/products -H "Content-Type: application/json" -d '{"name":"choy","price":"25000"}'
+{"error":{"code":"bad_json","message":"json: cannot unmarshal string into Go struct field productInput.price of type int64"}}
+```
+
+`choy` — «чай». `cannot unmarshal string` означает, что JSON-строку нельзя поместить в это числовое поле. Остальная часть раскрывает внутреннюю структуру и тип. CWE-209 описывает раскрытие чувствительной информации в сообщениях об ошибках.
+
+При `fmt.Errorf("context: %w", err)` добавленный контекст остаётся в тексте `Error()`. Следующие слои могут добавить пути к файлам или имена ограничений базы. Даже узбекское сообщение хранилища — внутренний текст, который может измениться. Это ужесточает прежнее правило GB-4.08.
+
+| Этап | Лог сервера | Ответ клиенту |
+|---|---|---|
+| до изменения | запись о запросе | текст декодера, включая типы Go |
+| после изменения | полный текст ошибки и ID запроса | выбранное сообщение, статус и тот же ID |
+
+## Стандартный ответ: problem details
+
+**Problem details** — JSON-формат ошибок из RFC 9457, опубликованного организацией интернет-стандартов IETF. `application/problem+json` обозначает именно этот формат ошибки, сохраняя синтаксис JSON.
+
+| Поле | Значение в этом API |
+|---|---|
+| `type` | URI — идентификатор типа проблемы; `about:blank` не добавляет смысла сверх статуса |
+| `title` | краткое описание типа; для `about:blank` используйте название статуса |
+| `status` | копия фактического статуса HTTP |
+| `detail` | публичное объяснение этого случая, помогающее клиенту исправить проблему |
+| `errors` | наше расширение: имя поля → сообщение валидации |
+| `request_id` | наше расширение: значение из `X-Request-Id` |
+
+URI идентифицирует тип. Он не обязан открывать страницу, хотя документация рекомендуется. Предпочтительны абсолютные URI; относительным стоит включать полный путь, как `/problems/insufficient-stock`. Клиенту следует получать структурированные данные из расширений, а не разбирать `detail`. Если нужны числовые остатки, API может определить расширения `available` и `requested`.
+
+Ниже фрагменты `cmd/api/problem.go`; полный файл приведён дальше:
+
+```go
+type problem struct {
+	Type      string            `json:"type"`
+	Title     string            `json:"title"`
+	Status    int               `json:"status"`
+	Detail    string            `json:"detail,omitempty"`
+	Errors    map[string]string `json:"errors,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+}
+
+// newProblem — maxsus turi yoʻq xato: type "about:blank", title esa statusning standart nomi
+// (RFC 9457 §4.2.1: about:blank boʻlsa title — HTTP status nomi).
+func newProblem(status int, detail string) problem {
+	return problem{
+		Type:   "about:blank",
+		Title:  http.StatusText(status),
+		Status: status,
+		Detail: detail,
+	}
+}
+
+// writeProblem — har xato javobi shu funksiyadan chiqadi: sarlavha → status → body (GB-4.03 tartibi),
+// media turi application/problem+json. request_id — GB-6.01'dagi requestID qoʻygan X-Request-Id: mijoz uni
+// aytsa, log'dagi qatorni topamiz. (Middleware'siz, testda, sarlavha boʻsh: omitempty uni tashlaydi.)
+func writeProblem(w http.ResponseWriter, p problem) {
+	p.RequestID = w.Header().Get("X-Request-Id")
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(p.Status)
+	json.NewEncoder(w).Encode(p) // Encode xatosi: log'ga yozish GB-8.02'da (writeJSON kabi)
+}
+```
+
+| Строки фрагмента | Код | Что делает |
+|---|---|---|
+| 1–8 | `type problem struct` | экспортирует поля для JSON; теги задают публичные имена; `Status` имеет тип `int`, остальные скалярные поля — строки |
+| 5–7 | `omitempty` | пропускает пустые `Detail`, `Errors`, `RequestID`; `Errors` сопоставляет строки строкам |
+| 12–19 | `newProblem` | возвращает значение структуры; `http.StatusText(status)` задаёт заголовок, например `Not Found` для 404 |
+| 24 | `writeProblem(w, p)` | получает writer и копию problem |
+| 25 | `p.RequestID = …` | читает заголовок ответа, установленный `requestID` |
+| 26–28 | заголовок → статус → кодирование | задаёт тип содержимого, записывает статус, затем сериализует `p` в writer |
+
+Комментарии описывают функции; скобки закрывают литералы и тела функций. Игнорируемая ошибка `Encode` отложена до [GB-8.02 · Логирование](/lab/youtube/gb#gb-8-02), как и в `writeJSON`.
+
+Замена `{"error":{"code":…}}` этим объектом ломает клиентов, ожидающих прежний контракт. Объявите об изменении или выпустите новую версию.
+
+## Одна функция преобразует ошибки в ответы
+
+```go
+func problemFor(err error) problem {
+	var se *store.StockError
+	var te *json.UnmarshalTypeError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return newProblem(http.StatusNotFound, "bunday ID'li mahsulot yoʻq")
+	case errors.As(err, &se):
+		return problem{
+			Type:   "/problems/insufficient-stock",
+			Title:  "Omborda yetarli emas",
+			Status: http.StatusConflict,
+			Detail: fmt.Sprintf("%s: omborda %d dona, soʻralgan %d", se.Name, se.Stock, se.Want),
+		}
+	// VAZIFA (TASK.md): 1) fieldErrors → 422 + errors; 2) store.ErrBadProduct, store.ErrBadQuantity → 422 + productRules;
+	// 3) *http.MaxBytesError → 413 — errBadJSON case'idan OLDIN.
+	case errors.Is(err, errBadID):
+		return newProblem(http.StatusBadRequest, "id butun son boʻlishi kerak")
+	case errors.As(err, &te) && te.Field != "":
+		return newProblem(http.StatusBadRequest, te.Field+": qiymat turi notoʻgʻri")
+	case errors.Is(err, errBadJSON):
+		return newProblem(http.StatusBadRequest, "body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan")
+	default:
+		return newProblem(http.StatusInternalServerError, "")
+	}
+}
+```
+
+`var se *store.StockError` и `var te *json.UnmarshalTypeError` объявляют целевые переменные. `errors.As(err, &se)` записывает найденный указатель в `se`; `&` передаёт её адрес. `errors.Is` узнаёт sentinel-ошибку через обёртки. `switch` без выражения проверяет случаи по порядку и выбирает первый истинный. Здесь используется `As`: его логический результат подходит для case, а найденное значение записывается в заранее объявленную переменную. `AsType` возвращает два значения.
+
+| Случай | Результат | Причина |
+|---|---|---|
+| `ErrNotFound` | 404, наш текст | товара нет |
+| `*StockError` | 409, наш тип и заголовок | собирает `detail` из разрешённых полей `Name`, `Stock`, `Want` |
+| `errBadID` | 400 | ID в пути не является целым числом |
+| ошибка типа с непустым `Field` | 400, текст для поля | `&&` требует оба условия; `+` соединяет путь поля с нашим сообщением |
+| `errBadJSON` | 400, общие требования к телу | обрабатывает остальные ошибки декодирования |
+| `default` | 500, пустой detail | неизвестные ошибки не раскрывают внутренний текст |
+
+`fmt.Sprintf` создаёт строку: `%s` вставляет имя, `%d` — целые количества. Комментарии `VAZIFA` отмечают недостающие случаи задания; они их не реализуют.
+
+Здесь `Field` равен `price`. В общем случае это путь к ошибочному значению, а не обязательно один буквальный ключ JSON. Для массива на верхнем уровне он пуст, поэтому запрос обрабатывает общий случай тела. Не раскрывайте `Struct`, `Type` или полный текст ошибки декодера.
+
+## Сохраните обе ошибки при декодировании
+
+`errBadJSON` — sentinel-ошибка API. Сохраниться должны и она, и исходная ошибка декодера:
+
+```go filename="cmd/api/json.go" showLineNumbers
+package main
+
+// JSON kirish va chiqish (GB-4.06): qat'iy oʻqish va limit. GB-6.02: xato javobi endi problem.go'da.
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+// writeJSON: sarlavha → status → body (GB-4.03 tartibi).
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v) // Encode xatosi: log'ga yozish GB-8.02'da
+}
+
+// maxBody — body'ning eng katta hajmi, baytda (GB-4.06).
+const maxBody = 1024
+
+// decodeJSON body'ni dst'ga oʻqiydi: eng koʻpi maxBody bayt, nomaʼlum kalit yoʻq, bitta JSON qiymat.
+// Xato boʻlsa javobni oʻzi yozadi va false qaytaradi: chaqiruvchi darhol return qiladi.
+// GB-6.02: Decode xatosi errBadJSON bilan birga oʻraladi (ikkita %w): problemFor ikkalasini ham koʻradi,
+// asl matn esa faqat log'ga boradi.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, fmt.Errorf("%w: %w", errBadJSON, err))
+		return false
+	}
+	// Decode faqat birinchi JSON qiymatni oʻqiydi: undan keyin hech narsa boʻlmasligi kerak.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("body'da bitta JSON boʻlishi kerak")
+		}
+		writeError(w, fmt.Errorf("%w: %w", errBadJSON, err))
+		return false
+	}
+	return true
+}
+```
+
+| Строки файла | Код | Что делает |
+|---|---|---|
+| 1–11 | пакет, комментарий, импорты | `encoding/json` работает с JSON; `errors` создаёт ошибку, `fmt` оборачивает её, `io` предоставляет EOF, `net/http` ограничивает ввод |
+| 14–18 | `writeJSON` | прежний успешный ответ: заголовок, статус, тело |
+| 21 | `maxBody = 1024` | лимит в байтах |
+| 27–30 | `decodeJSON`, reader, decoder | `dst any` — получатель результата; ограничивает ввод и запрещает неизвестные поля |
+| 31–34 | первый `Decode` | при ошибке оборачивает две ошибки, записывает ответ и возвращает `false` |
+| 36 | `dec.Decode(&struct{}{})` | второе чтение проверяет EOF; `&struct{}{}` — указатель на значение пустой структуры |
+| 37–41 | ошибка второго чтения | ещё одно значение JSON или некорректное продолжение идёт тем же путём; при успешном чтении создаёт ошибку |
+| 43–44 | `return true` | сюда доходит только полностью прочитанный корректный ввод; скобка закрывает функцию |
+
+Несколько `%w` поддерживаются с Go 1.20. Для этой обёртки могут одновременно сработать `errors.Is(err, errBadJSON)` и `errors.As(err, &te)`:
+
+```text
+fmt.Errorf("%w: %w", errBadJSON, decoderError)
+  ├─ errBadJSON
+  └─ *json.UnmarshalTypeError
+```
+
+Конкретная ошибка типа должна предшествовать общему sentinel-случаю. Прежнее преобразование в 413 намеренно отсутствует в стартовом коде; ограничение размера продолжает работать. В задании вы восстановите его статус. Ошибки неизвестных полей получают общие инструкции; этот код не извлекает имя поля из их текста.
+
+## Полную ошибку — в лог, публичный ответ — клиенту
+
+```go
+func writeError(w http.ResponseWriter, err error) {
+	p := problemFor(err)
+	log.Printf("%s xato %d: %q", w.Header().Get("X-Request-Id"), p.Status, err.Error())
+	writeProblem(w, p)
+}
+```
+
+Строка 1 принимает `err error`; строка 2 получает публичный problem. Строка 3 пишет ID, статус и полный текст в лог. `%q` заключает строку в кавычки и экранирует переводы строк как `\n`. Строка 4 записывает problem; строка 5 закрывает функцию. `err.Error()` должен быть только в вызове логирования.
+
+Обработчики заменяют `writeStoreError` этим вызовом и сразу возвращаются:
+
+```go
+	p, err := a.st.Get(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+```
+
+`p, err :=` получает товар и ошибку; ветка `if` записывает ошибку и завершает функцию. Middleware с уже выбранным статусом вызывает `writeProblem` напрямую. Например, recovery до начала ответа:
+
+```go
+writeProblem(w, newProblem(http.StatusInternalServerError, ""))
+```
+
+`requireJSON` использует 415; `muxErrors` преобразует 404 и 405 от mux, сохраняя `Allow`. Panic после начала записи ответа нельзя заменить новым 500: унаследованный recovery прерывает такой ответ.
+
+## Запуск: публичный текст и внутренний лог
+
+Запустите итоговую версию в первом терминале:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Во втором терминале предскажите результат строковой цены. Обе ошибки обёрнуты вместе.
+
+**A)** 400 с указанием поля · **B)** 400 с общим текстом о теле · **C)** 500 без detail
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Случай ошибки типа расположен перед `errBadJSON`. B получится, если поставить общий случай первым; C не учитывает распознанные ошибки.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/products -H "Content-Type: application/json" -d '{"name":"choy","price":"25000"}'
+HTTP/1.1 400 Bad Request
+Content-Type: application/problem+json
+X-Request-Id: SVVVISNI2QLQG4DWU2G4B2MTD3
+Date: Fri, 27 Nov 2026 17:10:11 GMT
+Content-Length: 142
+
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"price: qiymat turi notoʻgʻri","request_id":"SVVVISNI2QLQG4DWU2G4B2MTD3"}
+```
+
+`-s` скрывает индикатор прогресса curl; `-i` включает заголовки ответа. `-H` задаёт тип содержимого запроса; `-d` отправляет JSON методом POST. `Date` — HTTP-дата сервера; `Content-Length` — размер тела в байтах. ID и даты меняются между запросами.
+
+Соответствующий фрагмент первого терминала получен при том же запуске сервера. Записи остальных запросов опущены:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+2026/11/27 22:10:11 SVVVISNI2QLQG4DWU2G4B2MTD3 xato 400: "body JSON sifatida oʻqilmadi: json: cannot unmarshal string into Go struct field productInput.price of type int64"
+2026/11/27 22:10:11 SVVVISNI2QLQG4DWU2G4B2MTD3 POST "/products" 400 308.977µs
+```
+
+ID совпадает с заголовком и телом ответа. Первая строка сохраняет `productInput` и `int64`; запись о запросе добавляет метод, путь, статус и прошедшее время.
+
+Теперь запросите пять `oʻrik` — «абрикосов», товар 4, при остатке две штуки. Предскажите: **A)** 409 · **B)** 404 · **C)** 500.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `StockError` выбирает 409: товар есть, ошибка распознана. В detail попадают только разрешённые поля.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/orders -H "Content-Type: application/json" -d '{"product_id":4,"quantity":5}'
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+X-Request-Id: UTDKF2JCT6UPPY2X23Z2HGAXBO
+Date: Fri, 27 Nov 2026 17:10:11 GMT
+Content-Length: 174
+
+{"type":"/problems/insufficient-stock","title":"Omborda yetarli emas","status":409,"detail":"oʻrik: omborda 2 dona, soʻralgan 5","request_id":"UTDKF2JCT6UPPY2X23Z2HGAXBO"}
+```
+
+Для отсутствующего пути и неподдерживаемого метода существующего пути предскажите: **A)** 404 и 405 с `Allow` · **B)** два ответа 500 · **C)** текстовые тела.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Унаследованная обёртка mux заменяет эти тела ошибок объектами problem. B игнорирует явно заданные статусы; C описывает mux без обёртки. `-X PUT` задаёт метод.
+
+</details>
+
+```console
+$ curl -s localhost:8765/narsalar
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday yoʻl yoʻq","request_id":"4W6RCFEVWJ533YTQUBTXGZI4A4"}
+```
+
+```console
+$ curl -s -i -X PUT localhost:8765/products/1
+HTTP/1.1 405 Method Not Allowed
+Allow: DELETE, GET, HEAD
+Content-Type: application/problem+json
+X-Content-Type-Options: nosniff
+X-Request-Id: 7RATMYZA72AOM6VEHKDY2PEFXF
+Date: Fri, 27 Nov 2026 17:10:11 GMT
+Content-Length: 152
+
+{"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"7RATMYZA72AOM6VEHKDY2PEFXF"}
+```
+
+`Allow` сохраняет `DELETE, GET, HEAD`; `nosniff` — сохранённое значение `X-Content-Type-Options`, запрещающее угадывание типа содержимого.
+
+Что подходит для `detail`?
+
+**A)** текст хранилища, потому что он узбекский · **B)** поле клиента и выбранные публичные значения · **C)** `err.Error()` для любого 4xx
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Даже узбекский текст хранилища позже может получить внутренние детали. Язык сообщения и класс статуса сами по себе не делают его безопасным. Только `problemFor` выбирает, что покидает сервер.
+
+</details>
+
+## Для валидации ещё нужен отдельный случай
+
+Теперь `validate` возвращает этот именованный тип map:
+
+```go
+type fieldErrors map[string]string
+
+func (f fieldErrors) Error() string {
+	return fmt.Sprintf("validatsiya: %d ta maydon notoʻgʻri", len(f))
+}
+```
+
+Строка 1 определяет map «имя поля → сообщение». Строки 3–5 добавляют метод `Error() string` получателю-значению `f`, удовлетворяя `error`. `len(f)` считает ошибочные поля; `%d` форматирует это число. Обработчик по-прежнему проверяет длину конкретного map:
+
+```go
+	if f := validate(in); len(f) > 0 {
+		writeError(w, f)
+		return
+	}
+```
+
+Краткое объявление в `if` связывает `f`; `len(f) > 0` означает наличие ошибок. `writeError` принимает map как `error`, а `return` завершает обработчик. Не сравнивайте с nil интерфейс `error`, содержащий этот map: даже nil map внутри интерфейса даёт ненулевой интерфейс.
+
+До добавления нового случая предскажите результат пустого имени и нулевой цены.
+
+**A)** 400 · **B)** 422 · **C)** 500
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Для `fieldErrors` ещё нет случая, поэтому срабатывает `default`. B — нужный результат после задания; A смешивает корректный JSON с неверными значениями.
+
+</details>
+
+```console
+$ curl -s localhost:8765/products -H "Content-Type: application/json" -d '{"name":"","price":0}'
+{"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"LHNSLMJKV5WMB466KDY4XY6RGH"}
+```
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+2026/11/27 22:10:11 LHNSLMJKV5WMB466KDY4XY6RGH xato 500: "validatsiya: 2 ta maydon notoʻgʻri"
+2026/11/27 22:10:11 LHNSLMJKV5WMB466KDY4XY6RGH POST "/products" 500 84.684µs
+```
+
+Ни `detail`, ни внутренний текст не раскрываются, но статус неверный. Полная причина остаётся в логе. Комментарии о преобразовании этих ошибок в 422 описывают цель задания, а не поведение стартового кода.
+
+Ниже полный новый файл. Его действия объяснены выше; номера здесь относятся к строкам файла.
+
+<details>
+<summary>Полный cmd/api/problem.go</summary>
+
+```go filename="cmd/api/problem.go" showLineNumbers
+package main
+
+// Bir xil API xatolari (GB-6.02): har xato javobi RFC 9457 "problem details" shaklida.
+// Qoida: err.Error() — dasturchi uchun matn, u faqat log'ga boradi. Mijoz faqat biz tanlab
+// yozgan matnni oladi (detail, errors) va log'dagi qatorni topish uchun request_id'ni.
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// problem — RFC 9457 obyekti. type, title, status, detail — standart aʼzolar;
+// errors va request_id — bozor'ning kengaytmalari (RFC 9457 §3.2).
+type problem struct {
+	Type      string            `json:"type"`
+	Title     string            `json:"title"`
+	Status    int               `json:"status"`
+	Detail    string            `json:"detail,omitempty"`
+	Errors    map[string]string `json:"errors,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+}
+
+// newProblem — maxsus turi yoʻq xato: type "about:blank", title esa statusning standart nomi
+// (RFC 9457 §4.2.1: about:blank boʻlsa title — HTTP status nomi).
+func newProblem(status int, detail string) problem {
+	return problem{
+		Type:   "about:blank",
+		Title:  http.StatusText(status),
+		Status: status,
+		Detail: detail,
+	}
+}
+
+// writeProblem — har xato javobi shu funksiyadan chiqadi: sarlavha → status → body (GB-4.03 tartibi),
+// media turi application/problem+json. request_id — GB-6.01'dagi requestID qoʻygan X-Request-Id: mijoz uni
+// aytsa, log'dagi qatorni topamiz. (Middleware'siz, testda, sarlavha boʻsh: omitempty uni tashlaydi.)
+func writeProblem(w http.ResponseWriter, p problem) {
+	p.RequestID = w.Header().Get("X-Request-Id")
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(p.Status)
+	json.NewEncoder(w).Encode(p) // Encode xatosi: log'ga yozish GB-8.02'da (writeJSON kabi)
+}
+
+// API qatlamining oʻz sentinel xatolari (GB-2.08): decodeJSON va pathID asl xatoni shular bilan oʻraydi.
+var errBadJSON = errors.New("body JSON sifatida oʻqilmadi")
+
+var errBadID = errors.New("id butun son emas")
+
+// fieldErrors — validate natijasi: maydon nomi → nima notoʻgʻri. Error() metodi bor, demak u error:
+// handler uni boshqa xatolar kabi writeError'ga beradi, problemFor esa 422 qiladi.
+type fieldErrors map[string]string
+
+func (f fieldErrors) Error() string {
+	return fmt.Sprintf("validatsiya: %d ta maydon notoʻgʻri", len(f))
+}
+
+// productRules — 422'da mijozga koʻrsatiladigan katalog qoidalari. Store xatosining matni emas:
+// u ichki qatlam matni, ertaga unga boshqa tafsilot qoʻshilishi mumkin.
+const productRules = "nom 1–20 belgi, narx 1 tiyindan 10 mln soʻmgacha, qoldiq 0–1 000 000"
+
+// problemFor xatoni mijozga ketadigan problem'ga aylantiradi: status errors.Is/As bilan tanlanadi.
+// Hech bir case err.Error()ni ishlatmaydi: detail faqat biz tanlagan maydonlardan yigʻiladi.
+// switch birinchi mos case'ni oladi: aniqroq case (413) umumiyroq case'dan (errBadJSON) oldin turadi.
+func problemFor(err error) problem {
+	var se *store.StockError
+	var te *json.UnmarshalTypeError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return newProblem(http.StatusNotFound, "bunday ID'li mahsulot yoʻq")
+	case errors.As(err, &se):
+		return problem{
+			Type:   "/problems/insufficient-stock",
+			Title:  "Omborda yetarli emas",
+			Status: http.StatusConflict,
+			Detail: fmt.Sprintf("%s: omborda %d dona, soʻralgan %d", se.Name, se.Stock, se.Want),
+		}
+	// VAZIFA (TASK.md): 1) fieldErrors → 422 + errors; 2) store.ErrBadProduct, store.ErrBadQuantity → 422 + productRules;
+	// 3) *http.MaxBytesError → 413 — errBadJSON case'idan OLDIN.
+	case errors.Is(err, errBadID):
+		return newProblem(http.StatusBadRequest, "id butun son boʻlishi kerak")
+	case errors.As(err, &te) && te.Field != "":
+		return newProblem(http.StatusBadRequest, te.Field+": qiymat turi notoʻgʻri")
+	case errors.Is(err, errBadJSON):
+		return newProblem(http.StatusBadRequest, "body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan")
+	default:
+		return newProblem(http.StatusInternalServerError, "")
+	}
+}
+
+// writeError — handler'dagi har Go xatosi shu yerdan chiqadi: log'ga toʻliq xato (err.Error()),
+// mijozga problemFor tanlagan xavfsiz problem. Ikkalasida bir xil request ID.
+// Metod, yoʻl va status logRequests qatorida (GB-6.01); bu qator — xatoning oʻzi. %q: xato matnida
+// mijoz yuborgan narsa (yoʻl, kalit) boʻlishi mumkin, yangi qator log'da \n boʻlib qoladi (GB-6.01).
+func writeError(w http.ResponseWriter, err error) {
+	p := problemFor(err)
+	log.Printf("%s xato %d: %q", w.Header().Get("X-Request-Id"), p.Status, err.Error())
+	writeProblem(w, p)
+}
+```
+
+Строки 1–18 выбирают исполняемый пакет, документируют правило и импортируют пять стандартных пакетов плюс `store`. Строки 19–47 определяют и записывают problem. Строки 50 и 52 создают sentinel-ошибки JSON и ID. Строки 56–60 реализуют `fieldErrors`; строка 64 задаёт `productRules`, публичное описание правил каталога для задания. Строки 69–93 преобразуют ошибки; строки 99–103 логируют и записывают ответ. Остальные строки — комментарии, пустые разделители и закрывающие скобки.
+
+</details>
+
+## Частые ошибки
+
+Классическая ошибка — возвращать `err.Error()` в `detail`, даже для 4xx или узбекского сообщения хранилища. Показанная выше утечка объясняет причину. Исправление: выбирайте публичный текст в `problemFor`; внутренний оставляйте только в логах.
+
+Вторая ошибка: пропустить `return` после `writeError`. Полный метод сломанной версии:
+
+```go
+func (a *api) getProduct(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	p, err := a.st.Get(id)
+	if err != nil {
+		writeError(w, err)
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+```
+
+Сначала `pathID` обрабатывает некорректные ID. Затем `Get(99)` возвращает ошибку и товар с нулевыми значениями. После записи ошибки выполнение достигает `writeJSON`.
+
+Предскажите: **A)** только один problem с 404 · **B)** problem с 404, затем нулевой товар · **C)** 500.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Запись ошибки не завершает обработчик. Первый окончательный статус остаётся 404, но обе операции кодирования дописывают тело. Для A нужен `return`; C предполагает автоматический panic.
+
+</details>
+
+Остановите итоговый сервер и выполните во временной копии `unutgan`:
+
+```console
+$ curl -s -i localhost:8765/products/99
+HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+X-Request-Id: LGTP4BKJBTUYLF3AO4XNVOT6QK
+Date: Fri, 27 Nov 2026 17:10:12 GMT
+Content-Length: 176
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday ID'li mahsulot yoʻq","request_id":"LGTP4BKJBTUYLF3AO4XNVOT6QK"}
+{"id":0,"name":"","price":0,"stock":0}
+```
+
+Соответствующий фрагмент лога:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+2026/11/27 22:10:12 LGTP4BKJBTUYLF3AO4XNVOT6QK xato 404: "mahsulot 99: mahsulot topilmadi"
+2026/11/27 22:10:12 http: superfluous response.WriteHeader call from main.(*statusRecorder).WriteHeader (middleware.go:48)
+2026/11/27 22:10:12 LGTP4BKJBTUYLF3AO4XNVOT6QK GET "/products/99" 200 420.311µs
+```
+
+`superfluous response.WriteHeader call` означает лишний вызов записи статуса. `middleware.go:48` указывает строку вызова в обёртке. Настоящий HTTP-ответ сохраняет 404. Этот `statusRecorder` запоминает каждый вызов и ошибочно сохраняет последующий 200, поэтому запись о запросе тоже неверна. Для окончательных статусов net/http допускает не более одного заголовка 2xx–5xx; у информационных ответов 1xx другие правила.
+
+Исправьте обработчик:
+
+```go
+	p, err := a.st.Get(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+```
+
+Сохранение только первого окончательного статуса сделало бы обёртку надёжнее. Этого отдельного улучшения в данном снимке нет. Перед продолжением остановите сервер.
+
+Времена видео ниже **цитируются**, это не результаты повторного измерения. Свежие значения взяты из запусков сервера для этой страницы:
+
+| Запрос | Видео | Свежий запуск | Свежий/видео |
+|---|---|---|---|
+| строковая цена | 68.794 µs | 308.977 µs | 4.49× |
+| валидация без преобразования | 96.227 µs | 84.684 µs | 0.88× |
+| пропущенный `return` | 170.472 µs | 420.311 µs | 2.47× |
+
+Это время отдельных запросов, а не бенчмарк. Разные отношения отражают условия запуска; вывод об ускорении из них не следует. Неизменными должны быть статус, структура тела, безопасный текст и совпадающий ID запроса.
+
+## Проверьте себя
+
+1. Почему `detail` не должен содержать `err.Error()`?
+
+<details>
+<summary>Ответ</summary>
+
+Там могут быть внутренние типы, пути или имена ограничений базы из любого слоя обёртки. Они встречаются и в ошибках 4xx. Публичные сообщения выбирают отдельно.
+
+</details>
+
+2. В `problemFor` пришла неизвестная ошибка. Что отправляется и где причина?
+
+<details>
+<summary>Ответ</summary>
+
+500 без `detail`. `writeError` записывает полную причину в лог с тем же ID запроса.
+
+</details>
+
+3. Предскажите: `*http.MaxBytesError` обёрнут вместе с `errBadJSON`, случай которого стоит первым. Какой статус победит?
+
+<details>
+<summary>Ответ</summary>
+
+400. Совпадают оба случая, `switch` выбирает первый. Поставьте случай 413 перед общим случаем JSON.
+
+</details>
+
+4. Из GB-5.09: когда sqlc найдёт ссылку на несуществующий столбец в `query.sql`?
+
+<details>
+<summary>Ответ</summary>
+
+При `sqlc generate`, до запуска программы Go. Эта проверка схемы не заменяет обработку ошибок во время выполнения.
+
+</details>
+
+5. Правило из середины урока: что подходит для `detail` — узбекский текст хранилища, выбранные публичные поля или текст любой ошибки 4xx?
+
+<details>
+<summary>Ответ</summary>
+
+Выбранные публичные поля. Язык текста и класс статуса не делают внутренний текст безопасным.
+
+</details>
+
+## Домашнее задание
+
+Работайте с [TASK.md в папке урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar). Там одно задание с тремя обязательными шагами; обозначения сложности добавлены для этой страницы:
+
+1. 🟢 Преобразуйте `fieldErrors` в 422, тип `/problems/validation`, заголовок `Qiymatlar notoʻgʻri` — «неверные значения», и `Errors: fe`.
+2. 🟢 Преобразуйте и `store.ErrBadProduct`, и `store.ErrBadQuantity` в тот же тип/заголовок 422, с `Detail: productRules`.
+3. 🟡 Преобразуйте `*http.MaxBytesError` в 413 перед `errBadJSON`. Добавьте `tooBig.Limit` в публичное сообщение.
+
+`productRules` означает: имя 1–20 символов, цена от 1 тийина до 10 миллионов сумов, остаток 0–1 000 000. Один сум — 100 тийинов. Объявите `var fe fieldErrors`, цель-значение, и `var tooBig *http.MaxBytesError`, цель-указатель. Передайте их адреса в `As`. Не меняйте `tekshiruv_test.go`.
+
+Стартовый код падает именно в этих трёх местах. Ниже полный свежий вывод; узбекские сообщения называют фактический и ожидаемый статусы и указывают на недостающие случаи:
+
+```console
+$ go test ./...
+--- FAIL: TestVazifaFieldErrors (0.00s)
+    tekshiruv_test.go:38: POST /products {"name":"","price":0}: status 500, kutilgan 422. fieldErrors hozir problemFor'da default'ga tushyapti: errors.As(err, &fe) case'ini qoʻshing (TASK.md, 1-qadam). Body: {"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"SFBBLTPUPVUP76UK7V6LPCOEG2"}
+--- FAIL: TestVazifaStoreRules (0.00s)
+    tekshiruv_test.go:52: POST /products (21 belgili nom): status 500, kutilgan 422. store.ErrBadProduct va store.ErrBadQuantity uchun case qoʻshing (TASK.md, 2-qadam). Body: {"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"MJO25QTIV6NHAJDFVLXP6JBJY3"}
+--- FAIL: TestVazifaTooLarge (0.00s)
+    tekshiruv_test.go:72: POST /products (2000 baytli body): status 400, kutilgan 413. *http.MaxBytesError uchun case qoʻshing va uni errBadJSON case'idan OLDIN qoʻying: switch birinchi mos case'ni oladi (TASK.md, 3-qadam). Body: {"type":"about:blank","title":"Bad Request","status":400,"detail":"body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan","request_id":"UZBCX7WSSZ6YQGKCHSG3RTJGPN"}
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.005s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	(cached)
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+FAIL
+```
+
+`tekshiruv_test.go:38`, `:52`, `:72` указывают проверки с ошибками. `kutilgan` означает «ожидалось»; `OLDIN` — «перед». До завершения задания падение ожидаемо.
+
+<details>
+<summary>Решение и объяснение</summary>
+
+[Эталонное решение](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar/solution) добавляет два объявления целевых переменных выше и эти случаи:
+
+```go
+	case errors.As(err, &fe): // vazifa, 1-qadam
+		return problem{
+			Type:   "/problems/validation",
+			Title:  "Qiymatlar notoʻgʻri",
+			Status: http.StatusUnprocessableEntity,
+			Errors: fe,
+		}
+	case errors.Is(err, store.ErrBadProduct), errors.Is(err, store.ErrBadQuantity): // vazifa, 2-qadam
+		return problem{
+			Type:   "/problems/validation",
+			Title:  "Qiymatlar notoʻgʻri",
+			Status: http.StatusUnprocessableEntity,
+			Detail: productRules,
+		}
+	case errors.As(err, &tooBig): // vazifa, 3-qadam: errBadJSON'dan oldin
+		return newProblem(http.StatusRequestEntityTooLarge, fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit))
+```
+
+`fieldErrors` реализует `error` как значение, поэтому цель `*fieldErrors` не совпадёт со значениями, создаваемыми здесь. Запятая во втором `case` допускает любой из двух sentinel. Последний случай читает известный лимит, не раскрывая текст ошибки.
+
+`errors` — map-расширение этого API, а не обязательная структура RFC. Оба случая 422 используют один тип проблемы; один содержит ошибки полей, другой — публичное описание правил.
+
+Выполните из корня урока (`cd solution` переходит в папку ответа):
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	(cached)
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	(cached)
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+```
+
+Все пакеты проходят. `http.StatusText(413)` в Go даёт `Request Entity Too Large`; RFC 9110 называет статус `Content Too Large`. Go также сохраняет `Unprocessable Entity` для 422, тогда как RFC 9110 использует `Unprocessable Content`. Тесты намеренно ожидают формулировки Go.
+
+</details>
+
+После изменения запускайте `go test ./...` из корня своей папки урока, пока все пакеты не пройдут. Стартовый код также проходит vet:
+
+```console
+$ go vet ./...
+```
+
+Команда ничего не выводит. Успех vet не означает, что недостающие преобразования работают.
+
+Для Postgres-хранилища GB-5.10 добавьте также `ErrOrderNotFound` → 404 и `ErrDuplicate`/`ErrInUse` → 409. В этом снимке хранилище находится в памяти. Новые ошибки аутентификации в [GB-6.03 · Пароли](/lab/youtube/gb#gb-6-03) используют тот же подход: распознаваемая ошибка и одно преобразование в публичный ответ.
+
+## Источники
+
+- [RFC 9457 · Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
+- [RFC 9457 · type](https://www.rfc-editor.org/rfc/rfc9457#name-type)
+- [RFC 9457 · detail / extensions](https://www.rfc-editor.org/rfc/rfc9457#name-detail)
+- [RFC 9457 · about:blank](https://www.rfc-editor.org/rfc/rfc9457#name-aboutblank)
+- [RFC 9457 · application/problem+json](https://www.rfc-editor.org/rfc/rfc9457#name-iana-considerations)
+- [RFC 9457 · Security Considerations](https://www.rfc-editor.org/rfc/rfc9457#name-security-considerations)
+- [RFC 9110 · HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110)
+- [RFC 9110 · 500](https://www.rfc-editor.org/rfc/rfc9110#name-500-internal-server-error)
+- [RFC 9110 · 413 / 422](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content)
+- [CWE-209](https://cwe.mitre.org/data/definitions/209.html)
+- [OWASP · Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html)
+- [OWASP · Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [Go · Working with Errors in Go 1.13](https://go.dev/blog/go1.13-errors)
+- [Go · errors](https://pkg.go.dev/errors)
+- [Go · fmt.Errorf](https://pkg.go.dev/fmt#Errorf)
+- [Go · JSON Marshal / omitempty](https://pkg.go.dev/encoding/json#Marshal)
+- [Go · JSON UnmarshalTypeError](https://pkg.go.dev/encoding/json#UnmarshalTypeError)
+- [Go · net/http](https://pkg.go.dev/net/http)
+- [Go · Handler](https://pkg.go.dev/net/http#Handler)
+- [Go · ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter)
+- [Go · MaxBytesError](https://pkg.go.dev/net/http#MaxBytesError)
+- [Go · switch](https://go.dev/ref/spec#Switch_statements)
+- [Go · error interface](https://pkg.go.dev/builtin#error)
+- [bozor · cmd/api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar/cmd/api)
+- [sqlc](https://docs.sqlc.dev/)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, 2026-11-27. Все консольные команды выполнены повторно; случайные ID, даты и времена взяты из этих запусков. Только явно обозначенный столбец времени видео цитируется.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-02-api-xatolar)
+
+---
+
+← Предыдущий урок: [GB-6.01](/lab/youtube/gb/gb-6-01/ru) · Следующий урок: [GB-6.03](/lab/youtube/gb#gb-6-03) → · [Все уроки](/lab/youtube/gb)
+
+</div>
