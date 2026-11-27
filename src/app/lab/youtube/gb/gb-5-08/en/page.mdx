@@ -1,0 +1,858 @@
+---
+title: "Two buyers, one product: lost update and lock"
+date: "2026/11/27"
+description: "Reproduce overselling in Postgres and prevent it with a conditional UPDATE or SELECT FOR UPDATE, then test concurrent buyers in Go."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-08) · [Русский](/lab/youtube/gb/gb-5-08/ru) · **English**  
+Lesson GB-5.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-08) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+One apricot remains. Two buyers click Buy, and both receive success. The database reports stock `0`, with no error. Where did the second decrement go?
+
+**The one idea:** a transaction alone does not protect a separate read, check and write from another buyer. Put the stock condition in the `UPDATE`, or lock the row before reading it for a decision.
+
+By the end you will:
+
+- reproduce a **lost update** in two database connections;
+- combine the stock check and decrement in one conditional `UPDATE`;
+- use `SELECT … FOR UPDATE` through `tx` and explain who waits;
+- verify concurrent buyers and fix the coupon exercise.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| lost update | two buyers calculate from the same old stock; one decrement disappears | lost update |
+| conditional UPDATE | check and change a row in one SQL statement | conditional UPDATE |
+| row lock | conflicting writes and locking reads wait for the transaction to finish | row-level lock |
+
+**Overselling** means accepting more purchases than the available stock. `CommandTag` is the result description returned by `Exec`; `RowsAffected()` reads its row count.
+
+## Before you start
+
+- [GB-5.07 · Transactions](/lab/youtube/gb/gb-5-07/en): `Begin`, `Commit`, `Rollback`, `tx.Exec` and `tx.QueryRow`.
+- [GB-4.07 · Concurrent requests](/lab/youtube/gb/gb-4-07/en): lost updates in memory, `sync.Mutex`, `wg.Go` and `wg.Wait`.
+- [GB-5.05 · pgx and the connection pool](/lab/youtube/gb/gb-5-05/en): `QueryRow`, `Scan`, `$1`, context and `pgx.ErrNoRows`.
+- [GB-5.03 · SQL tables](/lab/youtube/gb/gb-5-03/en), [GB-5.04 · Related tables](/lab/youtube/gb/gb-5-04/en), [GB-5.02 · Postgres in Docker](/lab/youtube/gb/gb-5-02/en): `products`, constraints, `psql` and Compose.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/en), [GB-2.08 · Errors](/lab/youtube/gb/gb-2-08/en), [GB-2.05 · Methods](/lab/youtube/gb/gb-2-05/en), [GB-2.04 · Pointers](/lab/youtube/gb/gb-2-04/en), [GB-2.03 · Structs](/lab/youtube/gb/gb-2-03/en), [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en).
+- [GB-1.08 · Tests](/lab/youtube/gb/gb-1-08/en), [GB-1.07 · Functions](/lab/youtube/gb/gb-1-07/en), [GB-1.06 · Loops](/lab/youtube/gb/gb-1-06/en), [GB-1.05 · Conditions](/lab/youtube/gb/gb-1-05/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.01 · First program](/lab/youtube/gb/gb-1-01/en).
+
+From GB-5.07: an `UPDATE` runs inside a transaction, followed by `ROLLBACK`. Which stock remains? **A)** before the update · **B)** after the update · **C)** `NULL`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `ROLLBACK` undoes the transaction's changes. `COMMIT` confirms them. Today we study two transactions running together.
+
+</details>
+
+Use a copy of `lessons/gb-5-08-ikki-xaridor`. The module needs Go 1.27.4, pgx v5.13.0 and Docker Compose 2.20 or newer. It connects to a real Postgres server, so use the local folder rather than Playground. These settings applied to every Go run below:
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+```
+
+`CGO_ENABLED=0` disables C integration; gcc is unnecessary. `GOTOOLCHAIN` selects the Go version. Port `5458` was free for our run. If occupied, change the port in your copy's `compose.yaml` and set `DATABASE_URL` to match. The tests otherwise use the folder's default connection settings.
+
+Our copy uses Compose project name `gb508doc`; the course uses `gb508`, and the video used `bozor`. This changes container names. Here is the complete output when starting an already running container:
+
+```console
+$ docker compose up -d --wait
+ Container gb508doc-db-1 Running 
+ Container gb508doc-db-1 Waiting 
+ Container gb508doc-db-1 Healthy 
+```
+
+`up` starts services, `-d` leaves them in the background, and `--wait` waits for readiness. `Running` means running; `Waiting` precedes the successful health check, `Healthy`. The first start also prints creation messages.
+
+Load `bozor.sql`. It drops the lab tables and recreates them, including their data. This run reused existing tables; a fresh database additionally prints four `NOTICE … does not exist, skipping` messages.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+CREATE TABLE
+INSERT 0 1
+```
+
+`exec db` runs `psql` in the database service; `-f /lab/bozor.sql` reads the mounted SQL file. `DROP TABLE` removes the old tables, `CREATE TABLE` creates each table, and `INSERT 0 n` reports `n` inserted rows. The last row inserts coupon `BAHOR` with three uses.
+
+This lab isolates the stock rule: `Buy` does not insert into `orders` or `order_items`. The complete order transaction remains in GB-5.07.
+
+## Two connections, one old value
+
+`products.stock` has `CHECK (stock >= 0)`. Product `id=4` is `oʻrik` (“apricot”). Set its stock to one and check:
+
+```console
+$ docker compose exec db psql -c "UPDATE products SET stock = 1 WHERE id = 4"
+UPDATE 1
+```
+
+```console
+$ docker compose exec db psql -c "SELECT name, stock FROM products WHERE id = 4"
+ name  | stock 
+-------+-------
+ oʻrik |     1
+(1 row)
+```
+
+`UPDATE … SET` assigns the column value; `WHERE id = 4` selects the product. `UPDATE 1` counts one updated row, including a matched row assigned its existing value. It does not count sold units. The table shows the product name, stock and `(1 row)`.
+
+Open `docker compose exec db psql` in two terminals in the lab folder. Each is a separate database connection, called a session. In the transcript, `[A]` and `[B]` identify the session; do not type these prefixes into SQL.
+
+| Step | A | B | Committed stock |
+|---|---|---|---|
+| 1 | `BEGIN`; read `1` | | `1` |
+| 2 | | `BEGIN`; read `1` | `1` |
+| 3 | writes the calculated `0`; `COMMIT` | still remembers `1` | `0` |
+| 4 | | writes its calculated `0`; `COMMIT` | `0` |
+
+Both applications decide that one unit is available. A commits before B writes. What does B's `UPDATE products SET stock = 0 WHERE id = 4` return?
+
+**A)** error because the row changed · **B)** `UPDATE 1` · **C)** waits for A.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The row still matches `id=4`, and assigning zero is valid. There is no condition testing the previously read stock. A has already committed, so B does not wait for A. Option A assumes an automatic stale-read check that this statement does not request.
+
+</details>
+
+The folder's helper runs the same two real `psql` sessions in that order. `python3` executes `_video/sessions.py`; `naive` selects the read-check-write scenario. The initial `UPDATE 1` resets stock. `oxirgi` means “final”. These are our rerun's complete logs:
+
+```console
+$ python3 _video/sessions.py naive
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[B] BEGIN;
+BEGIN
+
+[B] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[B] COMMIT;
+COMMIT
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     0
+(1 row)
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Two successful purchases consumed one recorded unit: one decrement was lost. The nonnegative `CHECK` passes because zero is valid. A valid final column value does not prove the sales count is valid.
+
+## Why BEGIN does not fix the read-check-write sequence
+
+Postgres defaults to **READ COMMITTED**, the isolation level governing visibility between transactions. An ordinary `SELECT` sees other transactions' data committed before that query began. It also sees earlier writes from its own transaction.
+
+B read before A committed. Its next `UPDATE` is a new statement, but `SET stock = 0` still writes the value computed from B's old Go variable. It never recomputes the decrement from the database value. In READ COMMITTED, a conflicting updater can wait and then process a newer row version; we use that rule in the next section.
+
+This is a lost update in the database, related to GB-4.07's lost update in memory. It is not evidence of a Go memory data race: Go's race detector does not check this SQL business rule.
+
+The shipped demonstration is the complete `naive.go`. It is part of package `bozor`, alongside `Store` and its error values in `store.go`; it is not a standalone `main` program.
+
+```go filename="naive.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// buyNaive — videoning birinchi, XATO versiyasi: transaction bor, lekin oʻqish va yozish orasida qulf yoʻq.
+// Ikki xaridor bir xil eski qoldiqni oʻqib, ikkalasi ham yozadi (lost update). Faqat koʻrsatish uchun (naive_test.go): ishlatmang.
+func (s *Store) buyNaive(ctx context.Context, id int64, qty int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1, 3–8 | `package`, `import` | joins package `bozor`; imports context, error inspection and pgx |
+| 10–12 | comment and `buyNaive` | demonstration method; `s *Store` is the receiver, `id` the product, `qty` the number of units |
+| 13–17 | `Begin`, error branch, deferred rollback | reserves one connection for `tx`; returns a begin error; schedules rollback for every exit |
+| 19–21 | `var stock int`; `QueryRow(...).Scan(&stock)` | reads one stock value into the address `&stock`; `$1` is `id` |
+| 22–27 | `errors.Is`; `if err != nil` | maps no row to `ErrNotFound`; returns any other read error |
+| 28–30 | `stock < qty` | returns `ErrNotEnoughStock` if the remembered stock is insufficient |
+| 31–32 | `_, err = tx.Exec(...)` | discards the command tag with `_`; writes `stock-qty` as `$1`, `id` as `$2` |
+| 33–36 | error branch; `tx.Commit(ctx)` | returns a write error or commits; commit errors reach the caller |
+
+Blank lines and `//` comments have no runtime effect. `:=` creates variables; `=` assigns existing ones. Dots select methods; parentheses call them, braces enclose blocks, and `return` leaves the method. These spellings come from the prerequisite lessons.
+
+`buyNaive` deliberately demonstrates positive purchases only; it lacks the `qty <= 0` guard. Both final methods reject invalid quantities. A transaction makes this buyer's writes succeed or roll back together; it does not reserve the previously read stock for that buyer.
+
+The test starts 20 buyers with stock 5. Its central loop, shortened from the shipped helper, is:
+
+```go
+errs := make([]error, 20)
+var wg sync.WaitGroup
+for i := range errs {
+	wg.Go(func() {
+		errs[i] = store.Buy(ctx, 4, 1)
+	})
+}
+wg.Wait()
+```
+
+`make([]error, 20)` allocates 20 result slots. `i` is the slot index; `wg.Go` starts a function in a goroutine. Each writes only `errs[i]`. The loop has a separate `i` for each iteration. `wg.Wait()` waits for all buyers. The caller counts `nil` results as successes and accepts `ErrNotEnoughStock` for rejected buyers. `WaitGroup` is covered fully in [GB-7.01](/lab/youtube/gb#gb-7-01).
+
+How many successes can the naive method report? **A)** always 5 · **B)** more than 5, possibly 20 · **C)** always panic.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Several buyers can read the same stock before any writes. The video recorded 20, and this rerun also recorded 20. Scheduling changes the count; the SQL sequence above explains the bug without relying on timing. A transaction does not make answer A automatic, and this valid SQL need not panic.
+
+</details>
+
+Run the demonstration test without changing any file:
+
+```console
+$ go test -run Naive -v
+=== RUN   TestNaiveOversells
+    naive_test.go:15: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik
+--- PASS: TestNaiveOversells (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.104s
+```
+
+Here `PASS` means the test successfully **observed the bug**. The Uzbek log says: “attempt 1: 20 buyers, stock 5, told 20 of them ‘purchased’”. The final methods have a different test, which requires exactly five successes.
+
+The video's red test can also be rerun. In an empty working folder copy `go.mod`, `go.sum`, `bozor.sql`, and `store_test.go`. Copy `_video/stages/01-store.go` as `store.go`. In that copy of `store_test.go`, blank the entire `{"BuyLocked", (*Store).BuyLocked},` line, keeping the newline: this stage defines only `Buy`. Run `go test` there:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.08s)
+    --- FAIL: TestConcurrentBuyers/Buy (0.08s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.128s
+```
+
+`--- FAIL` names the test and subtest. `store_test.go:172` identifies the assertion: actual 20, expected 5. `exit status 1` marks failure; the last line names the module and duration. The video took `0.126s`, this run `0.128s`; those durations do not establish performance.
+
+## Fix 1: check and decrement in one UPDATE
+
+The rule fits one SQL condition:
+
+```sql
+UPDATE products
+SET stock = stock - 1
+WHERE id = 4 AND stock >= 1;
+```
+
+`SET` calculates from the row's current stock. `AND` requires both the matching id and at least one unit. An `UPDATE` holds a row lock against conflicting writers until its transaction finishes. An unmatched row is not updated.
+
+Reset stock to one. A begins and decrements, but leaves its transaction open. B submits the same conditional statement and waits. After A commits, what does B report?
+
+**A)** `UPDATE 1`, stock `-1` · **B)** `UPDATE 0` · **C)** CHECK error.
+
+<details>
+<summary>Answer</summary>
+
+**B.** After waiting, Postgres rechecks `WHERE` against the updated row. Stock is zero, so `stock >= 1` is false. Nothing is decremented. A ignores the condition; C assumes the decrement happens before the row qualifies.
+
+</details>
+
+`shartli` selects this scenario. The helper verifies that B produces no result for two seconds before A commits. “kutyapti = True” means it is waiting; this line comes from the helper, not Postgres.
+
+```console
+$ python3 _video/sessions.py shartli
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+UPDATE 1
+
+[B] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+UPDATE 0
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+| Moment | A | B | Stock after committed work |
+|---|---|---|---|
+| A updates | holds row lock; uncommitted `0` | | `1` |
+| B updates | still open | waits for A | `1` |
+| A commits | releases lock | rechecks `0 >= 1`; updates zero rows | `0` |
+
+The Go method from `store.go`, shown as a fragment:
+
+```go
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+```
+
+`qty <= 0` returns `ErrInvalidQuantity` before SQL. `Exec` returns `tag`, a `CommandTag`, and `err`. Return SQL errors first; then inspect `tag.RowsAffected()`. Zero means no row was updated. Here we assume the product exists and return `ErrNotEnoughStock`; an unknown id also gives zero.
+
+`$1` occurs twice but is one parameter, `qty`. `$2` is `id`. `nil` reports success. This single statement already runs in an implicit transaction, so no explicit `Begin` is needed for this isolated stock decrement. A full order with several writes still needs the transaction from GB-5.07.
+
+In the previous working folder replace `store.go` with `_video/stages/02-store.go`, keeping the same blank test line. Predict: **A)** overselling remains · **B)** exactly 5 successes · **C)** every buyer rejected.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Successful decrements consume the five units. The remaining statements find no qualifying stock row. The test checks five rounds.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.217s
+```
+
+The video recorded `0.227s`, our run `0.217s`. `PASS` confirms the stock rule; it is not a speed comparison between implementations.
+
+## Fix 2: SELECT FOR UPDATE inside tx
+
+If a decision requires reading the row into Go first, lock it during that read:
+
+```sql
+SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+```
+
+`FOR UPDATE` locks the selected row. Another transaction's writes or conflicting locking reads wait. An **ordinary SELECT remains allowed** and reads visible committed data. The lock does not make every reader wait.
+
+| Step | A | B |
+|---|---|---|
+| 1 | `BEGIN`; locking read returns `1` | `BEGIN` |
+| 2 | holds row lock | `SELECT … FOR UPDATE` waits |
+| 3 | writes `0`; `COMMIT` | waits until A ends |
+| 4 | finished | locks the updated row and reads `0`; rejects purchase |
+
+Predict B's locking read after A commits: **A)** old `1` · **B)** current `0` · **C)** always an error.
+
+<details>
+<summary>Answer</summary>
+
+**B** in this READ COMMITTED experiment. The read waits and then returns the updated row. The Go check sees insufficient stock. With different isolation levels, a concurrent change can instead require retrying the transaction.
+
+</details>
+
+`forupdate` runs the real sessions. Here B commits after reading; in Go, returning `ErrNotEnoughStock` takes the deferred rollback path.
+
+```console
+$ python3 _video/sessions.py forupdate
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[B] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+ stock 
+-------
+     1
+(1 row)
+
+[B] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+ stock 
+-------
+     0
+(1 row)
+
+[B] COMMIT;
+COMMIT
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Here is the complete final `store.go`, including both approaches. Its original comment on line 45 says another buyer cannot read the row. Read that as “cannot perform the conflicting locking read”: ordinary SELECT is allowed.
+
+```go filename="store.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08, GB-5.05).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq (GB-5.07).
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi kerak (GB-5.07: manfiy miqdor qoldiqni oshirib yuborar edi).
+var ErrInvalidQuantity = errors.New("miqdor noldan katta boʻlishi kerak")
+
+// Store — Postgres'dagi bozor jadvallariga Go'dan kirish (GB-5.05).
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Buy id mahsulotdan qty dona sotadi. Tekshiruv va kamaytirish bitta UPDATE buyrugʻida:
+// "WHERE stock >= $1" shart bajarilmasa qator oʻzgarmaydi va RowsAffected() nol boʻladi.
+// Bu darsda id mavjud deb faraz qilinadi: nol qator "qoldiq yetmaydi" degani (mavjud boʻlmagan id ham nol qator beradi;
+// ikkisini ajratish uchun alohida SELECT kerak, BuyLocked esa ErrNoRows orqali ErrNotFound beradi).
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+
+// BuyLocked ham sotadi, lekin boshqacha: avval qatorni FOR UPDATE bilan qulflaydi, qoldiqni Go'da tekshiradi,
+// keyin yozadi. Qulf transaction tugaguncha turadi, shuning uchun boshqa xaridorning FOR UPDATE'i yoki UPDATE'i shu qatorni kutadi (oddiy SELECT kutmaydi).
+func (s *Store) BuyLocked(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+The shared declarations on lines 1–23 import the packages, construct three sentinel error values with `errors.New`, and define `Store` with `pool *pgxpool.Pool`. `ErrNotFound` means “product not found”, `ErrNotEnoughStock` means “insufficient stock”, and `ErrInvalidQuantity` requires a positive quantity. Each is one error value that callers recognize with `errors.Is`. Lines 29–42 are the conditional method just explained.
+
+Only the new parts of `BuyLocked`:
+
+| Line | Code | What it does |
+|---|---|---|
+| 46–49 | method and quantity guard | same inputs and invalid-quantity rule as `Buy` |
+| 50–54 | `Begin`; deferred rollback | keeps reading and writing on one transaction connection |
+| 56–58 | `tx.QueryRow(... FOR UPDATE).Scan(&stock)` | acquires the lock and reads the stock |
+| 59–64 | no-row and other error branches | maps `pgx.ErrNoRows` to `ErrNotFound`; preserves other failures |
+| 65–67 | stock check | rejects the purchase while still holding the row lock |
+| 68–72 | `tx.Exec`; error check | writes the stock computed under the lock |
+| 73 | `tx.Commit(ctx)` | confirms the write and ends the transaction |
+
+Every early return after `Begin` reaches the deferred rollback. A successful commit also ends the transaction; the later deferred rollback returns `ErrTxClosed`, which this pattern ignores.
+
+In a fresh module copy containing the original `store.go`, `store_test.go`, `go.mod`, `go.sum` and `bozor.sql`, `go test` checks both stock methods. Predict: **A)** both pass · **B)** only conditional UPDATE passes · **C)** both oversell.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Each method permits exactly five successful purchases in each of five rounds. The read-check-write method now holds a database lock across those steps.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.378s
+```
+
+The video's matching run was `0.381s`; our run was `0.378s`. These are test durations, not throughput measurements. The useful count is **5/20 accepted, 15/20 rejected**, with final stock zero. The naive run accepted **20/20**, four times the available five units.
+
+## Choosing a method and a shared boundary
+
+| Requirement | Choice | Cost or limitation |
+|---|---|---|
+| rule fits `stock >= qty` | conditional UPDATE | zero rows does not distinguish absent product from insufficient stock |
+| read data, decide in Go, write | `FOR UPDATE` in one transaction | holds a lock while Go makes the decision; keep the transaction short |
+| write stock and complete an order | put the chosen rule in the order transaction | all related writes must use the same `tx` |
+
+Two application servers each have their own `sync.Mutex`. Does this prevent the database bug? **A)** yes · **B)** only within each process · **C)** only with the race detector.
+
+<details>
+<summary>Answer</summary>
+
+**B.** A Go mutex coordinates goroutines sharing that mutex in one process. The other server has a different mutex. The database rule must coordinate both servers. The race detector cannot enforce an SQL stock condition.
+
+</details>
+
+## Common mistakes
+
+**1. Sending FOR UPDATE through the pool.** This is the classic silent bug. After `tx := … Begin`, replace only the read in `BuyLocked` with:
+
+```go
+var stock int
+err = s.pool.QueryRow(ctx,
+	"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+```
+
+This is the fragment from `_video/stages/04-store-pool-mistake.go`. `pool.QueryRow` uses a separate connection rather than the connection reserved by `tx`. Its implicit transaction ends with that statement; the row lock is released before the later `tx.Exec`. Writing the words `FOR UPDATE` therefore does not protect the whole operation.
+
+Predict the test: **A)** PASS because FOR UPDATE appears · **B)** FAIL, too many successes · **C)** always panic.
+
+<details>
+<summary>Answer</summary>
+
+**B** in our run. The statement is valid, so no SQL syntax error or panic is required. The read's lock does not cover the write in the other transaction.
+
+</details>
+
+In the previous fresh stock-test copy replace `store.go` with `_video/stages/04-store-pool-mistake.go` and run:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.31s)
+    --- FAIL: TestConcurrentBuyers/BuyLocked (0.12s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.397s
+```
+
+The assertion at `store_test.go:172` expected five but received 20. The video recorded `0.381s`; this run `0.397s`. **Fix:** both read and write must use `tx`, as in the complete final file. Our tests use a pool of 40 connections; with 20 buyers and a smaller pool, this mistake can also exhaust connections because each buyer holds one and requests another.
+
+**2. Treating BEGIN as a stock reservation.** The naive example already showed this silent failure. Lock before reading, or combine the condition and decrement.
+
+**3. Assuming CHECK alone catches a stale absolute write.** Both buyers assigning zero pass `CHECK (stock >= 0)`. An unguarded *relative* decrement below zero does fail. The helper's `check` scenario first sets stock to zero; its complete output is:
+
+```console
+$ python3 _video/sessions.py check
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4;
+ERROR:  new row for relation "products" violates check constraint "products_stock_check"
+DETAIL:  Failing row contains (4, oʻrik, 3500000, -1, t).
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+`violates check constraint` means the new row breaks the named rule. `DETAIL` shows the rejected row: product 4, apricot, price `3500000` tiyin, stock `-1`, active `t` (true). The failed statement leaves stock zero. Keep the constraint as a final safeguard; use the conditional rule for an expected “insufficient stock” result.
+
+**4. Holding locks during unrelated work.** Finish the transaction promptly; avoid network calls while a stock row is locked. When locking several products, acquire them in a consistent order to reduce deadlocks, where transactions wait on one another. Postgres aborts one deadlocked transaction, so the caller must handle that error.
+
+## Check yourself
+
+**1.** What does `RowsAffected() == 0` tell you?
+
+<details>
+<summary>Answer</summary>
+
+The statement updated zero rows. For this SQL, either the id is absent or the stock condition failed. `Buy` assumes an existing id and returns `ErrNotEnoughStock`; the coupon task asks you to distinguish the reasons.
+
+</details>
+
+**2.** When does the FOR UPDATE lock end in `BuyLocked`? Can an ordinary SELECT read meanwhile?
+
+<details>
+<summary>Answer</summary>
+
+The lock lasts until the transaction commits or rolls back along these code paths. Ordinary SELECT can read visible committed data while the row lock is held. Conflicting writers and locking readers wait.
+
+</details>
+
+**3.** From GB-5.05: `QueryRow` finds no row. Where do you receive which error?
+
+<details>
+<summary>Answer</summary>
+
+`Scan` returns `pgx.ErrNoRows`. `BuyLocked` maps it to `ErrNotFound`.
+
+</details>
+
+**4.** Predict: stock is zero. `UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1` returns what? **A)** CHECK error · **B)** `UPDATE 0` · **C)** `UPDATE 1`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The row fails the WHERE condition, so the statement does not decrement it. This is the same rule used after the waiting update resumed.
+
+</details>
+
+## Homework
+
+Work from the original starter copy: [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-08-ikki-xaridor/TASK.md), [answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor/solution).
+
+- 🟢 **Required:** in `coupon.go`, rewrite `UseCoupon(ctx, code)` with one conditional UPDATE: `uses_left = uses_left - 1`, `WHERE code = $1 AND uses_left > 0`. Coupon `BAHOR` starts with three uses; ten concurrent calls must produce exactly three successes. Return `nil` for one updated row.
+- 🟢 **Required error distinction:** after zero updated rows, separately read the coupon. Map `pgx.ErrNoRows` to `ErrCouponNotFound`; an existing exhausted coupon gives `ErrCouponUsedUp`. Preserve other database errors.
+- 🟡 **Optional:** implement `UseCouponLocked` with `Begin`, `tx.QueryRow(... FOR UPDATE)`, the Go check, `tx.Exec` and `Commit`. Its test skips only while the optional stub remains.
+
+The green levels label the required steps on this written page; TASK.md does not assign them levels. Leave `store_test.go`, `coupon_test.go` and `naive_test.go` unchanged. Tests create a temporary schema per test and remove it afterwards; they require a running Postgres server.
+
+Start Postgres with the command from the beginning, then run `go test .` in the starter. The dot selects the current package. Our rerun failed on the intended coupon task:
+
+```console
+$ go test .
+--- FAIL: TestUseCouponConcurrent (0.06s)
+    coupon_test.go:61: 1-urinish: promo-kod 3 marta, 10 kishi bir vaqtda: 9 tasiga oʻtdi; kutilgan: 3 (TASK.md)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.696s
+FAIL
+```
+
+`coupon_test.go:61` says “attempt 1: coupon allows 3 uses, 10 people concurrently: accepted 9, expected 3”. The video-era task output recorded 10; scheduling changes that count. The final stock methods are already correct in the starter.
+
+<details>
+<summary>Answer</summary>
+
+For `UseCoupon`, `Exec` returns a tag; `RowsAffected() == 1` means success. A follow-up SELECT after zero rows only classifies the failure: it does not authorize another decrement. The lab does not concurrently delete or replenish coupons; a broader system must define how those concurrent changes affect error classification.
+
+For the optional method, use `BuyLocked` as the template and change the table, key and error mapping. Both statements must go through the same transaction. The complete answer is `solution/coupon.go`:
+
+```go filename="solution/coupon.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ErrCouponUsedUp — promo-kodning ishlatish soni tugagan.
+var ErrCouponUsedUp = errors.New("promo-kod tugagan")
+
+// ErrCouponNotFound — bunday promo-kod yoʻq.
+var ErrCouponNotFound = errors.New("promo-kod topilmadi")
+
+// UseCoupon promo-kodni bir marta ishlatadi: coupons.uses_left bittaga kamayadi.
+// Tekshiruv va kamaytirish bitta UPDATE buyrugʻida (WHERE uses_left > 0): parallel chaqiruvlarda ham roppa-rosa uses_left marta oʻtadi.
+func (s *Store) UseCoupon(ctx context.Context, code string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE coupons SET uses_left = uses_left - 1 WHERE code = $1 AND uses_left > 0", code)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Nol qator: promo-kod yoʻq yoki tugagan. Qaysi biri ekanini alohida oʻqib bilamiz.
+	var left int
+	err = s.pool.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return ErrCouponUsedUp
+}
+
+var errUseCouponLockedTODO = errors.New("UseCouponLocked hali yozilmagan")
+
+// UseCouponLocked ham promo-kodni ishlatadi, lekin boshqacha: qatorni FOR UPDATE bilan qulflaydi, Go'da tekshiradi, keyin yozadi.
+func (s *Store) UseCouponLocked(ctx context.Context, code string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var left int
+	err = tx.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1 FOR UPDATE", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if left == 0 {
+		return ErrCouponUsedUp
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE coupons SET uses_left = $1 WHERE code = $2", left-1, code)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+New names: `code` identifies the coupon, `left` holds remaining uses, `ErrCouponUsedUp` means “coupon exhausted”, and `ErrCouponNotFound` means “coupon not found”. Lines 19–26 perform the guarded decrement and return success. Lines 28–37 classify the zero-row result. Lines 44–67 repeat the transaction pattern, with `left == 0` checked under the row lock. Line 40 keeps the original optional-stub error value for the checker; the implemented method no longer returns it.
+
+</details>
+
+The answer has its own module. `cd` changes the working folder, and `&&` runs the next command only if the folder change succeeds:
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	0.708s
+```
+
+`ok` means all solution tests passed. The earlier course run recorded `0.700s`, our run `0.708s`; the correctness condition is three successes from ten calls. Return to the lab folder and remove its containers, network and data volume. `-v` deletes the lab volume:
+
+```bash
+cd ..
+docker compose down -v
+```
+
+## Sources
+
+- [PostgreSQL 18: READ COMMITTED](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED)
+- [PostgreSQL 18: row-level locks](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS)
+- [PostgreSQL 18: deadlocks](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-DEADLOCKS)
+- [PostgreSQL 18: SELECT locking clause](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [PostgreSQL 18: UPDATE](https://www.postgresql.org/docs/18/sql-update.html)
+- [PostgreSQL 18: ROLLBACK](https://www.postgresql.org/docs/18/sql-rollback.html)
+- [pgx: Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+- [pgconn: CommandTag.RowsAffected](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#CommandTag.RowsAffected)
+- [pgxpool: Pool.QueryRow](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.QueryRow)
+- [Go: WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go)
+- [Go: Mutex](https://pkg.go.dev/sync#Mutex)
+- [Go: loop variables per iteration](https://go.dev/blog/loopvar-preview)
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. Console blocks are reruns; video and earlier course measurements are explicitly identified in the text. No benchmark is claimed.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+---
+
+← Previous lesson: [GB-5.07](/lab/youtube/gb/gb-5-07/en) · Next lesson: [GB-5.09](/lab/youtube/gb/gb-5-09/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

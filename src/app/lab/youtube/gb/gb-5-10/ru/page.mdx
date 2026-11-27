@@ -1,0 +1,1033 @@
+---
+title: "Контрольная точка: API заказов, тесты на настоящем Postgres"
+date: "2026/11/27"
+description: "Транзакции, условный UPDATE и отдельная схема: проверяем правила API на настоящем Postgres и добавляем GET /orders/{id}."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-10/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-10"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-10/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-10/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-10"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-10) · **Русский** · [English](/lab/youtube/gb/gb-5-10/en)  
+Урок GB-5.10 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-10) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+В GB-4.08 каталог хранился в памяти: после остановки сервера заказы исчезали. Как после перехода на Postgres проверить отсутствие частичных заказов и отрицательных остатков?
+
+**Одна идея:** целостность заказа и правило остатка обеспечиваются базой; проверяйте их на настоящем Postgres. Отдельная схема для каждого теста защищает таблицы от параллельных тестов других пакетов.
+
+К концу урока вы:
+
+- запустите API с миграциями и начальными данными;
+- разберёте транзакцию и условный UPDATE в `PlaceOrder`;
+- проверите rollback, параллельные покупки и HTTP-ответы на настоящей базе;
+- добавите `GET /orders/{id}`, опираясь на эти тесты.
+
+| Термин | Смысл | Английский термин |
+|---|---|---|
+| интеграционный тест | настоящий обработчик, хранилище и база проверяются вместе | integration test |
+| изоляция тестов | у каждого теста свои таблицы и начальные данные | test isolation |
+| параллельное выполнение тестов пакетов | тестовые программы разных пакетов могут работать одновременно | package test parallelism |
+
+## Что нужно знать заранее
+
+Основа: [GB-5.09 · sqlc](/lab/youtube/gb/gb-5-09/ru), [GB-4.08 · API каталога](/lab/youtube/gb/gb-4-08/ru), [GB-5.08 · условный UPDATE](/lab/youtube/gb/gb-5-08/ru).
+Также: [GB-5.02 · Docker и Postgres](/lab/youtube/gb/gb-5-02/ru), [GB-5.03 · правила SQL](/lab/youtube/gb/gb-5-03/ru), [GB-5.04 · связанные таблицы](/lab/youtube/gb/gb-5-04/ru), [GB-5.05 · pgxpool](/lab/youtube/gb/gb-5-05/ru), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/ru), [GB-5.07 · транзакция](/lab/youtube/gb/gb-5-07/ru), [GB-4.03 · httptest](/lab/youtube/gb/gb-4-03/ru), [GB-4.05 · маршруты](/lab/youtube/gb/gb-4-05/ru), [GB-4.06 · проверка JSON](/lab/youtube/gb/gb-4-06/ru), [GB-4.07 · горутины](/lab/youtube/gb/gb-4-07/ru), [GB-3.06 · JSON](/lab/youtube/gb/gb-3-06/ru), [GB-2.08 · errors.Is и errors.As](/lab/youtube/gb/gb-2-08/ru), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru), [GB-1.08 · тесты](/lab/youtube/gb/gb-1-08/ru).
+
+Для кода Go: [GB-1.03 · int64](/lab/youtube/gb/gb-1-03/ru), [GB-1.06 · циклы](/lab/youtube/gb/gb-1-06/ru), [GB-2.01 · слайсы](/lab/youtube/gb/gb-2-01/ru), [GB-2.03 · структуры](/lab/youtube/gb/gb-2-03/ru), [GB-2.04 · указатели](/lab/youtube/gb/gb-2-04/ru), [GB-2.05 · методы](/lab/youtube/gb/gb-2-05/ru), [GB-2.06 · пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-3.02 · теги JSON](/lab/youtube/gb/gb-3-02/ru), [GB-4.04 · http.Server](/lab/youtube/gb/gb-4-04/ru).
+
+Все команды выполняются в `lessons/gb-5-10-buyurtma-api/`; Playground не подходит. Нужны Go 1.27.4, Docker Compose и goose v3.30.2. `CGO_ENABLED=0`: при этой проверке компилятор C не использовался.
+
+**Вспомните:** какой тип получит `Product.Stock`, сгенерированный sqlc для SQL `integer`? **A)** `int` · **B)** `int32` · **C)** `int64`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** С pgx/v5 sqlc отображает `integer` в `int32`. В сегодняшней структуре, написанной вручную, используется `Stock int`. Генерация запросов через sqlc — дополнительная часть задания.
+
+</details>
+
+## Спецификация и файлы
+
+`POST /orders` принимает `customer` и `items` в теле. В каждой позиции есть `product_id` и `quantity`.
+Деньги хранятся в тийинах, `int64`: `1200000` — 12 000 сумов. `unit_price` — цена единицы в момент продажи.
+Имена людей в примерах — вымышленные тестовые данные из `seed.sql`; `olma`, `non`, `choy`, `oʻrik` означают яблоки, хлеб, чай, абрикосы.
+
+| Запрос или ситуация | Результат |
+|---|---|
+| `GET /health` | `200`, `ok` |
+| `GET /products`, `GET /products/{id}` | список или один товар; неверный ID — `400`, отсутствующий товар — `404` |
+| `POST /products` | `201`; повтор имени — `409`, неверное значение — `422` |
+| `DELETE /products/{id}` | `204`; не найден — `404`, используется в заказе — `409` |
+| `POST /orders` | успех — `201`; отсутствующий товар — `404`, недостаточный остаток — `409`, неверное значение — `422`, повреждённый JSON — `400` |
+| `GET /orders/{id}` | пока отсутствует; домашнее задание |
+
+Валидация ограничивает имя клиента 1–100 символами, корзину — 1–20 позициями, количество — 1–100 единицами. Один товар в двух позициях тоже даёт `422`.
+`items[0].quantity` — поле количества первой позиции. Формат ошибки прежний: `error.code`, `error.message`, при необходимости `error.fields`.
+
+| Файл | Назначение |
+|---|---|
+| `cmd/api/main.go`, `handlers.go`, `json.go` | сервер, маршруты и обработчики, чтение/запись JSON |
+| `internal/store/store.go` | запросы pgx и бизнес-правила |
+| `internal/pgtest/pgtest.go` | изоляция тестов |
+| `migrations/`, `migrate.go`, `seed.sql` | три файла миграции, включение в бинарник, начальные данные |
+| `api_test.go`, `store_test.go` | тесты правил этого урока |
+| `tekshiruv_test.go`, `TASK.md`, `solution/` | проверки задания, условие и готовое решение |
+
+## Запускаем базу и сервер
+
+Повторная проверка для этой страницы выполнена в отдельной копии. В `compose.yaml` имя проекта заменено на `gb510-doc-verify`, строка порта — на `"127.0.0.1:47963:5432"`.
+Для повторения результатов задайте эти два значения в своей копии. Исходная папка использует имя `gb510` и порт `5510`; если сохраняете их, укажите `5510` и в URL.
+Пароль ниже — открытое демонстрационное значение только для локальной лаборатории.
+
+```bash
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:47963/bozor
+export DATABASE_URL="$GOOSE_DBSTRING"
+docker compose up -d --wait
+```
+
+`export` задаёт переменные окружения для следующих команд. `GOOSE_DRIVER` — тип базы, `GOOSE_MIGRATION_DIR` — папка миграций, `GOOSE_DBSTRING` — адрес подключения.
+`DATABASE_URL` читают API и тесты. `up -d --wait` запускает Postgres в фоне и ждёт готовности.
+
+Какая версия будет после `goose up`? **A)** 1 · **B)** 3 · **C)** 4. Три файла: товары, заказы с позициями, затем столбец статуса.
+
+<details>
+<summary>Ответ</summary>
+
+**B: 3.** Номера файлов — 1, 2, 3. Четыре товара не означают четвёртую версию миграции.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 21:42:32 OK   00001_products.sql (6.48ms)
+2026/11/27 21:42:32 OK   00002_orders.sql (9.4ms)
+2026/11/27 21:42:32 OK   00003_orders_status.sql (2.69ms)
+2026/11/27 21:42:32 goose: successfully migrated database to version: 3
+```
+
+Это наш полный вывод, включая дату и время. В видео времена 5.1/9.27/2.33 ms, у нас — 6.48/9.4/2.69 ms.
+Отношения приблизительно 1.27/1.01/1.15. Это разовые измерения, зависящие от нагрузки; существенный результат — применение всех трёх миграций.
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+`exec -T db` выполняет команду внутри контейнера без терминала; `psql -f` читает SQL-файл.
+`TRUNCATE … RESTART IDENTITY` очищает таблицы и перезапускает нумерацию ID. `INSERT 0 4`, `INSERT 0 3`, `INSERT 0 4`: четыре товара, три заказа, четыре позиции заказов.
+
+В первом терминале запустите сервер:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Следующие команды `curl` выполняйте во втором терминале. `-sS` скрывает индикатор прогресса, сохраняя ошибки; `-i` выводит заголовки ответа; `-d` отправляет тело.
+
+## 201 и следующий 409
+
+Двух яблок и одной упаковки чая хватает: `40 ≥ 2`, `8 ≥ 1`. Какой ответ? **A)** `201`, сумма `4900000` · **B)** `201`, сумма `5900000` · **C)** `409`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `2 × 1200000 + 2500000 = 4900000` тийинов, то есть 49 000 сумов. Вариант B использует цену абрикосов вместо чая; для C должен был закончиться товар.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/orders -d '{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":3,"quantity":1}]}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /orders/4
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 173
+
+{"id":4,"customer":"Aziza","status":"yangi","items":[{"product_id":1,"quantity":2,"unit_price":1200000},{"product_id":3,"quantity":1,"unit_price":2500000}],"total":4900000}
+```
+
+`201 Created` — создано. `Location: /orders/4` — адрес нового ресурса; маршрут чтения вы добавите в задании.
+`status: "yangi"` задаётся через `DEFAULT` в миграции. `Content-Type` сообщает тип тела, `Content-Length` — число байтов; `Date` меняется при каждом запуске.
+
+Теперь два яблока и пять абрикосов: абрикосов всего два. **Сколько яблок останется? A)** 36 · **B)** 38 · **C)** 40.
+
+<details>
+<summary>Ответ</summary>
+
+**B: 38.** Предыдущий успешный заказ забрал два яблока. Следующая транзакция откатится целиком.
+36 означает ошибочное сохранение первого изменения; 40 — ошибочную отмену и предыдущего успешного заказа.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/orders -d '{"customer":"Jasur","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":5}]}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 83
+
+{"error":{"code":"insufficient_stock","message":"oʻrik: qoldiq 2, soʻralgan 5"}}
+```
+
+```console
+$ curl -s localhost:8765/products/1
+{"id":1,"name":"olma","price":1200000,"stock":38}
+```
+
+```console
+$ docker compose exec -T db psql -c "SELECT id, customer, status FROM orders WHERE id > 3"
+ id | customer | status 
+----+----------+--------
+  4 | Aziza    | yangi
+(1 row)
+```
+
+`psql -c` выполняет одну SQL-команду. `WHERE id > 3` выбирает заказы после начальных данных: есть только заказ 4.
+`409 Conflict` и `insufficient_stock` означают недостаточный остаток. В сообщении `qoldiq` — доступное количество, `soʻralgan` — запрошенное.
+
+| Шаг | Яблоки внутри транзакции | Яблоки в другом соединении | Новый заказ |
+|---|---:|---:|---|
+| Заказ Aziza подтверждён | 38 | 38 | 4 существует |
+| Jasur: `BEGIN`, `INSERT orders` | 38 | 38 | ещё не подтверждён |
+| первый `UPDATE` | 36 | 38 | ещё не подтверждён |
+| абрикосы: ноль строк, `StockError` | 36 | 38 | ещё не подтверждён |
+| `ROLLBACK` | 38 | 38 | заказа Jasur нет |
+
+## От сервера до хранилища
+
+Полный входной файл с комментариями:
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor buyurtmalar API'si (GB-5.10, 5-modul nazorat nuqtasi): GB-4.08'dagi katalog API,
+// endi maʼlumot Postgres'da. Server toʻxtasa ham mahsulotlar va buyurtmalar saqlanib qoladi.
+//
+//	docker compose up -d --wait
+//	goose up                     (GOOSE_DRIVER, GOOSE_DBSTRING, GOOSE_MIGRATION_DIR: GB-5.06)
+//	docker compose exec db psql -f /lab/seed.sql
+//	export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5510/bozor
+//	go run ./cmd/api             → bozor API: http://localhost:8765
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// newServer — bozor API serveri (GB-4.04): route'lar newMux'da, sarlavhalar uchun vaqt chegarasi.
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newMux(st),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		return errors.New("DATABASE_URL yoʻq: export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5510/bozor")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil { // baza ishlamasa server ishga tushmaydi
+		return err
+	}
+	srv := newServer(":8765", store.New(pool))
+	fmt.Println("bozor API: http://localhost:8765")
+	return srv.ListenAndServe()
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–8 | заметки о запуске в комментариях; URL записан для исходного порта 5510 |
+| 9, 11–21 | `package main`; пакеты context, ошибок, вывода, HTTP, окружения, времени, store и pgxpool |
+| 23–30 | `newServer`: адрес, обработчик `newMux(st)`, 5 секунд на заголовки |
+| 32–37 | `main` вызывает `run`; при ошибке пишет в stderr и завершает процесс с кодом 1 |
+| 39–43 | `run() error`: возвращает понятную ошибку, если URL отсутствует |
+| 44–45 | context на 5 секунд для проверки подключения; `cancel` при возврате |
+| 46–50 | создание пула, проверка ошибки, `Close` при возврате |
+| 51–53 | `Ping` проверяет настоящее подключение; без базы HTTP-сервер не запускается |
+| 54–57 | пул → хранилище → сервер; вывод адреса и ожидание запросов |
+
+Пустые строки разделяют части; `{}` ограничивает блок или структуру, `&http.Server` означает её адрес.
+Успешный возврат `pgxpool.New` не гарантирует подключения. Для этого нужен `Ping`.
+При обычном возврате из `run` выполняются его `defer`; сам `os.Exit` их не выполняет.
+
+`Store` хранит только `pool *pgxpool.Pool`. Изменяемого каталога в памяти больше нет, поэтому прежний `sync.Mutex` не нужен.
+Обработчик передаёт базе `r.Context()`: при отключении клиента context отменяется. При стандартной настройке pgx прекращает ожидание и закрывает соединение.
+Следующая функция — полный фрагмент из `cmd/api/handlers.go`; остальные определения находятся в том же проекте.
+
+```go
+func (a *api) createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	items := make([]store.OrderItem, len(in.Items))
+	for i, it := range in.Items {
+		items[i] = store.OrderItem{ProductID: it.ProductID, Quantity: it.Quantity}
+	}
+	o, err := a.st.PlaceOrder(r.Context(), in.Customer, items)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("Location", fmt.Sprintf("/orders/%d", o.ID))
+	writeJSON(w, http.StatusCreated, o)
+}
+```
+
+`in` имеет тип `orderInput`. `decodeJSON` проверяет форму; `validateOrder` возвращает ошибки полей.
+`make` выделяет слайс позиций хранилища; цикл копирует входные ID и количество. `PlaceOrder` выполняет запись.
+Ошибка передаётся в `writeStoreError`; при успехе записываются `Location` и `201`.
+
+## Одна транзакция: условный UPDATE и цена
+
+Полный метод из `internal/store/store.go`:
+
+```go
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (Order, error) {
+	if len(items) == 0 {
+		return Order{}, fmt.Errorf("%w: savat boʻsh", ErrBadQuantity)
+	}
+	for _, it := range items {
+		if it.Quantity <= 0 {
+			return Order{}, fmt.Errorf("%w, hozir %d", ErrBadQuantity, it.Quantity)
+		}
+	}
+	// Qatorlar doim bir xil tartibda (ID boʻyicha) qulflanadi: ikki savat bir-birini kutib qotmaydi
+	// (deadlock, GB-5.08 Chuqurroq). Chaqiruvchining slice'i oʻzgarmasin: nusxa saralanadi.
+	items = slices.Clone(items)
+	slices.SortFunc(items, func(a, b OrderItem) int { return cmp.Compare(a.ProductID, b.ProductID) })
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Order{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	o := Order{Customer: customer}
+	err = tx.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id, status", customer).
+		Scan(&o.ID, &o.Status)
+	if err != nil {
+		return Order{}, err
+	}
+	for _, it := range items {
+		err = tx.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&it.UnitPrice)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Order{}, whyNoRow(ctx, tx, it)
+		}
+		if err != nil {
+			return Order{}, err
+		}
+		_, err = tx.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			o.ID, it.ProductID, it.Quantity, it.UnitPrice)
+		if err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+| Часть | Причина |
+|---|---|
+| пустая корзина и `Quantity <= 0` | вызов вне HTTP тоже должен отклонять недопустимую покупку |
+| `slices.Clone`, `slices.SortFunc`, `cmp.Compare` | одинаковый порядок блокировок по ID без изменения слайса вызывающего |
+| `Begin`, `defer Rollback` | транзакция на одном соединении; откат при каждом раннем возврате |
+| `INSERT … RETURNING id, status` | запись нового ID и стандартного статуса в `o` |
+| `$1` и `$2` | количество и ID товара соответственно; значения передаются отдельно от SQL |
+| `stock >= $1` | проверка и уменьшение остатка одной командой |
+| `RETURNING price`, `Scan(&it.UnitPrice)` | сохранение цены продажи в позиции |
+| `tx.Exec` | запись позиции через ту же транзакцию |
+| `append`, `Total += …` | позиции ответа и сумма в тийинах; `int64` приводит количество к типу цены |
+| `Commit` | подтверждение всех шагов; его ошибка тоже проверяется |
+
+`UPDATE` удерживает блокировку строки до конца транзакции. Противоположные корзины `[olma, choy]` и `[choy, olma]` могут ждать друг друга: **deadlock**.
+Порядок по ID предотвращает этот конфликт. Для этого есть `TestOppositeCarts`.
+При READ COMMITTED ожидавший `UPDATE` проверяет условие заново на обновлённой строке; 20 покупателей не смогут купить одну оставшуюся единицу одновременно.
+
+## Ноль строк: 404 или 409?
+
+Если обновлённая строка не найдена, `QueryRow(...).Scan(...)` возвращает `pgx.ErrNoRows`. Это не ошибка SQL: транзакция не прервана, в ней можно сделать следующий запрос.
+Не путайте это с прерванной транзакцией после ошибки SQL из GB-5.07.
+
+```go
+func whyNoRow(ctx context.Context, tx pgx.Tx, it OrderItem) error {
+	var p Product
+	err := tx.QueryRow(ctx,
+		"SELECT name, stock FROM products WHERE id = $1", it.ProductID).Scan(&p.Name, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("mahsulot %d: %w", it.ProductID, ErrNotFound)
+	}
+	if err != nil {
+		return err
+	}
+	return &StockError{Name: p.Name, Stock: p.Stock, Want: it.Quantity}
+}
+```
+
+`tx pgx.Tx` принимает ту же транзакцию. `whyNoRow` читает название и остаток.
+Если товара нет, `ErrNotFound` оборачивается через `%w`. Если есть — возвращается `&StockError{Name, Stock, Want}`.
+`Name` — название, `Stock` — доступное количество, `Want` — запрошенное. Затем возврат из `PlaceOrder` запускает `Rollback`.
+
+В начальных данных яблоки входят в заказы. Ответ на `DELETE /products/1`? **A)** `204` · **B)** `500` · **C)** `409`.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `order_items.product_id REFERENCES products(id)` не позволяет удалить товар. Хранилище преобразует `23503` в `ErrInUse`, обработчик возвращает `409`.
+A нарушил бы историю заказов; B считает ожидаемую бизнес-ситуацию внутренней ошибкой.
+
+</details>
+
+```console
+$ curl -sS -i -X DELETE localhost:8765/products/1
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 81
+
+{"error":{"code":"conflict","message":"mahsulot 1: mahsulot buyurtmalarda bor"}}
+```
+
+`writeStoreError` преобразует ошибки в статусы в одном месте:
+
+| Результат хранилища | HTTP и код |
+|---|---|
+| `ErrNotFound` | `404 not_found` |
+| `*StockError`, `errors.As` | `409 insufficient_stock` |
+| `ErrDuplicate` (`23505`, `UNIQUE`) | `409 conflict` |
+| `ErrInUse` (`23503`, внешний ключ) | `409 conflict` |
+| `ErrBadQuantity`, `ErrBadProduct` | `422 validation_failed` |
+| неожиданная ошибка | `500 internal`; подробности в журнале сервера |
+
+## Настоящий Postgres: своя схема у каждого теста
+
+Mock — код, подменяющий базу. Он не проверяет условный UPDATE, CHECK, внешний ключ и rollback внутри Postgres.
+**Интеграционный тест** запускает настоящие части вместе: `httptest → newMux → Store → Postgres`. Отдельный порт HTTP-сервера не нужен.
+**Изоляция тестов** обеспечивает независимость данных одного теста от изменений другого.
+
+```go filename="internal/pgtest/pgtest.go" showLineNumbers
+// Package pgtest — testlar uchun haqiqiy Postgres (mock emas). Har test oʻz boʻsh sxemasini oladi:
+// migratsiyalar (goose) va seed.sql shu sxemaga qoʻllanadi, test tugagach sxema oʻchiriladi.
+// Shuning uchun testlar bir-biriga xalaqit bermaydi, `go test ./...` paketlarni parallel
+// ishga tushirganda ham (GB-5.10 videosidagi xato), va sizning public sxemangizga tegmaydi.
+package pgtest
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/abdurahmon27/bozor"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+// LabURL — shu papkadagi compose.yaml koʻtaradigan Postgres. Boshqa manzil uchun DATABASE_URL qoʻying.
+const LabURL = "postgres://bozor:bozor-lab@localhost:5510/bozor"
+
+// New bu test uchun yangi sxema yaratadi, unga migratsiyalar va seed.sql'ni qoʻllaydi va shu sxemaga
+// ulangan pool qaytaradi. Postgres ishlamasa test aniq xabar bilan yiqiladi (oʻtkazib yuborilmaydi).
+func New(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		url = LabURL
+	}
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("DATABASE_URL notoʻgʻri: %v", err)
+	}
+	cfg.MaxConns = max(cfg.MaxConns, 4) // URL'da pool_max_conns=1 qolgan boʻlsa ham parallel test toʻxtab qolmasin (GB-5.07)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	admin, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err == nil {
+		err = admin.Ping(ctx)
+	}
+	if err != nil {
+		t.Fatalf("Postgres'ga ulanib boʻlmadi (%s:%d): avval shu papkada `docker compose up -d --wait` ishga tushiring.\n%v",
+			cfg.ConnConfig.Host, cfg.ConnConfig.Port, err)
+	}
+	schema := fmt.Sprintf("test_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("sxema yaratilmadi: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Logf("sxema %s oʻchirilmadi (qoʻlda: DROP SCHEMA %s CASCADE): %v", schema, schema, err)
+		}
+		admin.Close()
+	})
+
+	poolCfg := cfg.Copy()                                    // nusxa: admin pool'ning sozlamasi oʻzgarmasin (u ham shu cfg'dan yasalgan)
+	poolCfg.ConnConfig.RuntimeParams["search_path"] = schema // har ulanish jadvallarni shu sxemadan qidiradi
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	db := stdlib.OpenDBFromPool(pool) // goose database/sql bilan ishlaydi: pool ustidan *sql.DB
+	defer db.Close()
+	provider, err := bozor.NewProvider(db)
+	if err != nil {
+		t.Fatalf("goose: %v", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("migratsiya qoʻllanmadi: %v", err)
+	}
+	// Oddiy protokol: bitta matnda bir nechta SQL buyrugʻi boʻlishi mumkin (GB-5.07 testlari).
+	if _, err := pool.Exec(ctx, bozor.SeedSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("seed.sql bajarilmadi: %v", err)
+	}
+	return pool
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–24 | пакет и импорты; `LabURL` — стандартный адрес, `DATABASE_URL` заменяет его |
+| 25–34 | `t.Helper` связывает ошибку с вызывающим тестом; URL разбирается в настройки |
+| 35–37 | минимум 4 соединения; 30 секунд на подготовку, очистка context при возврате |
+| 39–46 | административный пул и `Ping`; без базы тест завершается понятной ошибкой, а не пропускается |
+| 47–50 | имя из значения времени `UnixNano`; `CREATE SCHEMA` создаёт отдельную группу таблиц |
+| 51–56 | после теста `DROP SCHEMA … CASCADE`, затем закрытие административного пула; ошибка записывается в журнал |
+| 58–64 | `cfg.Copy`, `search_path` для каждого соединения, пул теста и его Cleanup |
+| 66–71 | `*sql.DB` поверх пула pgx; `bozor.NewProvider` из корневого пакета передаёт встроенные миграции goose |
+| 72–79 | `Up` применяет миграции, simple protocol выполняет много команд из `SeedSQL`; возвращается пул |
+
+Схема — именованная группа таблиц в базе. `search_path` определяет, в какой группе искать имя `products`.
+`RuntimeParams` задаёт настройку каждому новому соединению; мы не полагаемся на случайный `SET` в одном соединении.
+Имя схемы нельзя передать как SQL-идентификатор через `$1`. Здесь имя получается из внутреннего значения времени, а не из текста клиента.
+
+`t.Cleanup` работает после теста; `defer` сработал бы при возврате из `New`. Cleanup выполняются в обратном порядке: сначала закрывается пул теста, затем удаляется схема.
+`db.Close` закрывает обёртку, но не пул pgx. `go:embed` в `migrate.go` включил миграции и seed в бинарник.
+
+| Тест A | Тест B |
+|---|---|
+| `search_path = test_A` | `search_path = test_B` |
+| `test_A.products`, `test_A.orders` | `test_B.products`, `test_B.orders` |
+| в конце удаляется только `test_A` | `test_B` продолжает работать |
+
+Имена на схеме сокращены; в коде это `test_<UnixNano>`.
+
+## Тесты, проверяющие правила
+
+`store_test` — внешний пакет: он использует хранилище через `store.New`. `testCtx(t)` даёт context со сроком, `count` выполняет SQL `count(*)`, `stockOf` читает остаток.
+Следующий тест каждый раз получает новый seed. Поэтому яблок 40, а не 38, оставшихся после предыдущего `curl`.
+
+```go
+func TestPlaceOrderRollsBack(t *testing.T) {
+	pool := pgtest.New(t)
+	_, err := store.New(pool).PlaceOrder(testCtx(t), "Jasur", []store.OrderItem{
+		{ProductID: 1, Quantity: 2}, {ProductID: 4, Quantity: 5},
+	})
+	var se *store.StockError
+	if !errors.As(err, &se) {
+		t.Fatalf("PlaceOrder(oʻrik x5) = %v; kutilgan *StockError", err)
+	}
+	if got := count(t, pool, "orders"); got != 3 {
+		t.Errorf("orders'da %d qator, kutilgan 3: yarim buyurtma qoldi", got)
+	}
+	if got := count(t, pool, "order_items"); got != 4 {
+		t.Errorf("order_items'da %d qator, kutilgan 4", got)
+	}
+	if got := stockOf(t, pool, 1); got != 40 {
+		t.Errorf("olma qoldigʻi %d, kutilgan 40: birinchi qator bekor boʻlmadi", got)
+	}
+}
+```
+
+`errors.As` проверяет тип ошибки `*StockError`. Затем проверяются три заказа, четыре позиции и 40 яблок.
+Одного HTTP `409` недостаточно: тест также проверяет отсутствие частичной записи в базе.
+
+20 покупателей, 8 упаковок чая. **A)** 20 успешных заказов · **B)** 8 успешных, 12 `StockError` · **C)** остаток −12.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Условный UPDATE проверяет каждую продажу в базе. A и C предполагают ошибочную раздельную проверку и запись.
+
+</details>
+
+```go
+func TestConcurrentOrders(t *testing.T) {
+	pool := pgtest.New(t)
+	st := store.New(pool)
+	ctx := testCtx(t)
+	errs := make([]error, 20)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = st.PlaceOrder(ctx, "xaridor", []store.OrderItem{{ProductID: 3, Quantity: 1}})
+		})
+	}
+	wg.Wait()
+	ok := 0
+	for _, err := range errs {
+		var se *store.StockError
+		switch {
+		case err == nil:
+			ok++
+		case !errors.As(err, &se):
+			t.Errorf("kutilmagan xato: %v", err)
+		}
+	}
+	if ok != 8 {
+		t.Errorf("%d ta buyurtma oʻtdi, kutilgan 8 (omborda 8 ta choy)", ok)
+	}
+	if got := stockOf(t, pool, 3); got != 0 {
+		t.Errorf("choy qoldigʻi %d, kutilgan 0", got)
+	}
+	if got := count(t, pool, "orders"); got != 3+8 {
+		t.Errorf("orders'da %d qator, kutilgan 11", got)
+	}
+}
+```
+
+В `errs` каждая горутина пишет на своё место `i`. `wg.Go` запускает работу, `wg.Wait` ждёт всех; подробнее о `sync.WaitGroup` — в GB-7.01.
+Следующий цикл считает `nil` и проверяет, что остальные ошибки — только `StockError`. Результат: 8 успешных заказов, остаток 0, заказов `3 + 8 = 11`.
+
+Фрагмент таблицы из `api_test.go`; это не самостоятельная программа:
+
+```go
+func TestRoutes(t *testing.T) {
+	tests := []struct {
+		name, method, path, body string
+		status                   int
+		want                     string
+	}{
+		{"katalog", "GET", "/products", "", 200, `"name":"oʻrik"`},
+		{"bitta", "GET", "/products/4", "", 200, `"stock":2`},
+		{"yoq_id", "GET", "/products/99", "", 404, `"code":"not_found"`},
+		{"son_emas", "GET", "/products/abc", "", 400, `"code":"bad_id"`},
+		{"yangi_mahsulot", "POST", "/products", `{"name":"anor","price":2000000,"stock":5}`, 201, `"id":5`},
+		{"takror_nom", "POST", "/products", `{"name":"olma","price":100,"stock":1}`, 409, `"code":"conflict"`},
+		{"buyurtma", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":1}]}`, 201, `"total":5900000`},
+		{"qoldiq_yetmaydi", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":5}]}`, 409, `"message":"oʻrik: qoldiq 2, soʻralgan 5"`},
+		{"yoq_mahsulot", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":99,"quantity":1}]}`, 404, `"code":"not_found"`},
+		{"nol_dona", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":0}]}`, 422, `"items[0].quantity"`},
+		{"boʻsh_savat", "POST", "/orders", `{"customer":"Aziza","items":[]}`, 422, `"items"`},
+		{"takror_qator", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":1},{"product_id":1,"quantity":2}]}`, 422, `"items[1].product_id"`},
+		{"notoʻgʻri_json", "POST", "/orders", `{"customer":`, 400, `"code":"bad_json"`},
+		{"oʻchirish", "DELETE", "/products/3", "", 204, ""},
+		{"buyurtmadagi", "DELETE", "/products/1", "", 409, `"code":"conflict"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := testAPI(t)
+			rec := send(h, tc.method, tc.path, tc.body)
+			if rec.Code != tc.status {
+				t.Errorf("%s %s: status %d, kutilgan %d: %s", tc.method, tc.path, rec.Code, tc.status, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("%s %s: body'da %s yoʻq: %s", tc.method, tc.path, tc.want, rec.Body)
+			}
+		})
+	}
+}
+```
+
+`tc` — текущий случай; `t.Run` — отдельный подтест. `testAPI(t)` даёт каждой строке mux в новой схеме; `_` отбрасывает ненужный пул.
+`send` создаёт `httptest.NewRequest` и `NewRecorder`, затем вызывает `h.ServeHTTP`. `rec.Code` — статус, `rec.Body` — тело.
+`strings.Contains` проверяет наличие нужного фрагмента. API-тест покупает два яблока и **абрикосы**: сумма `5900000`; предыдущий `curl` покупал чай.
+
+Если выбрать только тесты уже готовых возможностей урока, следующая команда должна пройти. `-run` применяет regex к именам тестов; `-count=1` отключает кэш; `./...` выбирает все пакеты.
+
+```console
+$ go test -count=1 -run 'Test(Routes|OrderConflictLeavesNoTrace|PlaceOrder.*|ConcurrentOrders|OppositeCarts|EmptyCart|AddDuplicate|Delete)$' ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.794s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.501s
+```
+
+**Полный `go test ./...` в стартере пока падает:** `tekshiruv_test.go` ожидает незавершённый `Order` и GET-маршрут.
+Результат `ok` в видео получен в копии без именно этих двух файлов проверок. В задании их не удаляйте.
+
+## Глубже (необязательно): защита и границы измерений
+
+- `CHECK (stock >= 0)` — дополнительная защита базы от ошибки приложения. Ноль строк после guard не прерывает транзакцию; ошибка CHECK прерывает.
+- Rollback не возвращает identity sequence назад. После отменённого заказа может остаться пропуск ID; непрерывность ID не гарантируется.
+- `go test` может кэшировать успех. Состояние базы не входит в ключ кэша; для настоящей интеграционной проверки используйте `-count=1` или `-count=5`.
+- `NewProvider` этого урока не использует общий advisory lock: миграции схем независимы. Параллельные миграции развёртывания в одной общей схеме — другая задача, GB-8.06.
+- В README API-тесты с блокировкой/без неё занимали 6.1/1.1 s: примерно 5.55 раза. Это **цитируемое** измерение подготовки к видео; для этой страницы оно не повторялось.
+- Результат `go test -race` тоже взят из журнала подготовки: проверка прошла в Docker с gcc. Эта страница проверена с `CGO_ENABLED=0`; race-проверка не повторялась.
+- `active` не включён в условие продажи этой лаборатории; товары seed активны. `404` для отсутствующего товара даже внутри тела — спецификация курса; другое API может выбрать `422`.
+- testcontainers-go может запускать Postgres из теста. Курс использует существующую настройку Compose; затем тот же подход будет в CI.
+
+## Частые ошибки
+
+**1. Очищать общий `public` в каждом тесте.** Успех одного пакета отдельно не означает успех всех пакетов.
+Фрагмент ошибочного `pgtest.New` из видео:
+
+```go
+// XATO VERSIYA: hamma test bitta public sxemada
+if _, err := admin.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
+	t.Fatalf("sxema tozalanmadi: %v", err)
+}
+pool := admin
+```
+
+Не применяйте этот код к основной базе: `DROP … CASCADE` удаляет таблицы схемы.
+Повторяйте только на отдельной лабораторной базе и в отдельной копии. Выполните следующее из папки урока; `cd` переходит в папку копии.
+`mktemp -d` создаёт временную папку, `cp -R` копирует проект, `rm` удаляет проверки задания только в копии.
+
+```bash
+demo=$(mktemp -d)
+cp -R . "$demo/"
+rm "$demo/cmd/api/tekshiruv_test.go" "$demo/internal/store/tekshiruv_test.go"
+cp "$demo/_video/stages/pgtest-shared.go" "$demo/internal/pgtest/pgtest.go"
+cd "$demo"
+```
+
+Это эксперимент из видео, а не способ сдачи задания. Только пакет store:
+
+```console
+$ go test -count=5 ./internal/store
+ok  	github.com/abdurahmon27/bozor/internal/store	1.912s
+```
+
+А оба пакета? **A)** пройдут, каждый тест начинает с чистого состояния · **B)** случайные тесты упадут · **C)** лишь замедлятся.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** У каждого пакета отдельный тестовый бинарник. Пока один удаляет `public`, другой использует его таблицы.
+A и C учитывают лишь последовательное выполнение внутри одного пакета.
+
+</details>
+
+```console
+$ go test -count=5 ./... > shared-failure.log 2>&1
+```
+
+Команда записала вывод в файл и завершилась с кодом 1. `> … 2>&1` направляет stdout и stderr в один файл.
+`sed` выводит первые 24 строки журнала; в этом запуске весь журнал занимает 23 строки:
+
+```console
+$ sed -n '1,24p' shared-failure.log
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestRoutes (0.53s)
+    --- FAIL: TestRoutes/buyurtmadagi (0.02s)
+        api_test.go:55: migratsiya qoʻllanmadi: partial migration error (type:sql,version:1): ERROR: duplicate key value violates unique constraint "pg_type_typname_nsp_index" (SQLSTATE 23505)
+--- FAIL: TestOrderConflictLeavesNoTrace (0.02s)
+    api_test.go:69: migratsiya qoʻllanmadi: failed to list migrations: ERROR: relation "goose_db_version" does not exist (SQLSTATE 42P01)
+--- FAIL: TestRoutes (2.66s)
+    --- FAIL: TestRoutes/katalog (2.01s)
+        api_test.go:55: seed.sql bajarilmadi: ERROR: deadlock detected (SQLSTATE 40P01)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	6.460s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+--- FAIL: TestPlaceOrder (2.03s)
+    store_test.go:45: migratsiya qoʻllanmadi: partial migration error (type:sql,version:3): ERROR: column "status" of relation "orders" already exists (SQLSTATE 42701)
+--- FAIL: TestPlaceOrderRollsBack (0.04s)
+    store_test.go:66: migratsiya qoʻllanmadi: partial migration error (type:sql,version:3): ERROR: relation "orders" does not exist (SQLSTATE 42P01)
+--- FAIL: TestOppositeCarts (1.07s)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	6.062s
+FAIL
+```
+
+`api_test.go:55` — строка теста, вызвавшая помощник: `t.Helper` привязывает сообщение к ней.
+`relation … does not exist` — таблицы нет (`42P01`); `deadlock detected` — взаимное ожидание (`40P01`).
+`duplicate key … unique constraint` — нарушено ограничение уникальности, повтор значения (`23505`); `column … already exists` — столбец уже есть (`42701`).
+Здесь это следствие столкновения подготовки тестов, а не бизнес-ошибка повторного названия товара.
+В видео падали другие подтесты. Случайный порядок меняет сообщение, но не причину.
+
+| Время | `cmd/api.test` | `store.test` |
+|---|---|---|
+| 1 | запрос к `products` | `DROP SCHEMA public CASCADE` |
+| 2 | таблицы нет: FAIL | повторно применяет миграции |
+
+**Исправление:** восстановите в копии `internal/pgtest/pgtest.go` исходный файл, показанный выше. Мы повторили проверку на той же копии для видео:
+
+```console
+$ go test -count=5 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	4.761s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	2.727s
+```
+
+`-p` задаёт число одновременно работающих программ пакетов; стандартное значение — GOMAXPROCS, обычно связанное с доступными процессорами.
+В этом уроке внутри пакетов нет `t.Parallel`: тесты последовательны. `-p 1` скрывает столкновение, отдельная схема устраняет причину.
+
+| Пять повторов, без проверок задания | Видео, s | Наш запуск, s | Наш/видео |
+|---|---:|---:|---:|
+| общая схема, только store | 2.134 | 1.912 | 0.90 |
+| отдельная схема, API | 4.458 | 4.761 | 1.07 |
+| отдельная схема, store | 2.777 | 2.727 | 0.98 |
+
+Числа не гарантируют скорость: важны нагрузка и состав тестов. Существенный результат — `FAIL → ok` и независимые данные при повторных запусках.
+
+**2. Считать `ErrNoRows` ошибкой SQL.** Ноль строк не прерывает транзакцию; `whyNoRow` работает в том же `tx`. Не применяйте этот приём бездумно после любой ошибки SQL.
+
+**3. Ждать 38 яблок в rollback-тесте.** Каждый тест получает новый seed, поэтому ожидает 40. Эксперимент с `curl` и схема теста независимы.
+
+**4. Ждать зелёных тестов в стартере.** Мы записали полную проверку в журнал:
+
+```console
+$ go test ./... > starter-failure.log 2>&1
+```
+
+```console
+$ sed -n '1,5p' starter-failure.log
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestGetOrder (0.22s)
+    --- FAIL: TestGetOrder/bor (0.05s)
+        tekshiruv_test.go:25: GET /orders/1: status 404, kutilgan 200 (TASK.md, 2–3-qadam): 404 page not found
+    --- FAIL: TestGetOrder/qatorsiz (0.05s)
+```
+
+`404`, ожидалось `200`: GET-маршрута ещё нет. Проверка хранилища тоже говорит `Order hali yozilmagan` — «Order ещё не написан». Исправление — выполнить задание, а не удалить проверку.
+
+## Проверьте себя
+
+**1.** Если guard не вернул строку, как различаются 404 и 409?
+
+<details>
+<summary>Ответ</summary>
+
+`whyNoRow` читает товар в той же транзакции: его нет — `ErrNotFound` → 404; есть — `StockError` → 409.
+
+</details>
+
+**2.** 20 параллельных запросов и 8 упаковок чая: сколько успехов, ошибок и какой конечный остаток?
+
+<details>
+<summary>Ответ</summary>
+
+8 успехов, 12 `StockError`, остаток 0. Заказов в тесте 11: 3 начальных и 8 новых.
+
+</details>
+
+**3.** Почему нельзя заменить `t.Cleanup` на `defer pool.Close()` внутри `pgtest.New`?
+
+<details>
+<summary>Ответ</summary>
+
+`defer` закроет пул при возврате из `New`. Тест ещё не начал работу. `Cleanup` выполняется после теста.
+
+</details>
+
+**4.** GB-5.07: изменяет ли базу `Rollback` после успешного `Commit`?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Транзакция завершена; pgx возвращает `ErrTxClosed`. Поэтому заранее установленный защитный `defer tx.Rollback(ctx)` безопасен.
+
+</details>
+
+## Домашнее задание
+
+Условие: [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-10-buyurtma-api/TASK.md).
+Код: [папка урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api).
+Ответ: [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api/solution).
+
+🟠 **Контрольное задание:** добавьте `GET /orders/{id}`. Не меняйте файлы `*_test.go`.
+
+1. `store.Order(ctx, id)`: клиент/статус из `orders`, позиции из `order_items` с `ORDER BY id`. Сумма — сложение `quantity × unit_price`.
+2. GET-маршрут и `getOrder` в `newMux`: `pathID → Order(r.Context(), id) → writeJSON`.
+3. В `writeStoreError`: `ErrOrderNotFound → 404 not_found`.
+
+`GET /orders/1` — 200, Dilnoza, два яблока и три единицы хлеба, сумма `3600000`; `/orders/99` — JSON `404 not_found`; `/orders/abc` — `400 bad_id`.
+`/orders/3` без позиций: `items: []`, `total: 0`, не `null`. GET по `Location` из POST должен возвращать тот же заказ.
+
+🟡 **Дополнительно:** генерируйте запросы через sqlc. Проверки результата не меняются.
+
+В исходной папке урока, при работающем Postgres:
+
+```bash
+go test ./...
+```
+
+<details>
+<summary>Ответ</summary>
+
+Используйте подход из `Get` и `List`. Начните с пустого слайса; проверьте `rows.Close` и `rows.Err`.
+Полный метод решения:
+
+```go
+func (s *Store) Order(ctx context.Context, id int64) (Order, error) {
+	o := Order{ID: id, Items: []OrderItem{}}
+	err := s.pool.QueryRow(ctx,
+		"SELECT customer, status FROM orders WHERE id = $1", id).Scan(&o.Customer, &o.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, fmt.Errorf("buyurtma %d: %w", id, ErrOrderNotFound)
+	}
+	if err != nil {
+		return Order{}, err
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY id", id)
+	if err != nil {
+		return Order{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPrice); err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := rows.Err(); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+Первый запрос оборачивает `ErrOrderNotFound` через `%w`. Второй читает позиции и считает сумму по цене продажи.
+При `rows.Err` частичный результат не возвращается. Обработчик:
+
+```go
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+```
+
+Маршрут и сопоставление ошибок добавляются в соответствующие функции:
+
+```go
+mux.HandleFunc("GET /orders/{id}", a.getOrder)
+
+// writeStoreError ichidagi case:
+case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrOrderNotFound):
+	writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: err.Error()})
+```
+
+Для отдельной проверки готового решения перейдите в его папку через `cd solution`; `DATABASE_URL` остаётся адресом той же лабораторной базы.
+
+```bash
+cd solution
+```
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.019s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.651s
+```
+
+Пять повторов тоже прошли:
+
+```console
+$ go test -count=5 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	5.728s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	3.804s
+```
+
+Эти времена включают проверки задания; состав тестов отличается от таблицы для копии видео выше.
+
+</details>
+
+Остановите сервер через Ctrl+C в его терминале. Вернитесь в папку копии урока и удалите контейнеры и том именно этого проекта Compose:
+
+```bash
+docker compose down -v
+```
+
+Следующий урок: [GB-6.01 · middleware](/lab/youtube/gb#gb-6-01).
+
+## Источники
+
+- [PostgreSQL 18](https://www.postgresql.org/docs/18/): [UPDATE … RETURNING](https://www.postgresql.org/docs/18/sql-update.html), [READ COMMITTED](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED), [транзакции](https://www.postgresql.org/docs/18/tutorial-transactions.html), [ROLLBACK](https://www.postgresql.org/docs/18/sql-rollback.html).
+- [TRUNCATE](https://www.postgresql.org/docs/18/sql-truncate.html), [схемы](https://www.postgresql.org/docs/18/ddl-schemas.html), [search_path](https://www.postgresql.org/docs/18/ddl-schemas.html#DDL-SCHEMAS-PATH), [DROP SCHEMA](https://www.postgresql.org/docs/18/sql-dropschema.html), [внешние ключи](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK), [взаимные блокировки](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-DEADLOCKS), [SQLSTATE](https://www.postgresql.org/docs/18/errcodes-appendix.html), [последовательности](https://www.postgresql.org/docs/18/functions-sequence.html).
+- pgx: [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool), [Ping](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Ping), [Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx), [RuntimeParams](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#Config), [OpenDBFromPool](https://pkg.go.dev/github.com/jackc/pgx/v5/stdlib#OpenDBFromPool), [DeadlineContextWatcherHandler](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#DeadlineContextWatcherHandler).
+- goose: [Provider](https://pkg.go.dev/github.com/pressly/goose/v3#Provider), [NewProvider](https://pkg.go.dev/github.com/pressly/goose/v3#NewProvider), [CLI](https://pressly.github.io/goose/documentation/cli-commands/).
+- Go: [флаги тестирования](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [-count](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [-p](https://pkg.go.dev/cmd/go#hdr-Compile_packages_and_dependencies), [T.Cleanup](https://pkg.go.dev/testing#T.Cleanup), [Request.Context](https://pkg.go.dev/net/http#Request.Context), [os.Exit](https://pkg.go.dev/os#Exit).
+- HTTP: [RFC 9110 status codes](https://www.rfc-editor.org/rfc/rfc9110#name-status-codes), [201](https://www.rfc-editor.org/rfc/rfc9110#name-201-created), [Location](https://www.rfc-editor.org/rfc/rfc9110#name-location), [DELETE](https://www.rfc-editor.org/rfc/rfc9110#name-delete), [409](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict), [422](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content).
+- [sqlc: типы Postgres](https://docs.sqlc.dev/en/stable/reference/datatypes.html), [testcontainers-go: Postgres](https://golang.testcontainers.org/modules/postgres/).
+- [README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api), [_video/chiqishlar.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-10-buyurtma-api/_video/chiqishlar.txt).
+
+Повторные запуски: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL 18.7 (`postgres:18-alpine`), pgx v5.13.0, goose v3.30.2, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api)
+
+---
+
+← Предыдущий урок: [GB-5.09](/lab/youtube/gb/gb-5-09/ru) · Следующий урок: [GB-6.01](/lab/youtube/gb#gb-6-01) → · [Все уроки](/lab/youtube/gb)
+
+</div>

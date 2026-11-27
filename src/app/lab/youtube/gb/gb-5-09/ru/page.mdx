@@ -1,0 +1,1192 @@
+---
+title: "sqlc: вы пишете SQL, Go-код генерируется"
+date: "2026/11/27"
+description: "Создайте Go-код из SQL, разберите типы и WithTx, найдите ошибку в имени столбца до запуска программы."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-09"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-09"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-09) · **Русский** · [English](/lab/youtube/gb/gb-5-09/en)  
+Урок GB-5.09 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-09) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+В SQL неверно назван столбец. `go build` и `go vet` прошли. Почему программа падает только при обращении к базе?
+
+**Одна идея:** SQL пишете вы; **sqlc** читает схему и запросы, затем создаёт обычный Go-код для проверенных запросов.
+При этой конфигурации он не подключается к базе. Неизвестный столбец обнаруживается при `sqlc generate`; ошибки выполнения всё равно нужно обрабатывать.
+
+После урока вы:
+
+- напишете комментарии в `query.sql` и конфигурацию `sqlc.yaml`;
+- прочитаете типы, `QueryRow`, `Scan` и цикл строк в `db/`;
+- переведёте `Store.Get`, `ListActive` и `PlaceOrder` на сгенерированные методы;
+- различите устаревший `db/`, забытый generate и ошибки типов выражений.
+
+| Термин | Простой смысл | Английский термин |
+|---|---|---|
+| аннотация запроса | имя Go-метода и форма результата в SQL-комментарии | query annotation |
+| сгенерированный код | Go-файлы, созданные sqlc из SQL и схемы | generated code |
+| ошибка при генерации | ошибка, найденная при проверке SQL до запуска программы | generation-time error |
+
+## Что нужно знать заранее
+
+- [GB-5.08 · Условный UPDATE](/lab/youtube/gb/gb-5-08/ru): `RowsAffected` и правило остатка.
+- [GB-5.05 · pgx и пул соединений](/lab/youtube/gb/gb-5-05/ru): `$1`, `QueryRow`, `Query`, `Scan`, context и `ErrNoRows`.
+- [GB-5.07 · Транзакция](/lab/youtube/gb/gb-5-07/ru), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/ru): `Begin`, `Commit`, `Rollback`, `Up`/`Down`.
+- [GB-5.02 · Лаборатория Postgres](/lab/youtube/gb/gb-5-02/ru), [GB-5.03 · Таблицы](/lab/youtube/gb/gb-5-03/ru), [GB-5.04 · NULL и SUM](/lab/youtube/gb/gb-5-04/ru).
+- [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru), [GB-2.03 · Структура](/lab/youtube/gb/gb-2-03/ru), [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru), [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru).
+- [GB-2.06 · Пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-2.07 · Интерфейс](/lab/youtube/gb/gb-2-07/ru), [GB-2.08 · Error](/lab/youtube/gb/gb-2-08/ru), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru).
+- [GB-1.01 · Команды Go](/lab/youtube/gb/gb-1-01/ru), [GB-1.02 · Переменные](/lab/youtube/gb/gb-1-02/ru), [GB-1.03 · Типы](/lab/youtube/gb/gb-1-03/ru), [GB-1.05 · Условие](/lab/youtube/gb/gb-1-05/ru), [GB-1.06 · Цикл](/lab/youtube/gb/gb-1-06/ru), [GB-1.07 · Функция и error](/lab/youtube/gb/gb-1-07/ru), [GB-1.08 · Тест](/lab/youtube/gb/gb-1-08/ru).
+- [GB-3.02 · JSON и raw string](/lab/youtube/gb/gb-3-02/ru), [GB-3.03 · Установка инструментов](/lab/youtube/gb/gb-3-03/ru): обратные кавычки, `go install` и `PATH`.
+
+Вопрос из GB-5.08: остаток `0`, условие `WHERE id = 4 AND stock >= 1`. Сколько вернёт `RowsAffected()`? **A)** `1` · **B)** `0` · **C)** ошибка CHECK.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Условие ложно, ни одна строка не обновлена. Новое значение для проверки CHECK даже не записывалось.
+
+</details>
+
+Работайте в копии папки `lessons/gb-5-09-sqlc`. Go Playground не выполнит этот опыт с локальным Postgres.
+Нужны Go 1.27.4, Docker Compose, goose v3.30.2 и pgx v5.13.0. Модуль самостоятельный; предыдущие папки копировать не нужно.
+Это `Store` из решения GB-5.07. Отдельная лаборатория `Buy`/`UseCoupon` из GB-5.08 объединится с ним в GB-5.10.
+
+Следующие настройки действуют для всех примеров. `export` экспортирует переменную окружения; `CGO_ENABLED=0` отключает интеграцию с C.
+`GOTOOLCHAIN` выбирает версию Go. При проверке порт `5409` был свободен. Если он занят, поменяйте порт в копии Compose и во всех URL.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+docker compose up -d --wait
+export GOOSE_DRIVER=postgres
+export GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:5409/bozor
+export DATABASE_URL="$GOOSE_DBSTRING"
+```
+
+`up -d --wait` запускает базу в фоне и ждёт готовности. Учётные данные в URL — открытая тестовая настройка только этой лаборатории.
+Goose и Go-программа подключаются к одной базе. В проверочной копии проект называется `gb509written`, в курсе — `gb509`, в видео — `bozor`: отсюда разные имена контейнеров.
+На новой базе `goose up` применяет три миграции:
+
+```console
+$ goose up
+2026/11/27 21:39:26 OK   00001_products.sql (4.04ms)
+2026/11/27 21:39:26 OK   00002_orders.sql (5.4ms)
+2026/11/27 21:39:26 OK   00003_orders_status.sql (1.6ms)
+2026/11/27 21:39:26 goose: successfully migrated database to version: 3
+```
+
+Префикс — время записи в журнал; `OK` означает, что файл применён. Последнее `3` — версия схемы.
+Цитата из видео: `7.72 / 6.97 / 2.81 ms`; повторное измерение: `4.04 / 5.4 / 1.6 ms`.
+Отношения старого времени к новому примерно `1.9 / 1.3 / 1.8`. Нагрузка и кэш меняют числа; существенный результат — все три миграции применены.
+
+Тестовые данные лежат в `seed.sql`. `exec db psql` запускает клиент в сервисе `db`; `-f` читает файл внутри контейнера:
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+Последнее число в `INSERT 0 n` — количество добавленных строк: товары, заказы, позиции заказов. Применяйте seed один раз.
+
+## Почему SQL-строка проходит компилятор?
+
+Для первого опыта в копии замените `store.go` и `main.go` этими двумя файлами. Код приведён точно из курса.
+Сначала сохраните итоговые файлы как `.start`. Временно скроем тест суффиксом `.off`: на первом этапе ещё нет `OrderItem`.
+Все эти действия выполняйте только в копии лаборатории.
+
+```bash
+cp store.go store.go.start
+cp main.go main.go.start
+cp query.sql query.sql.start
+mv store_test.go store_test.go.off
+cp _video/stages/01-store-qolda.go store.go
+cp _video/stages/01-main.go main.go
+```
+
+```go filename="_video/stages/01-store-qolda.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Videoning boshidagi holat: GB-5.05'dagi qoʻlda yozilgan Get, ustun nomida xato bilan (stock → qoldiq).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, qoldiq FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+```
+
+```go filename="_video/stages/01-main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+}
+```
+
+Строки первого файла:
+
+| Строка | Что делает |
+|---|---|
+| 1 | `package main`: пакет исполняемой программы. |
+| 3–9 | Импортирует `context`, `errors` и пакеты pgx; пустая строка отделяет внешние пакеты. |
+| 11–17 | Комментарий и структура `Product`: ID, имя, цена в тийинах, остаток. `int` — доменный тип. |
+| 19 | `ErrNotFound` — значение ошибки, которое вызывающий код узнаёт через `errors.Is`. |
+| 21–23 | `Store` хранит адрес pool; `*pgxpool.Pool` — указатель. |
+| 25–29 | Метод `Get` принимает `ctx` и `id`, создаёт `p`, отправляет SQL и выполняет `Scan` в четыре адреса `&p.…`. |
+| 30–32 | Если строки нет, возвращает пустой `Product{}` и `ErrNotFound`. |
+| 33–34 | Возвращает другой результат или ошибку и закрывает метод. |
+
+Второй файл: 1–10 пакет и импорты; 12 начало `main`; 13 основной context; 14 создание pool по URL из окружения.
+15–18 вывод ошибки в stderr и выход через `os.Exit(1)`; 19 отложенное закрытие pool.
+21 создание `Store`; 22 context на пять секунд; 23 освобождение ресурса таймера; 25 чтение товара; 26 вывод; 27 закрывающая скобка.
+Пустые строки служат читаемости. `qoldiq` означает «остаток», но настоящий SQL-столбец называется `stock`.
+
+Какая команда найдёт ошибку? **A)** `go build` · **B)** `go vet .` · **C)** `go run .`.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Для компилятора Go SQL — обычная строка. `go vet` тоже не знает эту таблицу. A и B предполагают проверку SQL-схемы.
+
+</details>
+
+```console
+$ go build
+$ go vet .
+$ go run .
+{0  0 0} ERROR: column "qoldiq" does not exist (SQLSTATE 42703)
+```
+
+Первые две команды ничего не напечатали и завершились с кодом `0`. `column … does not exist` означает «такого столбца нет».
+`42703` — код Postgres `undefined_column`. `Scan` не записал значения, поэтому выведен пустой `Product`.
+Программа лишь печатает ошибку, поэтому `go run` тоже завершился с `0`: успешный exit не гарантирует успешный запрос.
+Исправление: заменить в SQL `qoldiq` на `stock`.
+
+## query.sql и sqlc.yaml
+
+Повторяющиеся `QueryRow` и `Scan` для каждого запроса поручим инструменту. `sqlc generate` создаёт этот повторяющийся Go-код.
+Сначала установите инструмент. `cmd/sqlc` — пакет команды, `@v1.31.1` — выбранная версия.
+Каталог Go bin должен быть в `PATH`, как в GB-3.03:
+
+```console
+$ go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+$ sqlc version
+v1.31.1
+```
+
+Установка у нас ничего не напечатала. В исследовании видео холодная установка заняла около четырёх минут, наша повторная установка с кэшем — три секунды.
+Это разные условия, сравнивать скорость по ним нельзя. C-компилятор не понадобился: с `CGO_ENABLED=0` sqlc использует WebAssembly-вариант парсера.
+Это заранее собранный код парсера; PostgreSQL-сервер он не запускает.
+
+Пока поместим в `query.sql` только два запроса (`_video/stages/02-query.sql`):
+
+```sql filename="_video/stages/02-query.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+```
+
+```bash
+cp _video/stages/02-query.sql query.sql
+```
+
+`--` начинает SQL-комментарий. **Аннотация запроса** через `name:` задаёт имя Go-метода; `:one` возвращает одно значение и ошибку.
+`GetProduct` ищет по `id = $1`. Значение `$1` передаётся отдельным аргументом.
+`:many` возвращает слайс и ошибку. `ListActiveProducts` получает активные строки в порядке ID.
+Для команды без возвращаемых строк `:exec` возвращает только ошибку; применим его в транзакции.
+
+Полный `sqlc.yaml`:
+
+```yaml filename="sqlc.yaml" showLineNumbers
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: query.sql
+    gen:
+      go:
+        package: db
+        out: db
+        sql_package: pgx/v5
+```
+
+| Строка | Значение |
+|---|---|
+| 1 | `version: "2"` — формат конфигурации, не версия sqlc; кавычки делают его строкой. |
+| 2–3 | `sql` — список; `-` — один элемент; `engine` выбирает синтаксис Postgres. |
+| 4 | `schema` читает структуру таблиц из `migrations/`, пропуская goose `Down`. |
+| 5 | `queries` — источник запросов. |
+| 6–7 | `gen.go` включает генерацию Go-кода. |
+| 8 | `package` — имя создаваемого пакета. |
+| 9 | `out` — папка для файлов. |
+| 10 | `sql_package: pgx/v5` выбирает API pgx v5. |
+
+Файлы читаются по именам; поэтому важен порядок `00001_…`. sqlc не применяет миграции к базе: это работа goose.
+
+| До | Действие | После |
+|---|---|---|
+| `migrations/` + `query.sql` | `sqlc generate` | созданы `db/*.go` |
+| Go-программа + `db/*.go` | `go run .` | SQL отправлен через pgx в Postgres |
+
+Что выведет успешный generate? **A)** ничего · **B)** список файлов · **C)** `OK` и число запросов.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Успешная команда молчит. Для B нужен `ls db`; C путает её с выводом goose.
+
+</details>
+
+```console
+$ sqlc generate
+$ ls db
+db.go
+models.go
+query.sql.go
+```
+
+`generate` ничего не напечатал, `ls db` перечислил файлы. `0.9 s` — цитата из исследования видео; новое измерение — `0.755 s`.
+Отношение примерно `1.2`; это не гарантия времени даже для маленькой схемы. Существенно то, что проверка прошла до запуска программы.
+Парсер Postgres разбирает SQL; отсутствующий столбец sqlc находит по собственному каталогу схемы. База при этой конфигурации не участвует.
+
+## models.go: типы из схемы
+
+Какой Go-тип соответствует `stock integer NOT NULL`? **A)** `int` · **B)** `int32` · **C)** `int64`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Postgres `integer` занимает четыре байта; sqlc для pgx создаёт `int32`. A — наш доменный выбор, C соответствует `bigint`.
+
+</details>
+
+```go filename="db/models.go" showLineNumbers
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.31.1
+
+package db
+
+import (
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+type Order struct {
+	ID       int64
+	Customer string
+	Note     pgtype.Text
+	Status   string
+}
+
+type OrderItem struct {
+	ID        int64
+	OrderID   int64
+	ProductID int64
+	Quantity  int32
+	UnitPrice int64
+}
+
+type Product struct {
+	ID     int64
+	Name   string
+	Price  int64
+	Stock  int32
+	Active bool
+}
+```
+
+1–3 маркер сгенерированного файла и версия sqlc; 5 пакет; 7–9 импорт `pgtype`.
+11–16 `Order`: ID из `bigint`, `Customer` и `Status` из `text`, `Note` из nullable `text`.
+18–24 `OrderItem`: три ID и цена `int64`, количество `int32`.
+26–32 `Product`: ID и цена `int64`, имя `string`, остаток `int32`, активность `bool`.
+
+Для `Note` нужен **`pgtype.Text`**: Go `string` не представляет SQL `NULL`.
+Его поле `String` хранит строку, а `Valid` показывает наличие значения. `Valid: false` — `NULL`; `Valid: true, String: ""` — пустая строка.
+`Status` появился из третьей миграции. `DO NOT EDIT` означает «не редактировать вручную»: следующий generate перезапишет файл.
+
+## db.go и query.sql.go: обычный Go
+
+```go filename="db/db.go" showLineNumbers
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.31.1
+
+package db
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+```
+
+1–3 маркер файла; 5 пакет; 7–12 импорты. 14–18 интерфейс `DBTX` требует три метода.
+`Exec` возвращает `pgconn.CommandTag` и ошибку; `Query` — `pgx.Rows` и ошибку; `QueryRow` — `pgx.Row`.
+Имена параметров в интерфейсе необязательны. `...interface{}` — это `...any`: произвольное число аргументов.
+20–22 `New` помещает переданный DBTX в новый `Queries`; `&` возвращает его адрес. 24–26 `Queries.db` хранит этот DBTX.
+28–32 `WithTx` создаёт новый `Queries` с `tx` в поле `db`.
+И pool, и `pgx.Tx` имеют три метода; оба удовлетворяют этому интерфейсу.
+
+Теперь два полных фрагмента из `db/query.sql.go`. Это не весь файл:
+
+```go
+const getProduct = `-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1
+`
+
+type GetProductRow struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int32
+}
+
+func (q *Queries) GetProduct(ctx context.Context, id int64) (GetProductRow, error) {
+	row := q.db.QueryRow(ctx, getProduct, id)
+	var i GetProductRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Price,
+		&i.Stock,
+	)
+	return i, err
+}
+```
+
+```go
+const listActiveProducts = `-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id
+`
+
+type ListActiveProductsRow struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int32
+}
+
+func (q *Queries) ListActiveProducts(ctx context.Context) ([]ListActiveProductsRow, error) {
+	rows, err := q.db.Query(ctx, listActiveProducts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListActiveProductsRow
+	for rows.Next() {
+		var i ListActiveProductsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Price,
+			&i.Stock,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+```
+
+В фрагменте `GetProduct` строки 1–4 — `const` и raw string в обратных кавычках: SQL сохраняется без точки с запятой.
+6–11 — `GetProductRow`: четыре выбранных столбца. Поскольку `active` не выбран, это не `db.Product`.
+13 — сигнатура метода: тип `id int64` взят из `WHERE id = $1`. 14 — `QueryRow`; 15 — переменная результата `i`.
+16–21 — `Scan` получает адреса в порядке SELECT; многострочные аргументы заканчиваются запятыми. 22 — результат и ошибка, 23 — скобка.
+
+В фрагменте `ListActiveProducts`: 1–5 запрос, 7–12 структура результата, 14 сигнатура.
+15–18 `Query` и проверка ошибки; 19 `defer rows.Close`; 20 `var items` изначально `nil`.
+21–32 цикл: новая `i`, четыре адреса `Scan`, возврат при ошибке, `append`.
+33–35 последняя проверка `rows.Err()`; 36–37 возврат результата и закрытие.
+Без строк цикл не выполнится, `items` останется `nil`. Сгенерированный код — обычный pgx: ошибки никуда не исчезают.
+
+## Store вызывает сгенерированные методы
+
+В копии установите файлы второго этапа. Единственное изменение в `main.go` — `store := NewStore(pool)`; остальные строки прежние.
+
+```bash
+cp _video/stages/02-store-get.go store.go
+cp _video/stages/02-main-get.go main.go
+```
+
+```go filename="_video/stages/02-store-get.go" showLineNumbers
+// Video bosqichi: Get va ListActive sqlc orqali (query.sql: 02-query.sql).
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/abdurahmon27/bozor/db"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — bozor jadvallariga Go'dan kirish. pool — transaction ochish uchun (Begin),
+// q — sqlc query.sql'dan generatsiya qilgan soʻrovlar (db papkasi).
+type Store struct {
+	pool *pgxpool.Pool
+	q    *db.Queries
+}
+
+// NewStore pool ustida Store yaratadi: db.New pool'ni sqlc soʻrovlariga ulaydi.
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool, q: db.New(pool)}
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	r, err := s.q.GetProduct(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	if err != nil {
+		return Product{}, err
+	}
+	return Product{ID: r.ID, Name: r.Name, Price: r.Price, Stock: int(r.Stock)}, nil
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi. Mahsulot yoʻq boʻlsa boʻsh (nil emas) slice qaytaradi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.q.ListActiveProducts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Product, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, Product{ID: r.ID, Name: r.Name, Price: r.Price, Stock: int(r.Stock)})
+	}
+	return out, nil
+}
+```
+
+```go filename="_video/stages/02-main-get.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := NewStore(pool)
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+}
+```
+
+Новые части: 8 импорт пакета — путь модуля и `/db`; 26–29 `Store` теперь хранит `pool` и `q`.
+32–34 `NewStore` вызывает `db.New(pool)`. 38 `Get` переходит на готовый метод; 39–44 различают ошибки; 45 преобразует `Row` в доменный `Product`.
+`int(r.Stock)` преобразует `int32` в `int`. `ErrNoRows → ErrNotFound` остаётся ответственностью `Store`.
+50–53 `ListActiveProducts` и ошибка; 54 пустой слайс, отличный от `nil`; 55–57 преобразование строк в доменный тип; 58 результат.
+Остальные строки — прежние объявления, комментарии и скобки.
+
+| Вызов | Исполнитель SQL | Результат |
+|---|---|---|
+| `db.New(pool)` | `Queries.db = pool` | SQL ещё не выполнялся |
+| `s.q.GetProduct(ctx, 1)` | `pool.QueryRow` | `GetProductRow` и ошибка |
+| `Store.Get(ctx, 1)` | тот же запрос | доменный `Product` и доменная ошибка |
+
+Что выведет `Get(1)` на свежей базе? **A)** пустой товар · **B)** olma, остаток 40 · **C)** ID заказа.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `olma` («яблоко») — первый товар. Этот этап не создаёт заказ. A — нулевые значения при ошибке, C относится к следующему этапу.
+
+</details>
+
+```console
+$ go run .
+{1 olma 1200000 40} <nil>
+```
+
+Цена `1200000` указана в тийинах. `<nil>` означает отсутствие ошибки. Промежуточный вопрос: в `query.sql` добавлен `ProductByName`, но generate забыли.
+Что произойдёт, если `Store` вызывает новый метод? **A)** ошибка Go build · **B)** только runtime-ошибка · **C)** автоматический generate.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** У `db.Queries` нет метода. `go build` не вызывает sqlc автоматически.
+Следующая ошибка повторно получена с `_video/stages/05-store-undefined.go` вместо `store.go`: запрос есть в SQL, но `db/` устарел.
+Для точного повторения сначала сгенерируйте пять запросов из раздела о транзакции; затем поместите этот файл этапа в `store.go`.
+Добавьте в `query.sql` аннотацию `ProductByName :one` и `SELECT id, name, price, stock FROM products WHERE name = $1;`, без generate.
+
+</details>
+
+```console
+$ go build
+# github.com/abdurahmon27/bozor
+./store.go:132:16: s.q.ProductByName undefined (type *db.Queries has no field or method ProductByName)
+```
+
+`#` обозначает пакет; `store.go:132:16` — файл, строка, позиция. `undefined` — имя не определено.
+`has no field or method` — такого поля или метода нет. Исправление: после корректного SQL выполнить `sqlc generate`; сохранять `query.sql` и `db/` вместе.
+Если изменился лишь текст существующего запроса, компилятор Go может не заметить устаревший метод. Это проверяет `sqlc diff`.
+
+## Имена параметров и WithTx
+
+Для транзакции остаются прежние три SQL-запроса. Начальный вариант (`_video/stages/03-query-dollar.sql`) выглядит так:
+
+```sql filename="_video/stages/03-query-dollar.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+
+-- name: CreateOrder :one
+INSERT INTO orders (customer) VALUES ($1)
+RETURNING id;
+
+-- name: DecrementStock :one
+UPDATE products SET stock = stock - $1
+WHERE id = $2
+RETURNING price;
+
+-- name: AddOrderItem :exec
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES ($1, $2, $3, $4);
+```
+
+У `CreateOrder` есть `RETURNING id`, поэтому `:one`; `DecrementStock` возвращает цену, поэтому тоже `:one`.
+`AddOrderItem` записывает четыре параметра без строки результата: `:exec`.
+При этой конфигурации для нескольких параметров sqlc создаёт структуру `Params`. Имена он выводит из столбцов.
+Как назовётся поле для `$1` в `stock = stock - $1`? **A)** `Quantity` · **B)** `Stock` · **C)** `Column1`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Повторная генерация дала `Stock int32`, `ID int64`. A — нужный нам смысл, но он не записан; C здесь не получился.
+
+</details>
+
+```go
+type DecrementStockParams struct {
+	Stock int32
+	ID    int64
+}
+```
+
+Здесь `Stock` — вычитаемое количество, а не текущий остаток. Для явного имени заменим `$1` на `@quantity`, `$2` на `@id`.
+`@name` — сокращение `sqlc.arg(name)`. SQL, отправляемый Postgres, снова использует `$1`, `$2`.
+Полный итоговый `query.sql`:
+
+```sql filename="query.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+
+-- name: CreateOrder :one
+INSERT INTO orders (customer) VALUES ($1)
+RETURNING id;
+
+-- name: DecrementStock :one
+UPDATE products SET stock = stock - @quantity
+WHERE id = @id
+RETURNING price;
+
+-- name: AddOrderItem :exec
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES ($1, $2, $3, $4);
+```
+
+```console
+$ sqlc generate
+```
+
+Команда ничего не напечатала. Теперь созданы эти структуры:
+
+```go
+type DecrementStockParams struct {
+	Quantity int32
+	ID       int64
+}
+```
+
+```go
+type AddOrderItemParams struct {
+	OrderID   int64
+	ProductID int64
+	Quantity  int32
+	UnitPrice int64
+}
+```
+
+`Quantity int32` происходит из SQL `integer`, ID и цена `int64` — из SQL `bigint`. Поля `Params` делают Go-вызов явным.
+Внутри `AddOrderItem` находятся `q.db.Exec(ctx, addOrderItem, arg.OrderID, arg.ProductID, arg.Quantity, arg.UnitPrice)` и `return err`.
+А `CreateOrder` возвращает `int64` через `QueryRow` и `Scan(&id)`. Полные методы — в `db/query.sql.go` курса.
+
+Теперь восстановите сохранённые итоговые файлы и тест. Если вы использовали сломанный файл для вопроса, этот шаг восстановит и его.
+Нужные доменные объявления из `store.go` и полный метод `PlaceOrder`:
+
+```bash
+cp store.go.start store.go
+cp main.go.start main.go
+cp query.sql.start query.sql
+mv store_test.go.off store_test.go
+sqlc generate
+```
+
+```go
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq: baza CHECK (stock >= 0) bilan rad etdi (GB-5.07).
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi va integer ustuniga (int32) sigʻishi kerak.
+var ErrInvalidQuantity = errors.New("miqdor notoʻgʻri: 1 dan 2147483647 gacha boʻlishi kerak")
+
+// OrderItem — buyurtmadagi bitta qator: qaysi mahsulot va nechta.
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+```
+
+```go
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	for _, it := range items {
+		if it.Quantity <= 0 || it.Quantity > math.MaxInt32 {
+			return 0, ErrInvalidQuantity
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.q.WithTx(tx)
+
+	orderID, err := qtx.CreateOrder(ctx, customer)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		price, err = qtx.DecrementStock(ctx, db.DecrementStockParams{
+			Quantity: int32(it.Quantity),
+			ID:       it.ProductID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23514" { // 23514 = check_violation: CHECK (stock >= 0) buzildi
+			return 0, ErrNotEnoughStock
+		}
+		if err != nil {
+			return 0, err
+		}
+		err = qtx.AddOrderItem(ctx, db.AddOrderItemParams{
+			OrderID:   orderID,
+			ProductID: it.ProductID,
+			Quantity:  int32(it.Quantity),
+			UnitPrice: price,
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return orderID, nil
+}
+```
+
+Объявления: два значения ошибок; `OrderItem` содержит ID товара и количество. `math.MaxInt32` — `2147483647`.
+В импорты `store.go` добавлены `math` и `github.com/jackc/pgx/v5/pgconn`.
+
+| Строки метода | Изменение и задача |
+|---|---|
+| 1–6 | Количество положительное и помещается в `int32`; иначе ошибка до открытия транзакции. `\|\|` — «или». |
+| 7–11 | `Begin`, проверка ошибки, `defer Rollback`: правило GB-5.07. |
+| 12 | `qtx := s.q.WithTx(tx)` — новый `Queries`, исполнитель запросов — `tx`. |
+| 14–17 | `CreateOrder` даёт ID; при ошибке возврат. |
+| 18–23 | `range items`, переменная `price`; проверенное количество `int32` и ID товара передаются в `DecrementStockParams`. |
+| 24–26 | Преобразование `ErrNoRows` в `ErrNotFound`. |
+| 27–30 | `errors.As` извлекает `*pgconn.PgError`; `23514` (`check_violation`) — нарушение CHECK остатка. |
+| 31–33 | Возврат другой ошибки. |
+| 34–42 | Запись ID заказа, товара, количества и текущей цены через `AddOrderItemParams`; проверка ошибки. |
+| 43–48 | Закрытие цикла, проверка ошибки `Commit`, возврат ID и `nil`. |
+
+`price, err =` присваивает значение прежней `err`, не создавая внутреннюю переменную.
+`WithTx` не открывает транзакцию и не выполняет commit; это остаётся в `Store`.
+
+| Состояние | `s.q.db` | `qtx.db` | База |
+|---|---|---|---|
+| до `Begin` | pool | отсутствует | транзакции нет |
+| после `WithTx(tx)` | pool | tx | открытая транзакция |
+| `qtx.CreateOrder` и остальные | pool | tx | неподтверждённые изменения |
+| после `Commit` | pool | завершённый tx | изменения подтверждены |
+
+Если внутри транзакции вызвать `s.q`, запрос может уйти через pool по другому соединению. Все три действия должны использовать `qtx`.
+Итоговый `main.go`:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := NewStore(pool)
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 1},
+	}
+	id, err := store.PlaceOrder(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+Новые строки 28–31: в слайсе `items` две единицы первого товара и одна второго. 32 вызывает `PlaceOrder`, 33 печатает ID и ошибку.
+`"Aziza"` — вымышленное имя тестового клиента. Остальные строки совпадают с предыдущим main.
+Какой ID получит первый записываемый заказ? **A)** `1` · **B)** `4` · **C)** `0`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Seed создал три заказа. В этой свежей базе следующий ID — `4`. Повторные запуски меняют ID и остаток; непрерывность identity-номеров не гарантируется.
+
+</details>
+
+```console
+$ go run .
+{1 olma 1200000 40} <nil>
+4 <nil>
+```
+
+Первая строка — `Get`, вторая — заказ. Чтение произошло до заказа, поэтому на экране ещё `40`.
+После commit остаток товара 1 равен `38`; позиции заказа — `2 × 1200000` и `1 × 400000`.
+Оптимизация SQL остаётся вашей работой: sqlc создаёт код для выполнения написанного вами запроса.
+
+## Ошибка при генерации, а старый код остаётся
+
+Испортим первый запрос в `query.sql`. Не заменяйте весь файл, только напишите `qoldiq` вместо `stock`:
+
+```sql
+-- name: GetProduct :one
+SELECT id, name, price, qoldiq FROM products
+WHERE id = $1;
+```
+
+Что сделает `go build` после неудачного generate? **A)** ошибка, `db/` пуст · **B)** пройдёт со старым кодом · **C)** ошибка из-за частичных файлов.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Ошибка столбца найдена на этапе проверки; прежние Go-файлы не изменились. A и C предполагают удаление существующего `db/`.
+
+</details>
+
+```console
+$ sqlc generate
+# package db
+query.sql:2:25: column "qoldiq" does not exist
+$ go build
+```
+
+`query.sql:2:25` — вторая строка, позиция 25; `# package db` — пакет, который должен был генерироваться.
+Сообщение выдал sqlc, не сервер Postgres: SQLSTATE отсутствует. В этом примере generate завершился с `1`, build — с `0`.
+Хеши Go-файлов тоже не изменились. Build прошёл молча, но новый SQL от этого не стал правильным.
+Исправление: вернуть `stock`, затем проверить успешное выполнение generate.
+
+## Глубже (необязательно): db/ и SQL всегда вместе
+
+`db/` обычно коммитят в git. Для сборки программы установка sqlc не обязательна: достаточно Go-файлов.
+`sqlc diff` сравнивает файлы, которые должны получиться при генерации, с существующими.
+В чистой исходной копии:
+
+```console
+$ sqlc diff
+```
+
+Вывода нет, exit `0`. Когда мы добавили SQL-запрос без generate, команда показала diff и вернула exit `1`.
+Текст различий зависит от файлов; здесь он не воспроизводится. Включение этого правила в автоматическую проверку разбирается в GB-8.05.
+
+Тип вычисляемого столбца — предположение sqlc. Мы повторно сгенерировали три варианта в отдельной копии:
+
+| Выражение OrderTotal | Результат sqlc v1.31.1 | Ограничение |
+|---|---|---|
+| `COALESCE(SUM(quantity * unit_price), 0)` | `interface{}` | не подходит Go-методу, ожидающему `int64` |
+| `SUM(quantity * unit_price) AS total` | `int64` | без строк Postgres возвращает `NULL` |
+| `COALESCE(SUM(quantity * unit_price), 0)::bigint AS total` | `int64` | пустой результат `0`, тип задан в SQL |
+
+Для `SUM(bigint)` Postgres возвращает `numeric`. `COALESCE` выбирает первое значение, отличное от `NULL`.
+`::bigint` преобразует SQL-тип; `AS total` именует столбец результата. Читать сигнатуру sqlc и тестировать с настоящей базой всё равно нужно.
+Конфигурация страницы проверяет без базы; sqlc также поддерживает анализ с базой при других настройках.
+
+## Частые ошибки
+
+**1. «Build прошёл, значит новый SQL правильный».** В опыте с `qoldiq` выше остался старый `db/`.
+Исправление: поправьте столбец, проверьте exit generate, затем `sqlc diff`. Компилятор найдёт забытую генерацию только при использовании нового метода.
+
+**2. Исправлять `db/*.go` вручную.** Следующий generate уничтожит изменение. Исправьте SQL или `sqlc.yaml`, затем генерируйте снова.
+
+**3. Использовать pool вместо транзакции.** `s.q` привязан к pool. После `qtx := s.q.WithTx(tx)` отправляйте все три запроса через `qtx`.
+
+**4. Не проверять тип SUM.** В копии решения мы убрали `::bigint` из `OrderTotal`.
+Новый метод вернул `interface{}`, а `store.go` ожидал `int64`. Реальный результат:
+
+```sql
+-- name: OrderTotal :one
+SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+```console
+$ go vet .
+# github.com/abdurahmon27/bozor
+# [github.com/abdurahmon27/bozor]
+vet: ./store.go:158:9: cannot use 1st function result (value of type interface{}) as int64 value in return statement: need type assertion
+```
+
+`store.go:158:9` — адрес ошибки в файле решения. `cannot use … as int64` — результат не подходит типу `int64`.
+Здесь `go vet` не понял SQL; он обнаружил ошибку Go-типов после генерации.
+Исправление: `COALESCE(…)::bigint AS total`, затем generate.
+
+Полностью убирать `COALESCE` тоже нельзя. Следующий неверный вариант при генерации дал `int64`:
+
+```sql
+-- name: OrderTotal :one
+SELECT SUM(quantity * unit_price) AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+```console
+$ go test -run TestOrderTotal .
+--- FAIL: TestOrderTotal (0.05s)
+    store_test.go:262: OrderTotal(3): can't scan into dest[0] (col: total): cannot scan NULL into *int64
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.055s
+FAIL
+```
+
+`store_test.go:262` — строка проверки. `cannot scan NULL into *int64` означает, что нельзя записать `NULL` по адресу `int64`.
+У заказа `3` нет позиций. Исправление: ноль через `COALESCE`, явный тип через `::bigint`.
+
+**5. Преобразовывать количество в `int32` без проверки.** `int32(it.Quantity)` обрезает слишком большое число. Сначала проверьте границы `1 … math.MaxInt32`.
+**6. Всегда ждать пустой слайс от `:many`.** При этой настройке возможен `nil`. В доменном методе используйте `make([]Product, 0, len(rows))`.
+Другой вариант: `emit_empty_slices: true` в `gen.go`; повторная генерация создаёт `items := []T{}`.
+
+## Проверьте себя
+
+**1.** Что возвращают `:one`, `:many`, `:exec`?
+
+<details>
+<summary>Ответ</summary>
+
+Значение и ошибку; слайс и ошибку; только ошибку. `:one` не преобразует отсутствие строки в бизнес-ошибку.
+
+</details>
+
+**2.** Когда sqlc находит отсутствующий столбец? Все ли SQL-ошибки находятся тогда?
+
+<details>
+<summary>Ответ</summary>
+
+При generate, сверяясь со схемой. Нет: остаются нарушения CHECK, ошибки соединения и ошибки выполнения вроде SUM/NULL.
+
+</details>
+
+**3.** Из GB-5.06: зачем нужен `-- +goose Down`? Выполняет ли его sqlc?
+
+<details>
+<summary>Ответ</summary>
+
+Для отката миграции; его применяет `goose down`. sqlc пропускает `Down` и читает `Up` как описание схемы.
+
+</details>
+
+**4.** Предскажите результат: `:many` не нашёл строк. `len(rows)` и `rows == nil`? **A)** `0, true` · **B)** `0, false` · **C)** ошибка.
+
+<details>
+<summary>Ответ</summary>
+
+**A**: при этой конфигурации используется `var items []T`. С `emit_empty_slices: true` получится B. `Store.ListActive` сам создаёт пустой слайс.
+
+</details>
+
+**5.** Изменился ли `s.q.db` после `WithTx`? Кто выполняет commit?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Новый `qtx.db = tx`; прежний `s.q.db = pool`. Commit вызывает `Store`.
+
+</details>
+
+## Домашнее задание
+
+[Папка курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc),
+[полный TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-09-sqlc/TASK.md),
+[ответы и тесты](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc/solution).
+После опытов с этапами используйте чистую исходную копию. Тестовый файл не меняйте.
+
+- 🟢 **Обязательно:** добавьте `ProductByName :one`, `CheapestProducts :many`, `OrderTotal :one` в `query.sql`; запустите generate.
+  Перепишите `ByName`, `Cheapest`, `OrderTotal` через `s.q`, убрав ручные `Scan` и `pool.Query/QueryRow`.
+  Неизвестное имя даёт `ErrNotFound`; отсутствие активных товаров — пустой слайс, отличный от `nil`; заказ без позиций — сумму `0`.
+- 🟡 **Необязательно:** напишите `AddStock :execrows` для `Restock`. Он возвращает число затронутых строк и ошибку.
+  Используйте `WithTx`; `0` строк означает `ErrNotFound`, все изменения откатываются.
+
+Тесты создают временную схему, сами применяют части `Up` и seed, не затрагивая public. Только для тестов `goose up` не нужен.
+`cd` меняет папку; `./...` выбирает все пакеты этого модуля.
+Команды проверки:
+
+```bash
+docker compose up -d --wait
+go test .
+```
+
+Исходный вариант намеренно падает на `TestQueriesMovedToSqlc`. Наш повторный запуск дал шесть сообщений: трёх запросов нет, три метода всё ещё написаны вручную.
+Это ожидаемая ошибка задания; недоступная база — другая ошибка. Здесь описано условие задания вместо повторения всего журнала starter.
+Полный повторно полученный результат в папке решения:
+
+```console
+$ go test ./...
+ok  	github.com/abdurahmon27/bozor	0.244s
+?   	github.com/abdurahmon27/bozor/db	[no test files]
+```
+
+<details>
+<summary>Ответ</summary>
+
+`ByName`, как `Get`, преобразует `ErrNoRows` и выполняет `Row → Product`.
+`Cheapest` получает активные товары через `ORDER BY price, id LIMIT $1`. Параметр `LIMIT` у sqlc имеет тип `int32`.
+При `n < 0` или `n > math.MaxInt32` сначала верните ошибку; отрицательный `LIMIT` в Postgres недопустим.
+Собирайте результат в `make([]Product, 0, len(rows))`. Не забудьте `Stock: int(r.Stock)`.
+Для `OrderTotal` достаточно следующего запроса и `return s.q.OrderTotal(ctx, orderID)`:
+
+```sql
+-- name: OrderTotal :one
+SELECT COALESCE(SUM(quantity * unit_price), 0)::bigint AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+🟡 Добавьте аннотацию `AddStock :execrows` к `UPDATE products SET stock = stock + @quantity WHERE id = @id`.
+Проверьте ошибку `qtx.AddStock`, при числе `0` верните `ErrNotFound`; иначе в конце commit.
+`go test -run Restock -v` выполняет обе проверки. В starter пропускается только проверка необязательного переноса, поведение `Restock` проверяется.
+
+</details>
+
+После работы выполните в своей копии `docker compose down -v`: команда удаляет контейнер и volume этой лаборатории.
+Наши проверочные контейнер и volume тоже удалены. Следующий урок — GB-5.10, контрольная точка с API заказов.
+
+## Источники
+
+- [sqlc v1.31.1](https://docs.sqlc.dev/en/v1.31.1/index.html)
+
+- [Установка](https://docs.sqlc.dev/en/v1.31.1/overview/install.html)
+
+- [Аннотации запросов](https://docs.sqlc.dev/en/v1.31.1/reference/query-annotations.html)
+
+- [Конфигурация](https://docs.sqlc.dev/en/v1.31.1/reference/config.html)
+
+- [Схема из миграций](https://docs.sqlc.dev/en/v1.31.1/howto/ddl.html)
+
+- [Именованные параметры](https://docs.sqlc.dev/en/v1.31.1/howto/named_parameters.html)
+
+- [CLI: generate, diff](https://docs.sqlc.dev/en/v1.31.1/reference/cli.html)
+
+- [Типы данных](https://docs.sqlc.dev/en/v1.31.1/reference/datatypes.html)
+
+- [Руководство PostgreSQL](https://docs.sqlc.dev/en/v1.31.1/tutorials/getting-started-postgresql.html)
+
+- [sqlc: parse_wasi.go](https://github.com/sqlc-dev/sqlc/blob/v1.31.1/internal/engine/postgresql/parse_wasi.go)
+
+- [sqlc: postgresql_type.go](https://github.com/sqlc-dev/sqlc/blob/v1.31.1/internal/codegen/golang/postgresql_type.go)
+
+- [go-pgquery / WebAssembly](https://github.com/wasilibs/go-pgquery)
+
+- [pgx: Text](https://pkg.go.dev/github.com/jackc/pgx/v5/pgtype#Text)
+
+- [pgx: Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+
+- [pgx: RowsAffected](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#CommandTag.RowsAffected)
+
+- [PostgreSQL: числовые типы](https://www.postgresql.org/docs/18/datatype-numeric.html)
+
+- [PostgreSQL: агрегаты](https://www.postgresql.org/docs/18/functions-aggregate.html)
+
+- [PostgreSQL: коды ошибок](https://www.postgresql.org/docs/18/errcodes-appendix.html)
+
+- [goose: аннотации](https://pressly.github.io/goose/documentation/annotations/)
+
+- [Go: vet](https://pkg.go.dev/cmd/vet)
+
+- [Go: строковые литералы](https://go.dev/ref/spec#String_literals)
+
+- [Go: селекторы](https://go.dev/ref/spec#Selectors)
+
+- [Go: сгенерированный код](https://go.dev/s/generatedcode)
+
+- [README курса](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-09-sqlc/README.md)
+
+Результаты повторно получены с `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, sqlc v1.31.1, goose v3.30.2, pgx v5.13.0 и PostgreSQL 18, 2026-11-27.
+Время из видео и холодной установки явно помечено как цитата; остальные показанные результаты взяты из новых запусков.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc)
+
+---
+
+← Предыдущий урок: [GB-5.08](/lab/youtube/gb/gb-5-08/ru) · Следующий урок: [GB-5.10](/lab/youtube/gb/gb-5-10/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

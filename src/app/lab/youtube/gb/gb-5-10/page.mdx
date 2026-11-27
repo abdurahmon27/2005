@@ -1,0 +1,1033 @@
+---
+title: "Nazorat nuqtasi: buyurtmalar API, haqiqiy Postgres'da testlar"
+date: "2026/11/27"
+description: "Buyurtma yaxlitligi, shartli UPDATE va alohida schema: API qoidalarini haqiqiy Postgres'da tekshirib, GET /orders/{id} qoʻshing."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 42
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-10"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-10"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-10/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-10/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-10"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-5-10/ru) · [English](/lab/youtube/gb/gb-5-10/en)  
+Dars GB-5.10 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-10) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+GB-4.08 katalogi xotirada edi: server toʻxtasa, buyurtmalar yoʻqolardi. Postgres'ga oʻtgach, yarim buyurtma va manfiy qoldiq yoʻqligini qanday tekshirasiz?
+
+**Bitta gʻoya:** buyurtma yaxlitligi va qoldiq qoidasi bazada bajariladi; ularni haqiqiy Postgres'da tekshiring. Har test alohida schema olsa, parallel paketlar bir-birining jadvallarini buzmaydi.
+
+Dars oxirida siz:
+
+- API'ni migratsiya va namunaviy maʼlumot bilan ishga tushirasiz;
+- `PlaceOrder`dagi transaction va shartli UPDATE sababini oʻqiysiz;
+- rollback, parallel xaridlar va HTTP javoblarini haqiqiy bazada tekshirasiz;
+- shu testlarga tayanib `GET /orders/{id}`ni qoʻshasiz.
+
+| Soʻz | Maʼnosi | Inglizcha |
+|---|---|---|
+| integration test | haqiqiy handler, store va baza birga tekshiriladi | integration test |
+| test izolyatsiyasi | har testning oʻz jadvallari va boshlangʻich maʼlumoti bor | test isolation |
+| paket testlarining parallel ishlashi | turli paketlarning test dasturlari bir vaqtda ishlashi mumkin | package test parallelism |
+
+## Oldin bilish kerak
+
+Asos: [GB-5.09 · sqlc](/lab/youtube/gb/gb-5-09), [GB-4.08 · katalog API](/lab/youtube/gb/gb-4-08), [GB-5.08 · shartli UPDATE](/lab/youtube/gb/gb-5-08).
+Shuningdek: [GB-5.02 · Docker va Postgres](/lab/youtube/gb/gb-5-02), [GB-5.03 · SQL qoidalari](/lab/youtube/gb/gb-5-03), [GB-5.04 · bogʻlangan jadvallar](/lab/youtube/gb/gb-5-04), [GB-5.05 · pgxpool](/lab/youtube/gb/gb-5-05), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06), [GB-5.07 · transaction](/lab/youtube/gb/gb-5-07), [GB-4.03 · httptest](/lab/youtube/gb/gb-4-03), [GB-4.05 · route](/lab/youtube/gb/gb-4-05), [GB-4.06 · JSON tekshiruvi](/lab/youtube/gb/gb-4-06), [GB-4.07 · goroutine](/lab/youtube/gb/gb-4-07), [GB-3.06 · JSON](/lab/youtube/gb/gb-3-06), [GB-2.08 · errors.Is va errors.As](/lab/youtube/gb/gb-2-08), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09), [GB-1.08 · testlar](/lab/youtube/gb/gb-1-08).
+
+Go kodi uchun: [GB-1.03 · int64](/lab/youtube/gb/gb-1-03), [GB-1.06 · sikl](/lab/youtube/gb/gb-1-06), [GB-2.01 · slice](/lab/youtube/gb/gb-2-01), [GB-2.03 · struct](/lab/youtube/gb/gb-2-03), [GB-2.04 · pointer](/lab/youtube/gb/gb-2-04), [GB-2.05 · metod](/lab/youtube/gb/gb-2-05), [GB-2.06 · paket](/lab/youtube/gb/gb-2-06), [GB-3.02 · JSON tag](/lab/youtube/gb/gb-3-02), [GB-4.04 · http.Server](/lab/youtube/gb/gb-4-04).
+
+Barcha buyruqlar `lessons/gb-5-10-buyurtma-api/` ichida bajariladi; Playground yetmaydi. Go 1.27.4, Docker Compose va goose v3.30.2 kerak. `CGO_ENABLED=0`: bu tekshiruvda C kompilyatori ishlatilmagan.
+
+**Eslash:** SQL'dagi `integer` uchun sqlc yaratgan `Product.Stock` qaysi turda? **A)** `int` · **B)** `int32` · **C)** `int64`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** pgx/v5 bilan sqlc `integer`ni `int32`ga oʻgiradi. Bugungi qoʻlda yozilgan struct esa `Stock int` ishlatadi. Soʻrovlarni sqlc bilan yaratish vazifada ixtiyoriy.
+
+</details>
+
+## Spetsifikatsiya va fayllar
+
+`POST /orders` body'da `customer` va `items` oladi. Har qatorning `product_id` va `quantity` qiymati bor.
+Pul `int64` tiyinda: `1200000` — 12 000 soʻm. `unit_price` sotuv paytidagi dona narxi.
+Misollardagi odam ismlari `seed.sql`dagi sunʼiy test maʼlumotidir; `olma`, `non`, `choy`, `oʻrik` mahsulot nomlari.
+
+| Soʻrov yoki holat | Natija |
+|---|---|
+| `GET /health` | `200`, `ok` |
+| `GET /products`, `GET /products/{id}` | roʻyxat yoki bitta mahsulot; notoʻgʻri ID `400`, yoʻq mahsulot `404` |
+| `POST /products` | `201`; nom takrorlansa `409`, notoʻgʻri qiymat `422` |
+| `DELETE /products/{id}` | `204`; topilmasa `404`, buyurtmada ishlatilsa `409` |
+| `POST /orders` | muvaffaqiyat `201`; yoʻq mahsulot `404`, qoldiq kam `409`, notoʻgʻri qiymat `422`, buzilgan JSON `400` |
+| `GET /orders/{id}` | hozir yoʻq; uy vazifasi |
+
+Validatsiya mijoz nomini 1–100 belgi, savatni 1–20 qator, donani 1–100 bilan cheklaydi. Bir mahsulot ikki qatorda kelishi ham `422`.
+`items[0].quantity` — birinchi qatorning dona maydoni. Xato shakli avvalgidek: `error.code`, `error.message`, zarur boʻlsa `error.fields`.
+
+| Fayl | Vazifa |
+|---|---|
+| `cmd/api/main.go`, `handlers.go`, `json.go` | server, route va handler, JSON oʻqish/yozish |
+| `internal/store/store.go` | pgx soʻrovlari va biznes qoidalari |
+| `internal/pgtest/pgtest.go` | test izolyatsiyasi |
+| `migrations/`, `migrate.go`, `seed.sql` | uchta migratsiya fayli, ularni binary'ga kiritish, boshlangʻich maʼlumot |
+| `api_test.go`, `store_test.go` | bugungi qoidalar testlari |
+| `tekshiruv_test.go`, `TASK.md`, `solution/` | vazifa tekshiruvlari, shart va tayyor javob |
+
+## Baza va serverni ishga tushirish
+
+Bu sahifadagi qayta tekshiruv alohida nusxada bajarildi. `compose.yaml`dagi loyiha nomi `gb510-doc-verify`, port qatori `"127.0.0.1:47963:5432"` qilindi.
+Shu natijalarni takrorlash uchun nusxangizda shu ikki qiymatni qoʻying. Asl papka `gb510` nomi va `5510` portini ishlatadi; ularni saqlasangiz URL'da ham `5510` yozing.
+Quyidagi parol faqat mahalliy laboratoriyaning ochiq namunaviy qiymati.
+
+```bash
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:47963/bozor
+export DATABASE_URL="$GOOSE_DBSTRING"
+docker compose up -d --wait
+```
+
+`export` keyingi buyruqlarga muhit qiymatlarini beradi. `GOOSE_DRIVER` — baza turi, `GOOSE_MIGRATION_DIR` — migratsiya papkasi, `GOOSE_DBSTRING` — ulanish manzili.
+`DATABASE_URL`ni API va testlar oʻqiydi. `up -d --wait` Postgres'ni fonda ishga tushirib, tayyorligini kutadi.
+
+`goose up`dan keyin qaysi versiya? **A)** 1 · **B)** 3 · **C)** 4. Uch fayl: mahsulotlar, buyurtmalar va qatorlar, keyin status ustuni.
+
+<details>
+<summary>Javob</summary>
+
+**B: 3.** Fayllarning raqamlari 1, 2, 3. Toʻrt mahsulot soni migratsiya versiyasi emas.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 21:42:32 OK   00001_products.sql (6.48ms)
+2026/11/27 21:42:32 OK   00002_orders.sql (9.4ms)
+2026/11/27 21:42:32 OK   00003_orders_status.sql (2.69ms)
+2026/11/27 21:42:32 goose: successfully migrated database to version: 3
+```
+
+Bu bizning toʻliq chiqishimiz; sana-vaqt prefiksi ham saqlangan. Videodagi vaqtlar 5.1/9.27/2.33 ms, bizda 6.48/9.4/2.69 ms.
+Nisbatlar taxminan 1.27/1.01/1.15. Bular bir martalik, yuklamaga bogʻliq oʻlchovlar; muhim natija — uchala migratsiya qoʻllanganidir.
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+`exec -T db` konteyner ichida terminalsiz buyruq bajaradi; `psql -f` SQL faylni oʻqiydi.
+`TRUNCATE … RESTART IDENTITY` jadvallarni tozalab, ID sanogʻini qayta boshlaydi. `INSERT 0 4`, `INSERT 0 3`, `INSERT 0 4`: toʻrt mahsulot, uch buyurtma, toʻrt buyurtma qatori.
+
+Birinchi terminalda serverni ishga tushiring:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Ikkinchi terminalda keyingi `curl` buyruqlarini bajaring. `-sS` bajarilish hisoblagichini yashiradi, xatoni saqlaydi; `-i` javob sarlavhalarini ham chiqaradi; `-d` body yuboradi.
+
+## 201 va keyingi 409
+
+Ikki olma va bitta choy yetarli: `40 ≥ 2`, `8 ≥ 1`. Javob? **A)** `201`, jami `4900000` · **B)** `201`, jami `5900000` · **C)** `409`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** `2 × 1200000 + 2500000 = 4900000` tiyin, yaʼni 49 000 soʻm. B varianti choy oʻrniga oʻrik narxini ishlatadi; C uchun qoldiq yetishmasligi kerak edi.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/orders -d '{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":3,"quantity":1}]}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /orders/4
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 173
+
+{"id":4,"customer":"Aziza","status":"yangi","items":[{"product_id":1,"quantity":2,"unit_price":1200000},{"product_id":3,"quantity":1,"unit_price":2500000}],"total":4900000}
+```
+
+`201 Created` — yaratildi. `Location: /orders/4` — yangi resurs manzili; uni oʻqish route'ini vazifada qoʻshasiz.
+`status: "yangi"`ni migratsiyadagi `DEFAULT` beradi. `Content-Type` body turini, `Content-Length` baytlar sonini bildiradi; `Date` har safar oʻzgaradi.
+
+Endi ikki olma va besh oʻrik: oʻrik atigi ikkita. **Olma qoldigʻi nechta qoladi? A)** 36 · **B)** 38 · **C)** 40.
+
+<details>
+<summary>Javob</summary>
+
+**B: 38.** Avvalgi muvaffaqiyatli buyurtma ikki olmani olgan. Keyingi transaction butunlay bekor boʻladi.
+36 — faqat birinchi yangilanish qolgan degan xato; 40 — avvalgi muvaffaqiyatli buyurtmani ham bekor qilish degan xato.
+
+</details>
+
+```console
+$ curl -sS -i localhost:8765/orders -d '{"customer":"Jasur","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":5}]}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 83
+
+{"error":{"code":"insufficient_stock","message":"oʻrik: qoldiq 2, soʻralgan 5"}}
+```
+
+```console
+$ curl -s localhost:8765/products/1
+{"id":1,"name":"olma","price":1200000,"stock":38}
+```
+
+```console
+$ docker compose exec -T db psql -c "SELECT id, customer, status FROM orders WHERE id > 3"
+ id | customer | status 
+----+----------+--------
+  4 | Aziza    | yangi
+(1 row)
+```
+
+`psql -c` bitta SQL buyruq bajaradi. `WHERE id > 3` namunadan keyingi buyurtmalarni tanlaydi: faqat 4-buyurtma bor.
+`409 Conflict` va `insufficient_stock` qoldiq yetmaganini bildiradi. Xabardagi `qoldiq` — bor dona, `soʻralgan` — kerakli dona.
+
+| Qadam | Transaction ichida olma | Boshqa ulanishda olma | Yangi buyurtma |
+|---|---:|---:|---|
+| Aziza buyurtmasi tasdiqlangan | 38 | 38 | 4 mavjud |
+| Jasur: `BEGIN`, `INSERT orders` | 38 | 38 | hali tasdiqlanmagan |
+| birinchi `UPDATE` | 36 | 38 | hali tasdiqlanmagan |
+| oʻrik: nol qator, `StockError` | 36 | 38 | hali tasdiqlanmagan |
+| `ROLLBACK` | 38 | 38 | Jasur buyurtmasi yoʻq |
+
+## Serverdan store'gacha
+
+Toʻliq kirish fayli, izohlari bilan:
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor buyurtmalar API'si (GB-5.10, 5-modul nazorat nuqtasi): GB-4.08'dagi katalog API,
+// endi maʼlumot Postgres'da. Server toʻxtasa ham mahsulotlar va buyurtmalar saqlanib qoladi.
+//
+//	docker compose up -d --wait
+//	goose up                     (GOOSE_DRIVER, GOOSE_DBSTRING, GOOSE_MIGRATION_DIR: GB-5.06)
+//	docker compose exec db psql -f /lab/seed.sql
+//	export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5510/bozor
+//	go run ./cmd/api             → bozor API: http://localhost:8765
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// newServer — bozor API serveri (GB-4.04): route'lar newMux'da, sarlavhalar uchun vaqt chegarasi.
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newMux(st),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		return errors.New("DATABASE_URL yoʻq: export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5510/bozor")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil { // baza ishlamasa server ishga tushmaydi
+		return err
+	}
+	srv := newServer(":8765", store.New(pool))
+	fmt.Println("bozor API: http://localhost:8765")
+	return srv.ListenAndServe()
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1–8 | izohlardagi ishga tushirish eslatmalari; URL asl 5510 portiga yozilgan |
+| 9, 11–21 | `package main`; context, xato, chiqish, HTTP, muhit, vaqt, store va pgxpool paketlari |
+| 23–30 | `newServer`: manzil, `newMux(st)` handler'i, sarlavha uchun 5 soniya |
+| 32–37 | `main` `run`ni chaqiradi; xato boʻlsa stderr'ga yozib, 1 bilan chiqadi |
+| 39–43 | `run() error`: URL yoʻq boʻlsa aniq xato qaytaradi |
+| 44–45 | ulanishni tekshirish uchun 5 soniyalik context; qaytishda `cancel` |
+| 46–50 | pool yaratish, xatoni tekshirish, qaytishda `Close` |
+| 51–53 | `Ping` haqiqiy ulanishni tekshiradi; baza ishlamasa HTTP server boshlanmaydi |
+| 54–57 | pool → store → server; manzilni chiqaradi va soʻrovlarni kutadi |
+
+Boʻsh qatorlar oʻqishni ajratadi; `{}` blok yoki struct chegarasini, `&http.Server` uning manzilini bildiradi.
+`pgxpool.New` qaytishi muvaffaqiyatli ulanish kafolati emas. `Ping` shu sabab kerak.
+`run` oddiy qaytganda uning `defer`lari bajariladi; `os.Exit` oʻzi `defer`larni bajarmaydi.
+
+`Store` faqat `pool *pgxpool.Pool` saqlaydi. Oʻzgaruvchan katalog xotirada yoʻq, shuning uchun eski `sync.Mutex` kerak emas.
+Handler bazaga `r.Context()` beradi: mijoz uzilsa context bekor boʻladi. pgx standart sozlamada kutishni tugatib, ulanishni yopadi.
+Quyidagi funksiya `cmd/api/handlers.go`dan toʻliq parcha; qolgan taʼriflar oʻsha loyihada.
+
+```go
+func (a *api) createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	items := make([]store.OrderItem, len(in.Items))
+	for i, it := range in.Items {
+		items[i] = store.OrderItem{ProductID: it.ProductID, Quantity: it.Quantity}
+	}
+	o, err := a.st.PlaceOrder(r.Context(), in.Customer, items)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("Location", fmt.Sprintf("/orders/%d", o.ID))
+	writeJSON(w, http.StatusCreated, o)
+}
+```
+
+`in` — `orderInput`. `decodeJSON` shaklni tekshiradi; `validateOrder` maydon xatolarini beradi.
+`make` store qatorlari uchun slice ajratadi; sikl kiruvchi ID va donani koʻchiradi. `PlaceOrder` haqiqiy yozuvni bajaradi.
+Xato `writeStoreError`ga boradi; muvaffaqiyatda `Location` va `201` yoziladi.
+
+## Bitta transaction: shartli UPDATE va narx
+
+`internal/store/store.go`dagi toʻliq metod:
+
+```go
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (Order, error) {
+	if len(items) == 0 {
+		return Order{}, fmt.Errorf("%w: savat boʻsh", ErrBadQuantity)
+	}
+	for _, it := range items {
+		if it.Quantity <= 0 {
+			return Order{}, fmt.Errorf("%w, hozir %d", ErrBadQuantity, it.Quantity)
+		}
+	}
+	// Qatorlar doim bir xil tartibda (ID boʻyicha) qulflanadi: ikki savat bir-birini kutib qotmaydi
+	// (deadlock, GB-5.08 Chuqurroq). Chaqiruvchining slice'i oʻzgarmasin: nusxa saralanadi.
+	items = slices.Clone(items)
+	slices.SortFunc(items, func(a, b OrderItem) int { return cmp.Compare(a.ProductID, b.ProductID) })
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Order{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	o := Order{Customer: customer}
+	err = tx.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id, status", customer).
+		Scan(&o.ID, &o.Status)
+	if err != nil {
+		return Order{}, err
+	}
+	for _, it := range items {
+		err = tx.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&it.UnitPrice)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Order{}, whyNoRow(ctx, tx, it)
+		}
+		if err != nil {
+			return Order{}, err
+		}
+		_, err = tx.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			o.ID, it.ProductID, it.Quantity, it.UnitPrice)
+		if err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+| Qism | Sababi |
+|---|---|
+| boʻsh savat va `Quantity <= 0` | HTTP'dan tashqari chaqiruv ham noqonuniy xarid qilmasin |
+| `slices.Clone`, `slices.SortFunc`, `cmp.Compare` | chaqiruvchi slice'ini oʻzgartirmay, ID boʻyicha bir xil qulf tartibi |
+| `Begin`, `defer Rollback` | bir ulanishdagi transaction; har erta qaytishda bekor qilish |
+| `INSERT … RETURNING id, status` | `o`ga yangi ID va standart status yozish |
+| `$1` va `$2` | mos ravishda dona va mahsulot ID'si; qiymatlar SQL'dan alohida beriladi |
+| `stock >= $1` | qoldiqni tekshirish va kamaytirish bitta buyruqda |
+| `RETURNING price`, `Scan(&it.UnitPrice)` | sotuv paytidagi narxni qatorga yozish |
+| `tx.Exec` | buyurtma qatorini aynan shu transaction orqali yozish |
+| `append`, `Total += …` | javob qatorlari va tiyindagi jami; `int64` donani narx turiga oʻgiradi |
+| `Commit` | hamma qadamni tasdiqlash; uning xatosi ham tekshiriladi |
+
+`UPDATE` qator qulfini transaction oxirigacha ushlab turadi. Qarama-qarshi `[olma, choy]` va `[choy, olma]` savatlar bir-birini kutishi mumkin: **deadlock**.
+ID tartibi shu qarama-qarshilikni oldini oladi. `TestOppositeCarts` buning uchun bor.
+READ COMMITTED'da kutgan `UPDATE` yangilangan qatorga shartni qayta tekshiradi; 20 xaridor bir dona qoldiqni birgalikda sotib ololmaydi.
+
+## Nol qator: 404 yoki 409?
+
+`QueryRow(...).Scan(...)` yangilangan qator topmasa `pgx.ErrNoRows` beradi. Bu SQL xatosi emas: transaction buzilmagan, ichida yana soʻrov qilish mumkin.
+GB-5.07'dagi SQL xatosidan keyingi buzilgan transaction bilan adashtirmang.
+
+```go
+func whyNoRow(ctx context.Context, tx pgx.Tx, it OrderItem) error {
+	var p Product
+	err := tx.QueryRow(ctx,
+		"SELECT name, stock FROM products WHERE id = $1", it.ProductID).Scan(&p.Name, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("mahsulot %d: %w", it.ProductID, ErrNotFound)
+	}
+	if err != nil {
+		return err
+	}
+	return &StockError{Name: p.Name, Stock: p.Stock, Want: it.Quantity}
+}
+```
+
+`tx pgx.Tx` aynan oldingi transaction'ni qabul qiladi. `whyNoRow` nom va qoldiqni oʻqiydi.
+Mahsulot yoʻq boʻlsa `%w` bilan `ErrNotFound` oʻraladi. Bor boʻlsa `&StockError{Name, Stock, Want}` qaytadi.
+`Name` — nom, `Stock` — bor dona, `Want` — soʻralgan dona. Soʻng `PlaceOrder`dan qaytish `Rollback`ni ishlatadi.
+
+Oʻrnatilgan namunada olma buyurtmalarda bor. `DELETE /products/1` javobi? **A)** `204` · **B)** `500` · **C)** `409`.
+
+<details>
+<summary>Javob</summary>
+
+**C.** `order_items.product_id REFERENCES products(id)` mahsulotni oʻchirishga yoʻl qoʻymaydi. Store `23503`ni `ErrInUse`ga aylantiradi, handler esa `409` beradi.
+A buyurtma tarixini buzardi; B kutilgan biznes holatini ichki xato deb hisoblaydi.
+
+</details>
+
+```console
+$ curl -sS -i -X DELETE localhost:8765/products/1
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 16:42:32 GMT
+Content-Length: 81
+
+{"error":{"code":"conflict","message":"mahsulot 1: mahsulot buyurtmalarda bor"}}
+```
+
+`writeStoreError` bitta joyda xatolarni statusga aylantiradi:
+
+| Store natijasi | HTTP va kod |
+|---|---|
+| `ErrNotFound` | `404 not_found` |
+| `*StockError`, `errors.As` | `409 insufficient_stock` |
+| `ErrDuplicate` (`23505`, `UNIQUE`) | `409 conflict` |
+| `ErrInUse` (`23503`, tashqi kalit) | `409 conflict` |
+| `ErrBadQuantity`, `ErrBadProduct` | `422 validation_failed` |
+| kutilmagan xato | `500 internal`; tafsilot server logida |
+
+## Haqiqiy Postgres: har testning oʻz schema'si
+
+Mock — baza oʻrnidagi soxta kod. U Postgres'dagi shartli UPDATE, CHECK, tashqi kalit va rollback'ni tekshirmaydi.
+**Integration test** haqiqiy qismlarni birga ishlatadi: `httptest → newMux → Store → Postgres`. Alohida HTTP server porti kerak emas.
+**Test izolyatsiyasi** esa bitta test boshqa testning maʼlumotini oʻzgartirmasligini taʼminlaydi.
+
+```go filename="internal/pgtest/pgtest.go" showLineNumbers
+// Package pgtest — testlar uchun haqiqiy Postgres (mock emas). Har test oʻz boʻsh sxemasini oladi:
+// migratsiyalar (goose) va seed.sql shu sxemaga qoʻllanadi, test tugagach sxema oʻchiriladi.
+// Shuning uchun testlar bir-biriga xalaqit bermaydi, `go test ./...` paketlarni parallel
+// ishga tushirganda ham (GB-5.10 videosidagi xato), va sizning public sxemangizga tegmaydi.
+package pgtest
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/abdurahmon27/bozor"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+// LabURL — shu papkadagi compose.yaml koʻtaradigan Postgres. Boshqa manzil uchun DATABASE_URL qoʻying.
+const LabURL = "postgres://bozor:bozor-lab@localhost:5510/bozor"
+
+// New bu test uchun yangi sxema yaratadi, unga migratsiyalar va seed.sql'ni qoʻllaydi va shu sxemaga
+// ulangan pool qaytaradi. Postgres ishlamasa test aniq xabar bilan yiqiladi (oʻtkazib yuborilmaydi).
+func New(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		url = LabURL
+	}
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("DATABASE_URL notoʻgʻri: %v", err)
+	}
+	cfg.MaxConns = max(cfg.MaxConns, 4) // URL'da pool_max_conns=1 qolgan boʻlsa ham parallel test toʻxtab qolmasin (GB-5.07)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	admin, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err == nil {
+		err = admin.Ping(ctx)
+	}
+	if err != nil {
+		t.Fatalf("Postgres'ga ulanib boʻlmadi (%s:%d): avval shu papkada `docker compose up -d --wait` ishga tushiring.\n%v",
+			cfg.ConnConfig.Host, cfg.ConnConfig.Port, err)
+	}
+	schema := fmt.Sprintf("test_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("sxema yaratilmadi: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Logf("sxema %s oʻchirilmadi (qoʻlda: DROP SCHEMA %s CASCADE): %v", schema, schema, err)
+		}
+		admin.Close()
+	})
+
+	poolCfg := cfg.Copy()                                    // nusxa: admin pool'ning sozlamasi oʻzgarmasin (u ham shu cfg'dan yasalgan)
+	poolCfg.ConnConfig.RuntimeParams["search_path"] = schema // har ulanish jadvallarni shu sxemadan qidiradi
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	db := stdlib.OpenDBFromPool(pool) // goose database/sql bilan ishlaydi: pool ustidan *sql.DB
+	defer db.Close()
+	provider, err := bozor.NewProvider(db)
+	if err != nil {
+		t.Fatalf("goose: %v", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("migratsiya qoʻllanmadi: %v", err)
+	}
+	// Oddiy protokol: bitta matnda bir nechta SQL buyrugʻi boʻlishi mumkin (GB-5.07 testlari).
+	if _, err := pool.Exec(ctx, bozor.SeedSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("seed.sql bajarilmadi: %v", err)
+	}
+	return pool
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1–24 | paket va importlar; `LabURL` standart manzil, `DATABASE_URL` uni almashtiradi |
+| 25–34 | `t.Helper` xatoni chaqiruvchi testga bogʻlaydi; URL sozlamaga oʻqiladi |
+| 35–37 | kamida 4 ulanish; tayyorlash uchun 30 soniya, qaytishda context tozalanadi |
+| 39–46 | admin pool va `Ping`; baza ishlamasa test oʻtkazib yuborilmaydi, aniq xato beradi |
+| 47–50 | `UnixNano` vaqt qiymatidan nom; `CREATE SCHEMA` bilan alohida jadvallar guruhi |
+| 51–56 | test tugagach `DROP SCHEMA … CASCADE`, keyin admin pool yopiladi; xato logga yoziladi |
+| 58–64 | `cfg.Copy`, har ulanish uchun `search_path`, test pool'i va uning Cleanup'i |
+| 66–71 | pgx pool ustidan `*sql.DB`; root `bozor.NewProvider` embedded migratsiyalarni goose'ga beradi |
+| 72–79 | `Up` migratsiyalarni qoʻllaydi, simple protocol koʻp buyruqli `SeedSQL`ni bajaradi; pool qaytadi |
+
+`schema` bu bazadagi nomlangan jadvallar guruhi. `search_path` `products` nomini aynan qaysi guruhdan qidirishni belgilaydi.
+`RuntimeParams` har yangi ulanishga shu sozlamani beradi; bitta ulanishdagi tasodifiy `SET`ga tayanmaymiz.
+Schema nomini `$1` bilan SQL identifier sifatida berib boʻlmaydi. Bu yerda nom ichki vaqt qiymatidan keladi, mijoz matnidan emas.
+
+`t.Cleanup` test tugaganda ishlaydi, `defer` esa `New` qaytishi bilan ishlardi. Cleanup'lar teskari tartibda: avval test pool'i yopiladi, keyin schema oʻchiriladi.
+`db.Close` wrapper'ni yopadi, pgx pool'ni yopmaydi. `migrate.go`dagi `go:embed` migratsiyalar va seed'ni binary ichiga olgan.
+
+| Test A | Test B |
+|---|---|
+| `search_path = test_A` | `search_path = test_B` |
+| `test_A.products`, `test_A.orders` | `test_B.products`, `test_B.orders` |
+| tugaganda faqat `test_A` oʻchadi | `test_B` ishlashda davom etadi |
+
+Nomlar chizmada qisqartirilgan; kodda `test_<UnixNano>`.
+
+## Qoidalarni tekshiradigan testlar
+
+`store_test` tashqi paket: `store.New` orqali omborni ishlatadi. `testCtx(t)` muddatli context, `count` SQL'dagi `count(*)`, `stockOf` qoldiqni oʻqiydi.
+Quyidagi test har safar yangi seed oladi. Shuning uchun unda olma 40, oldingi `curl`dan qolgan 38 emas.
+
+```go
+func TestPlaceOrderRollsBack(t *testing.T) {
+	pool := pgtest.New(t)
+	_, err := store.New(pool).PlaceOrder(testCtx(t), "Jasur", []store.OrderItem{
+		{ProductID: 1, Quantity: 2}, {ProductID: 4, Quantity: 5},
+	})
+	var se *store.StockError
+	if !errors.As(err, &se) {
+		t.Fatalf("PlaceOrder(oʻrik x5) = %v; kutilgan *StockError", err)
+	}
+	if got := count(t, pool, "orders"); got != 3 {
+		t.Errorf("orders'da %d qator, kutilgan 3: yarim buyurtma qoldi", got)
+	}
+	if got := count(t, pool, "order_items"); got != 4 {
+		t.Errorf("order_items'da %d qator, kutilgan 4", got)
+	}
+	if got := stockOf(t, pool, 1); got != 40 {
+		t.Errorf("olma qoldigʻi %d, kutilgan 40: birinchi qator bekor boʻlmadi", got)
+	}
+}
+```
+
+`errors.As` xatoning `*StockError` ekanini tekshiradi. Soʻng uch buyurtma, toʻrt qator va 40 olma tekshiriladi.
+Faqat HTTP `409`ni koʻrish yetmaydi: bu test bazada yarim yozuv qolmaganini ham tekshiradi.
+
+20 xaridor, 8 choy. **A)** 20 muvaffaqiyat · **B)** 8 muvaffaqiyat, 12 `StockError` · **C)** qoldiq −12.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Shartli UPDATE har sotuvni bazada tekshiradi. A va C tekshiruv bilan yozuv alohida boʻlgandagi buzilgan holatni taxmin qiladi.
+
+</details>
+
+```go
+func TestConcurrentOrders(t *testing.T) {
+	pool := pgtest.New(t)
+	st := store.New(pool)
+	ctx := testCtx(t)
+	errs := make([]error, 20)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = st.PlaceOrder(ctx, "xaridor", []store.OrderItem{{ProductID: 3, Quantity: 1}})
+		})
+	}
+	wg.Wait()
+	ok := 0
+	for _, err := range errs {
+		var se *store.StockError
+		switch {
+		case err == nil:
+			ok++
+		case !errors.As(err, &se):
+			t.Errorf("kutilmagan xato: %v", err)
+		}
+	}
+	if ok != 8 {
+		t.Errorf("%d ta buyurtma oʻtdi, kutilgan 8 (omborda 8 ta choy)", ok)
+	}
+	if got := stockOf(t, pool, 3); got != 0 {
+		t.Errorf("choy qoldigʻi %d, kutilgan 0", got)
+	}
+	if got := count(t, pool, "orders"); got != 3+8 {
+		t.Errorf("orders'da %d qator, kutilgan 11", got)
+	}
+}
+```
+
+`errs`da har goroutine oʻz `i` joyiga yozadi. `wg.Go` ishni boshlaydi, `wg.Wait` hammasini kutadi; `sync.WaitGroup` GB-7.01'da chuqurroq ochiladi.
+Keyingi sikl `nil`larni sanaydi, qolgan xatolar faqat `StockError` ekanini tekshiradi. Natija: 8 muvaffaqiyat, qoldiq 0, buyurtmalar `3 + 8 = 11`.
+
+`api_test.go`dagi jadvaldan parcha; bu mustaqil dastur emas:
+
+```go
+func TestRoutes(t *testing.T) {
+	tests := []struct {
+		name, method, path, body string
+		status                   int
+		want                     string
+	}{
+		{"katalog", "GET", "/products", "", 200, `"name":"oʻrik"`},
+		{"bitta", "GET", "/products/4", "", 200, `"stock":2`},
+		{"yoq_id", "GET", "/products/99", "", 404, `"code":"not_found"`},
+		{"son_emas", "GET", "/products/abc", "", 400, `"code":"bad_id"`},
+		{"yangi_mahsulot", "POST", "/products", `{"name":"anor","price":2000000,"stock":5}`, 201, `"id":5`},
+		{"takror_nom", "POST", "/products", `{"name":"olma","price":100,"stock":1}`, 409, `"code":"conflict"`},
+		{"buyurtma", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":1}]}`, 201, `"total":5900000`},
+		{"qoldiq_yetmaydi", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":2},{"product_id":4,"quantity":5}]}`, 409, `"message":"oʻrik: qoldiq 2, soʻralgan 5"`},
+		{"yoq_mahsulot", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":99,"quantity":1}]}`, 404, `"code":"not_found"`},
+		{"nol_dona", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":0}]}`, 422, `"items[0].quantity"`},
+		{"boʻsh_savat", "POST", "/orders", `{"customer":"Aziza","items":[]}`, 422, `"items"`},
+		{"takror_qator", "POST", "/orders", `{"customer":"Aziza","items":[{"product_id":1,"quantity":1},{"product_id":1,"quantity":2}]}`, 422, `"items[1].product_id"`},
+		{"notoʻgʻri_json", "POST", "/orders", `{"customer":`, 400, `"code":"bad_json"`},
+		{"oʻchirish", "DELETE", "/products/3", "", 204, ""},
+		{"buyurtmadagi", "DELETE", "/products/1", "", 409, `"code":"conflict"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := testAPI(t)
+			rec := send(h, tc.method, tc.path, tc.body)
+			if rec.Code != tc.status {
+				t.Errorf("%s %s: status %d, kutilgan %d: %s", tc.method, tc.path, rec.Code, tc.status, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("%s %s: body'da %s yoʻq: %s", tc.method, tc.path, tc.want, rec.Body)
+			}
+		})
+	}
+}
+```
+
+`tc` — joriy holat; `t.Run` alohida subtest. `testAPI(t)` har qatorga yangi schema'dagi mux beradi; `_` kerak boʻlmagan pool'ni tashlaydi.
+`send` `httptest.NewRequest` va `NewRecorder` yasab, `h.ServeHTTP`ni chaqiradi. `rec.Code` status, `rec.Body` body.
+`strings.Contains` kerakli parcha borligini tekshiradi. API testi ikki olma va **oʻrik** oladi: jami `5900000`; oldingi `curl` esa choy olgandi.
+
+Faqat darsdagi mavjud imkoniyatlar testlarini tanlasak, quyidagisi oʻtishi kerak. `-run` test nomlariga regex qoʻllaydi; `-count=1` keshni chetlab oʻtadi; `./...` barcha paketlarni tanlaydi.
+
+```console
+$ go test -count=1 -run 'Test(Routes|OrderConflictLeavesNoTrace|PlaceOrder.*|ConcurrentOrders|OppositeCarts|EmptyCart|AddDuplicate|Delete)$' ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.794s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.501s
+```
+
+**Starter'dagi toʻliq `go test ./...` hali yiqiladi:** `tekshiruv_test.go` tugallanmagan `Order` va GET route'ini kutadi.
+Videodagi `ok` holati aynan shu ikki tekshiruv faylisiz yozilgan nusxadan olingan. Ularni vazifada oʻchirmang.
+
+## Chuqurroq (ixtiyoriy): himoya va oʻlchov chegaralari
+
+- `CHECK (stock >= 0)` — ilova xatosiga qarshi bazadagi qoʻshimcha himoya. Guard nol qator qaytarsa transaction tirik; CHECK xatosi esa uni buzadi.
+- Rollback identity sequence'ni orqaga qaytarmaydi. Bekor qilingan buyurtma ID'sida boʻshliq qolishi mumkin; ID'lar uzluksizligi kafolatlanmaydi.
+- `go test` muvaffaqiyatni keshlashi mumkin. Baza holati kesh kalitiga kirmaydi; haqiqiy integratsion tekshiruvda `-count=1` yoki `-count=5` ishlating.
+- Bu darsdagi `NewProvider` umumiy advisory lock ishlatmaydi: har schema migratsiyasi mustaqil. Bitta umumiy schema'ga parallel deploy migratsiyasi boshqa masala, GB-8.06.
+- README'da qulf bilan/qulfsiz API testlari 6.1/1.1 s: taxminan 5.55 marta. Bu videoga tayyorlov oʻlchovidan **iqtibos**, bu sahifa uchun qayta oʻlchanmagan.
+- `go test -race` natijasi ham tayyorlov jurnalidan: Docker'da gcc bilan oʻtgan. Bu sahifa `CGO_ENABLED=0` bilan tekshirildi; race oʻlchovi qayta bajarilmadi.
+- `active` bu laboratoriyada sotuv shartiga qoʻshilmagan; seed mahsulotlari faol. Nomaʼlum mahsulotga body ichida ham `404` — kurs spetsifikatsiyasi; boshqa API `422` tanlashi mumkin.
+- testcontainers-go Postgres'ni testdan ishga tushirishi mumkin. Bu kurs mavjud Compose setup'ini ishlatadi; keyin CI'da ham shu yoʻl.
+
+## Koʻp uchraydigan xatolar
+
+**1. Har testda umumiy `public`ni tozalash.** Bir paket yolgʻiz oʻtsa, hammasi ham oʻtadi degan xulosa notoʻgʻri.
+Videodagi xato `pgtest.New`dan parcha:
+
+```go
+// XATO VERSIYA: hamma test bitta public sxemada
+if _, err := admin.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
+	t.Fatalf("sxema tozalanmadi: %v", err)
+}
+pool := admin
+```
+
+Bu kodni asosiy bazangizga qoʻllamang: `DROP … CASCADE` shu schema jadvallarini oʻchiradi.
+Takrorlash faqat alohida laboratoriya bazasida, alohida nusxada. Quyidagini dars papkasidan bajaring; `cd` nusxa papkasiga oʻtadi.
+`mktemp -d` yangi vaqtinchalik papka yaratadi, `cp -R` loyiha nusxasini oladi, `rm` faqat nusxadagi vazifa tekshiruvlarini olib tashlaydi.
+
+```bash
+demo=$(mktemp -d)
+cp -R . "$demo/"
+rm "$demo/cmd/api/tekshiruv_test.go" "$demo/internal/store/tekshiruv_test.go"
+cp "$demo/_video/stages/pgtest-shared.go" "$demo/internal/pgtest/pgtest.go"
+cd "$demo"
+```
+
+Bu video tajribasi, uy vazifasini topshirish usuli emas. Faqat store paketi:
+
+```console
+$ go test -count=5 ./internal/store
+ok  	github.com/abdurahmon27/bozor/internal/store	1.912s
+```
+
+Ikkala paket-chi? **A)** oʻtadi, har test toza · **B)** tasodifiy testlar yiqiladi · **C)** faqat sekinroq.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Har paketning alohida test dasturi bor. Bir paket `public`ni oʻchirayotgan paytda boshqasi uning jadvallaridan foydalanadi.
+A va C faqat bitta paket ichidagi ketma-ket bajarilishni hisobga oladi.
+
+</details>
+
+```console
+$ go test -count=5 ./... > shared-failure.log 2>&1
+```
+
+Buyruq chiqishni faylga yozdi va 1 bilan tugadi. `> … 2>&1` stdout va stderr'ni bir faylga yoʻnaltiradi.
+`sed` jurnalning dastlabki 24 qatorini chiqaradi; bu yugurishda jurnalning oʻzi 23 qator:
+
+```console
+$ sed -n '1,24p' shared-failure.log
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestRoutes (0.53s)
+    --- FAIL: TestRoutes/buyurtmadagi (0.02s)
+        api_test.go:55: migratsiya qoʻllanmadi: partial migration error (type:sql,version:1): ERROR: duplicate key value violates unique constraint "pg_type_typname_nsp_index" (SQLSTATE 23505)
+--- FAIL: TestOrderConflictLeavesNoTrace (0.02s)
+    api_test.go:69: migratsiya qoʻllanmadi: failed to list migrations: ERROR: relation "goose_db_version" does not exist (SQLSTATE 42P01)
+--- FAIL: TestRoutes (2.66s)
+    --- FAIL: TestRoutes/katalog (2.01s)
+        api_test.go:55: seed.sql bajarilmadi: ERROR: deadlock detected (SQLSTATE 40P01)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	6.460s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+--- FAIL: TestPlaceOrder (2.03s)
+    store_test.go:45: migratsiya qoʻllanmadi: partial migration error (type:sql,version:3): ERROR: column "status" of relation "orders" already exists (SQLSTATE 42701)
+--- FAIL: TestPlaceOrderRollsBack (0.04s)
+    store_test.go:66: migratsiya qoʻllanmadi: partial migration error (type:sql,version:3): ERROR: relation "orders" does not exist (SQLSTATE 42P01)
+--- FAIL: TestOppositeCarts (1.07s)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+    store_test.go:155: kutilmagan xato (deadlock?): ERROR: deadlock detected (SQLSTATE 40P01)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	6.062s
+FAIL
+```
+
+`api_test.go:55` — yordamchini chaqirgan test qatori: `t.Helper` sabab xabar shu yerga bogʻlangan.
+`relation … does not exist` — jadval yoʻq (`42P01`); `deadlock detected` — bir-birini kutish (`40P01`).
+`duplicate key … unique constraint` — noyob qiymat takrorlangan (`23505`); `column … already exists` — ustun allaqachon bor (`42701`).
+Bu yerda ular test setup'lari toʻqnashganini koʻrsatadi; mahsulot nomining biznes takrori emas.
+Videoda boshqa subtestlar yiqilgan. Tasodifiy vaqt tartibi xabarni oʻzgartiradi, sababni emas.
+
+| Vaqt | `cmd/api.test` | `store.test` |
+|---|---|---|
+| 1 | `products`ga soʻrov | `DROP SCHEMA public CASCADE` |
+| 2 | jadval yoʻq: FAIL | migratsiyalarni qayta qoʻllaydi |
+
+**Tuzatish:** nusxadagi `internal/pgtest/pgtest.go`ni yuqorida koʻrsatilgan asl faylga qaytaring. Oʻsha video nusxasida qayta tekshirdik:
+
+```console
+$ go test -count=5 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	4.761s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	2.727s
+```
+
+`-p` bir vaqtda ishlaydigan paket dasturlarining sonini belgilaydi; standarti GOMAXPROCS, odatda mavjud protsessorlar soniga bogʻliq.
+Bu darsda paket ichida `t.Parallel` yoʻq: testlar ketma-ket. `-p 1` toʻqnashuvni yashiradi, alohida schema esa sababni tuzatadi.
+
+| Besh marta, vazifa tekshiruvlarisiz | Video, s | Bizning yugurish, s | Biz/video |
+|---|---:|---:|---:|
+| umumiy schema, faqat store | 2.134 | 1.912 | 0.90 |
+| alohida schema, API | 4.458 | 4.761 | 1.07 |
+| alohida schema, store | 2.777 | 2.727 | 0.98 |
+
+Sonlar tezlik kafolati emas: yuklama va sinov tarkibi muhim. Muhim oʻlchov — `FAIL → ok`, takroriy yugurishda ham maʼlumot ajratilganligi.
+
+**2. `ErrNoRows`ni SQL xatosi deb bilish.** Nol qator transaction'ni buzmaydi; `whyNoRow` shu `tx`da ishlaydi. Har qanday SQL xatosidan keyin shu usulni koʻr-koʻrona qoʻllamang.
+
+**3. Rollback testida olma 38 kutish.** Har test yangi seed oladi, shuning uchun 40 kutadi. `curl` tajribasi bilan test schema'si alohida.
+
+**4. Starter'da hamma test yashil boʻlishini kutish.** Toʻliq tekshiruvni jurnalladik:
+
+```console
+$ go test ./... > starter-failure.log 2>&1
+```
+
+```console
+$ sed -n '1,5p' starter-failure.log
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestGetOrder (0.22s)
+    --- FAIL: TestGetOrder/bor (0.05s)
+        tekshiruv_test.go:25: GET /orders/1: status 404, kutilgan 200 (TASK.md, 2–3-qadam): 404 page not found
+    --- FAIL: TestGetOrder/qatorsiz (0.05s)
+```
+
+`404`, kutilgan `200`: GET route hali yoʻq. Store tekshiruvi ham `Order hali yozilmagan` deydi. Tuzatish — uy vazifasini bajarish, tekshiruvni oʻchirish emas.
+
+## Oʻzingizni tekshiring
+
+**1.** Guard qator qaytarmasa, 404 va 409 qanday ajratiladi?
+
+<details>
+<summary>Javob</summary>
+
+`whyNoRow` shu transaction'da mahsulotni oʻqiydi: yoʻq boʻlsa `ErrNotFound` → 404, bor boʻlsa `StockError` → 409.
+
+</details>
+
+**2.** 20 parallel soʻrov va 8 choy: nechta muvaffaqiyat, nechta xato, yakuniy qoldiq?
+
+<details>
+<summary>Javob</summary>
+
+8 muvaffaqiyat, 12 `StockError`, qoldiq 0. Testdagi buyurtma soni 11: seed'dagi 3 va yangi 8.
+
+</details>
+
+**3.** Nega `t.Cleanup` oʻrniga `defer pool.Close()`ni `pgtest.New` ichida qoʻymaymiz?
+
+<details>
+<summary>Javob</summary>
+
+`defer` `New` qaytishi bilan pool'ni yopadi. Test hali ishlamagan boʻladi. `Cleanup` test tugaganda ishlaydi.
+
+</details>
+
+**4.** GB-5.07: muvaffaqiyatli `Commit`dan keyingi `Rollback` bazani oʻzgartiradimi?
+
+<details>
+<summary>Javob</summary>
+
+Yoʻq. Transaction tugagan; pgx `ErrTxClosed` beradi. Shu sabab himoya uchun oldindan qoʻyilgan `defer tx.Rollback(ctx)` xavfsiz.
+
+</details>
+
+## Uy vazifasi
+
+Shart: [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-10-buyurtma-api/TASK.md).
+Kod: [dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api).
+Javob: [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api/solution).
+
+🟠 **Nazorat vazifasi:** `GET /orders/{id}`ni qoʻshing. `*_test.go` fayllarini oʻzgartirmang.
+
+1. `store.Order(ctx, id)`: `orders`dan mijoz/status, `order_items`dan qatorlar `ORDER BY id` bilan. Jami `quantity × unit_price` yigʻindisi.
+2. `newMux`ga GET route va `getOrder`: `pathID → Order(r.Context(), id) → writeJSON`.
+3. `writeStoreError`ga `ErrOrderNotFound → 404 not_found`.
+
+`GET /orders/1` — 200, Dilnoza, ikki olma va uch non, jami `3600000`; `/orders/99` — JSON `404 not_found`; `/orders/abc` — `400 bad_id`.
+`/orders/3` qatorsiz: `items: []`, `total: 0`; `null` emas. POST'dagi `Location`ni GET qilish aynan shu buyurtmani qaytarishi kerak.
+
+🟡 **Ixtiyoriy:** soʻrovlarni sqlc bilan generatsiya qiling. Natija tekshiruvlari oʻzgarmaydi.
+
+Asl dars papkasida, Postgres ishlab turganda:
+
+```bash
+go test ./...
+```
+
+<details>
+<summary>Javob</summary>
+
+`Get` va `List`dagi yoʻldan foydalaning. Boʻsh slice bilan boshlang; `rows.Close` va `rows.Err`ni tekshiring.
+Javobdagi toʻliq metod:
+
+```go
+func (s *Store) Order(ctx context.Context, id int64) (Order, error) {
+	o := Order{ID: id, Items: []OrderItem{}}
+	err := s.pool.QueryRow(ctx,
+		"SELECT customer, status FROM orders WHERE id = $1", id).Scan(&o.Customer, &o.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, fmt.Errorf("buyurtma %d: %w", id, ErrOrderNotFound)
+	}
+	if err != nil {
+		return Order{}, err
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY id", id)
+	if err != nil {
+		return Order{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPrice); err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := rows.Err(); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+Birinchi soʻrov `ErrOrderNotFound`ni `%w` bilan oʻraydi. Ikkinchisi qatorlarni oʻqib, sotuvdagi narxdan jami hisoblaydi.
+`rows.Err` boʻlsa yarim natija qaytmaydi. Handler:
+
+```go
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+```
+
+Route va xatoni statusga aylantirish tegishli funksiyalarga qoʻshiladi:
+
+```go
+mux.HandleFunc("GET /orders/{id}", a.getOrder)
+
+// writeStoreError ichidagi case:
+case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrOrderNotFound):
+	writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: err.Error()})
+```
+
+Tayyor javobni alohida tekshirish uchun `cd solution` bilan uning papkasiga oʻting; `DATABASE_URL` oʻsha laboratoriya bazasiga qoladi.
+
+```bash
+cd solution
+```
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.019s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.651s
+```
+
+Besh marta qayta tekshirish ham oʻtdi:
+
+```console
+$ go test -count=5 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	5.728s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	3.804s
+```
+
+Bu vaqtlar vazifa tekshiruvlarini ham oʻz ichiga oladi; oldingi video-nusxa jadvali bilan bir xil sinov tarkibi emas.
+
+</details>
+
+Server terminalida Ctrl+C bilan serverni toʻxtating. Dars nusxasiga qaytib, aynan shu Compose loyihasini konteyner va volume'i bilan tozalang:
+
+```bash
+docker compose down -v
+```
+
+Keyingi dars: [GB-6.01 · middleware](/lab/youtube/gb#gb-6-01).
+
+## Manbalar
+
+- [PostgreSQL 18](https://www.postgresql.org/docs/18/): [UPDATE … RETURNING](https://www.postgresql.org/docs/18/sql-update.html), [READ COMMITTED](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED), [transaction](https://www.postgresql.org/docs/18/tutorial-transactions.html), [ROLLBACK](https://www.postgresql.org/docs/18/sql-rollback.html).
+- [TRUNCATE](https://www.postgresql.org/docs/18/sql-truncate.html), [schema](https://www.postgresql.org/docs/18/ddl-schemas.html), [search_path](https://www.postgresql.org/docs/18/ddl-schemas.html#DDL-SCHEMAS-PATH), [DROP SCHEMA](https://www.postgresql.org/docs/18/sql-dropschema.html), [tashqi kalitlar](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK), [deadlock](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-DEADLOCKS), [SQLSTATE](https://www.postgresql.org/docs/18/errcodes-appendix.html), [ketma-ketliklar](https://www.postgresql.org/docs/18/functions-sequence.html).
+- pgx: [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool), [Ping](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Ping), [Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx), [RuntimeParams](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#Config), [OpenDBFromPool](https://pkg.go.dev/github.com/jackc/pgx/v5/stdlib#OpenDBFromPool), [DeadlineContextWatcherHandler](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#DeadlineContextWatcherHandler).
+- goose: [Provider](https://pkg.go.dev/github.com/pressly/goose/v3#Provider), [NewProvider](https://pkg.go.dev/github.com/pressly/goose/v3#NewProvider), [CLI](https://pressly.github.io/goose/documentation/cli-commands/).
+- Go: [test bayroqlari](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [-count](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [-p](https://pkg.go.dev/cmd/go#hdr-Compile_packages_and_dependencies), [T.Cleanup](https://pkg.go.dev/testing#T.Cleanup), [Request.Context](https://pkg.go.dev/net/http#Request.Context), [os.Exit](https://pkg.go.dev/os#Exit).
+- HTTP: [RFC 9110 status codes](https://www.rfc-editor.org/rfc/rfc9110#name-status-codes), [201](https://www.rfc-editor.org/rfc/rfc9110#name-201-created), [Location](https://www.rfc-editor.org/rfc/rfc9110#name-location), [DELETE](https://www.rfc-editor.org/rfc/rfc9110#name-delete), [409](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict), [422](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content).
+- [sqlc: Postgres turlari](https://docs.sqlc.dev/en/stable/reference/datatypes.html), [testcontainers-go: Postgres](https://golang.testcontainers.org/modules/postgres/).
+- [README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api), [_video/chiqishlar.txt](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-10-buyurtma-api/_video/chiqishlar.txt).
+
+Qayta yugurishlar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL 18.7 (`postgres:18-alpine`), pgx v5.13.0, goose v3.30.2, 2026-11-27.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-10-buyurtma-api)
+
+---
+
+← Oldingi dars: [GB-5.09](/lab/youtube/gb/gb-5-09) · Keyingi dars: [GB-6.01](/lab/youtube/gb#gb-6-01) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
