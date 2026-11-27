@@ -1,0 +1,857 @@
+---
+title: "Requests run at the same time: sync.Mutex and -race"
+date: "2026/11/27"
+description: "The server handles requests at the same time: see how a data race corrupts the stock, catch it with go test -race and fix it with sync.Mutex."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-07/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-07"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-07) · [Русский](/lab/youtube/gb/gb-4-07/ru) · **English**  
+Lesson GB-4.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-07) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-07-mutex-race)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Every test of bozor passes. But when a thousand requests arrive at once, the program crashes or the stock of apricots (`oʻrik`) comes out wrong.
+The question: why does code that is correct for one request break for a thousand, how do you find it, and how do you fix it?
+
+**One idea:** the server runs requests that arrive at the same time in separate **goroutines** (one per new connection), so all handlers touch the same in-memory catalog (a `map`) at the same time.
+An access without synchronization where at least one side writes is a **data race**: the read–modify–write steps interleave and an update is lost (or the runtime stops the program with `fatal error: concurrent map …`).
+`go test -race` finds every such pair; **`sync.Mutex`** (`Lock` + `defer Unlock`) makes that step indivisible.
+The rule: **every** access to shared data, reads included, goes under the same lock.
+
+By the end of the lesson you will:
+
+- see with `curl` that the server handles requests at the same time;
+- understand why `go test` crashes with a thousand parallel requests and read the `go test -race` report (`Read at` / `Previous write`, file:line);
+- fix the `Sell` method with `sync.Mutex` and state the locking rule;
+- find the mutex-copying mistake with `go vet`;
+- in the homework, protect `Restock`, write `Total` and make `go test .` pass.
+
+Today's three core new words:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| goroutine | a function that runs at the same time as other calls; the server gives it every new connection | goroutine |
+| data race | an access without synchronization to one memory location where at least one side writes | data race |
+| mutex (lock) | a lock that only one goroutine can hold at a time; the others wait | `sync.Mutex` |
+
+Helpers: `wg.Go` and `wg.Wait` (only "starts" and "waits"; `sync.WaitGroup` itself is in [GB-7.01](/lab/youtube/gb#gb-7-01)), the lost update (read–modify–write steps interleaving) and `409 Conflict`.
+Every other new name gets one sentence where it appears.
+
+## Before you start
+
+This lesson builds on:
+
+- [GB-4.06 · JSON in and out](/lab/youtube/gb/gb-4-06/en): `POST /products`, `http.MaxBytesReader`. The recall question is from this lesson.
+- [GB-4.04 · The first server, line by line](/lab/youtube/gb/gb-4-04/en): `ServeMux`, `HandleFunc`, `ListenAndServe` and the port.
+- [GB-4.03 · A handler is a plain function](/lab/youtube/gb/gb-4-03/en): `w` and `r`, `WriteHeader` (the status and headers of the response), `httptest.NewRequest`, `NewRecorder`.
+- [GB-4.02 · An HTTP client in Go](/lab/youtube/gb/gb-4-02/en): `time.Second`, stopping the server with `Ctrl+C`.
+- [GB-4.01 · An HTTP request is text](/lab/youtube/gb/gb-4-01/en): `curl`, the parts of an address (`localhost:8085/slow`), status codes.
+- [GB-3.05 · Iterators](/lab/youtube/gb/gb-3-05/en): `iter.Seq`, `yield` — only in the "Going deeper" section.
+- [GB-2.09 · defer, panic and recover](/lab/youtube/gb/gb-2-09/en): `defer` runs when the function exits.
+- [GB-2.08 · Errors in depth](/lab/youtube/gb/gb-2-08/en): an error value created with `errors.New` (`ErrStock`).
+- [GB-2.05 · Methods](/lab/youtube/gb/gb-2-05/en): value receiver and pointer receiver. [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/en): `map` and comma-ok.
+- [GB-1.08 · The first test](/lab/youtube/gb/gb-1-08/en): `go test`, `t.Errorf`, the `ok` and `FAIL` lines.
+
+**How to run the code.** The code of this lesson is in a folder of the course repository:
+[lessons/gb-4-07-mutex-race](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-07-mutex-race). Download it and open a terminal in that folder
+(`cd` moves the terminal to another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-07-mutex-race
+```
+
+The folder contains: `main.go` (the code at the end of the video and the starting point of the task), `buy_test.go` (the test from the video), `tekshiruv_test.go` (checks the task), `TASK.md` (the task), `solution/` (the answer) and `_video/` — a separate folder for every step of the video (`01-slow`, `02-race`, `03-mutex`, `04-nusxa`, `05-deadlock`).
+The folder has its own `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`) and no external modules. If an older Go is installed, `go` downloads the needed version by itself.
+
+The script that runs a step as in the video: `./_video/run.sh <step> <command>`. It copies the files of the step folder into a temporary `bozor/` folder together with this `go.mod`, runs the command there
+and prints a line `(chiqish kodi: N)` ("exit code") at the end. That line is the script's output, not the program's; I left it out of the blocks below.
+
+**An important note on `-race`.** The race detector needs a C compiler (on Linux usually `gcc`). My machine has no `gcc`, so I took every `go test -race` result with `_video/race.sh`, in Docker:
+inside the `golang:1.26.8` image (it has gcc), but with the `go1.27.4` toolchain as Go itself. Every other command ran on the normal machine with `CGO_ENABLED=0`.
+That is why the file path in the report is `/home/dev/bozor/main.go` (a folder inside Docker): you will see the path of your own folder. If you have `gcc`, a plain `go test -race` is enough.
+
+One question from the previous lesson. What did we use to read the JSON body of a `POST` request with a size limit?
+
+**A)** `http.MaxBytesReader` · **B)** `DisallowUnknownFields` · **C)** `json.NewEncoder`
+
+<details>
+<summary>Answer</summary>
+
+**A.** `http.MaxBytesReader` reads the body with a size limit; a body larger than the limit gives an error ([GB-4.06](/lab/youtube/gb/gb-4-06/en), [pkg.go.dev: MaxBytesReader](https://pkg.go.dev/net/http#MaxBytesReader)). That made a single request safe.
+If you chose **B**: `DisallowUnknownFields` rejects not the size but an extra key in the body (`400`). **C** writes a response (`Encoder`) and does not read the body.
+Today's question is different: what happens when requests are *many* and arrive *at the same time*.
+
+</details>
+
+## Requests run at the same time
+
+First we need proof: does the server really run requests that arrive together side by side? For that we write a slow handler ourselves. `slowHandler` imitates heavy work:
+it writes that it started, sleeps for one second and writes that it finished. `time.Sleep` stands for waiting on a database or an external service.
+
+```go filename="_video/01-slow/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+)
+
+func slowHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("boshladi")
+	time.Sleep(time.Second)
+	fmt.Println("tugadi")
+}
+
+func main() {
+	http.HandleFunc("/slow", slowHandler)
+	log.Fatal(http.ListenAndServe("localhost:8085", nil))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `func slowHandler(w http.ResponseWriter, r *http.Request) {` | the handler: the signature from [GB-4.03](/lab/youtube/gb/gb-4-03/en). We chose the name `slowHandler` |
+| 11 | `fmt.Println("boshladi")` | prints "boshladi" ("started") to the server's own terminal (not into the response body) |
+| 12 | `time.Sleep(time.Second)` | puts the goroutine to sleep for one second; `time.Second` is the one second from [GB-4.02](/lab/youtube/gb/gb-4-02/en) |
+| 13 | `fmt.Println("tugadi")` | after sleeping prints "tugadi" ("finished") |
+| 17 | `http.HandleFunc("/slow", slowHandler)` | attaches the path `/slow` to this handler ([GB-4.04](/lab/youtube/gb/gb-4-04/en)) |
+| 18 | `log.Fatal(http.ListenAndServe("localhost:8085", nil))` | listens on port 8085; if the port is busy, prints the error and ends the program |
+
+The handler writes nothing into the response body, so `curl` prints nothing. The visible output is the server's own records (its log).
+
+We start the server. The video used one terminal, so the command ends with `&`: the shell runs the command in the background and the terminal stays free (the shell only prints a background-job line such as `[1] 12345`: that is not the program's output).
+A more convenient variant is two terminals: `./_video/run.sh 01-slow go run .` in the first, `curl` in the second; you stop the server in the first one with `Ctrl+C`.
+
+```console
+$ go run . &
+```
+
+This command prints nothing: the server starts working in the background.
+
+The second command: one `curl`, three identical addresses.
+
+```bash
+$ curl -s --parallel --parallel-immediate localhost:8085/slow localhost:8085/slow localhost:8085/slow
+```
+
+| Part | What it does |
+|---|---|
+| `-s` | hides extra output (the progress bar) |
+| `--parallel` | requests the addresses at the same time, not one after another |
+| `--parallel-immediate` | opens all three connections right away; without it `curl` waits to see whether a connection can be reused and delays the second and third request |
+| `localhost:8085/slow` | the address: the computer itself, port 8085, path `/slow` ([GB-4.01](/lab/youtube/gb/gb-4-01/en)) |
+
+Predict. Three addresses went out at the same time. In what order does the server write its log?
+
+**A)** `boshladi`, `tugadi` — three times in a row · **B)** three `boshladi`, then three `tugadi` · **C)** only one request gets an answer
+
+<details>
+<summary>Answer</summary>
+
+**B.** All three requests ran together: each wrote `boshladi` and went to sleep, and a second later all of them wrote `tugadi`.
+If you chose **A**, you thought the server handles requests one by one: then every `boshladi` would come after the previous `tugadi`, and the whole thing would take three seconds. With **C** you thought the second and third requests are rejected; the server does not reject them.
+
+</details>
+
+```console
+$ curl -s --parallel --parallel-immediate localhost:8085/slow localhost:8085/slow localhost:8085/slow
+boshladi
+boshladi
+boshladi
+tugadi
+tugadi
+tugadi
+```
+
+The server printed these lines, not `curl`. I measured the time (curl 8.22.0, on this machine):
+
+| Command | Time (my run) | Measurement from the video |
+|---|---|---|
+| `curl -s --parallel --parallel-immediate` × 3 addresses | 1.007 · 1.008 · 1.008 s (three runs) | 1.006 s |
+| `curl -s --parallel` (without `--parallel-immediate`) × 3 addresses | 2.007 s | 2.009 s |
+| three `curl` calls one after another | 3.024 s | — (not in the video) |
+
+The times change a little with machine load; what matters is the ratio. Three requests fit into one second: they overlapped. One after another would take three seconds.
+Without `--parallel-immediate`, `curl` delayed the later requests (2 seconds), so this flag is needed here.
+
+**Why is it so on the server?** The `Server.Serve` method of `net/http` accepts connections and creates a new service goroutine **for each new connection**; the goroutine reads the request and calls the handler ([documentation](https://pkg.go.dev/net/http#Server.Serve)).
+A **goroutine** is a function that runs at the same time as other calls; the full explanation is in [GB-7.01](/lab/youtube/gb#gb-7-01). Today one thing matters: they run at the same time.
+Three `curl` transfers opened three connections, so `slowHandler` ran three times together. Requests on one connection are read one after another: the concurrency comes from *different* connections.
+
+| Step | What happens |
+|---|---|
+| 1 | three connections arrive at the same time |
+| 2 | the server opens a separate goroutine for each |
+| 3 | the handler runs three times at the same time |
+| 4 | the handlers may touch the same data (for example the catalog): the danger is here |
+
+## The catalog and `Sell`: one request is fine
+
+Now "the same data". The bozor catalog lives in memory: a `Store` struct with a `products` map inside. The key is the product ID, the value is a `Product`.
+To find a product by ID we use a map, not a slice. In this lesson the catalog is shortened and lives in its own folder; in [GB-4.08](/lab/youtube/gb#gb-4-08) we merge it with the rest of bozor.
+
+Here is the variant without a mutex, `_video/02-race/main.go`. I explain every line, because today's mistake hides right here:
+
+```go filename="_video/02-race/main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+// Product — katalogdagi bitta mahsulot (GB-3.02).
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+// ErrStock — mahsulot yoʻq yoki omborda soʻralgancha dona yoʻq.
+var ErrStock = errors.New("qoldiq yetmaydi")
+
+// Store — xotiradagi katalog: ID → mahsulot.
+type Store struct {
+	products map[int64]Product
+}
+
+// Sell id'li mahsulotdan quantity dona sotadi (quantity musbat deb olinadi: bu laboratoriya soddalashtirilgan).
+func (s *Store) Sell(id int64, quantity int) error {
+	p, ok := s.products[id]
+	if !ok || p.Stock < quantity {
+		return ErrStock
+	}
+	p.Stock -= quantity
+	s.products[id] = p
+	return nil
+}
+
+// buy — POST /buy: oʻrikdan (ID 3) bitta dona sotadi. Soddalik uchun har xato 409 Conflict (haqiqiy API'da yoʻq
+// mahsulot 404 boʻlardi).
+func (s *Store) buy(w http.ResponseWriter, r *http.Request) {
+	if err := s.Sell(3, 1); err != nil {
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	fmt.Fprintln(w, "sotildi")
+}
+
+func main() {
+	st := &Store{products: map[int64]Product{
+		3: {ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}}
+	http.HandleFunc("POST /buy", st.buy)
+	http.ListenAndServe("localhost:8080", nil)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10–15 | `type Product struct {…}` | a product ([GB-3.02](/lab/youtube/gb/gb-3-02/en)); the price is `int64`, in tiyin |
+| 18 | `var ErrStock = errors.New("qoldiq yetmaydi")` | an error value ([GB-2.08](/lab/youtube/gb/gb-2-08/en)): returned when the sale is impossible |
+| 21–23 | `type Store struct { products map[int64]Product }` | the catalog: `map[int64]Product` — the key is the ID (`int64`), the value is a `Product` |
+| 26 | `func (s *Store) Sell(id int64, quantity int) error {` | sells `quantity` pieces of product `id`, `quantity` is the number of pieces; a pointer receiver ([GB-2.05](/lab/youtube/gb/gb-2-05/en)) |
+| 27 | `p, ok := s.products[id]` | takes a **copy** of the product from the map into `p` and the found-or-not flag into `ok` ([GB-2.02](/lab/youtube/gb/gb-2-02/en)) |
+| 28–30 | `if !ok \|\| p.Stock < quantity { return ErrStock }` | no such product or not enough stock — `ErrStock` |
+| 31 | `p.Stock -= quantity` | reduces the stock in the copy |
+| 32 | `s.products[id] = p` | **writes** the copy back into the map |
+| 33 | `return nil` | no error |
+| 38 | `func (s *Store) buy(w http.ResponseWriter, r *http.Request) {` | the `POST /buy` handler |
+| 39–42 | `if err := s.Sell(3, 1); err != nil { w.WriteHeader(http.StatusConflict); return }` | sells one apricot (ID 3); on an error, status `409` and `return` |
+| 43 | `fmt.Fprintln(w, "sotildi")` | on success the response is `sotildi` ("sold") |
+| 46–52 | `func main() {…}` | the catalog has one product (the apricot, stock 5), `POST /buy` is connected, the server is on port 8080 |
+
+`409 Conflict` means "the request conflicts with the current state of the resource" ([RFC 9110 §15.5.10](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict)): when the stock is not enough, the request conflicts with the current state of the catalog.
+A simplification of the lab: `buy` answers every error with `409`; in a real API a missing product would be `404`.
+
+The key point: inside `Sell` there are three steps — in line 27 we **read**, in line 31 we **modify**, in line 32 we **write**. In a single request these three steps run one after another and are correct.
+
+## The lost update: two requests, one stock
+
+Now two requests, A and B, enter `Sell` at the same time. The apricot stock is 5. Each wants to sell one piece, so the stock should end at 3.
+The state when the steps interleave:
+
+| Time | A | B | `Stock` in the catalog |
+|---|---|---|---|
+| 1 | `p, ok := s.products[id]` → `p.Stock` = 5 | | 5 |
+| 2 | | `p, ok := s.products[id]` → `p.Stock` = 5 | 5 |
+| 3 | `p.Stock -= 1` → 4 in the copy; `s.products[id] = p` | | 4 |
+
+The second request also writes 4 from its own copy. What is the stock at the end?
+
+**A)** 3 · **B)** 4 · **C)** 5
+
+<details>
+<summary>Answer</summary>
+
+**B — 4.** At time 2 B had read stock 5 and did not see A's write; it lowered its own copy to 4 and wrote it. Two pieces were sold, but the stock fell by only one: one update was **lost**.
+**A** (3) is the correct result when requests run one after another, but here they are interleaved. For **C** (5) both would have had to write nothing.
+
+</details>
+
+| Time | A | B | `Stock` |
+|---|---|---|---|
+| 4 | | `p.Stock -= 1` → 4 in the copy; `s.products[id] = p` | 4 (expected: 3) |
+
+This is a **data race**: two goroutines accessed **one memory location**, at least one of them **wrote**, and there was **no synchronization** (nothing makes one wait for the other). All three conditions together make a data race.
+Writing to a map from several goroutines at once is not allowed in Go: the **runtime** — Go's own code that runs together with your program — stops the program if it notices (`fatal error`). If it does not notice, you get a silently wrong stock, as above.
+
+## A test with a thousand requests
+
+We recreate this in a test. In `buy_test.go` the helper function `orderParallel` sends n `POST /buy` requests at the same time:
+
+```go filename="buy_test.go" showLineNumbers
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+)
+
+// orderParallel n ta "POST /buy" soʻrovini bir vaqtda yuboradi.
+func orderParallel(st *Store, n int) {
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			st.buy(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/buy", nil))
+		})
+	}
+	wg.Wait()
+}
+
+func TestBuyParallel(t *testing.T) {
+	st := &Store{products: map[int64]Product{3: {Stock: 1000}}}
+	orderParallel(st, 1000)
+	if got := st.products[3].Stock; got != 0 {
+		t.Errorf("qoldiq %d, kutilgan 0", got)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11 | `func orderParallel(st *Store, n int) {` | sends n requests to the catalog `st` (we chose the names `st` and `n`) |
+| 12 | `var wg sync.WaitGroup` | a counter from the `sync` package: it tracks the goroutines that were started; details in [GB-7.01](/lab/youtube/gb#gb-7-01) |
+| 13 | `for range n {` | the loop runs n times ([GB-1.06](/lab/youtube/gb/gb-1-06/en)) |
+| 14 | `wg.Go(func() {` | **starts the function in a new goroutine** (`WaitGroup.Go` is available since Go 1.25) |
+| 15 | `st.buy(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/buy", nil))` | no server: builds a recorder and a request and calls `buy` as an ordinary function ([GB-4.03](/lab/youtube/gb/gb-4-03/en)) |
+| 18 | `wg.Wait()` | **waits** until all goroutines have finished |
+| 21 | `func TestBuyParallel(t *testing.T) {` | the test function ([GB-1.08](/lab/youtube/gb/gb-1-08/en)) |
+| 22 | `st := &Store{products: map[int64]Product{3: {Stock: 1000}}}` | `&` makes a pointer to the `Store`; one element in the map: key 3, a `Product` with only `Stock` = 1000 |
+| 23 | `orderParallel(st, 1000)` | sends a thousand requests at the same time |
+| 24–26 | `if got := st.products[3].Stock; got != 0 { t.Errorf(…) }` | when everything is done, `got` (the stock) must be 0, otherwise `Errorf` reports it |
+
+There are a thousand pieces and a thousand requests each sell one: at the end the stock must be 0. Predict: what does `go test` most often print without a mutex?
+
+**A)** `ok` · **B)** `FAIL`, the stock is not 0 · **C)** the program crashes
+
+<details>
+<summary>Answer</summary>
+
+**C.** Most often the program crashes; sometimes you get a plain `FAIL`. The runtime notices a simultaneous read and write of the map and stops the program itself: this is not a test failure (`t.Errorf`), the whole test process dies.
+**A** does not happen: a thousand requests break this code. **B** is the theoretically correct case (the "lost update" above) and it does appear sometimes, but most often the runtime stops the program earlier.
+
+</details>
+
+```console
+$ go test
+fatal error: concurrent map read and map write
+
+goroutine 113 [running]:
+internal/runtime/maps.fatal({0x625df1?, 0x16?})
+	…/src/runtime/panic.go:1197 +0x18
+github.com/abdurahmon27/bozor.(*Store).Sell(...)
+	…/main.go:27
+github.com/abdurahmon27/bozor.(*Store).buy(0x2d8978282098, {0x867480, 0x2d897849a880}, 0x0?)
+	…/main.go:39 +0x59
+github.com/abdurahmon27/bozor.orderParallel.func1()
+	…/buy_test.go:15 +0xec
+sync.(*WaitGroup).Go.func1()
+	…/src/sync/waitgroup.go:258 +0x4a
+created by sync.(*WaitGroup).Go in goroutine 20
+	…/src/sync/waitgroup.go:238 +0x7d
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.006s
+```
+
+How to read it: the first line names the cause — `concurrent map read and map write`. `goroutine 113 [running]:` is the goroutine that crashed; then comes the chain of calls (from the bottom up: `orderParallel` → `buy` → `Sell`) and file:line, where `main.go:27` is `p, ok := s.products[id]`.
+`exit status 2` — the process ended because of the `fatal error`, and the last line is `FAIL` with the package and the time. I shortened parts of the paths (`…`): you will see the path of your own folder.
+
+I ran the test on the unfixed code 20 times: it crashed all 20 times — 9 times `concurrent map read and map write`, 11 times `concurrent map writes`. In the measurement made while preparing the video (I did not re-measure it, I only quote it here) 9 of 10 runs crashed and one gave a plain `FAIL`.
+So the runtime check is **not guaranteed**: the Go documentation calls it "lightweight, best-effort" detection ([Go 1.6 release notes](https://go.dev/doc/go1.6), [Go FAQ](https://go.dev/doc/faq#atomic_maps)). We need a reliable tool.
+
+## `go test -race`: reading the report
+
+`-race` is a flag for `go test`: in running code it finds a dangerous pair (a write and a read, or two writes, to one location with no synchronization between them) and prints a report.
+The flag needs a C compiler (the note above); my results are from Docker:
+
+```console
+$ go test -race
+==================
+WARNING: DATA RACE
+Read at 0x00c0000e0690 by goroutine 34:
+  github.com/abdurahmon27/bozor.(*Store).Sell()
+      /home/dev/bozor/main.go:27 +0x97
+  github.com/abdurahmon27/bozor.(*Store).buy()
+      /home/dev/bozor/main.go:39 +0x18d
+  …
+Previous write at 0x00c0000e0690 by goroutine 10:
+  github.com/abdurahmon27/bozor.(*Store).Sell()
+      /home/dev/bozor/main.go:32 +0x144
+  github.com/abdurahmon27/bozor.(*Store).buy()
+      /home/dev/bozor/main.go:39 +0x18d
+  …
+```
+
+The report is shortened (`…` marks omitted lines); the real one also has `Goroutine 34 (running) created at:` blocks. In my run `-race` printed several reports:
+the first began with internal map lines such as `runtime.mapaccess2_fast64()` (it also points at line 27 of the same `Sell`), the second is the one above, where `Sell` is on top. At the end the runtime stopped the program anyway with `concurrent map read and map write`.
+Addresses and goroutine numbers differ on every run.
+
+| Part | Meaning |
+|---|---|
+| `WARNING: DATA RACE` | the start of the report |
+| `Read at 0x00c0000e0690 by goroutine 34:` | the **read**: the number that starts with `0x…` is a memory address; goroutine 34 read |
+| `…(*Store).Sell()` and `main.go:27 +0x97` | where it read: the `Sell` method, line 27 of `main.go` (`p, ok := s.products[id]`). `+0x97` is an offset inside the function, we do not need it |
+| `Previous write at 0x00c0000e0690 by goroutine 10:` | the **earlier write**, **at the same address**, goroutine 10 |
+| `main.go:32 +0x144` | where it wrote: line 32 of `Sell` (`s.products[id] = p`) |
+
+The address is the same on both sides — one memory location. One goroutine read, another wrote, and there is no synchronization between them.
+So a data race has three conditions: **one memory location**, **at least one write**, **no synchronization**. `-race` finds such a pair and fails the test.
+But it finds it only in code that **actually ran**, so the test must call the code in parallel (our `orderParallel` does). `go test -race` runs in every project, in CI; we cover CI in [GB-8.05](/lab/youtube/gb#gb-8-05).
+
+## `sync.Mutex`: `Lock` and `defer Unlock`
+
+The fix: we add a field `mu` of type `sync.Mutex` to `Store` — a **lock**. Only one goroutine can hold it at a time, the others wait.
+Its zero value is ready to use: an unlocked lock, no separate creation is needed. We chose the name `mu`.
+
+```go
+type Store struct {
+	mu       sync.Mutex
+	products map[int64]Product
+}
+```
+
+Two lines at the start of `Sell`:
+
+```go
+func (s *Store) Sell(id int64, quantity int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.products[id]
+	if !ok || p.Stock < quantity {
+		return ErrStock
+	}
+	p.Stock -= quantity
+	s.products[id] = p
+	return nil
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `s.mu.Lock()` | takes the lock; if it is held, waits until it is released |
+| 3 | `defer s.mu.Unlock()` | `defer` ([GB-2.09](/lab/youtube/gb/gb-2-09/en)): however `Sell` ends — with `return ErrStock` or `return nil` — the lock is released |
+| 4–9 | read, check, write | the old code is unchanged, but it is now one **indivisible** step: the second request waits |
+
+Now A and B work like this:
+
+| Step | A | B | Lock |
+|---|---|---|---|
+| 1 | `Lock` — took it | | held by A |
+| 2 | reads, writes (stock 4) | waits in `Lock` | held by A |
+| 3 | `Unlock` — released | | free |
+| 4 | | `Lock` — took it | held by B |
+| 5 | | reads (4), writes (3) | held by B |
+
+There is no race: B reads the stock **after** A has written. The same test, the same `-race`:
+
+```console
+$ go test -race
+ok  	github.com/abdurahmon27/bozor	1.018s
+```
+
+A thousand requests, no race, stock 0. A plain `go test` on this code gives `ok` in `0.005s`. Race mode is much slower: according to the documentation usually 2–20 times the time and 5–10 times the memory ([Data Race Detector](https://go.dev/doc/articles/race_detector));
+in this test the ratio is even larger (1.02 s instead of 0.005 s; in three runs 1.016–1.020 s). I did not measure why. What matters: `-race` is for tests and CI, not for a running server.
+
+## Reads go under the lock too
+
+We add a `Stock` method to `Store`: it returns the stock for an `id` and **only reads**:
+
+```go
+func (s *Store) Stock(id int64) int {
+	return s.products[id].Stock
+}
+```
+
+The question: every writer (`Sell`) is under the lock. `Stock` only reads. Does it need the lock?
+
+**A)** no: reading does no harm · **B)** yes: reads go under the lock too · **C)** only if there is a single writer
+
+<details>
+<summary>Answer</summary>
+
+**B.** The report above contained a read too: `Read at` and `Previous write`. If the writer is under the lock and the reader is not, they still collide: the reader reads the map while the writer is changing it.
+To prove it I built a small example; it is **not** in the course folder, I ran it, so I give its complete code. `Sell` is under the lock, `Stock` is not; two goroutines: one calls `Sell` 500 times, the other calls `Stock` 500 times:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Store struct {
+	mu    sync.Mutex
+	stock map[int64]int
+}
+
+func (s *Store) Sell(id int64, quantity int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stock[id] -= quantity
+}
+
+// Stock qulfsiz oʻqiydi: yozuvchi (Sell) qulf ostida, oʻquvchi qulfsiz.
+func (s *Store) Stock(id int64) int {
+	return s.stock[id]
+}
+
+func main() {
+	st := &Store{stock: map[int64]int{3: 1000}}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 500 {
+			st.Sell(3, 1)
+		}
+	})
+	wg.Go(func() {
+		for range 500 {
+			st.Stock(3)
+		}
+	})
+	wg.Wait()
+	fmt.Println("qoldiq:", st.Stock(3))
+}
+```
+
+Save this file as `main.go` in a new folder, with a `go.mod` next to it (`go mod init bozor`), then run `go run -race .`. From my run (Docker, report shortened):
+
+```console
+$ go run -race .
+==================
+WARNING: DATA RACE
+Write at 0x00c00012c010 by goroutine 8:
+  main.(*Store).Sell()
+      /home/dev/bozor/main.go:16 +0x104
+  main.main.func1()
+      /home/dev/bozor/main.go:29 +0x44
+
+Previous read at 0x00c00012c010 by goroutine 9:
+  main.(*Store).Stock()
+      /home/dev/bozor/main.go:21 +0x5d
+  main.main.func2()
+      /home/dev/bozor/main.go:34 +0x39
+  …
+==================
+qoldiq: 500
+Found 2 data race(s)
+exit status 66
+```
+
+This time `Previous read` is a read: line 21 of `Stock`; the write is line 16 of `Sell`. The number and order of reports differ every time (my run printed two reports). A plain `go run .` (without race mode) crashed in one of my attempts with `fatal error: concurrent map read and map write`.
+The final rule: **every** access to `products`, reads included, goes under the **same** `mu`. So `Stock` gets `s.mu.Lock()` and `defer s.mu.Unlock()` too:
+
+```go
+func (s *Store) Stock(id int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.products[id].Stock
+}
+```
+
+</details>
+
+## Do not copy a mutex
+
+A classic mistake: writing `Sell` without the star.
+
+```go
+func (s Store) Sell(id int64, quantity int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+```
+
+The receiver (`s`) arrives as a **value** of `Store` ([GB-2.05](/lab/youtube/gb/gb-2-05/en)): every call gets a **copy** of `Store`, and the lock is copied too.
+Each request holds the lock in its own copy, nobody waits for anybody — there is no protection and `go test` crashes again (I checked in `_video/04-nusxa`: in 6 runs, 6 times `fatal error`).
+`go vet` finds the cause:
+
+```console
+$ go vet ./...
+main.go:28:9: Sell passes lock by value: github.com/abdurahmon27/bozor.Store contains sync.Mutex
+```
+
+Reading it: `main.go:28:9` is the file, line 28, column 9 (where the type `Store` is written). `Sell passes lock by value` — `Sell` passes the lock by value; `Store contains sync.Mutex` — `Store` has a `sync.Mutex` inside ([`go vet`, copylocks](https://pkg.go.dev/cmd/vet)).
+The fix is the star: `func (s *Store) Sell(…)`. The lock is not copied, all calls hold one lock and `go vet` is silent.
+
+## Going deeper (optional): a lock inside an iterator — deadlock
+
+We wrap the `All` iterator from [GB-3.05](/lab/youtube/gb/gb-3-05/en) in a lock, the simple variant: `Lock` and `defer Unlock`, and we call `yield` under that lock too.
+
+```go
+func (s *Store) All() iter.Seq[Product] {
+	return func(yield func(Product) bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, p := range s.products {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+Now in the loop body we call `Sell`. The loop body runs as `yield`, that is, while `All` holds the lock:
+
+```go
+for p := range st.All() {
+	st.Sell(p.ID, 1)
+}
+```
+
+The full file: `_video/05-deadlock/main.go`. The program freezes:
+
+```console
+$ go run .
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x387967816ca0?, 0x70?, 0x42fce5?)
+	…/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0x387967788050)
+	…/src/internal/sync/mutex.go:149 +0x15a
+internal/sync.(*Mutex).Lock(...)
+	…/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	…/src/sync/mutex.go:46
+main.(*Store).Sell(0x387967788050, 0x3, 0x1)
+	…/main.go:28 +0x67
+main.main-range1({0x3, {0x480271, 0x6}, 0x3567e0, 0x5})
+	…/main.go:57 +0x56
+main.(*Store).All.func1(0x387967816e90)
+	…/main.go:45 +0xda
+main.main()
+	…/main.go:56 +0x142
+exit status 2
+```
+
+Reading the report: `fatal error: all goroutines are asleep - deadlock!` — every goroutine is waiting and nobody can continue: a **deadlock**. `goroutine 1 [sync.Mutex.Lock]:` — the first goroutine is waiting on a lock.
+Read from the bottom up: `main.main` → `All.func1` (the first anonymous function inside `All`; it calls the loop body) → `main.main-range1` (the loop body) → `Sell` → `Lock`.
+`Sell` waits for the lock, but `All` holds it and will not release it until the body ends. `sync.Mutex` does not protect you from waiting for yourself: one goroutine cannot take the lock twice.
+The numbers in parentheses (`0x3`, `0x1`) are call arguments (id 3, quantity 1), we do not need them. I shortened the output (`…` — file paths).
+
+The rule: release the lock before `yield`, or take a copy inside the lock and loop over it without the lock. Do not call code inside a lock that waits for the same lock.
+
+## Common mistakes
+
+**1. "The test passed, so it is safe."** The most common mistake. A test with one request gives `ok`, and code without a mutex works correctly on one goroutine: the `Sell` at the start of this lesson does.
+A data race shows only when the code is called in parallel. The cure: a parallel test (`orderParallel`) and `go test -race`; do not trust a plain `go test`, which sometimes gives `ok` too.
+
+**2. `-race` does not run.** If there is no C compiler:
+
+```console
+$ go test -race
+go: -race requires cgo; enable cgo by setting CGO_ENABLED=1
+```
+
+This is what happens on this machine when `go env CGO_ENABLED` is `0`: no compiler was found, so Go turned `cgo` off by itself. If you force `CGO_ENABLED=1`, the error without a compiler is this:
+
+```console
+$ CGO_ENABLED=1 go test -race
+# runtime/cgo
+cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
+FAIL	github.com/abdurahmon27/bozor [build failed]
+```
+
+The fix: install `gcc` (`apt install gcc`, on macOS `xcode-select --install`). I used Docker (`_video/race.sh`).
+
+**3. Locking only the writer.** `Sell` is under the lock, `Stock` is not: the read is a race too (the report in the section "Reads go under the lock too"). The rule: every access to `products` goes under one lock.
+
+**4. Copying the lock.** `func (s Store) Sell`: `go vet` tells you (the section "Do not copy a mutex"). The fix is a pointer receiver.
+
+**5. `Lock` inside a lock.** If `Total` calls `s.Stock(…)`, then `Stock` also calls `Lock`, and the lock is already held by `Total`: a deadlock, the same cause as in the "Going deeper" section above. The cure is to take the lock once and use `s.products` directly (the task).
+
+## Check yourself
+
+**1.** What does the server run requests that arrive together in, and why is that dangerous?
+
+<details>
+<summary>Answer</summary>
+
+**In goroutines**: the server gives every new connection to a separate goroutine, handlers run at the same time and touch shared data (the catalog `map`) at the same time. If at least one writes and there is no synchronization, an update is lost or the runtime stops the program.
+
+</details>
+
+**2.** What is a data race and which flag finds it?
+
+<details>
+<summary>Answer</summary>
+
+A data race is an access to **one memory location**, **with at least one write**, **without synchronization**. `go test -race` finds it (it needs a C compiler and finds it only in code that ran).
+
+</details>
+
+**3.** When does `defer s.mu.Unlock()` inside `Sell` run: only on `return nil`, or on `return ErrStock` as well?
+
+<details>
+<summary>Answer</summary>
+
+**In both cases.** `defer` runs when the function exits, however it ends; both `return ErrStock` and `return nil` end `Sell`. So the error path never leaves the lock held ([GB-2.09](/lab/youtube/gb/gb-2-09/en)).
+
+</details>
+
+**4.** Predict: the `Total` of the task starts with `s.mu.Lock()` and calls `s.Stock(1)` inside. What happens?
+
+**A)** everything works · **B)** `Stock` waits for the lock: deadlock · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Total` holds the lock, and `Stock` calls `Lock` and waits for the same lock. One goroutine cannot take a `sync.Mutex` twice: the same cause as `All` + `Sell` in the "Going deeper" section.
+I did not run this code separately; the conclusion rests on the real `deadlock` output in that section. If you chose **A**, you thought a lock does not wait for itself; **C** — the compiler does not check locks.
+
+</details>
+
+**5.** From the previous lesson ([GB-4.04](/lab/youtube/gb/gb-4-04/en)): when does `http.ListenAndServe` return?
+
+<details>
+<summary>Answer</summary>
+
+**Only with an error**, for example when the port is busy. That is why we check its result ([GB-4.04](/lab/youtube/gb/gb-4-04/en), [pkg.go.dev](https://pkg.go.dev/net/http#Server.ListenAndServe): "ListenAndServe always returns a non-nil error").
+
+</details>
+
+## Homework
+
+The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-07-mutex-race/TASK.md) in the course folder; the folder:
+[lessons/gb-4-07-mutex-race](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-07-mutex-race). I added the level marks (🟢🟡).
+
+`main.go` already has `Restock`, but **without a lock** — the earlier state of `Sell` from the video; `Total` is not written yet (it always returns `0`). `Restock` adds pieces to the stock and returns `ErrNotFound` when the product does not exist.
+`Sell`, `Restock` and `Total` can be called at the same time, so every access to `products` must be under one lock.
+
+- 🟢 **Step 1, `Restock`.** Put `s.mu.Lock()` at the start of the method and `defer s.mu.Unlock()` on the next line. The logic does not change.
+- 🟡 **Step 2, `Total`.** Return the sum of the `Stock` of all products (`for _, p := range s.products` over the map). The lock is taken **once** at the start of `Total`; do not call `s.Stock(…)` inside.
+- 🟡 **Optional.** If you have `gcc`, run `go test -race .` on the starter code and check that the report shows the line of `Restock`.
+
+Do not change `Product`, `Store`, `Sell`, `Stock`, `buy`, `slowHandler`, `main`, `buy_test.go` and `tekshiruv_test.go`. At the start, the format check and `go vet` print nothing:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Nothing was printed: both the format and `go vet` are clean. The task test fails like this at the start (I ran it, the output is shortened; the messages say in Uzbek what was expected):
+
+```console
+$ go test .
+--- FAIL: TestVazifaTotalOddiy (0.00s)
+    tekshiruv_test.go:33: Total() = 0, kutilgan 165 (40 + 120 + 5): Total hamma mahsulotlarning qoldigʻini qoʻshishi kerak
+--- FAIL: TestVazifaParallel (0.01s)
+    tekshiruv_test.go:47: bir vaqtda 900 ta chaqiruvda (Sell + Restock + Total) store buzildi yoki qotib qoldi (1-urinish).
+        Tekshiring: Restock va Total ham s.mu.Lock() + defer s.mu.Unlock() ostida boʻlsin; Total ichida s.Stock'ni chaqirmang (qulf ichida yana Lock: deadlock).
+        Tekshiruv jarayonining chiqishi (boshi):
+        fatal error: concurrent map read and map write
+        …
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.011s
+FAIL
+```
+
+The check test calls `Sell`, `Restock` and `Total` from hundreds of goroutines at the same time. Code without a lock sometimes crashes by itself, so the test runs in a second process and turns its output into a message in Uzbek (`tekshiruv_test.go`).
+
+<details>
+<summary>Answer: the solution and an explanation</summary>
+
+The answer is [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-07-mutex-race/solution/main.go). Two changes:
+
+```go
+func (s *Store) Restock(id int64, quantity int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.products[id]
+	if !ok {
+		return ErrNotFound
+	}
+	p.Stock += quantity
+	s.products[id] = p
+	return nil
+}
+
+func (s *Store) Total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, p := range s.products {
+		total += p.Stock
+	}
+	return total
+}
+```
+
+In `Restock` the lock is the same as in `Sell`: two lines, the logic does not change; `p.Stock += quantity` is the opposite of `-=`. In `Total`: the lock once, direct access to `s.products` inside, no call to `Stock(…)`.
+Check results (I ran them):
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.013s
+```
+
+The solution is clean with `-race` too: in Docker (`./_video/race.sh solution go test -race -count=1 .`) it printed `ok  	github.com/abdurahmon27/bozor	4.061s` (the solution files are copied into the folder root, so the package path is `…/bozor`).
+
+</details>
+
+## Sources
+
+- [pkg.go.dev: net/http — Server.Serve](https://pkg.go.dev/net/http#Server.Serve) — a new service goroutine for every new connection; [Server.ListenAndServe](https://pkg.go.dev/net/http#Server.ListenAndServe) — always returns a non-nil error
+- [pkg.go.dev: sync — Mutex](https://pkg.go.dev/sync#Mutex) — the zero value is an unlocked lock; must not be copied after first use; [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go) — starts in a new goroutine ([Go 1.25 release notes](https://go.dev/doc/go1.25))
+- [Go Data Race Detector](https://go.dev/doc/articles/race_detector) — the report format, the cgo requirement, the time and memory overhead
+- [Go memory model](https://go.dev/ref/mem) — synchronization and the `Unlock` → next `Lock` order
+- [Go FAQ: maps are not atomic](https://go.dev/doc/faq#atomic_maps), [Go 1.6 release notes](https://go.dev/doc/go1.6) — lightweight (best-effort) detection of concurrent map access
+- [pkg.go.dev: cmd/vet](https://pkg.go.dev/cmd/vet) — `copylocks`; [pkg.go.dev: iter](https://pkg.go.dev/iter); [pkg.go.dev: time.Sleep](https://pkg.go.dev/time#Sleep)
+- [RFC 9110 §15.5.10: 409 Conflict](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict)
+- [Course folder: lessons/gb-4-07-mutex-race](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-07-mutex-race)
+
+Results come from `go1.27.4 linux/amd64` with `CGO_ENABLED=0`; the `-race` results come from Docker (the `golang:1.26.8` image with the `go1.27.4` toolchain), 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-07-mutex-race)
+
+---
+
+← Previous lesson: [GB-4.06](/lab/youtube/gb/gb-4-06/en) · Next lesson: [GB-4.08](/lab/youtube/gb#gb-4-08) → · [All lessons](/lab/youtube/gb)
+
+</div>
