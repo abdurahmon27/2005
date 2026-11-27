@@ -1,0 +1,990 @@
+---
+title: "HTTP-клиент в Go: таймаут, статус и закрытие тела ответа"
+date: "2026/11/27"
+description: "Правильно отправляете запрос к внешнему API из Go: Client{Timeout}, почему 404 — не ошибка, defer resp.Body.Close и чтение JSON в struct; затем укрепляете fetchRate."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-02/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-02"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-02"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-02) · **Русский** · [English](/lab/youtube/gb/gb-4-02/en)  
+Урок GB-4.02 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-02) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-02-http-client)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+bozor хранит цены в сумах, а покупатели хотят видеть цену ещё и в долларах. Курс доллара меняется каждый день, поэтому берём его у внешнего **API**: API — это данные, которые другая программа отдаёт по HTTP.
+Это один вызов, но ошибиться в нём можно в трёх местах. Сегодня мы закрываем все три.
+
+**Одна идея:** `http.Get` и `client.Get` возвращают ошибку только тогда, когда запрос **не удалось выполнить**: соединение оборвалось, время вышло, ошибка протокола, слишком много перенаправлений.
+Если сервер ответил — и `404`, и `503` — то `err` пуст (`nil`), а состояние лежит в `resp.StatusCode`: проверяем его мы сами. У стандартного клиента `Timeout` равен 0, то есть ожидания ответа
+ничто не ограничивает; молчащий сервер остановит программу навсегда, поэтому мы задаём `&http.Client{Timeout: …}`. `resp.Body` — поток: после проверки ошибки **пишем**
+`defer resp.Body.Close()` и читаем JSON через `Decode`.
+
+К концу урока вы:
+
+- увидите, почему стандартный `http.Get` бесконечно ждёт молчащий сервер, и ограничите ожидание через `http.Client{Timeout: 2 * time.Second}`;
+- увидите, почему при ответе `404` значение `err` равно `nil`, и напишете проверку `resp.StatusCode != http.StatusOK`;
+- закроете `resp.Body` через `defer resp.Body.Close()` и увидите, как `go vet` находит ошибку «`defer` раньше проверки ошибки»;
+- напишете `fetchRate`, читающую JSON в struct `rateResponse`, и увидите её третью ловушку (статус `200`, но в теле ошибка);
+- в задании укрепите `fetchRate` против этой ловушки — с типом `*StatusError` и `io.LimitReader` — и добьётесь, чтобы `go test` прошёл.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| таймаут (Timeout) | самое долгое время, которое клиент ждёт ответ; `0` — без ограничения | timeout |
+| проверка статуса | после получения ответа мы сами сравниваем `resp.StatusCode` | status check |
+| `resp.Body` и `Close` | основная часть ответа: читается как поток, затем закрывается | response body, close |
+
+Вспомогательные слова: запись `time.Second` и `&http.Client{…}`, а также `float64(x)` и `%.2f`/`%.0f` (только для показа цены).
+
+## Что нужно знать заранее
+
+Урок опирается на [GB-4.01 · HTTP-запрос — это текст](/lab/youtube/gb/gb-4-01/ru): первая строка ответа (`HTTP/1.1 200 OK`), код статуса, заголовки и тело. Понадобится и это:
+
+- [GB-3.02 · JSON и теги структур](/lab/youtube/gb/gb-3-02/ru): `json.NewDecoder(r).Decode(&v)`, теги, адрес `&` для Decode.
+- [GB-2.09 · defer, panic и recover](/lab/youtube/gb/gb-2-09/ru): `defer f.Close()` стоит после проверки ошибки.
+- [GB-2.08 · Ошибки в Go глубже: %w, errors.Is и errors.As](/lab/youtube/gb/gb-2-08/ru): `%w` и typed error.
+- [GB-2.04 · Указатель: копия или общее значение](/lab/youtube/gb/gb-2-04/ru): `&x` — адрес x.
+- [GB-2.02 · Map: поиск, comma-ok и непредсказуемый порядок](/lab/youtube/gb/gb-2-02/ru): отсутствующий ключ map даёт нулевое значение.
+- [GB-2.03 · Struct: типы Product и Order](/lab/youtube/gb/gb-2-03/ru): `Product` и литерал структуры.
+- [GB-1.07 · Функция и первый error](/lab/youtube/gb/gb-1-07/ru): `(результат, error)`, `os.Exit(1)`, `os.Stderr`.
+- [GB-1.03 · Целые числа и деньги](/lab/youtube/gb/gb-1-03/ru): цена в тийинах, `int64`, `tiyinPerSom`.
+- [GB-1.04 · Текст и форматированный вывод](/lab/youtube/gb/gb-1-04/ru): `fmt.Printf`, `%s`, `go vet`.
+- [GB-3.05 · Итераторы](/lab/youtube/gb/gb-3-05/ru): вопрос в конце урока оттуда.
+
+**Как запустить код.** Код урока лежит в папке курсового репозитория:
+[lessons/gb-4-02-http-client](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-02-http-client). Скачайте её и откройте терминал в этой папке
+(`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-02-http-client
+```
+
+В папке: `main.go` (код в конце видео и начальное состояние задания), `tekshiruv_test.go` (проверяет задание), `TASK.md` (условие), `solution/` (решение) и `_video/`.
+В `_video/` каждый шаг видео лежит в своей папке: `_video/01-get/main.go`, `_video/02-sukut/main.go` и так далее. Чтобы запустить шаг, переходим (`cd`) в его папку и пишем `go run .`.
+Модуль написан для Go 1.27 (в `go.mod` стоит `go 1.27`): если у вас Go старше, `go` сам скачает нужную версию.
+Результаты получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0`; все команды я тоже запускал заново.
+
+Два шага выходят в интернет: они обращаются к открытому API курсов. **Курс меняется каждый день**, у вас может получиться другое число: ниже я скажу об этом на месте. У API есть ограничение:
+при слишком большом числе запросов он отвечает `429` (слишком много запросов), и доступ восстанавливается примерно через 20 минут. Тесты задания к этому API не обращаются.
+
+Вопрос по прошлому уроку. В первой строке ответа сервера стоит `HTTP/1.1 404 Not Found`. Что это значит?
+
+**A)** сервер ответил: не найдено · **B)** связь с сервером оборвалась · **C)** текст запроса написан неверно
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Сервер ответил, и сам ответ — `404`: запрошенное не найдено. Связь не оборвалась, текст запроса тоже прочитан ([GB-4.01](/lab/youtube/gb/gb-4-01/ru)).
+Если вы выбрали **B**, вы решили, что ответа нет: при обрыве связи самой строки ответа не было бы. **C** — на неверно написанный запрос сервер вернул бы другой код, например `400`.
+
+</details>
+
+Эта разница — центр сегодняшнего урока. В Go **проблема со связью возвращается как `err`**, а **ответ сервера приходит внутри `resp`** — успешным он может быть, а может и не быть.
+
+| Что произошло | Где это видно в Go |
+|---|---|
+| запрос не выполнен (нет соединения, время вышло) | `err != nil`, `resp` нет |
+| сервер ответил: `200`, `404`, `503` | `err == nil`, код в `resp.StatusCode` |
+
+Сегодня три темы. Первая — `http.Client` и `Timeout`: ограничить ожидание, если сервер не отвечает. Вторая — проверка кода статуса самостоятельно.
+Третья — закрыть тело ответа и прочитать из него JSON.
+
+## API и первый вызов: http.Get
+
+Сначала сам API. Адрес: `https://open.er-api.com/v6/latest/USD`. Разберём его на части (как адрес в [GB-4.01](/lab/youtube/gb/gb-4-01/ru)):
+
+| Часть | Смысл |
+|---|---|
+| `https://` | протокол: HTTP, с шифрованным соединением (TLS) |
+| `open.er-api.com` | имя сервера: открытый API курсов |
+| `/v6/latest/USD` | путь: версия 6, последние курсы, счёт от одного доллара: сколько стоит один доллар в других валютах |
+
+Ключ не нужен. Ответ — JSON ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)). Нужная нам часть выглядит так (`…` — пропущенные значения):
+
+```json
+{
+  "result": "success",
+  "base_code": "USD",
+  "rates": { "EUR": 0.911313, "UZS": 11966.840025, … }
+}
+```
+
+| Ключ | Смысл |
+|---|---|
+| `result` | `"success"` — запрос прошёл |
+| `base_code` | `"USD"` — счёт от одного доллара |
+| `rates` | код валюты и курс: `"UZS"` — сум, `1 USD = 11966.84 сум` |
+
+Теперь вызовем его из Go. Первый шаг — `_video/01-get/main.go`:
+
+```go filename="_video/01-get/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	resp, err := http.Get("https://open.er-api.com/v6/latest/USD")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(resp.Status, resp.StatusCode)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 3–7 | `import ( "fmt"; "net/http"; "os" )` | `net/http` — стандартный пакет для HTTP, сегодняшняя новинка; `fmt` и `os` из прошлых уроков |
+| 10 | `resp, err := http.Get("…")` | отправляет GET-запрос по адресу и возвращает **два** значения: `resp` — ответ, `err` — ошибка |
+| 11–14 | `if err != nil { … os.Exit(1) }` | при ошибке печатает `xato:` в стандартный поток ошибок (`os.Stderr`) и завершается с кодом выхода 1 ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)) |
+| 15 | `fmt.Println(resp.Status, resp.StatusCode)` | `resp.Status` — текст строки ответа (`200 OK`), `resp.StatusCode` — число этого кода (`200`, `int`) |
+
+Сначала подумайте. Что напечатает программа?
+
+**A)** `200` · **B)** `200 OK 200` · **C)** `OK 200`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Println` пишет два значения через пробел: `resp.Status` само состоит из двух слов (`200 OK`), затем `resp.StatusCode` (`200`). В **A** нет `Status`; в **C** нет кода: `Status` уже включает код.
+
+</details>
+
+Запускаем (`cd` — переход в папку этого шага):
+
+```console
+$ cd _video/01-get && go run .
+200 OK 200
+```
+
+`200 OK` — это `resp.Status`, следующее `200` — `resp.StatusCode`. Это код и текст строки ответа, которую вы видели в `curl -v` в [GB-4.01](/lab/youtube/gb/gb-4-01/ru): `HTTP/1.1 200 OK`.
+Одна строка работает. Но `http.Get` использует **стандартный клиент**, и одна его настройка создаёт риск из-за внешнего сервера.
+
+## Первая тихая ошибка: сервер, который не отвечает
+
+У стандартного клиента `Timeout` равен 0, а ноль означает, что **ожидание ответа не ограничено**. Точнее: стандартный транспорт даёт 30 секунд на открытие соединения и 10 секунд на TLS-рукопожатие,
+но ожидание заголовков ответа не ограничивает. Если сервер принял соединение и молчит, программа будет ждать и ждать.
+
+Чтобы это увидеть, нужен сервер, который не отвечает. Во втором терминале команда `nc`:
+
+```console
+$ nc -l 8089
+```
+
+`nc` ничего не печатает: он стоит и ждёт. `nc` (netcat) — простая сетевая программа, `-l` (listen) значит «слушай». `8089` — **порт**: сетевой номер одной программы на этом компьютере.
+`nc` принимает соединение на этом порту, но ничего не пишет: это «молчащий сервер». (Версии `nc` различаются: это вариант LibreSSL/OpenBSD; в GNU netcat — `nc -l -p 8089`.)
+
+Направим программу на этот сервер. Адрес — `http://localhost:8089`: `localhost` — сам этот компьютер, `8089` — порт. `_video/02-sukut/main.go` отличается от предыдущего двумя местами
+(остальные строки те же):
+
+```go
+	fmt.Println("soʻrov yuborildi")
+	resp, err := http.Get("http://localhost:8089")
+```
+
+Первая строка печатает текст перед `Get`: чтобы было видно, что запрос ушёл. Во второй — адрес молчащего `nc`. Каким будет результат?
+
+**A)** сразу ошибка · **B)** ошибка через 30 секунд · **C)** ошибки нет: программа ждёт
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `http.Get` вызван со стандартным клиентом, `Timeout` равен 0: ожидание не ограничено. Соединение открылось (`nc` его принял), поэтому ошибки соединения тоже нет; а ответ не приходит.
+**A** было бы, если бы порт никто не слушал («connection refused»). **B** — 30 секунд — это предел только на *открытие* соединения; оно уже открыто.
+
+</details>
+
+Запускаем `nc` в одном терминале и программу — в другом. В видео программу остановили через Control C. Чтобы запуск повторялся, я отправил тот же сигнал через `timeout` спустя 6 секунд:
+
+```console
+$ cd _video/02-sukut && timeout -s INT 6 go run .
+soʻrov yuborildi
+signal: interrupt
+```
+
+Напечатано `soʻrov yuborildi` («запрос отправлен»), потом 6 секунд ничего. `signal: interrupt` — программа прервана (`interrupt` — сигнал, который отправляет Control C). Когда вы нажимаете Control C в видео, терминал сам показывает `^C`
+(`^Csignal: interrupt`); с `timeout` `^C` не появляется, остальное то же. Шесть секунд — не случайность: я остановил программу сам; если бы не остановил, она ждала бы и через 30 секунд.
+Если сервер никогда не ответит, наша программа тоже никогда не продолжит работу.
+
+## Решение: http.Client и Timeout
+
+Решение — собственный **клиент**. `http.Client` — struct, у него есть поля; в поле `Timeout` задаём предел ожидания. `_video/03-timeout/main.go`:
+
+```go filename="_video/03-timeout/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:8089")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(resp.Status)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7 | `"time"` | `time` — стандартный пакет для работы со временем |
+| 11 | `client := &http.Client{Timeout: 2 * time.Second}` | `http.Client{…}` — struct `Client` с полем `Timeout`; `time.Second` — одна секунда, `2 * time.Second` — две секунды; `&` берёт **адрес** структуры ([GB-2.04](/lab/youtube/gb/gb-2-04/ru)), и один клиент используется во всех вызовах |
+| 12 | `resp, err := client.Get("http://localhost:8089")` | теперь `client.Get`: не `http.Get`, а наш клиент. Адрес снова молчащий `nc` |
+
+Сервер по-прежнему молчит. Что будет напечатано?
+
+**A)** ошибка через 2 секунды · **B)** сразу ошибка · **C)** по-прежнему ждёт
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `Timeout` — предел ожидания. Когда он превышен, клиент прерывает запрос и `Get` возвращает ошибку. **C** — это поведение клиента с `Timeout` 0 (стандартного). **B** — причин ошибиться раньше `Timeout` нет.
+
+</details>
+
+Запускаем новый `nc` (он завершается после одного соединения) и программу:
+
+```console
+$ cd _video/03-timeout && go run .
+xato: Get "http://localhost:8089": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+exit status 1
+```
+
+Части сообщения: `Get "http://localhost:8089"` — какой вызов и какой адрес; `context deadline exceeded` — «срок вышел»; в скобках — причина: `Client.Timeout exceeded while awaiting headers`,
+то есть `Timeout` превышен, заголовки ответа не пришли. Слово `context` в сообщении мы разберём в [GB-7.03 · `select` и `context`](/lab/youtube/gb#gb-7-03); пока читайте его как «срок».
+`exit status 1` — из `os.Exit(1)` ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)). Теперь ожидание ограничено, программа не зависает.
+
+Схема:
+
+| Время | Что происходит |
+|---|---|
+| 0 с | программа вызывает `client.Get`, запрос уходит; клиент запускает таймер на 2 секунды |
+| 0–2 с | сервер (`nc`) молчит |
+| 2 с | таймер истекает; `Get` возвращает ошибку: `deadline exceeded` |
+
+Эти 2 секунды я измерил. Число из видео — «2 секунды» (так написан код). Я собрал бинарный файл с новым `nc` и замерил через `time` (этого замера в видео нет):
+
+```console
+$ go build -o kurs .
+```
+
+`go build` ничего не напечатал: появился новый файл `kurs` (если он не нужен, удалите его).
+
+```console
+$ time ./kurs
+xato: Get "http://localhost:8089": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+
+real	0m2.003s
+user	0m0.000s
+sys	0m0.003s
+```
+
+`real` — время по настенным часам: 2.003 секунды, почти ровно `Timeout: 2 * time.Second` (при втором запуске тоже 2.003). Если машина занята, могут добавиться сотые доли секунды; главное — соотношение:
+**время ожидания клиента равно значению `Timeout`, а не скорости машины**. `user` и `sys` — процессорное время: пока программа ждёт, она почти ничего не делает. (Вывод `time` зависит от оболочки: здесь bash.)
+
+## Вторая тихая ошибка: 404 — не ошибка
+
+Второй случай: сервер отвечает, но не так, как мы ждали. Отправим запрос по несуществующему адресу: `/v6/nothing`. `_video/04-404/main.go`:
+
+```go filename="_video/04-404/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("https://open.er-api.com/v6/nothing")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println("err:", err)
+	fmt.Println(resp.Status, resp.StatusCode)
+}
+```
+
+Новые строки: 12 — адрес `/v6/nothing` («ничего»: такого пути нет); 17 — печатает само значение `err` (сюда мы дойдём, только если `err == nil`); 18 — статус. Что вернёт `Get`?
+
+**A)** `err != nil`, `resp` нет · **B)** `err` равен nil, статус `404` · **C)** panic
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Сервер ответил, поэтому запрос **выполнен**: `err` равен nil, а `404` лежит внутри `resp`. **A** — так было бы при проблеме со связью (предыдущий раздел). **C** — `Get` не вызывает panic; panic появится позже, если использовать `resp`, которого нет.
+
+</details>
+
+```console
+$ cd _video/04-404 && go run .
+err: <nil>
+404 Not Found 404
+```
+
+`err: <nil>` — ошибки нет (`nil`, при печати выглядит как `<nil>`, [GB-1.07](/lab/youtube/gb/gb-1-07/ru)); `404 Not Found 404` — `Status` и `StatusCode`. Документация `Get` говорит об этом прямо:
+*"A non-2xx response doesn't cause an error"* — ответ, код которого не начинается с `2xx`, ошибку не порождает. `Get` возвращает ошибку, если запрос не выполнен: ошибка соединения, срока или протокола, слишком много перенаправлений.
+**Проверять статус — наше дело.**
+
+Завернём это в функцию, которую bozor вызывает из других мест. `fetchRate`: на входе клиент, адрес и код валюты, на выходе курс и ошибка.
+
+```go
+func fetchRate(client *http.Client, url, code string) (float64, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	// …
+}
+```
+
+`url, code string` — оба параметра типа `string` (краткая запись `url string, code string`); `client *http.Client` — **указатель** на `Client` ([GB-2.04](/lab/youtube/gb/gb-2-04/ru)): именно этот тип даёт `&http.Client{…}`.
+Результаты `(float64, error)`: курс (дробное число) и ошибка ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)). `Get` теперь вызывается у самого клиента. При ошибке возвращаем ноль и `err`.
+
+Проверка статуса:
+
+```go
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("kurs soʻrovi: javob %s", resp.Status)
+	}
+	// …
+```
+
+`http.StatusOK` — имя числа `200` (константа пакета). Если `StatusCode` ему не равен, создаём ошибку сами: `fmt.Errorf` ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)). В сообщение добавили `resp.Status`, чтобы было видно, что произошло
+(например, `kurs soʻrovi: javob 404 Not Found`). Пока это просто текст: в задании вы замените его собственным типом.
+
+Теперь соберём все три случая в одной таблице:
+
+| Случай | `err` | `resp.StatusCode` | Что делаем |
+|---|---|---|---|
+| нет соединения, время вышло | `!= nil` | `resp` тоже нет | возвращаем `err` |
+| сервер ответил, но не `200` | `nil` | `404`, `503`, … | проверяем сами и создаём ошибку |
+| сервер ответил `200` | `nil` | `200` | читаем тело |
+
+## resp.Body: поток, Close и JSON
+
+Третье — тело. Ответ состоит из двух частей:
+
+```text
+client.Get(url)
+   │
+   ▼
+сервер ──► строка статуса и заголовки ──► resp.Status, resp.StatusCode   приходит сразу
+       └─► тело (body)                ──► resp.Body                      поток: читается, затем закрывается
+```
+
+Статус и заголовки сразу лежат в `resp`. **Тело** — это **поток**: данные из него мы читаем сами через `Decode`. Тип `resp.Body` — `io.ReadCloser`: это `Reader`
+(`io.Reader` из [GB-2.07](/lab/youtube/gb/gb-2-07/ru), из него читают) и метод `Close`. `Close` — закрыть тело.
+
+Зачем закрывать? Документация: если тело не прочитано до конца и **не закрыто**, соединение, открытое к серверу, может не быть использовано следующим запросом повторно (*"may not reuse"*). Поэтому сразу после проверки ошибки пишем
+`defer resp.Body.Close()`: как `defer f.Close()` из [GB-2.09](/lab/youtube/gb/gb-2-09/ru). Документация добавляет: если `err == nil`, то `resp.Body` никогда не равен `nil`.
+
+Тип, который берёт из ответа только нужные поля:
+
+```go
+type rateResponse struct {
+	Result   string             `json:"result"`
+	BaseCode string             `json:"base_code"`
+	Rates    map[string]float64 `json:"rates"`
+}
+```
+
+`rateResponse` — struct: `Result`, `BaseCode`, `Rates`. Теги ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)) связывают поля с ключами JSON: ключ `base_code` попадает в поле `BaseCode`.
+`Rates` — map ([GB-2.02](/lab/youtube/gb/gb-2-02/ru)): ключ — код валюты (`string`), значение — курс (`float64`).
+
+Программа, которая собирает всё вместе, — `_video/05-decode/main.go`:
+
+```go filename="_video/05-decode/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+type rateResponse struct {
+	Result   string             `json:"result"`
+	BaseCode string             `json:"base_code"`
+	Rates    map[string]float64 `json:"rates"`
+}
+
+func main() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://open.er-api.com/v6/latest/USD")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var data rateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(data.BaseCode, data.Rates["UZS"])
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 18 | `client := &http.Client{Timeout: 5 * time.Second}` | в этой программе 5 секунд: настоящий API может отвечать медленнее двух секунд |
+| 24 | `defer resp.Body.Close()` | **после** проверки ошибки; при выходе из функции тело закрывается |
+| 25 | `var data rateResponse` | пустая struct, которую заполнит JSON |
+| 26 | `json.NewDecoder(resp.Body).Decode(&data)` | `resp.Body` — источник; `Decode` читает JSON и записывает в struct по адресу `&data`; при ошибке — `err` ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)) |
+| 30 | `fmt.Println(data.BaseCode, data.Rates["UZS"])` | от какой валюты счёт и курс сума: из map по ключу `"UZS"` |
+
+```console
+$ cd _video/05-decode && go run .
+USD 11966.840025
+```
+
+`USD` — `base_code`, `11966.840025` — `UZS` из `rates`. Это число — **сегодняшнее значение API**: 2026-11-27 и в видео, и в моём запуске получилось именно оно. API обновляет его раз в сутки
+(в ответе есть `cache-control: max-age=3600`), поэтому у вас получится другое число. Это не ошибка: проверки ниже («12000 сум — примерно 1 доллар») опираются не на курс, а на соотношение.
+
+## Подключаем к bozor: цена в долларах
+
+Теперь добавим `fetchRate` в код bozor. Это `main.go` из папки; задание тоже начинается с этого файла. Он собирает всё в одном месте:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+const tiyinPerSom = 100 // 1 soʻm = 100 tiyin (GB-1.03)
+
+// rateURL — ochiq kurs API'si: 1 USD necha valyutaga teng (kalitsiz, bepul).
+const rateURL = "https://open.er-api.com/v6/latest/USD"
+
+// Product — katalogdagi mahsulot (GB-2.03); narx tiyinda.
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+// rateResponse — kurs API'si javobining bizga kerak qismi.
+type rateResponse struct {
+	Result   string             `json:"result"`
+	BaseCode string             `json:"base_code"`
+	Rates    map[string]float64 `json:"rates"`
+}
+
+// StatusError — server 200 dan boshqa status bilan javob bergani.
+// VAZIFA (2-qadam): fetchRate shu turdagi xato qaytarsin (TASK.md).
+type StatusError struct {
+	Code int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("server %d status bilan javob berdi", e.Code)
+}
+
+// fetchRate url'dan kurs javobini oladi va code valyutasining kursini qaytaradi
+// (1 USD = ? code).
+// VAZIFA: 1-qadam (code yoʻq / result "success" emas), 2-qadam (*StatusError), 3-qadam (javob hajmi).
+func fetchRate(client *http.Client, url, code string) (float64, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("kurs soʻrovi: javob %s", resp.Status)
+	}
+	var data rateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("kurs javobi: %w", err)
+	}
+	return data.Rates[code], nil
+}
+
+func run() error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	rate, err := fetchRate(client, rateURL, "UZS")
+	if err != nil {
+		return err
+	}
+	p := Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}
+	som := float64(p.Price) / tiyinPerSom
+	fmt.Printf("1 USD = %.2f soʻm\n", rate)
+	fmt.Printf("%s: %.0f soʻm = %.2f USD\n", p.Name, som, som/rate)
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+Читаем новые строки (остальные объяснены выше):
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 14 | `const rateURL = "https://…/latest/USD"` | имя для адреса: `const` — константа (как в [GB-1.03](/lab/youtube/gb/gb-1-03/ru)) |
+| 33–39 | `type StatusError struct { Code int }` и метод `Error()` | typed error ([GB-2.08](/lab/youtube/gb/gb-2-08/ru)): одно поле — код статуса ответа. Пока не используется: в задании `fetchRate` будет его возвращать |
+| 44–58 | `func fetchRate(…)` | функция, собранная выше шаг за шагом; `%w` — вернуть ошибку в обёртке ([GB-2.08](/lab/youtube/gb/gb-2-08/ru)); последняя строка — курс из map по ключу `code` |
+| 61 | `client := &http.Client{Timeout: 5 * time.Second}` | клиент на 5 секунд |
+| 62 | `rate, err := fetchRate(client, rateURL, "UZS")` | `rateURL` — имя адреса, `"UZS"` — запрошенная валюта; результат `rate` — курс |
+| 66 | `p := Product{…, Price: 1_200_000, …}` | яблоко: цена в тийинах, `int64` (1 200 000 тийинов = 12 000 сумов) |
+| 67 | `som := float64(p.Price) / tiyinPerSom` | `float64(…)` — превратить целое число в дробное; затем делим на `tiyinPerSom`: получаем сумы. Это **только для показа**: расчёты и хранение остаются в тийинах (`int64`) |
+| 68 | `Printf("1 USD = %.2f soʻm\n", rate)` | `%.2f` — дробное число с двумя цифрами после точки |
+| 69 | `Printf("%s: %.0f soʻm = %.2f USD\n", …)` | `%.0f` — дробное число без дробной части; `som/rate` — сумы, делённые на курс, дают доллары |
+
+Что будет напечатано? Запускаем `main.go` из папки (`cd` не нужен: мы уже в ней):
+
+```console
+$ go run .
+1 USD = 11966.84 soʻm
+olma: 12000 soʻm = 1.00 USD
+```
+
+Первая строка — курс из API (округлён через `%.2f`). Вторая — яблоко: 12 000 сумов, примерно один доллар. Курс меняется каждый день: в строке `1 USD` у вас будет другое число, а во второй строке —
+другое значение около `1.00` в зависимости от курса. Важно соотношение: цена в долларах = цена в сумах ÷ курс.
+
+## Третья ловушка: статус 200, но ошибка
+
+Если API не знает код валюты, он отвечает со статусом `200`, а тело такое (собственный тип ошибки API):
+
+```json
+{
+  "result": "error",
+  "error-type": "unsupported-code"
+}
+```
+
+`result` — `"error"`, `error-type` — тип ошибки API. Статус `200` («запрос прошёл»), но данных нет. Такой случай даёт адрес `…/latest/XXX` (`XXX` — несуществующий код валюты)
+(значение `unsupported-code` мы наблюдали у этого API 2026-11-27; в документации есть `result` и `error-type`). Направим `fetchRate` из видео на этот адрес — `_video/07-xato200/main.go`:
+
+```go filename="_video/07-xato200/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+type rateResponse struct {
+	Result   string             `json:"result"`
+	BaseCode string             `json:"base_code"`
+	Rates    map[string]float64 `json:"rates"`
+}
+
+func fetchRate(client *http.Client, url, code string) (float64, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("kurs soʻrovi: javob %s", resp.Status)
+	}
+	var data rateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("kurs javobi: %w", err)
+	}
+	return data.Rates[code], nil
+}
+
+func main() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	rate, err := fetchRate(client, "https://open.er-api.com/v6/latest/XXX", "UZS")
+	fmt.Println(rate, err)
+}
+```
+
+В строке 34 адрес `…/latest/XXX`, код — `"UZS"`; строка 35 печатает результат. Что будет напечатано?
+
+**A)** ошибка: курс не найден · **B)** `0 <nil>` · **C)** panic
+
+<details>
+<summary>Ответ</summary>
+
+**B: `0` и `nil`.** Статус `200`, JSON прочитан правильно: в `result` попало `"error"`, а `Rates` остался пустым (в ответе нет `rates`). Отсутствующий ключ map даёт нулевое значение
+([GB-2.02](/lab/youtube/gb/gb-2-02/ru)): `data.Rates["UZS"]` — это `0`. Ни один шаг не вернул ошибку. **A** — в функции такой проверки нет; **C** — чтение отсутствующего ключа panic не вызывает.
+
+</details>
+
+```console
+$ cd _video/07-xato200 && go run .
+0 <nil>
+```
+
+Программа тихо работает с нулевым курсом: цена делится `som/rate` на ноль, и цена в долларах получается неверной. Это третья ловушка: **статус `200` не значит, что тело верное**. Исправите её в задании.
+
+## Глубже (необязательно): повторное использование клиента, Timeout и LimitReader
+
+Этот раздел не нужен для главной идеи, но встречается в рабочем коде. Три правила:
+
+1. **Не создавайте клиент заново при каждом вызове.** Используйте один клиент: открытые к серверу соединения хранятся внутри него и используются повторно. Об этом говорит документация
+   (*"Clients should be reused instead of created as needed"*), и она же называет безопасным вызов из нескольких мест одновременно. Поэтому `run` создаёт один `client` и передаёт его в `fetchRate`.
+2. **`Timeout` — предел на весь запрос.** По документации он включает соединение, перенаправления и **чтение тела ответа**. Отдельный срок для каждого запроса — через `context`, в [GB-7.03](/lab/youtube/gb#gb-7-03).
+3. **Не доверяйте размеру ответа внешнего сервера.** `io.LimitReader` читает из тела не больше заданного числа байт:
+
+```go
+	body := io.LimitReader(resp.Body, 1<<20) // 1 MB
+	if err := json.NewDecoder(body).Decode(&data); err != nil {
+```
+
+`1<<20` — сдвиг единицы на 20 бит влево: `1048576` байт, то есть 1 мегабайт. `io.LimitReader(resp.Body, 1<<20)` — это сам `resp.Body`, но после первого мегабайта он говорит «конец».
+Теперь `Decode` читает из `body`. Если само значение JSON длиннее одного мегабайта, `Decode` не может дочитать его до конца и возвращает ошибку: код не забьёт память бесконечно большим ответом.
+Вы примените это в третьем шаге задания.
+
+## Частые ошибки
+
+**1. «`err == nil` — значит, ответ успешный».** Самое распространённое заблуждение. Выше мы видели: и при ответе `404 Not Found` значение `err` равно `nil` (раздел «Вторая тихая ошибка» выше).
+`err` говорит только о том, что запрос не выполнен; о содержании ответа он ничего не сообщает. Исправление: после проверки `err` проверьте ещё и `resp.StatusCode`.
+
+**2. `defer resp.Body.Close()` раньше проверки ошибки.** Самая частая ошибка в коде. Неправильный вариант — `_video/06-vet/main.go`:
+
+```go filename="_video/06-vet/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://open.er-api.com/v6/latest/USD")
+	defer resp.Body.Close()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(resp.Status)
+}
+```
+
+В строке 13 `defer resp.Body.Close()` стоит **раньше** `if err != nil` из строки 14. Если `Get` вернёт ошибку, `resp` равен `nil`, и чтение `Body` у `nil` обрушит программу panic.
+`go vet` ([GB-1.04](/lab/youtube/gb/gb-1-04/ru)) находит это ещё до запуска программы. Сначала подумайте: что скажет `go vet`?
+
+<details>
+<summary>Ответ</summary>
+
+Он назовёт строку с ошибкой и причину: `main.go:13:8` — строка 13, столбец 8 (`resp` в `resp.Body`), причина: `resp` использован без проверки ошибки. Точные слова — ниже.
+
+</details>
+
+```console
+$ cd _video/06-vet && go vet .
+main.go:13:8: using resp before checking for errors
+```
+
+`main.go:13:8` — файл, строка, столбец; `using resp before checking for errors` — «`resp` использован до проверки ошибок». Исправление: пишите `defer` **после** блока `if err != nil { … }`,
+как в `fetchRate`.
+
+Саму panic я тоже увидел. Для этого в том же файле я заменил адрес на `http://localhost:1`, который никто не слушает. Этого шага в папке нет; я запустил его во временной папке,
+вот его полный код:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://localhost:1")
+	defer resp.Body.Close()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(resp.Status)
+}
+```
+
+```console
+$ go run .
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x62dcbe]
+…
+exit status 2
+```
+
+Середина вывода (`goroutine 1 [running]:` и путь к файлу) зависит от машины, поэтому сокращена до `…`. `nil pointer dereference` — «разыменование `nil`-указателя», то есть обращение к значению через него:
+`resp` равен `nil`, и прочитать у него `Body` нельзя. `exit status 2` — завершение из-за panic ([GB-2.09](/lab/youtube/gb/gb-2-09/ru)).
+
+**3. Стандартный `http.Get` в рабочем коде.** Это первая ловушка урока: без `Timeout` молчащий сервер навсегда остановит программу. Исправление: всегда создавайте собственный `http.Client{Timeout: …}`.
+
+**4. «Статус `200` — значит, тело верное».** Третья ловушка (раздел «Третья ловушка»): `result` и отсутствующий ключ вы проверяете сами. Это первый шаг задания.
+
+## Проверьте себя
+
+**1.** Что произойдёт, если у клиента `Timeout` равен нулю, и как это исправить?
+
+<details>
+<summary>Ответ</summary>
+
+Клиент будет ждать ответ бесконечно: молчащий сервер навсегда остановит программу (мы видели это с `nc -l 8089`). Исправление: задать собственного клиента, например `&http.Client{Timeout: 2 * time.Second}`, и вызывать `client.Get` вместо `http.Get`.
+
+</details>
+
+**2.** У `Get` значение `err` равно `nil`, статус `404`. Что это значит и что делать дальше?
+
+<details>
+<summary>Ответ</summary>
+
+Сервер ответил, ошибка не в `Get`, а в самом ответе. Код статуса проверяем сами: если `resp.StatusCode != http.StatusOK`, создаём ошибку и возвращаем её.
+
+</details>
+
+**3.** Из [GB-3.05](/lab/youtube/gb/gb-3-05/ru): что должен сделать итератор, если `yield` вернул `false`?
+
+<details>
+<summary>Ответ</summary>
+
+Остановиться (`return`) и больше не вызывать `yield`. Иначе runtime вызовет panic (`range function continued iteration after function for loop body returned false`).
+
+</details>
+
+**4.** Сначала подумайте. `fetchRate` из видео (как в готовом `main.go`) направлена на сервер, который отвечает `503 Service Unavailable`. Чем будет `err`?
+
+**A)** `nil` · **B)** `kurs soʻrovi: javob 503 Service Unavailable` · **C)** программа вызовет panic
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Сервер ответил, `err == nil`, но `resp.StatusCode != http.StatusOK`: функция возвращает `fmt.Errorf("kurs soʻrovi: javob %s", resp.Status)`. Это сообщение вы увидите ниже, в настоящем выводе теста задания
+(`status 503: xato «kurs soʻrovi: javob 503 Service Unavailable» …`). **A** — собственный `err` у `Get` равен `nil`, но после проверки статуса `fetchRate` возвращает свою ошибку; **C** — ни один шаг не вызывает panic.
+
+</details>
+
+## Домашнее задание
+
+Задание лежит в папке [lessons/gb-4-02-http-client](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-02-http-client) курсового репозитория, в файле `TASK.md`. Оно делает `fetchRate` из `main.go`
+надёжной. Проверку выполняет `tekshiruv_test.go`: он не обращается к настоящему интернету, каждый тест поднимает свой поддельный сервер. `httptest` и `HandlerFunc` внутри тестового файла мы объясним в [GB-4.03](/lab/youtube/gb/gb-4-03/ru);
+пока достаточно знать: тестовый сервер отвечает нужным статусом и телом, а вы проверяете `fetchRate`, направив её на этот сервер.
+
+| Уровень | Задание |
+|---|---|
+| 🟡 | **Шаг 1.** Ответ `200`, но курса нет. (a) Если `result` не `"success"`, верните ошибку; в сообщении должно быть значение `error-type` из API (добавьте в `rateResponse` поле с ключом `error-type`). (b) Если `result` равен `"success"`, но запрошенного `code` нет в `rates`, тоже верните ошибку; в сообщении должен быть код: используйте форму `v, ok := m[k]` |
+| 🟢 | **Шаг 2.** При статусе, отличном от `200`, верните `&StatusError{Code: resp.StatusCode}` (тип уже есть в `main.go`), чтобы вызывающий получал `Code` через `errors.As` |
+| 🟢 | **Шаг 3.** Читайте `Decode` через `io.LimitReader(resp.Body, 1<<20)`: ответ больше 1 МБ должен давать ошибку |
+
+Не меняйте `Product`, `StatusError`, `run` и `main`. `Timeout` и `defer resp.Body.Close()` должны остаться на месте. Проверка (в этой же папке):
+
+```console
+$ go test .
+--- FAIL: TestVazifaKodYoq (0.00s)
+    tekshiruv_test.go:74: «XXX» kodi javobda yoʻq: fetchRate xato qaytarishi kerak, hozir 0 va nil — map'da yoʻq kalit nol beradi, vergulli shaklni ishlating (TASK.md, 1-qadam)
+--- FAIL: TestVazifaResultXato (0.00s)
+    tekshiruv_test.go:88: API "result":"error" dedi (status 200), fetchRate esa 0 va nil qaytardi; kerak: xato, matnida API'ning error-type qiymati (TASK.md, 1-qadam)
+--- FAIL: TestVazifaStatusError (0.00s)
+    --- FAIL: TestVazifaStatusError/404 (0.00s)
+        tekshiruv_test.go:108: status 404: xato «kurs soʻrovi: javob 404 Not Found» *StatusError emas; errors.As topishi uchun &StatusError{Code: resp.StatusCode} qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaStatusError/503 (0.00s)
+        tekshiruv_test.go:108: status 503: xato «kurs soʻrovi: javob 503 Service Unavailable» *StatusError emas; errors.As topishi uchun &StatusError{Code: resp.StatusCode} qaytaring (TASK.md, 2-qadam)
+--- FAIL: TestVazifaKattaJavob (0.01s)
+    tekshiruv_test.go:125: javob 2 MB dan katta, fetchRate esa 12000.5 va nil qaytardi; kerak: xato — body'ni io.LimitReader(resp.Body, 1<<20) orqali oʻqing (TASK.md, 3-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.316s
+FAIL
+```
+
+Так тест падает на начальном коде (это мой запуск, вывод полный). Каждое сообщение называет шаг (`TASK.md, 1-qadam` — «шаг 1»). `TestVideo` и `TestVideoTimeout` проходят сразу: они проверяют
+`fetchRate` и `Timeout` из видео. Не меняйте `tekshiruv_test.go`; работайте, пока не появится `ok`. Подсказки:
+
+- 1(a): в `rateResponse` нужно поле `ErrorType string` с тегом `json:"error-type"` (дефис в ключе спокойно пишется в теге). Проверка стоит после `Decode`, до обращения к `Rates`.
+- 1(b): `rate, ok := data.Rates[code]`; если `!ok`, ошибка вроде `fmt.Errorf("kurs topilmadi: %s", code)`.
+- 2: при статусе, отличном от `200`, можно вернуться, не читая тело: `defer resp.Body.Close()` его закроет.
+- 3: `body := io.LimitReader(resp.Body, 1<<20)` (импортируйте `"io"`) и передайте в `Decode` `body` вместо `resp.Body`.
+
+<details>
+<summary>Ответ: solution/main.go</summary>
+
+Сначала попробуйте сами. Решение — `solution/main.go` в курсовом репозитории:
+
+```go filename="solution/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+)
+
+const tiyinPerSom = 100 // 1 soʻm = 100 tiyin (GB-1.03)
+
+// rateURL — ochiq kurs API'si: 1 USD necha valyutaga teng (kalitsiz, bepul).
+const rateURL = "https://open.er-api.com/v6/latest/USD"
+
+// Product — katalogdagi mahsulot (GB-2.03); narx tiyinda.
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+// rateResponse — kurs API'si javobining bizga kerak qismi.
+type rateResponse struct {
+	Result    string             `json:"result"`
+	ErrorType string             `json:"error-type"`
+	BaseCode  string             `json:"base_code"`
+	Rates     map[string]float64 `json:"rates"`
+}
+
+// StatusError — server 200 dan boshqa status bilan javob bergani.
+// fetchRate shu turdagi xato qaytaradi: chaqiruvchi errors.As bilan kodini oladi.
+type StatusError struct {
+	Code int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("server %d status bilan javob berdi", e.Code)
+}
+
+// fetchRate url'dan kurs javobini oladi va code valyutasining kursini qaytaradi
+// (1 USD = ? code).
+func fetchRate(client *http.Client, url, code string) (float64, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, &StatusError{Code: resp.StatusCode}
+	}
+	var data rateResponse
+	// Tashqi server javobining hajmiga ishonmaymiz: ko'pi bilan 1 MB (1<<20 bayt).
+	body := io.LimitReader(resp.Body, 1<<20)
+	if err := json.NewDecoder(body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("kurs javobi: %w", err)
+	}
+	if data.Result != "success" {
+		return 0, fmt.Errorf("kurs API xatosi: %s", data.ErrorType)
+	}
+	rate, ok := data.Rates[code]
+	if !ok {
+		return 0, fmt.Errorf("kurs topilmadi: %s", code)
+	}
+	return rate, nil
+}
+
+func run() error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	rate, err := fetchRate(client, rateURL, "UZS")
+	if err != nil {
+		return err
+	}
+	p := Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}
+	som := float64(p.Price) / tiyinPerSom
+	fmt.Printf("1 USD = %.2f soʻm\n", rate)
+	fmt.Printf("%s: %.0f soʻm = %.2f USD\n", p.Name, som, som/rate)
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+Отличия от начального `main.go`:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 6 | `"io"` | импорт для `io.LimitReader` |
+| 28 | `ErrorType string` ``json:"error-type"`` | тип ошибки API: дефис в ключе спокойно пишется в теге |
+| 52 | `return 0, &StatusError{Code: resp.StatusCode}` | шаг 2: тип вместо простого текста; вызывающий получает `Code` через `errors.As` |
+| 55–58 | `body := io.LimitReader(resp.Body, 1<<20)` и `Decode(&data)` | шаг 3: больше 1 МБ не читается |
+| 60–62 | `if data.Result != "success" { … }` | шаг 1(a): `result` не `success` — ошибка со значением `error-type` из API |
+| 63–66 | `rate, ok := data.Rates[code]` и `if !ok { … }` | шаг 1(b): кода нет в `rates` — ошибка; форма с запятой отличает отсутствующий ключ от нулевого значения ([GB-2.02](/lab/youtube/gb/gb-2-02/ru)) |
+
+Результат (в `solution/` лежит тот же `tekshiruv_test.go`):
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.311s
+```
+
+`ok` — все тесты прошли (`0.311s` — время на моей машине, у вас будет другое).
+
+</details>
+
+## Источники
+
+- [pkg.go.dev: net/http, Client](https://pkg.go.dev/net/http#Client) — `Timeout` включает соединение, перенаправления и чтение тела; `0` — без ограничения; клиент нужно использовать повторно, и он безопасен при одновременном использовании
+- [pkg.go.dev: net/http, Get](https://pkg.go.dev/net/http#Get) — "non-2xx response doesn't cause an error"; ошибки: слишком много перенаправлений, ошибка протокола; при `err == nil` значение `resp.Body` не равно `nil`, и его нужно закрыть
+- [pkg.go.dev: net/http, Response](https://pkg.go.dev/net/http#Response) — `Body`: если тело не прочитано до конца и не закрыто, соединение может не использоваться повторно
+- [pkg.go.dev: net/http, константы статусов](https://pkg.go.dev/net/http#pkg-constants) — `http.StatusOK` (200)
+- [RFC 9110: коды статуса](https://www.rfc-editor.org/rfc/rfc9110#name-status-codes) — `200`, `404`, `503`
+- [go vet: httpresponse](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/httpresponse) — `using resp before checking for errors`
+- [pkg.go.dev: io, LimitReader](https://pkg.go.dev/io#LimitReader) — раздел «Глубже»
+- [Спецификация Go: выражения индексации](https://go.dev/ref/spec#Index_expressions) — отсутствующий ключ map даёт нулевое значение
+- [ExchangeRate-API: открытый доступ](https://www.exchangerate-api.com/docs/free) — API без ключа, `result` и `error-type`, ограничение числа запросов (`429`). Данные курсов: [Rates By Exchange Rate API](https://www.exchangerate-api.com)
+- [Папка курса: lessons/gb-4-02-http-client](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-02-http-client)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27. Значения открытого API курсов относятся к этому дню: они меняются.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-02-http-client)
+
+---
+
+← Предыдущий урок: [GB-4.01](/lab/youtube/gb/gb-4-01/ru) · Следующий урок: [GB-4.03](/lab/youtube/gb/gb-4-03/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

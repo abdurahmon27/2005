@@ -1,0 +1,837 @@
+---
+title: "Обработчик — обычная функция: проверяем его через httptest"
+date: "2026/11/27"
+description: "Вы вызовете HTTP-обработчик без запуска сервера через httptest и проверите статус, заголовок и JSON-тело в обычном go test."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-03"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-03) · **Русский** · [English](/lab/youtube/gb/gb-4-03/en)  
+Урок GB-4.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-03) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Каталог bozor отдаётся по HTTP. Если после каждой правки запускать сервер и проверять вручную через `curl`, проверка получается медленной и не повторяется.
+Вопрос: как проверить код, который формирует ответ, без запуска сервера, одним `go test`?
+
+**Главная идея:** обработчик (handler) — обычная функция с сигнатурой `func(w http.ResponseWriter, r *http.Request)`. Сервер читает текст запроса в структуру `*http.Request`, вызывает эту функцию
+и делает из того, что записано в `w`, текст ответа. Поэтому обработчик можно вызвать и без сервера: `httptest.NewRequest` создаёт запрос, а `httptest.NewRecorder` — `w`, который сохраняет записанное.
+Порядок ответа: заголовки → статус → тело. Если `WriteHeader` не вызван, первый `Write` ставит статус `200`; `Header().Set` и `WriteHeader` после `Write` ни на что не влияют.
+
+К концу урока вы:
+
+- прочитаете сигнатуру `func(w http.ResponseWriter, r *http.Request)` и объясните, что такое `w` и `r`;
+- вызовете обработчик без сервера, порта и `curl` — через `httptest.NewRequest` и `httptest.NewRecorder` — и проверите статус, заголовок и JSON-тело;
+- объясните порядок ответа (заголовки → статус → тело) и почему без `WriteHeader` статус равен `200`;
+- напишете обработчик `catalogHandler` и добьётесь, чтобы `go test .` проходил.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| обработчик (handler) | функция, которую сервер вызывает на каждый запрос: получает запрос, пишет ответ в `w` | handler |
+| `httptest.NewRequest` и `httptest.NewRecorder` | свой запрос на входе и своё место для ответа: вызов без сервера | httptest request, recorder |
+| порядок ответа | заголовки, потом статус, потом тело; после первого `Write` предыдущее уже не изменить | response order |
+
+Вспомогательные слова: `json.NewEncoder(w).Encode(v)` (записывает значение в `w` как JSON) и `http.HandlerFunc` с `httptest.NewServer` (последний, необязательный раздел).
+Каждое другое новое имя я поясняю одной фразой по ходу дела.
+
+## Что нужно знать заранее
+
+Урок опирается на следующие:
+
+- [GB-4.02 · HTTP-клиент](/lab/youtube/gb/gb-4-02/ru): `http.Get`, разница между `err` и статусом, `resp.Body`, `Decode`. Последний раздел читает тестовый файл из этого урока.
+- [GB-4.01 · HTTP-запрос — это текст](/lab/youtube/gb/gb-4-01/ru): строка запроса `GET /products/1 HTTP/1.1`, заголовки, `Content-Type`, коды статуса, `405`.
+- [GB-3.02 · JSON и теги структур](/lab/youtube/gb/gb-3-02/ru): `Product`, теги `json:"id"`, `encoding/json`.
+- [GB-2.07 · interface и io.Writer](/lab/youtube/gb/gb-2-07/ru): `io.Writer`, `fmt.Fprintln`, интерфейс.
+- [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru): `*T`.
+- [GB-1.08 · Первый тест: go test](/lab/youtube/gb/gb-1-08/ru): `func TestXxx(t *testing.T)`, `t.Errorf`, `go test -v`, `-run`.
+- [GB-1.03 · Целые числа и деньги](/lab/youtube/gb/gb-1-03/ru): цена в тийинах.
+- [GB-3.06 · Контрольная точка: bozor CLI v0](/lab/youtube/gb#gb-3-06): последний вопрос — из этого урока.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса:
+[lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest). Скачайте её и откройте терминал в этой папке
+(`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-03-handler-httptest
+```
+
+В папке: `main.go` и `handler_test.go` (код в конце видео), `tekshiruv_test.go` (проверяет задание), `TASK.md` (задание), `solution/` (ответ) и `_video/` — отдельная папка
+для каждого шага видео (`01-request`, `02-recorder`, …). У папки свой `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`), внешних модулей нет.
+
+Скрипт, который запускает шаг так же, как в видео: `./_video/run.sh <шаг> <команда>`. Он копирует файлы шага во временную папку `bozor/` вместе с этим `go.mod`, выполняет там команду
+и в конце печатает код выхода (`(chiqish kodi: 0)`, «chiqish kodi» — «код выхода»): `0` — команда завершилась без ошибки, `1` — с ошибкой. Эта последняя строка — вывод скрипта, а не программы.
+
+Результаты получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0`; все команды я тоже перезапустил. Модуль написан под Go 1.27: если у вас Go старше, `go` сам скачает нужную версию.
+
+Один вопрос по прошлому уроку. Сервер ответил `503 Service Unavailable`. Чему равен `err` из `http.Get`?
+
+**A)** `nil`; статус лежит в `resp` · **B)** `err != nil` · **C)** программа вызывает `panic`
+
+<details>
+<summary>Ответ</summary>
+
+**A: `err` равен `nil`, а статус лежит в `resp.StatusCode`.** Сервер ответил, значит сетевой ошибки нет; `503` — данные внутри ответа ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)). Если вы выбрали **B**, вы смешали
+ошибку статуса с сетевой ошибкой; а `panic` у `http.Get` не бывает. Это была сторона клиента: отправляем запрос, читаем ответ. Сегодня — вторая сторона: функция, которая принимает запрос и формирует ответ.
+
+</details>
+
+## Что сервер делает с одним запросом
+
+Текст запроса такой же, как в [GB-4.01](/lab/youtube/gb/gb-4-01/ru): первая строка `GET /products/1 HTTP/1.1`, затем заголовки и тело. На каждый запрос сервер делает три вещи:
+
+| Шаг | Что происходит |
+|---|---|
+| 1 | сервер читает пришедший по сети текст запроса в структуру Go — `http.Request` |
+| 2 | сервер вызывает **нашу функцию**: передаёт ей запрос и место, куда писать ответ |
+| 3 | то, что функция записала, становится текстом ответа |
+
+```text
+текст запроса                   сервер                         наш код
+GET /products/1 HTTP/1.1  ──►   1. читает текст в
+Host: …                            http.Request
+                                2. вызывает handler(w, r) ──►  func(w, r) { … пишет в w }
+текст ответа              ◄──   3. то, что записано в w,
+HTTP/1.1 200 OK …                  отправляет как ответ
+```
+
+Сегодня нас интересует только функция посередине. Эта функция называется **обработчик** (handler).
+
+## Сигнатура обработчика: w и r
+
+Вот самый маленький обработчик. Пока мы его только читаем, не запускаем:
+
+```go
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+```
+
+Первая строка функции — её **сигнатура** (signature): имя, параметры и тип результата.
+
+| Часть | Смысл |
+|---|---|
+| `func` | объявление функции ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)) |
+| `healthHandler` | имя функции. Имя выбрали мы: обработчик, проверяющий, что сервер жив |
+| `w http.ResponseWriter` | первый параметр: имя `w`, тип `http.ResponseWriter`. Ответ записывается в него |
+| `r *http.Request` | второй параметр: имя `r`, тип `*http.Request`. Пришедший запрос. Звёздочка — указатель на структуру ([GB-2.04](/lab/youtube/gb/gb-2-04/ru)): запрос не копируется |
+| (типа результата нет) | функция ничего не возвращает. Ответ не возвращают: его записывают в `w` |
+
+`http` — имя пакета `net/http`; `ResponseWriter` и `Request` — типы из этого пакета. Сервер ждёт обработчик именно с такой сигнатурой: имена `w` и `r` — привычка, а тип и порядок — правило.
+
+## ResponseWriter: куда пишется ответ
+
+Тип `w` — `http.ResponseWriter` — это **интерфейс** (interface), как в [GB-2.07](/lab/youtube/gb/gb-2-07/ru). В пакете `net/http` он объявлен так (комментарии убраны):
+
+```go
+type ResponseWriter interface {
+	Header() Header
+	Write([]byte) (int, error)
+	WriteHeader(statusCode int)
+}
+```
+
+Три метода:
+
+| Метод | Что делает |
+|---|---|
+| `Header()` | возвращает таблицу заголовков ответа; её тип тоже `Header`. Заголовки кладём в эту таблицу |
+| `Write([]byte)` | записывает байты в тело ответа |
+| `WriteHeader(statusCode int)` | задаёт код статуса |
+
+У `ResponseWriter` есть метод `Write`, значит он ещё и `io.Writer`. Поэтому работает `fmt.Fprintln(w, "ok")`: он записывает в `w` строку `ok` и перевод строки.
+Это всё тело `healthHandler`.
+
+Важное правило: **если `WriteHeader` не вызван, первый `Write` ставит статус `200`** ([документация ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter)).
+`healthHandler` статус не задаёт, значит ответ будет с `200`. Скоро проверим.
+
+## httptest.NewRequest: создаём запрос сами
+
+Функция готова. Но кто даст ей `w` и `r`? Обычно сервер: его мы напишем в уроке [GB-4.04 · Первый сервер, строка за строкой](/lab/youtube/gb#gb-4-04).
+Но обработчик — обычная функция, мы тоже можем её вызвать. Для этого нужны только `w` и `r`. Их создаёт пакет `net/http/httptest`.
+
+Сначала запрос. Эта программа создаёт `r` и заглядывает внутрь:
+
+```go filename="_video/01-request/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/products/1", nil)
+	fmt.Println(req.Method, req.URL.Path, req.Proto)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10 | `req := httptest.NewRequest(http.MethodGet, "/products/1", nil)` | создаёт запрос и возвращает `*http.Request`; результат в `req`. Первый аргумент — метод: `http.MethodGet` — это строка `"GET"`. Второй — путь, из строки запроса в [GB-4.01](/lab/youtube/gb/gb-4-01/ru). Третий — тело: `nil`, то есть его нет |
+| 11 | `fmt.Println(req.Method, req.URL.Path, req.Proto)` | заглядывает в запрос: `Method` — метод, `URL.Path` — путь, `Proto` — версия протокола |
+
+Предскажите: что выведет `go run .`?
+
+**A)** `GET /products/1 HTTP/1.1` · **B)** `GET /products/1` · **C)** `/products/1 GET`
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `Println` печатает аргументы через один пробел: метод, путь, версия. В **B** вы забыли версию (`Proto`) — третий аргумент тоже есть.
+В **C** вы поменяли порядок: `Println` пишет аргументы в том порядке, в каком их передали, а здесь `Method` первый.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-request go run .
+GET /products/1 HTTP/1.1
+(chiqish kodi: 0)
+```
+
+Это ровно строка запроса из `curl -v`. `http.Request` — представление этого текста в Go.
+
+## httptest.NewRecorder: вызываем обработчик как функцию
+
+Теперь место для ответа. `httptest.NewRecorder()` — тоже `ResponseWriter`: он никуда ничего не отправляет, а сохраняет записанное. Сохранённое читаем через `rec.Code` (статус) и `rec.Body` (тело).
+Вся программа:
+
+```go filename="_video/02-recorder/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	fmt.Printf("%d %q\n", rec.Code, rec.Body.String())
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 9–11 | `func healthHandler(…) { fmt.Fprintln(w, "ok") }` | обработчик из предыдущего раздела |
+| 14 | `req := httptest.NewRequest(http.MethodGet, "/health", nil)` | запрос; путь теперь `/health` |
+| 15 | `rec := httptest.NewRecorder()` | `ResponseWriter`, который сохраняет записанное |
+| 16 | `healthHandler(rec, req)` | весь фокус здесь: вызываем обработчик как обычную функцию. Вместо `w` передаём `rec`, вместо `r` — `req` |
+| 17 | `fmt.Printf("%d %q\n", rec.Code, rec.Body.String())` | `rec.Code` — статус, `rec.Body.String()` — записанное тело как строка. `%d` — число, `%q` — строка в кавычках, со скрытыми символами |
+
+Обработчик статус не задавал. Чему будет равен `rec.Code`?
+
+**A)** `0` · **B)** `200` · **C)** `500`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `200`.** Правило выше: если `WriteHeader` не вызван, первый `Write` ставит статус `200`. Если вы выбрали **A**, вы решили, что «не заданный статус = ноль»;
+**C** — там, где ошибки нет, `500` не появится.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-recorder go run .
+200 "ok\n"
+(chiqish kodi: 0)
+```
+
+`200` — статус. Тело — `ok` и перевод строки: его добавил `Fprintln`; `%q` показал его как `\n`.
+
+На настоящем сервере первый `Write` отправляет `200`; а recorder начинает со `200` — результат тот же. Не понадобились ни сервер, ни порт, ни `curl`: это обычный вызов функции.
+
+## Первый тест: TestHealth
+
+Превратим этот вызов в тест. Файл `handler_test.go` — в форме из [GB-1.08](/lab/youtube/gb/gb-1-08/ru), в одном пакете с `healthHandler` (`package main`):
+
+```go filename="_video/03-test/handler_test.go" showLineNumbers
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestHealth(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != "ok\n" {
+		t.Errorf("body %q, kutilgan %q", got, "ok\n")
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 9 | `func TestHealth(t *testing.T) {` | тестовая функция ([GB-1.08](/lab/youtube/gb/gb-1-08/ru)) |
+| 10–12 | `req`, `rec`, `healthHandler(rec, req)` | три строки из предыдущего раздела: запрос, recorder, вызов |
+| 13–15 | `if rec.Code != http.StatusOK { t.Errorf(…) }` | статус `200`? `http.StatusOK` — имя числа `200`. Если нет, тест пишет сообщение об ошибке |
+| 16–18 | `if got := rec.Body.String(); got != "ok\n" { t.Errorf(…) }` | тело ровно `ok` и перевод строки? `Fprintln` добавляет перевод строки, поэтому ожидаемое значение — не `"ok"`, а `"ok\n"` |
+
+Пройдёт ли тест? Оба условия выполнены, значит пройдёт:
+
+```console
+$ ./_video/run.sh 03-test go test -v
+=== RUN   TestHealth
+--- PASS: TestHealth (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+`PASS` и `ok`: тест прошёл. Ни сервера, ни порта, ни `curl`. Время — тысячные доли секунды: в видео было `0.002s`, выше — мой запуск. Это число зависит от загрузки машины
+(в каждом запуске может выйти `0.002s` или `0.003s`); важен порядок величины: миллисекунды, потому что ничего не запускается и сети нет.
+
+## Обработчик с данными: productHandler
+
+`healthHandler` только говорит `ok`. Теперь обработчик, который отдаёт товар. Весь файл (`Product` — структура из [GB-3.02](/lab/youtube/gb/gb-3-02/ru), цена в тийинах):
+
+```go filename="_video/04-product/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// Product — katalogdagi bitta mahsulot (GB-3.02).
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+var olma = Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}
+
+// healthHandler — server tirikligini tekshirish: har soʻrovga «ok».
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+// productHandler — GET'ga olma mahsulotini JSON qilib beradi, boshqa metodga 405.
+func productHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(olma) // Encode xatosi: log'ga yozish GB-8.02'da
+}
+
+// main serverni ishga tushirmaydi (u GB-4.04'da): handler'ni oddiy funksiya kabi chaqirib, javobni chiqaradi.
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/products/1", nil)
+	rec := httptest.NewRecorder()
+	productHandler(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+```
+
+**Товар (строка 18).** `var olma = Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}` — значение `Product`, которое отдаёт обработчик (`olma` — «яблоко»). Цена в тийинах: `1_200_000` тийинов ([GB-1.03](/lab/youtube/gb/gb-1-03/ru)).
+
+**Заголовок (строка 32).** `w.Header().Set("Content-Type", "application/json")`: `w.Header()` возвращает таблицу заголовков, `Set` кладёт в неё значение. `application/json` сообщает, что тело — JSON
+([GB-4.01](/lab/youtube/gb/gb-4-01/ru)). Заголовок ставим **до** тела; почему — в разделе «Порядок ответа».
+
+**Тело (строка 33).** `json.NewEncoder(w).Encode(olma)`: в `NewEncoder` передаём `w` — это обратное к `Decode`, он пишет JSON в любой `io.Writer`. `Encode` записывает в `w` значение `olma` (объявленный в этом файле `Product`).
+Ошибку `Encode` пока не проверяем: запись в лог — в [GB-8.02](/lab/youtube/gb#gb-8-02).
+
+**Метод (строки 27–31).** Обработчик может читать и из `r`: `r.Method` — первое слово строки запроса. Если это не `GET`, ответ — `405` (Method Not Allowed): заголовок `Allow` сообщает, какой метод разрешён
+(`http.MethodGet`); [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed) — стандарт HTTP — делает его обязательным в ответе `405`. `WriteHeader(http.StatusMethodNotAllowed)` задаёт статус: `405`.
+`return` завершает функцию на этом месте, поэтому тело не пишется. В [GB-4.05](/lab/youtube/gb#gb-4-05) `ServeMux` сам проверит метод; здесь мы написали проверку вручную, чтобы показать чтение из `r`.
+
+**main (строки 37–42).** Вызывает обработчик по адресу `/products/1` методом `GET` и печатает статус и тело. `%s` — строка; `Encode` добавляет в конец перевод строки, поэтому `\n` в `Printf` не нужен.
+
+Предскажите: что выведет `go run .`?
+
+**A)** `200 {"ID":1,"Name":"olma","Price":12000,"Stock":40}` · **B)** `200 {"id":1,"name":"olma","price":1200000,"stock":40}` · **C)** `200 {"name":"olma"}`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Ключи берутся из тегов `json` у `Product`, строчными буквами ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)); цена хранится в тийинах: `1200000`. В **A** вы забыли про теги (ключи были бы с заглавной) и пересчитали цену
+в сумы — `Encode` ничего не пересчитывает. **C** — `Encode` записывает всю структуру, а не только `Name`.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-product go run .
+200 {"id":1,"name":"olma","price":1200000,"stock":40}
+(chiqish kodi: 0)
+```
+
+Статус `200`: `WriteHeader` мы не вызывали, его задал первый `Write`. Теперь тест. `TestProduct` не сравнивает тело построчно: он читает тело в `Product`.
+
+```go
+func TestProduct(t *testing.T) {
+	rec := httptest.NewRecorder()
+	productHandler(rec, httptest.NewRequest(http.MethodGet, "/products/1", nil))
+	var got Product
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("body JSON emas: %v", err)
+	}
+	if got != olma {
+		t.Errorf("mahsulot %v, kutilgan %v", got, olma)
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–2 | `rec := …; productHandler(rec, httptest.NewRequest(…))` | recorder и вызов; запрос создаётся прямо в аргументе через `NewRequest` |
+| 3 | `var got Product` | пустая переменная для прочитанного товара |
+| 4–6 | `if err := json.NewDecoder(rec.Body).Decode(&got); err != nil { t.Fatalf(…) }` | `Decode` из [GB-4.02](/lab/youtube/gb/gb-4-02/ru), только источник — `rec.Body`. Если тело — не JSON, `t.Fatalf` останавливает тест здесь |
+| 7–9 | `if got != olma { t.Errorf(…) }` | сравниваем структуры `got` и `olma` одним `!=`: Go сравнивает структуры поле за полем |
+
+`TestProductMetod` проверяет путь `405` (`Metod` — «метод»):
+
+```go
+func TestProductMetod(t *testing.T) {
+	rec := httptest.NewRecorder()
+	productHandler(rec, httptest.NewRequest(http.MethodPost, "/products/1", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rec.Result().Header.Get("Allow"); got != "GET" {
+		t.Errorf("Allow %q, kutilgan %q", got, "GET")
+	}
+}
+```
+
+Запрос — `POST`; ожидаем статус `405` и `Allow: GET`. Заголовок берётся из `rec.Result().Header`. `Result()` строит из записанного recorder'ом обычный `*http.Response` (тот же тип, что `resp` в [GB-4.02](/lab/youtube/gb/gb-4-02/ru));
+его заголовки — снимок на момент первого `Write` или `WriteHeader`. А `rec.Header()` — живая таблица: заголовок, поставленный обработчиком после `Write`, был бы в ней виден, хотя клиенту он не уйдёт
+([документация httptest](https://pkg.go.dev/net/http/httptest#ResponseRecorder.Result)).
+
+`-run Product` запускает тесты, в названии которых есть `Product`: `TestProduct` и `TestProductMetod`. Оба проходят:
+
+```console
+$ ./_video/run.sh 04-product go test -v -run Product
+=== RUN   TestProduct
+--- PASS: TestProduct (0.00s)
+=== RUN   TestProductMetod
+--- PASS: TestProductMetod (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+В видео последняя строка была с `0.003s`; выше — мой запуск: те же миллисекунды, разница — от загрузки машины.
+
+## Порядок ответа: заголовки, статус, тело
+
+В обработчике порядок важен. Три шага, именно в такой последовательности:
+
+| Шаг | Вызов | Что происходит |
+|---|---|---|
+| 1 | `w.Header().Set(…)` | заголовки собираются в таблице; ничего ещё не отправлено |
+| 2 | `w.WriteHeader(…)` | задаётся статус (если не вызван — `200`) |
+| 3 | `w.Write(…)` или `Encode` | пишется тело |
+
+При первом вызове `Write` заголовки и статус **отправляются**. Последующие `Header().Set` и `WriteHeader` ничего не меняют:
+отправленное не вернуть ([документация ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter)).
+
+```text
+Header().Set(…)  ─►  WriteHeader(…)  ─►  Write(…) / Encode(…)  ─►  отправлено
+  заголовки           статус               тело                     при первом Write
+
+                                                   последующие Set / WriteHeader: без эффекта
+```
+
+Поэтому в `productHandler` `Content-Type` ставится до `Encode`, а `Allow` — до `WriteHeader`. Что бывает при нарушении порядка — в разделе «Частые ошибки».
+
+## Глубже (необязательно): http.Handler, HandlerFunc и NewServer
+
+Тестовый файл из [GB-4.02](/lab/youtube/gb/gb-4-02/ru) использовал `http.HandlerFunc` и `httptest.NewServer`. Теперь вы можете его прочитать.
+
+Сервер ждёт обработчик типа `http.Handler`. Это **интерфейс с одним методом**: `ServeHTTP(ResponseWriter, *Request)`. У нашей функции такого метода нет.
+`http.HandlerFunc` — **тип функции**: `type HandlerFunc func(ResponseWriter, *Request)`. У него есть метод `ServeHTTP`, и он вызывает функцию внутри. Значит `http.HandlerFunc(f)` — способ
+превратить обычную функцию в `Handler` ([документация HandlerFunc](https://pkg.go.dev/net/http#HandlerFunc)).
+
+`httptest.NewServer` открывает на этом компьютере на свободном порту **настоящий** сервер. Вся программа:
+
+```go filename="_video/07-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Println(resp.Status)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10–12 | `srv := httptest.NewServer(http.HandlerFunc(func(w …, r …) { … }))` | литерал функции — с `w` и `r`, форма нашего обработчика; `HandlerFunc` делает из него `Handler`; `NewServer` открывает сервер. Скобки закрываются по очереди: функция, `HandlerFunc`, `NewServer` |
+| 13 | `defer srv.Close()` | как в [GB-2.09](/lab/youtube/gb/gb-2-09/ru): `srv.Close()` вызовется при завершении функции |
+| 14–19 | `resp, err := http.Get(srv.URL)` и проверка ошибки | `srv.URL` — адрес сервера; клиент отправляет ему настоящий запрос ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)) |
+| 20 | `fmt.Println(resp.Status)` | печатает строку статуса ответа |
+
+Что выведет программа? `A)` `200 OK` · `B)` `ok` · `C)` ошибка.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `resp.Status` — код статуса и пояснение: `200 OK`. Тело (`ok`) в этой строке не печатается. `ok` (B) — это тело, записанное обработчиком, а ошибки (C) нет: сервер открылся и ответил.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-server go run .
+200 OK
+(chiqish kodi: 0)
+```
+
+Клиент отправил настоящий запрос, наш обработчик ответил. Что когда использовать:
+
+| Что проверяем | Что нужно | Почему |
+|---|---|---|
+| сам обработчик | `httptest.NewRecorder` | быстро, порт не нужен |
+| клиентский код (например, из [GB-4.02](/lab/youtube/gb/gb-4-02/ru)) | `httptest.NewServer` | клиент говорит с настоящим сервером |
+
+Тестовый сервер находится на этом же компьютере, поэтому хватает обычного `http.Get`; для обращения к внешнему серверу нужен таймаут (`Timeout`) ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)).
+
+## Частые ошибки
+
+**1. Сначала тело, потом статус.** Самая частая ошибка. Вот `notFoundHandler`: `Fprintln` пишет тело, а потом через `WriteHeader` мы задаём `404`.
+
+```go filename="_video/05-tartib/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "topilmadi")
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func main() {}
+```
+
+Тест для него (`TestNotFound`) запускается через `go test` и ждёт статус `404`:
+
+```go filename="_video/05-tartib/handler_test.go" showLineNumbers
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestNotFound(t *testing.T) {
+	rec := httptest.NewRecorder()
+	notFoundHandler(rec, httptest.NewRequest(http.MethodGet, "/yoq", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusNotFound)
+	}
+}
+```
+
+Чему будет равен `rec.Code`?
+
+**A)** `404` · **B)** `200` · **C)** `panic`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `200`.** `Fprintln` уже отправил `200` при первом `Write`; последующий `WriteHeader(404)` ничего не меняет. Если вы выбрали **A**, вы решили, что побеждает последний вызов —
+на деле первый. **C**: эта ошибка не останавливает программу, её молча игнорируют.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-tartib go test
+--- FAIL: TestNotFound (0.00s)
+    handler_test.go:13: status 200, kutilgan 404
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.003s
+(chiqish kodi: 1)
+```
+
+Как читать: `--- FAIL: TestNotFound` — упавший тест; `handler_test.go:13` — ошибка в 13-й строке тестового файла (`t.Errorf`); `status 200, kutilgan 404` — слева статус, который дал обработчик, справа тот, что ждал тест
+(`kutilgan` — «ожидалось»). `exit status 1` — тестовый бинарник завершился с ошибкой, последний `FAIL` — пакет упал ([GB-1.08](/lab/youtube/gb/gb-1-08/ru)). Тест поймал ошибку.
+
+Исправление: сначала `WriteHeader`, потом тело ([`_video/06-tartib-fix/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/_video/06-tartib-fix/main.go)):
+
+```go
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintln(w, "topilmadi")
+}
+```
+
+Пройдёт ли тест? Да, статус `404`:
+
+```console
+$ ./_video/run.sh 06-tartib-fix go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+**На настоящем сервере эта ошибка уходит молча.** Без теста ничего не падает: клиент получает `200`, а сервер лишь пишет строку в лог. Чтобы это показать, я запустил этот обработчик через `httptest.NewServer`.
+Этого примера нет в папке курса: я создал его в отдельной папке (с тем же `go.mod`, что у курса); весь код здесь:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "topilmadi")
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Println(resp.Status)
+}
+```
+
+```console
+$ go run .
+2026/11/27 15:39:02 http: superfluous response.WriteHeader call from main.main.func1 (main.go:12)
+200 OK
+```
+
+Первая строка — лог сервера (`log` начинает строку со времени; время каждый раз другое): `superfluous response.WriteHeader call` — «лишний вызов»; `main.go:12` — строка, где стоит `WriteHeader`.
+Вторая строка — то, что увидел клиент: `200 OK`, а не `404`.
+
+**2. Думать, что для проверки обработчика нужен сервер.** Обработчик — обычная функция: хватает `httptest.NewRecorder`, порт не открывается, тест идёт за миллисекунды. `httptest.NewServer` нужен только
+для проверки клиентского кода (последний раздел).
+
+## Проверьте себя
+
+**1.** Какова сигнатура обработчика и куда записывается ответ?
+
+<details>
+<summary>Ответ</summary>
+
+`func(w http.ResponseWriter, r *http.Request)`; функция ничего не возвращает. Ответ записывается в `w`, а `r` — пришедший запрос.
+
+</details>
+
+**2.** Каким будет статус, если обработчик не вызвал `WriteHeader`?
+
+<details>
+<summary>Ответ</summary>
+
+`200`: первый `Write` ставит статус `200`.
+
+</details>
+
+**3.** Из предыдущего модуля ([GB-3.06](/lab/youtube/gb#gb-3-06)): при сохранении `bozor.json` мы сначала пишем во временный файл, а потом делаем `rename`. Зачем?
+
+<details>
+<summary>Ответ</summary>
+
+Чтобы не остался наполовину записанный файл: `rename` подменяет файл за один шаг.
+
+</details>
+
+**4.** Предскажите: если вызвать `healthHandler` с методом `http.MethodPost` по пути `/health`, чему равны `rec.Code` и `rec.Body.String()`? Обработчик вообще не смотрит на `r`.
+
+<details>
+<summary>Ответ</summary>
+
+`200 "ok\n"`: `healthHandler` ничего не читает из `r`, поэтому метод не важен. Я запустил это. Примера нет в папке курса; весь код:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+func main() {
+	req := httptest.NewRequest(http.MethodPost, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	fmt.Printf("%d %q\n", rec.Code, rec.Body.String())
+}
+```
+
+```console
+$ go run .
+200 "ok\n"
+```
+
+Отличие от `productHandler`: тот проверяет `r.Method`, поэтому на `POST` отвечает `405`.
+
+</details>
+
+## Домашнее задание
+
+Задание — в файле [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/TASK.md) папки курса; папка:
+[lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest). Значков уровня (🟢🟡) в папке курса нет: их поставил я.
+В `main.go` есть `catalog` (`[]Product`: `olma` — «яблоко», `non` — «хлеб», `oʻrik` — «абрикос»), а `catalogHandler` пуст. Напишите его; `Product`, `healthHandler`, `productHandler`, `main` и `handler_test.go` не меняйте.
+
+- 🟢 **Шаг 1, GET.** Запишите `catalog` как JSON-массив: сначала заголовок `Content-Type: application/json`, потом `json.NewEncoder(w).Encode(...)` (как в `productHandler`).
+- 🟡 **Шаг 2, другой метод.** Если метод не `GET`: заголовок `Allow: GET`, потом `w.WriteHeader(http.StatusMethodNotAllowed)`, потом `return`. Тела быть не должно. Заголовок — **до** `WriteHeader`.
+- 🟡 **Шаг 3, пустой каталог.** Если `catalog` пуст (`nil`), ответ всё равно должен быть `[]`, а не `null`: nil-слайс в JSON — это `null` ([GB-3.06](/lab/youtube/gb#gb-3-06)). Нужен пустой, но не `nil` слайс: `[]Product{}`.
+
+Проверка — в этой папке `go test .`. Не меняйте `tekshiruv_test.go`: он вызывает `catalogHandler` без сервера, через `httptest.NewRecorder` — так, как вы делали в уроке. В исходном состоянии формат и `go vet` ничего не выводят:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+А тест падает так (это мой запуск). Каждое сообщение по-узбекски говорит, что ожидалось:
+
+```console
+$ go test .
+--- FAIL: TestVazifaGET (0.00s)
+    tekshiruv_test.go:29: GET: Content-Type «», kutilgan «application/json»: sarlavhani Encode'dan OLDIN qoʻying
+    tekshiruv_test.go:33: GET: body JSON massiv emas (EOF): catalog'ni json.NewEncoder(w).Encode bilan yozing, hozirgi body: ""
+--- FAIL: TestVazifaMetod (0.00s)
+    --- FAIL: TestVazifaMetod/POST (0.00s)
+        tekshiruv_test.go:45: POST: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: POST: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+    --- FAIL: TestVazifaMetod/PUT (0.00s)
+        tekshiruv_test.go:45: PUT: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: PUT: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+    --- FAIL: TestVazifaMetod/DELETE (0.00s)
+        tekshiruv_test.go:45: DELETE: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: DELETE: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+--- FAIL: TestVazifaBosh (0.00s)
+    tekshiruv_test.go:63: catalog boʻsh: body «», kutilgan «[]» (nil slice JSON'da null boʻladi: boʻsh, lekin nil boʻlmagan slice kerak)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+Работайте, пока не появится `ok`. Подсказки:
+
+- Скопируйте `productHandler` и передайте `catalog` вместо `olma`; блок `if r.Method != http.MethodGet { … }` остаётся как есть.
+- Порядок: `w.Header().Set(…)` → `w.WriteHeader(…)` → тело. Заголовок, поставленный после `Write`/`Encode`, пропадает.
+- Шаг 3: `products := catalog`, затем `if products == nil { products = []Product{} }` и `Encode(products)`.
+
+<details>
+<summary>Ответ: catalogHandler из solution/main.go</summary>
+
+Сначала попробуйте сами. Ответ — в [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/solution/main.go) репозитория курса; `catalogHandler`:
+
+```go
+func catalogHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	products := catalog
+	if products == nil {
+		products = []Product{} // nil slice JSON'da null boʻlardi
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(products) // Encode xatosi: log'ga yozish GB-8.02'da
+}
+```
+
+Строка за строкой:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2–6 | `if r.Method != http.MethodGet { … return }` | шаг 2: заголовок `Allow`, потом `405`, потом `return` — тот же блок, что в `productHandler` |
+| 7 | `products := catalog` | берёт `catalog` под новым именем |
+| 8–10 | `if products == nil { products = []Product{} }` | шаг 3: вместо `nil`-слайса пустой, но не `nil` слайс: в JSON это `[]` |
+| 11 | `w.Header().Set("Content-Type", "application/json")` | шаг 1: заголовок до тела |
+| 12 | `json.NewEncoder(w).Encode(products)` | шаг 1: записывает массив в `w` |
+
+Проверка:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+`ok` — тесты, проверяющие `catalogHandler` без сервера, прошли. В `solution/` лежат те же тестовые файлы, поэтому ответ проходит те же тесты.
+(`-count=1` отключает кеш тестов Go, результат каждый раз считается заново.)
+
+</details>
+
+## Источники
+
+- [pkg.go.dev: net/http — ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter) — `Header`, `Write`, `WriteHeader`; если `WriteHeader` не вызван, первый `Write` отправляет `200`; изменение заголовков после `Write`/`WriteHeader` не действует
+- [pkg.go.dev: net/http — Handler](https://pkg.go.dev/net/http#Handler), [HandlerFunc](https://pkg.go.dev/net/http#HandlerFunc), [Request](https://pkg.go.dev/net/http#Request)
+- [pkg.go.dev: net/http/httptest](https://pkg.go.dev/net/http/httptest) — `NewRequest`, `NewRecorder` (`Code`, `Body`, `Result`), `NewServer`
+- [pkg.go.dev: encoding/json — NewEncoder](https://pkg.go.dev/encoding/json#NewEncoder) и [Marshal](https://pkg.go.dev/encoding/json#Marshal) — `Encode`, теги, nil-слайс как `null`
+- [RFC 9110 §15.5.6: 405 Method Not Allowed](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed) — в ответе `405` заголовок `Allow` обязателен
+- [Папка курса: lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+---
+
+← Предыдущий урок: [GB-4.02](/lab/youtube/gb/gb-4-02/ru) · Следующий урок: [GB-4.04](/lab/youtube/gb#gb-4-04) → · [Все уроки](/lab/youtube/gb)
+
+</div>
