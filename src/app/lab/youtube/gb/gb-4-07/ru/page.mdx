@@ -81,9 +81,9 @@ cd go-backend-uz/lessons/gb-4-07-mutex-race
 Скрипт, который запускает шаг так же, как в видео: `./_video/run.sh <шаг> <команда>`. Он копирует файлы папки шага во временную папку `bozor/` вместе с этим `go.mod`, выполняет там команду
 и в конце печатает строку `(chiqish kodi: N)` («код выхода»). Эта строка — вывод скрипта, не программы; в блоках ниже я её опустил.
 
-**Важно про `-race`.** Детектор гонок требует C-компилятор (в Linux обычно `gcc`). У меня `gcc` нет, поэтому все результаты `go test -race` я получил через `_video/race.sh` в Docker:
-в образе `golang:1.26.8` (там есть gcc), но сам Go — toolchain `go1.27.4`. Все остальные команды запущены на обычной машине с `CGO_ENABLED=0`.
-Поэтому путь файла в отчёте — `/home/dev/bozor/main.go` (папка внутри Docker): у вас будет путь вашей папки. Если у вас есть `gcc`, достаточно обычного `go test -race`.
+**Важно про `-race`.** В Linux детектору гонок нужны включённый `cgo` и C-компилятор (обычно `gcc`). На macOS начиная с Go 1.20 детектор гонок не зависит от Xcode или cgo ([примечания Go 1.20](https://go.dev/doc/go1.20#cgo)). У меня `gcc` нет, поэтому все результаты `go test -race` я получил через `_video/race.sh` в Docker:
+в образе `golang:1.26.8` (там есть gcc), но сам Go — toolchain `go1.27.4`. Остальные исходные примеры из видео запущены на обычной машине с `CGO_ENABLED=0`; при сравнении времени ниже оба режима запускаются в Docker.
+Поэтому путь файла в отчёте — `/home/dev/bozor/main.go` (папка внутри Docker): у вас будет путь вашей папки. В Linux с установленным `gcc` и включённым `cgo` достаточно обычного `go test -race`; на macOS для этого урока устанавливать Xcode не требуется.
 
 Один вопрос по прошлому уроку. Чем мы ограничивали размер тела JSON в `POST`-запросе при чтении?
 
@@ -491,8 +491,16 @@ $ go test -race
 ok  	github.com/abdurahmon27/bozor	1.018s
 ```
 
-Тысяча запросов, гонки нет, остаток 0. Обычный `go test` на этом коде даёт `ok` за `0.005s`. Режим race заметно медленнее: по документации обычно в 2–20 раз по времени и в 5–10 раз по памяти ([Data Race Detector](https://go.dev/doc/articles/race_detector));
-в этом тесте разница ещё больше (1,02 с вместо 0,005 с; в трёх запусках 1,016–1,020 с). Причину я не измерял. Важно: `-race` используют в тестах и CI, а не на работающем сервере.
+Тысяча запросов, гонки нет, остаток 0. Основная причина примерно одной секунды здесь — ожидание race runtime перед выходом: настройка `GORACE` `atexit_sleep_ms` по умолчанию равна `1000` миллисекунд ([Data Race Detector](https://go.dev/doc/articles/race_detector#Options)). Нельзя делить это время на `0.005s` обычного `go test` и заключать, что код замедлился в 200 раз.
+
+Для проверки отключим ожидание; `-count=1` исключает получение результата теста из кеша:
+
+```console
+$ GORACE=atexit_sleep_ms=0 go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	0.082s
+```
+
+Я повторил измерение в окружении Docker через `_video/race.sh 03-mutex` (go1.27.4 linux/amd64): в трёх запусках время в строке `ok` составило 1,045–1,062 с с обычным `-race` и 0,067–0,082 с без ожидания. Отдельное измерение: для каждого режима заранее собрали тестовый бинарник; среднее wall-время трёх запусков race без ожидания — 0,102 с, обычного режима — 0,036 с (примерно в 2,8 раза; включает запуск процесса). Этот короткий тест не является бенчмарком производительности. Сама проверка гонок тоже расходует дополнительное время и память: обычный диапазон в документации — в 2–20 раз по времени и в 5–10 раз по памяти ([Data Race Detector](https://go.dev/doc/articles/race_detector#Runtime_Overhead)). Используем `-race` в параллельных тестах и CI.
 
 ## Чтение тоже под замком
 
@@ -679,7 +687,7 @@ exit status 2
 **1. «Тест прошёл, значит, безопасно».** Самая распространённая ошибка. Тест с одним запросом даёт `ok`, и код без мьютекса на одной горутине работает верно: таков `Sell` в начале урока.
 Гонка данных проявляется только при параллельном вызове. Лекарство: параллельный тест (`orderParallel`) и `go test -race`; не полагайтесь на обычный `go test`, который иногда тоже выдаёт `ok`.
 
-**2. `-race` не работает.** Если нет C-компилятора:
+**2. `-race` не работает.** Если в Linux нет C-компилятора:
 
 ```console
 $ go test -race
@@ -695,7 +703,7 @@ cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
 FAIL	github.com/abdurahmon27/bozor [build failed]
 ```
 
-Исправление: установите `gcc` (`apt install gcc`, на macOS `xcode-select --install`). Я воспользовался Docker (`_video/race.sh`).
+Исправление в Linux: установите C-компилятор (например, `apt install gcc`) и проверьте, что `cgo` включён (`go env CGO_ENABLED`: `1`). На macOS начиная с Go 1.20 детектору гонок не нужны Xcode/cgo ([примечания Go 1.20](https://go.dev/doc/go1.20#cgo)). Я воспользовался Docker в Linux (`_video/race.sh`).
 
 **3. Замок только на пишущем.** `Sell` под замком, `Stock` без замка: чтение тоже гонка (отчёт в разделе «Чтение тоже под замком»). Правило: каждое обращение к `products` — под одним замком.
 
@@ -763,7 +771,7 @@ FAIL	github.com/abdurahmon27/bozor [build failed]
 
 - 🟢 **Шаг 1, `Restock`.** В начало метода поставьте `s.mu.Lock()`, а в следующую строку `defer s.mu.Unlock()`. Логика не меняется.
 - 🟡 **Шаг 2, `Total`.** Верните сумму `Stock` всех товаров (`for _, p := range s.products` по map). Замок берётся **один раз** в начале `Total`; не вызывайте внутри `s.Stock(…)`.
-- 🟡 **По желанию.** Если у вас есть `gcc`, запустите `go test -race .` на стартовом коде и проверьте, что в отчёте видна строка `Restock`.
+- 🟡 **По желанию.** В Linux с C-компилятором и включённым `cgo` (на macOS Xcode не требуется) запустите `go test -race .` на стартовом коде и проверьте, что в отчёте видна строка `Restock`.
 
 Не меняйте `Product`, `Store`, `Sell`, `Stock`, `buy`, `slowHandler`, `main`, `buy_test.go` и `tekshiruv_test.go`. На старте формат и `go vet` ничего не печатают:
 
@@ -835,7 +843,7 @@ ok  	github.com/abdurahmon27/bozor/solution	0.013s
 
 - [pkg.go.dev: net/http — Server.Serve](https://pkg.go.dev/net/http#Server.Serve) — новая служебная горутина на каждое новое соединение; [Server.ListenAndServe](https://pkg.go.dev/net/http#Server.ListenAndServe) — всегда возвращает ошибку, не равную `nil`
 - [pkg.go.dev: sync — Mutex](https://pkg.go.dev/sync#Mutex) — нулевое значение — открытый замок; после первого использования не копируется; [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go) — запускает в новой горутине ([Go 1.25 release notes](https://go.dev/doc/go1.25))
-- [Go Data Race Detector](https://go.dev/doc/articles/race_detector) — формат отчёта, требование cgo, накладные расходы по времени и памяти
+- [Go Data Race Detector](https://go.dev/doc/articles/race_detector) — формат отчёта, `atexit_sleep_ms`, требования платформ, накладные расходы по времени и памяти
 - [Go memory model](https://go.dev/ref/mem) — синхронизация и порядок `Unlock` → следующий `Lock`
 - [Go FAQ: map не атомарны](https://go.dev/doc/faq#atomic_maps), [Go 1.6 release notes](https://go.dev/doc/go1.6) — лёгкое обнаружение одновременного обращения к map (best-effort)
 - [pkg.go.dev: cmd/vet](https://pkg.go.dev/cmd/vet) — `copylocks`; [pkg.go.dev: iter](https://pkg.go.dev/iter); [pkg.go.dev: time.Sleep](https://pkg.go.dev/time#Sleep)
