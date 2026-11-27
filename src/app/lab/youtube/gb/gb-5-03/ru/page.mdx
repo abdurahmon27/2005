@@ -1,0 +1,750 @@
+---
+title: "Нужный SQL: CREATE TABLE, INSERT, SELECT и ограничения"
+date: "2026/11/27"
+description: "Создайте products, выбирайте товары через SQL и проверьте, как NOT NULL, UNIQUE и CHECK отклоняют неверные данные."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-03"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-03) · **Русский** · [English](/lab/youtube/gb/gb-5-03/en)  
+Урок GB-5.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-03) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Сам файл `bozor.json` не запрещает записать пустое название и отрицательную цену. Эти правила проверяет только наш Go-код.
+Где хранить правила, если данные записывает и другая программа?
+
+**Одна идея:** схема таблицы — её столбцы, типы и правила — это контракт, который база проверяет при каждой записи.
+Если правило нарушено, Postgres возвращает ошибку и не сохраняет неверную строку.
+
+После урока вы сможете:
+
+- создать таблицу `products` проекта bozor через `CREATE TABLE`;
+- добавлять строки через `INSERT`, выбирать их с помощью `SELECT`, `WHERE`, `AND`, `ORDER BY`, `LIMIT`;
+- получать выданный базой новый `id` через `RETURNING`;
+- читать ошибки `NOT NULL`, `UNIQUE`, `CHECK` и добавить запрет пустого названия.
+
+| Слово | Простое значение | Английский термин |
+|---|---|---|
+| таблица | столбцы с именами и типами; каждая строка — запись об одном товаре | table |
+| `INSERT` / `SELECT` | записать новую строку / прочитать существующие строки | insert / select |
+| ограничение | правило, по которому сама база отклоняет неверную строку | constraint |
+
+## Что нужно знать заранее
+
+- [GB-5.02 · Docker Compose и psql](/lab/youtube/gb/gb-5-02/ru): контейнер, именованный том (volume), `psql` и флаг `-c`.
+- [GB-5.01 · Зачем нужна база данных](/lab/youtube/gb#gb-5-01): каталог, в который пишут несколько процессов.
+- [GB-1.03 · Целые числа и деньги](/lab/youtube/gb/gb-1-03/ru): цена в тийинах, хранение в `int64`.
+- [GB-1.08 · Первый тест](/lab/youtube/gb/gb-1-08/ru): `go test .`, `FAIL`, чтение имени файла и номера строки.
+- [GB-3.02 · JSON и сохранение](/lab/youtube/gb/gb-3-02/ru): `bozor.json`.
+- [GB-4.08 · API каталога](/lab/youtube/gb/gb-4-08/ru): каталог в памяти сервера.
+
+**Где запускать.** Нужны Docker с Compose и Go; Playground эту лабораторную не запустит.
+В папке курса `lessons/gb-5-03-sql-jadval` находятся SQL-файлы, `compose.yaml`, `go.mod`, `TASK.md` и `solution/`.
+`tekshiruv_test.go` вызывает `psql` из Go; подключение к базе из Go разбирается в [GB-5.05](/lab/youtube/gb#gb-5-05).
+
+Выполните следующие команды Linux из корня репозитория курса.
+`mktemp -d` создаёт временную папку; `cp -R` копирует лабораторную; `cd` переходит в копию.
+`export` задаёт окружение следующих команд.
+`sed -i` меняет порт только в копии на `15463`; если он занят, выберите другой свободный порт.
+`COMPOSE_PROJECT_NAME` отделяет имена контейнера и тома от других уроков.
+С `CGO_ENABLED=0` компилятор C не нужен; `GOTOOLCHAIN` выбирает версию Go, использованную при проверке.
+
+```bash
+lab=$(mktemp -d)
+cp -R lessons/gb-5-03-sql-jadval "$lab/sql"
+cd "$lab/sql"
+export COMPOSE_PROJECT_NAME=gb503docs
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+sed -i 's/127.0.0.1:5463:5432/127.0.0.1:15463:5432/' compose.yaml
+```
+
+Все следующие команды выполняются в этой копии. Файлы курса не меняются.
+В видео имя проекта было `bozor`; здесь контейнер называется `gb503docs-db-1`.
+Все результаты в консоли получены повторным запуском, а не процитированы из видео; строки состояния Compose зависят от машины.
+
+Сначала вопрос из GB-5.02: что будет с данными в именованном томе после `docker compose down` без `-v`?
+
+**A)** удалятся · **B)** останутся в томе · **C)** контейнер тоже останется
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Контейнер удаляется, именованный том остаётся. В A перепутаны `down` и `down -v`; в C — контейнер и том.
+
+</details>
+
+## Таблица: имена и типы столбцов
+
+Запускаем базу в фоне: `-d` — фоновый режим, `--wait` — ожидание готовности базы.
+`Healthy` означает, что проверка работоспособности прошла.
+
+```console
+$ docker compose up -d --wait
+ Network gb503docs_default Creating 
+ Volume gb503docs_pgdata Creating 
+ Volume gb503docs_pgdata Creating 
+ Network gb503docs_default Creating 
+ Volume gb503docs_pgdata Created 
+ Volume gb503docs_pgdata Created 
+ Network gb503docs_default Created 
+ Network gb503docs_default Created 
+ Container gb503docs-db-1 Creating 
+ Container gb503docs-db-1 Created 
+ Container gb503docs-db-1 Starting 
+ Container gb503docs-db-1 Started 
+ Container gb503docs-db-1 Waiting 
+ Container gb503docs-db-1 Healthy 
+```
+
+Этот фрагмент `compose.yaml` задаёт для `psql` пользователя и базу; оба имени — `bozor`.
+Поэтому в каждой команде можно не писать `-U bozor -d bozor`.
+
+```yaml
+environment:
+  PGUSER: bozor
+  PGDATABASE: bozor
+```
+
+`docker compose exec -T db` выполняет команду внутри контейнера `db`; `-T` отключает выделение терминала.
+`psql -c` выполняет одну команду. `\dt` выводит список таблиц; это команда `psql`, а не SQL.
+В новом томе пока нет таблиц:
+
+```console
+$ docker compose exec -T db psql -c '\dt'
+Did not find any tables.
+```
+
+`Did not find any tables` — «таблицы не найдены».
+Начинаем с файла из видео, где заданы только типы. Основной `products.sql` содержит итоговую таблицу с правилами.
+
+```sql filename="_video/01-oddiy/products.sql" showLineNumbers
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text,
+    price  bigint,
+    stock  integer,
+    active boolean
+);
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `CREATE TABLE products (` | создаёт `products`; в скобках перечислены столбцы через запятую |
+| 2 | `id bigint` | `id` — целое число на 8 байт |
+| 3 | `GENERATED ALWAYS AS IDENTITY` | база сама выдаёт `id` новой строке |
+| 4 | `PRIMARY KEY,` | первичный ключ однозначно определяет строку: без повторов и `NULL` |
+| 5 | `name text,` | название товара, текст |
+| 6 | `price bigint,` | цена в тийинах; 8 байт, как у `int64` в Go |
+| 7 | `stock integer,` | остаток, целое число на 4 байта |
+| 8 | `active boolean` | активность: значение `true` или `false` |
+| 9 | `);` | завершает список столбцов и SQL-команду |
+
+`NULL` означает отсутствие значения; подробно — в [GB-5.04](/lab/youtube/gb#gb-5-04).
+Кроме `id`, у столбцов пока нет бизнес-правил.
+`-f` выполняет SQL-файл. Compose подключает нашу папку в контейнер как `/lab` только для чтения.
+
+```console
+$ docker compose exec -T db psql -f /lab/_video/01-oddiy/products.sql
+CREATE TABLE
+```
+
+Изменение состояния: таблицы не было → есть таблица с пятью столбцами и нулём строк.
+
+## INSERT: записываем четыре товара
+
+Сопоставляем значения товара со столбцами. **`INSERT INTO`** задаёт таблицу и столбцы для записи.
+`id` не указываем: его выдаёт база. Полный файл `seed.sql` из курса:
+
+```sql filename="seed.sql" showLineNumbers
+INSERT INTO products (name, price, stock, active)
+VALUES ('olma', 1200000, 40, true),
+       ('non', 400000, 3, true),
+       ('choy', 2500000, 8, true),
+       ('oʻrik', 3500000, 2, true);
+```
+
+Строка 1 задаёт порядок столбцов. Строка 2 начинается с `VALUES`; каждая группа скобок — строка значений в этом порядке.
+Строки 3–5 содержат остальные товары; запятая разделяет строки, последняя `;` завершает команду.
+`'olma'` — текст в одинарных кавычках, числа — тийины, `true` обозначает активный товар.
+Названия означают яблоко (`olma`), хлеб (`non`), чай (`choy`) и абрикос (`oʻrik`).
+
+Сколько строк запишет выполнение файла?
+
+**A)** `1` · **B)** `4` · **C)** `5`, ведь столбцов пять
+
+<details>
+<summary>Ответ</summary>
+
+**B.** После `VALUES` четыре группы скобок. Одна команда может записать несколько строк; число столбцов не равно числу строк.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+INSERT 0 4
+```
+
+В `INSERT 0 4` число `4` — количество добавленных строк. Первое `0` — историческое поле, теперь всегда равное нулю.
+**`SELECT`** читает строки; `*` означает все столбцы, `FROM products` задаёт исходную таблицу.
+Какие `id` появятся: **A)** все `0` · **B)** `1, 2, 3, 4` · **C)** столбца `id` не будет?
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Счётчик identity новой таблицы выдал каждой строке очередной номер. Пропуск `id` в `INSERT` не удаляет столбец.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT * FROM products'
+ id | name  |  price  | stock | active 
+----+-------+---------+-------+--------
+  1 | olma  | 1200000 |    40 | t
+  2 | non   |  400000 |     3 | t
+  3 | choy  | 2500000 |     8 | t
+  4 | oʻrik | 3500000 |     2 | t
+(4 rows)
+```
+
+Первая строка — имена столбцов; разделители рисуют границы таблицы; `(4 rows)` означает четыре строки.
+`t` в `active` — это `true`. Состояние: ноль строк → четыре товара.
+Пока не считайте увиденный порядок гарантией: в следующем разделе зададим его явно.
+
+## SELECT: фильтрация, сортировка и ограничение
+
+Нужны название и цена, а не вся таблица. `SELECT name, price` возвращает только эти два столбца.
+`WHERE stock < 5` оставляет строки с остатком меньше пяти; `<` означает строго меньше.
+
+**A)** olma, choy · **B)** non, oʻrik · **C)** все товары?
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Остаток non — `3`, oʻrik — `2`; olma с `40` и choy с `8` не проходят условие.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5'
+ name  |  price  
+-------+---------
+ non   |  400000
+ oʻrik | 3500000
+(2 rows)
+```
+
+`AND` требует истинности обоих условий. Что останется, если добавить `price > 1000000`?
+`>` означает строго больше.
+
+**A)** non · **B)** oʻrik · **C)** non и oʻrik
+
+<details>
+<summary>Ответ</summary>
+
+**B.** non стоит `400000` и не проходит новое условие. oʻrik стоит `3500000`; оба условия истинны.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5 AND price > 1000000'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+(1 row)
+```
+
+`ORDER BY price DESC` сортирует по убыванию цены; без `DESC` порядок будет по возрастанию.
+Без `ORDER BY` Postgres не гарантирует порядок строк.
+
+```sql
+SELECT name, price
+FROM products
+WHERE stock < 5
+ORDER BY price DESC;
+```
+
+Какие строки и в каком порядке вернутся?
+
+**A)** non, oʻrik · **B)** oʻrik, non · **C)** olma, choy
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Фильтр не изменился: остались oʻrik и non. `DESC` ставит `3500000` перед `400000`.
+A — порядок по возрастанию; C игнорирует фильтр.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5 ORDER BY price DESC'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+ non   |  400000
+(2 rows)
+```
+
+`LIMIT 2` допускает не более двух строк в результате.
+На этот раз `WHERE` нет: какие два товара самые дорогие во всей таблице?
+
+**A)** oʻrik, choy · **B)** olma, non · **C)** oʻrik, non
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Цены по убыванию: `3500000`, `2500000`, `1200000`, `400000`.
+`LIMIT` берёт первые две строки отсортированного результата; C ошибочно сохраняет прежний фильтр.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products ORDER BY price DESC LIMIT 2'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+ choy  | 2500000
+(2 rows)
+```
+
+| Шаг | Строки или результат |
+|---|---|
+| `FROM products` | четыре товара |
+| `WHERE stock < 5` | non и oʻrik |
+| `ORDER BY price DESC` | oʻrik, non |
+| `SELECT name, price` | только название и цена в каждой строке |
+
+Таблица объясняет результат; в тексте SQL первым пишется `SELECT`.
+При равных ценах добавьте второй ключ для устойчивого порядка: `ORDER BY price, id`.
+
+## Кавычки: текст или имя столбца
+
+Текст в SQL пишется в одинарных кавычках: `'olma'`. Двойные кавычки выделяют имя: `"olma"` — имя столбца.
+Внешние кавычки оболочки передают SQL-текст одним аргументом; это отдельный уровень кавычек.
+
+```sql
+SELECT name FROM products WHERE name = "olma";
+```
+
+Что сделает этот ошибочный запрос? В SQL `=` проверяет равенство.
+
+**A)** найдёт яблоко · **B)** поищет столбец `olma` и выдаст ошибку · **C)** вернёт все строки
+
+<details>
+<summary>Ответ</summary>
+
+**B.** В таблице есть столбец `name`, но нет `olma`. В A текстовое значение перепутано с именем столбца.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name FROM products WHERE name = "olma"'
+ERROR:  column "olma" does not exist
+LINE 1: SELECT name FROM products WHERE name = "olma"
+                                               ^
+```
+
+`column … does not exist` — «такого столбца нет». `LINE 1` указывает строку запроса, `^` — место ошибки.
+Исправление: внутри SQL — `'olma'`, снаружи для оболочки — двойные кавычки.
+Теперь возвращается одна строка с яблоком:
+
+```console
+$ docker compose exec -T db psql -c "SELECT name FROM products WHERE name = 'olma'"
+ name 
+------
+ olma
+(1 row)
+```
+
+## RETURNING: новый id и недостающее правило
+
+Нужно сразу узнать, какой `id` база выдала новому товару.
+**`RETURNING id`** возвращает `id` добавленной строки. Применение из Go будет в GB-5.05.
+Какой `id` получит `sut` («молоко»): **A)** `4` · **B)** `5` · **C)** результата не будет?
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Предыдущие четыре строки получили `1`–`4`. `RETURNING` не отменяет запись: `INSERT 0 1` внизу тоже подтверждает добавление строки.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('sut', 900000) RETURNING id"
+ id 
+----
+  5
+(1 row)
+
+INSERT 0 1
+```
+
+Но тип не проверяет бизнес-правило. `''` — текст нулевой длины; `-5` тоже допустимое значение `bigint`.
+`RETURNING *` возвращает все столбцы новой строки. Что произойдёт?
+
+**A)** база отклонит строку · **B)** строка запишется · **C)** отрицательная цена заменится на `0`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** У `name` и `price` пока только типы. Они не запрещают пустой текст или отрицательное число; автоматического исправления тоже нет.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('', -5) RETURNING *"
+ id | name | price | stock | active 
+----+------+-------+-------+--------
+  6 |      |    -5 |       | 
+(1 row)
+
+INSERT 0 1
+```
+
+Пустые ячейки `stock` и `active` здесь означают `NULL`: значения не переданы, `DEFAULT` тоже нет.
+А `name` — это `''`, а не `NULL`. Обычный вывод `psql` может показывать оба случая пустыми ячейками.
+Состояние: пять правильных строк → шесть строк, одна нарушает бизнес-правила.
+
+## Ограничения: база сама отклоняет строку
+
+Цена должна быть положительной независимо от того, какая программа её записывает.
+**Ограничение** хранит это требование в таблице. Теперь используем основной `products.sql`:
+
+```sql filename="products.sql" showLineNumbers
+DROP TABLE IF EXISTS products;
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text    NOT NULL UNIQUE,
+    price  bigint  NOT NULL CHECK (price > 0),
+    stock  integer NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    active boolean NOT NULL DEFAULT true
+);
+```
+
+| Строка | Новое правило | Результат |
+|---|---|---|
+| 1 | `DROP TABLE IF EXISTS products` | удаляет таблицу со всеми строками, если она существует |
+| 2–5 | `CREATE TABLE`, identity, `PRIMARY KEY` | новая таблица и первичный ключ, как раньше |
+| 6 | `NOT NULL UNIQUE` | название не может быть `NULL` или повторяться |
+| 7 | `NOT NULL CHECK (price > 0)` | цена обязательна и должна быть больше нуля |
+| 8 | `NOT NULL DEFAULT 0 CHECK (stock >= 0)` | пропущенный остаток становится `0`; отрицательный отклоняется |
+| 9 | `NOT NULL DEFAULT true` | пропущенная активность становится `true`; явный `NULL` отклоняется |
+| 10 | `);` | завершает определение таблицы |
+
+`>=` — больше или равно. `DEFAULT` подставляет значение пропущенного столбца, но не заменяет явно переданный `NULL`.
+`CHECK (условие)` отклоняет строку, когда условие ложно; результат `NULL` проходит.
+Поэтому для обязательного значения нужен и `NOT NULL`. Для `id` это требование обеспечивает `PRIMARY KEY`.
+
+| Путь записи | Что проверяется | Если правило нарушено |
+|---|---|---|
+| тип значения | совместимость с `bigint`, `text`, `integer`, `boolean` | ошибка |
+| `NOT NULL` | отсутствие значения | ошибка |
+| `CHECK` | условие ложно | ошибка |
+| `UNIQUE` | повтор значения существующей строки | ошибка |
+| сохранение | все требования выполнены | новая строка |
+
+Это путь, наблюдавшийся в PostgreSQL 18.7; порядок проверок не является гарантией, на которую должно полагаться приложение.
+Ошибка не оставляет половину неверной строки в таблице; не ожидайте от первого сообщения перечня всех проблем.
+
+Пересоздание таблицы удалит шесть старых строк. Затем загрузим четыре товара заново:
+
+```console
+$ docker compose exec -T db psql -f /lab/products.sql
+DROP TABLE
+CREATE TABLE
+```
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+INSERT 0 4
+```
+
+Изменение таблицы без удаления разбирается в [GB-5.06](/lab/youtube/gb#gb-5-06).
+Что теперь произойдёт со строкой `('', -5)`?
+
+**A)** ошибка `NOT NULL` из-за пустого названия · **B)** ошибка `CHECK` из-за цены · **C)** обе ошибки
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `''` — существующее значение, поэтому проходит `NOT NULL`. А цена `-5` нарушает `price > 0`.
+В C предполагается, что одно сообщение перечисляет все нарушенные правила.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('', -5)"
+ERROR:  new row for relation "products" violates check constraint "products_price_check"
+DETAIL:  Failing row contains (5, , -5, 0, t).
+```
+
+`new row for relation … violates check constraint` — «новая строка таблицы нарушает ограничение CHECK».
+Здесь `relation` означает таблицу; `products_price_check` — имя правила.
+`DETAIL` показывает отклонённую строку: `id=5`, пустой текст названия, цена `-5`, остаток `0`, активность `t`.
+Последние два значения дал `DEFAULT`. В таблице по-прежнему четыре строки.
+
+Чтобы запретить и пустой текст, добавьте следующее в строку 6; это часть домашнего задания:
+
+```sql
+name   text    NOT NULL UNIQUE CHECK (name <> ''),
+```
+
+`<>` — не равно. `''` — две одинарные кавычки подряд: пустой текст.
+Это правило не проверяет названия из пробелов; сегодняшняя задача касается именно пустого текста.
+
+Промежуточный вопрос: в таблице есть `choy`. Что будет при добавлении второго `choy` с другой ценой?
+
+**A)** добавится вторая строка · **B)** обновится старая цена · **C)** ошибка `UNIQUE`
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Правило задано для названия, а не цены. `INSERT` пытается добавить новую строку, а не обновляет цену существующей.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('choy', 2600000)"
+ERROR:  duplicate key value violates unique constraint "products_name_key"
+DETAIL:  Key (name)=(choy) already exists.
+```
+
+`duplicate key value` — «повтор значения ключа»; `already exists` — «уже существует».
+`products_name_key` — правило уникальности названия. Строка не добавилась.
+
+Как проверяется явно переданный `NULL` в названии?
+
+**A)** отклоняется правилом `NOT NULL` · **B)** `DEFAULT` создаёт название · **C)** это то же, что пустой текст
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `NULL` — отсутствие значения; `''` — существующий текст. Для `name` к тому же не задан `DEFAULT`.
+Одного `CHECK` недостаточно для запрета `NULL`.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES (NULL, 900000)"
+ERROR:  null value in column "name" of relation "products" violates not-null constraint
+DETAIL:  Failing row contains (7, null, 900000, 0, t).
+```
+
+`null value in column "name" … violates not-null constraint` — «NULL в столбце name нарушает правило NOT NULL».
+Строка из `DETAIL` тоже не сохранилась. В таблице остались четыре товара.
+
+## Глубже (необязательно): пропуски между id
+
+Номер identity выдаётся до проверки строки. Отклонение строки не возвращает выданный номер.
+Три команды `INSERT` отклонены. Что появится, если теперь добавить `sut` и запросить `id`?
+
+**A)** `5` · **B)** `8` · **C)** `4`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Эти попытки получили `5`, `6`, `7` от счётчика identity до проверки ограничений.
+Отказ в записи строки не возвращает счётчик назад. В A число строк перепутано со следующим `id`.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('sut', 900000) RETURNING id"
+ id 
+----
+  8
+(1 row)
+
+INSERT 0 1
+```
+
+| Действие | Выданный id | Строк в таблице |
+|---|---|---|
+| начальные товары | `1`–`4` | `4` |
+| неверная цена | `5` | `4` |
+| повтор названия | `6` | `4` |
+| название `NULL` | `7` | `4` |
+| sut | `8` | `5` |
+
+`id` определяет строку; это не число товаров и не непрерывный порядковый номер.
+Не полагайтесь на последовательность без пропусков. Такое поведение даёт счётчик sequence, который использует identity.
+
+## Частые ошибки
+
+1. **«NOT NULL отклоняет и пустое название».** В опыте с `VALUES ('', -5)` цена была отклонена правилом `CHECK`; название прошло `NOT NULL`.
+   Исправление: добавьте для `name` правило `CHECK (name <> '')`, сохранив `NOT NULL` для `NULL`.
+2. **Двойные кавычки вокруг текста.** Ошибка `WHERE name = "olma"` показана в разделе о кавычках.
+   `column "olma" does not exist` означает, что база искала столбец. Исправление: `WHERE name = 'olma'`.
+3. **Ожидать, что INSERT обновит старую строку.** Второй `choy` вызвал ошибку `UNIQUE`; прежняя цена не изменилась.
+   Используйте `INSERT` для добавления новых строк.
+4. **Полагаться на увиденный порядок.** Без `ORDER BY` порядок не гарантирован. Укажите нужный столбец, а для равных значений добавьте `id`.
+5. **Ожидать сохранения данных при пересоздании.** `DROP TABLE` удаляет и строки.
+   В лабораторной мы повторно загрузили `seed.sql`; изменение системы с существующими данными — тема GB-5.06.
+
+## Проверьте себя
+
+1. В таблице с ограничениями какое правило отклоняет `('', -5)`, а какое пропускает?
+
+<details>
+<summary>Ответ</summary>
+
+`CHECK (price > 0)` отклоняет; `name NOT NULL` пропускает пустой текст.
+Речь о таблице до добавления ещё одного `CHECK` из домашнего задания.
+
+</details>
+
+2. В каком порядке приходят строки без `ORDER BY`?
+
+<details>
+<summary>Ответ</summary>
+
+Гарантированного порядка нет. Один вывод в порядке вставки не означает, что следующий запрос вернёт тот же порядок.
+
+</details>
+
+3. Предскажите: что вернёт `SELECT name, price FROM products WHERE stock < 5 ORDER BY price DESC`, если есть только четыре товара из `seed.sql`?
+
+<details>
+<summary>Ответ</summary>
+
+oʻrik (`3500000`), затем non (`400000`). `WHERE` фильтрует по остатку, `ORDER BY` сортирует оставшееся по цене.
+Вопрос задаёт начальное состояние из четырёх строк; последующие дополнительные команды `INSERT` не учитываются.
+
+</details>
+
+4. Что будет с каталогом GB-4.08 после остановки сервера? А с этой таблицей?
+
+<details>
+<summary>Ответ</summary>
+
+Каталог API находился в памяти и терялся после остановки сервера.
+Эта таблица хранится в базе на именованном томе; пересоздание контейнера её не удаляет. `down -v` удаляет и том.
+
+</details>
+
+## Домашнее задание
+
+Работайте с [папкой курса и TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval).
+README не назначает уровни; значки ниже — предложенная сложность двух его шагов.
+
+- 🟢 `products.sql`: добавьте `CHECK (name <> '')` для `name`. Остальные столбцы не меняйте.
+- 🟡 `arzon.sql` («дешёвый»): напишите один `SELECT`. Нужны `name`, `price` двух самых дешёвых активных товаров с ценой строго меньше `3000000` тийинов.
+  Цена по возрастанию, не более двух строк. `WHERE active` оставляет строки, где `active` истинно.
+
+`go test .` запускает тесты этой папки; они работают в отдельных временных схемах и затем удаляют их.
+Учебные строки в `public` на проверку не влияют. Docker должен работать; недоступная база не приводит к молчаливому пропуску теста.
+Реальный результат для копии с невыполненным заданием:
+
+```console
+$ go test .
+--- FAIL: TestConstraintlar (1.50s)
+    --- FAIL: TestConstraintlar/boʻsh_nom (0.19s)
+        tekshiruv_test.go:95: boʻsh nom: qator qabul qilindi, baza rad etishi kerak edi. products.sql'da name ustuniga CHECK (name <> '') qoʻshing (TASK.md, 1-qadam)
+--- FAIL: TestArzon (0.00s)
+    tekshiruv_test.go:108: arzon.sql'da SELECT yoʻq: faol mahsulotlardan narxi 3 000 000 tiyindan kam boʻlgan eng arzon ikkitasini tanlang (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	1.507s
+FAIL
+```
+
+`TestConstraintlar/boʻsh_nom` («ограничения / пустое название») — первое задание; `tekshiruv_test.go:95` — место вывода сообщения.
+`TestArzon` («дешёвые») — второе задание: в файле пока нет запроса. До исправления обеих проблем тест должен падать.
+
+<details>
+<summary>Ответ</summary>
+
+[Файлы решения](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval/solution).
+В `products.sql` меняется только строка `name`:
+
+```sql
+name   text    NOT NULL UNIQUE CHECK (name <> ''),
+```
+
+Полный `arzon.sql`:
+
+```sql filename="solution/arzon.sql" showLineNumbers
+SELECT name, price
+FROM products
+WHERE active AND price < 3000000
+ORDER BY price, id
+LIMIT 2;
+```
+
+Строка 1 выбирает столбцы; 2 задаёт таблицу; 3 вместе проверяет активность и цену.
+Строка 4 сортирует по возрастанию цены, при равенстве — по `id`; строка 5 ограничивает результат.
+В проверочный каталог также добавлены активный `qand` («сахар», `1100000`) и неактивный `sut` («молоко», `900000`).
+Поэтому ожидается `non|400000`, затем `qand|1100000`.
+Второй набор сравнивает цены `2999999`, `3000000`, `3000001`: граничная цена `3000000` не входит.
+
+После самостоятельного выполнения можно проверить и готовый ответ поверх копии. `cp` заменит два SQL-файла и ничего не выведет:
+
+```console
+$ cp solution/products.sql solution/arzon.sql .
+
+```
+
+```console
+$ go test .
+ok  	github.com/abdurahmon27/bozor	3.087s
+```
+
+В журнале подготовки урока проверка решения заняла `3.659s`, при повторном запуске — `3.087s`: примерно `0.84×` исходного времени.
+Это не тест скорости: нагрузка и расходы Docker меняются; важный результат — обе задачи прошли проверку.
+
+</details>
+
+После работы эта команда удаляет контейнер и том именно проекта `gb503docs`, включая учебные данные:
+
+```console
+$ docker compose down -v
+ Container gb503docs-db-1 Stopping 
+ Container gb503docs-db-1 Stopped 
+ Container gb503docs-db-1 Removing 
+ Container gb503docs-db-1 Removed 
+ Volume gb503docs_pgdata Removing 
+ Network gb503docs_default Removing 
+ Volume gb503docs_pgdata Removed 
+ Network gb503docs_default Removed 
+```
+
+## Источники
+
+- [CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html), [типы столбцов и размеры](https://www.postgresql.org/docs/18/datatype-numeric.html).
+- [Столбцы identity](https://www.postgresql.org/docs/18/ddl-identity-columns.html), [sequence и невозвращаемые номера](https://www.postgresql.org/docs/18/functions-sequence.html).
+- [INSERT и его метка результата](https://www.postgresql.org/docs/18/sql-insert.html), [RETURNING](https://www.postgresql.org/docs/18/dml-returning.html).
+- [SELECT](https://www.postgresql.org/docs/18/sql-select.html), [выборка из таблицы и WHERE](https://www.postgresql.org/docs/18/queries-table-expressions.html), [ORDER BY](https://www.postgresql.org/docs/18/queries-order.html), [AND](https://www.postgresql.org/docs/18/functions-logical.html).
+- [Ограничения](https://www.postgresql.org/docs/18/ddl-constraints.html), [NOT NULL](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-NOT-NULL), [CHECK](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS), [UNIQUE](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS).
+- [Текст и имена в двойных кавычках](https://www.postgresql.org/docs/18/sql-syntax-lexical.html), [сравнение и NULL](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [psql](https://www.postgresql.org/docs/18/app-psql.html), [PGUSER и PGDATABASE](https://www.postgresql.org/docs/18/libpq-envars.html).
+- [Compose up и --wait](https://docs.docker.com/reference/cli/docker/compose/up/), [Compose down и -v](https://docs.docker.com/reference/cli/docker/compose/down/).
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL `18.7` (`postgres:18-alpine`), Docker `29.8.1`, Compose `5.4.0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval)
+
+---
+
+← Предыдущий урок: [GB-5.02](/lab/youtube/gb/gb-5-02/ru) · Следующий урок: [GB-5.04](/lab/youtube/gb#gb-5-04) → · [Все уроки](/lab/youtube/gb)
+
+</div>

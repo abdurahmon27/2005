@@ -1,0 +1,655 @@
+---
+title: "Postgres в Docker Compose и подключение через psql"
+date: "2026/11/27"
+description: "Запустите Postgres с compose.yaml, изучите таблицы через psql и проверьте, чем down отличается от down -v."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-02/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-02"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-02"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-02) · **Русский** · [English](/lab/youtube/gb/gb-5-02/en)  
+Урок GB-5.02 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-02) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Когда два процесса записывают каталог bozor в один JSON-файл, одно обновление может потеряться. Как вместо файла запустить отдельную базу?
+
+**Одна идея:** Postgres — отдельный **сервер**; `compose.yaml` описывает его, а `psql` подключается к нему. Данные хранятся в именованном томе (volume): после удаления контейнера остаются, после удаления тома исчезают.
+
+После урока вы сможете:
+
+- запустить Postgres для bozor с помощью `compose.yaml`;
+- посмотреть список таблиц, столбцы и три товара через `psql`;
+- объяснить разницу между `down` и `down -v` и ошибку занятого порта;
+- добавить отдельный сервис тестовой базы и пройти `go test`.
+
+| Термин | Простое значение | По-английски |
+|---|---|---|
+| сервер | программа, которая ждёт подключений на порту и управляет файлами базы | server |
+| именованный том | место для данных под управлением Docker, которое сохраняется вне контейнера | named volume |
+| `psql` | клиентская программа, отправляющая команды Postgres и показывающая ответы | psql |
+
+## Что нужно знать заранее
+
+- [GB-5.01 · Зачем нужна база](/lab/youtube/gb#gb-5-01): два процесса записывают один файл, возникает потерянное обновление.
+- [GB-4.01 · HTTP-запрос — это текст](/lab/youtube/gb/gb-4-01/ru): одинарные кавычки в оболочке и `|` между командами.
+- [GB-4.04 · Первый сервер](/lab/youtube/gb/gb-4-04/ru): сервер, порт и `address already in use`.
+- [GB-4.07 · Запросы выполняются одновременно](/lab/youtube/gb/gb-4-07/ru): гонка данных и `-race`; вопрос на повторение взят оттуда.
+- [GB-1.08 · Первый тест](/lab/youtube/gb/gb-1-08/ru): `go test`, `ok`, `FAIL`.
+- [GB-1.03 · Числа и деньги](/lab/youtube/gb/gb-1-03/ru): bozor хранит цены в целых тийинах.
+
+Возьмите код из [папки курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose). Выполняйте команды в ней; `cd` переходит в другую папку.
+Урок требует локального Docker и файлов, поэтому в Go Playground не работает.
+
+Docker Engine должен работать, Docker Compose должен быть установлен: [установка](https://docs.docker.com/engine/install/).
+В Linux также нужен доступ к Docker. `psql` уже есть в образе; установка на компьютер нужна только для примера с URL.
+Порты `5482` и `5483` должны быть свободны. Для демонстрации левый порт можно изменить; тест задания ожидает именно эти два.
+
+В папке: `compose.yaml`, `bozor.sql`, `TASK.md`, проверяющий `tekshiruv_test.go`, `go.mod` и ответ в `solution/`.
+Модуль требует `go 1.27`. Для страницы использованы `go1.27.4` и `CGO_ENABLED=0`.
+
+**Вспомните:** что может потеряться, если два процесса читают, меняют и перезаписывают один файл?
+**A)** оба обновления · **B)** одно обновление · **C)** имя файла
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Последняя запись заменяет обновление другого процесса. Имя файла остаётся; сохранение обоих обновлений не гарантировано.
+
+</details>
+
+## Кто запускает сервер?
+
+Postgres — отдельный процесс, ожидающий подключений на сетевом порту `5432`. Сегодня клиентом будет `psql`, позже — программа bozor на Go.
+Файлами базы управляет сервер; клиенты отправляют ему команды. Так клиенты перестают независимо перезаписывать один файл.
+Согласованность нескольких SQL-шагов разберём в [GB-5.07 · Транзакция](/lab/youtube/gb#gb-5-07).
+
+| Шаг | Кто выполняет | Где данные |
+|---|---|---|
+| подключение | `psql` → порт `5432` → Postgres | файлами по-прежнему управляет сервер |
+| команда | Postgres читает или записывает | файлы базы в именованном томе |
+| ответ | Postgres → `psql` | клиент показывает вывод на экране |
+
+**Docker** запускает программу в контейнере. **Образ (image)** — готовый пакет программы и необходимых файлов.
+**Контейнер** — среда отдельного процесса, запущенного из этого образа.
+**Docker Compose** управляет контейнерами по описанию в одном файле. Официальный образ Postgres поддерживает PostgreSQL Docker Community.
+
+## compose.yaml: назначение каждой строки
+
+Чтобы запускать сервер повторяемо, запишем настройки в файл. **YAML** группирует имена и значения с помощью отступов.
+Ниже полная копия `compose.yaml` из папки курса:
+
+```yaml filename="compose.yaml" showLineNumbers
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: bozor
+      POSTGRES_PASSWORD: bozor
+      POSTGRES_DB: bozor
+    ports:
+      - "127.0.0.1:5482:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+volumes:
+  pgdata:
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `services:` | список запускаемых сервисов; сервис — описание одной программы |
+| 2 | `db:` | выбранное имя сервиса; отступ в два пробела связывает его с `services` |
+| 3 | `image: postgres:18-alpine` | образ Postgres 18 на Alpine Linux; после `:` указан вариант версии |
+| 4 | `environment:` | переменные окружения, передаваемые контейнеру |
+| 5 | `POSTGRES_USER: bozor` | пользователь, создаваемый при первом запуске |
+| 6 | `POSTGRES_PASSWORD: bozor` | учебный пароль этого пользователя |
+| 7 | `POSTGRES_DB: bozor` | имя базы, создаваемой при первом запуске |
+| 8–9 | `ports:` и `- "127.0.0.1:5482:5432"` | `-` обозначает элемент списка, в кавычках записано сопоставление портов |
+| 10–11 | `volumes:` и `- pgdata:/var/lib/postgresql` | подключают именованный `pgdata` к папке внутри контейнера |
+| 12 | пустая строка | улучшает читаемость |
+| 13–14 | `volumes:` и `pgdata:` | объявляют том на верхнем уровне; пустое значение выбирает стандартные настройки |
+
+Настройки `POSTGRES_*` подготавливают базу только при пустой папке данных.
+Пароль `bozor` предназначен для локальной учебной базы; настоящие пароли — в [GB-8.01](/lab/youtube/gb#gb-8-01).
+
+Запись порта состоит из трёх частей:
+
+| Часть | Значение | Смысл |
+|---|---|---|
+| адрес хоста | `127.0.0.1` | подключение только с этого компьютера |
+| левый порт | `5482` | порт компьютера, к которому вы подключаетесь |
+| правый порт | `5432` | порт, на котором Postgres ждёт внутри контейнера |
+
+Именованный **том (volume)** — отдельное хранилище под управлением Docker. При удалении контейнера его собственные файлы исчезают, данные в томе остаются.
+Новый контейнер снова подключает `pgdata`. Два `volumes:` выполняют разные задачи: внутренний подключает, внешний объявляет.
+
+## Запуск и готовность
+
+`docker compose up -d` запускает сервисы из файла. `-d` оставляет их работать в фоне, освобождая терминал.
+Приведённые повторные запуски выполнены, как в видео, в новой папке `bozor`; в папке курса префикс имён длиннее.
+Образ уже был загружен; при первом запуске могут появиться строки скачивания.
+
+```console
+$ docker compose up -d
+[+] up 3/3
+ ✔ Network bozor_default Created                                            0.1s
+ ✔ Volume bozor_pgdata   Created                                            0.0s
+ ✔ Container bozor-db-1  Started                                            0.3s
+```
+
+`[+] up 3/3` — подготовлены три объекта; `✔` означает завершённое действие.
+`Network` — сеть Docker, `Volume` — хранилище, `Container` — среда работающего процесса.
+`Created` — создан, `Started` — запущен. `bozor` в именах взят из папки проекта, `db` и `pgdata` — из файла; `1` — номер контейнера.
+
+В видео контейнер запустился за `0.3s`; при повторном замере — тоже за `0.3s`. Времена сети и тома и порядок строк меняются.
+Эти числа не измеряют скорость запросов; `Started` также не гарантирует готовность базы к подключениям.
+Здесь важны ответы сервера и сохранение данных в томе.
+
+`docker compose logs db` выводит журнал сервиса. `|` передаёт его в `tail -n 1`, показывающий последнюю строку.
+Дождитесь сообщения о готовности и продолжайте:
+
+```console
+$ docker compose logs db | tail -n 1
+db-1  | 2026-11-27 12:49:23.991 UTC [1] LOG:  database system is ready to accept connections
+```
+
+`db-1` — контейнер сервиса; далее дата, время и `[1]` — номер процесса. `LOG` обозначает тип записи журнала.
+`database system is ready to accept connections` — система базы готова принимать подключения.
+При повторном запуске время изменилось; вывод console на этой странице получен заново, а не скопирован из видео.
+
+## psql: таблицы и строки
+
+Для отправки команд серверу используем клиент **psql**. Части команды:
+
+| Часть | Назначение |
+|---|---|
+| `docker compose exec` | выполняет команду внутри работающего контейнера |
+| `db` | выбирает сервис |
+| `psql` | клиентская программа Postgres |
+| `-U bozor` | имя пользователя; заглавная `U` |
+| `-d bozor` | имя базы; относится к другой программе, чем флаг в `up -d` |
+| `-c` | выполняет следующую команду и выходит |
+| `'\dt'` | команда psql для списка таблиц; одинарные кавычки передают текст одним аргументом |
+
+База только что создана. Что выведет `\dt`?
+**A)** есть `products` · **B)** таблицы не найдены · **C)** база не найдена
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `POSTGRES_DB` создал базу, но таблиц мы ещё не создавали. A предполагает автоматическое создание таблицы; C путает базу с таблицей.
+
+</details>
+
+```console
+$ docker compose exec db psql -U bozor -d bozor -c '\dt'
+Did not find any tables.
+```
+
+`Did not find any tables.` — таблицы не найдены.
+
+Теперь загрузим `bozor.sql` из курса. SQL — язык команд для базы данных. `CREATE TABLE` создаёт таблицу, `INSERT` добавляет три товара.
+Полный файл приведён ниже; написание SQL будем практиковать в [GB-5.03](/lab/youtube/gb/gb-5-03/ru).
+
+```sql filename="bozor.sql" showLineNumbers
+-- bozor: products jadvali va uchta mahsulot (SQL'ni GB-5.03'da oʻzimiz yozamiz)
+CREATE TABLE products (
+    id    bigint PRIMARY KEY,
+    name  text    NOT NULL,
+    price bigint  NOT NULL,
+    stock integer NOT NULL
+);
+
+INSERT INTO products (id, name, price, stock) VALUES
+    (1, 'olma', 1200000, 40),
+    (2, 'non', 400000, 25),
+    (3, 'oʻrik', 3500000, 5);
+```
+
+1. Первая строка с `--` — комментарий.
+2. Строки 2–7 описывают таблицу `products`. Скобки группируют столбцы, запятые разделяют их, `;` завершает команду.
+3. `id` — номер товара, `PRIMARY KEY` делает его уникальным и обязательным; `bigint` хранит большое целое число.
+4. `name` — название, `text` — текстовый тип. `price` — цена в тийинах, `stock` — остаток, `integer` — целочисленный тип.
+5. `NOT NULL` запрещает отсутствие значения; запрета пустой строки это не означает.
+6. `INSERT INTO` выбирает таблицу для записи, `VALUES` задаёт значения. Строки 9–12 добавляют три строки; одинарные кавычки окружают названия товаров.
+
+`olma`, `non`, `oʻrik` — «яблоко», «хлеб», «абрикос». `1200000` тийинов = `12000` сумов.
+`< bozor.sql` подаёт файл на стандартный ввод; `-T` отключает подключение терминала, поскольку ввод идёт из файла.
+
+Предположите: что означает `3` в ответе загрузки `INSERT 0 3`?
+**A)** три столбца · **B)** три добавленные строки · **C)** третья база
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `INSERT` добавляет строки. Первое `0` — старое поле, теперь всегда ноль; это не номер столбца или базы.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -U bozor -d bozor < bozor.sql
+CREATE TABLE
+INSERT 0 3
+$ docker compose exec db psql -U bozor -d bozor -c '\dt'
+          List of tables
+ Schema |   Name   | Type  | Owner 
+--------+----------+-------+-------
+ public | products | table | bozor
+(1 row)
+```
+
+`CREATE TABLE` — таблица создана. Заголовок следующего ответа `List of tables` означает список таблиц.
+**Схема (schema)** — именованная группа таблиц; `public` — стандартное имя схемы.
+`Name` — имя, `Type: table` — объект является таблицей, `Owner: bozor` — владелец. `(1 row)` — одна строка в списке.
+
+`\d products` показывает структуру одной таблицы:
+
+```console
+$ docker compose exec db psql -U bozor -d bozor -c '\d products'
+              Table "public.products"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | bigint  |           | not null | 
+ name   | text    |           | not null | 
+ price  | bigint  |           | not null | 
+ stock  | integer |           | not null | 
+Indexes:
+    "products_pkey" PRIMARY KEY, btree (id)
+```
+
+`Table "public.products"` — полное имя схемы и таблицы. `Column` — столбец, `Type` — тип, `Nullable` — допустимо ли отсутствие значения.
+`not null` — недопустимо. Столбцы `Collation` и `Default` разберём в [GB-5.03](/lab/youtube/gb/gb-5-03/ru).
+Видео скрывает нижние строки; здесь вывод приведён полностью.
+`products_pkey` под `Indexes` — индекс, созданный для первичного ключа `id`; `btree` — его тип.
+Индекс — вспомогательная структура поиска строки по `id`; `btree` — её древовидный тип.
+
+`SELECT name FROM products` означает: получить столбец `name` из `products`.
+Предположите: **A)** четыре столбца · **B)** три названия товаров · **C)** только одно название
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Запрос выбирает только `name`, а строк три. Все столбцы не запрошены, количество строк не ограничено одной.
+
+</details>
+
+```console
+$ docker compose exec db psql -U bozor -d bozor -c 'SELECT name FROM products'
+ name  
+-------
+ olma
+ non
+ oʻrik
+(3 rows)
+```
+
+`name` — столбец результата; `(3 rows)` — три строки. Разделительные линии рисует psql, это не данные.
+Подробный синтаксис SQL — в следующем уроке.
+
+**Короткий вопрос:** что произойдёт, если при загрузке файла убрать `-T`?
+**A)** всё работает так же · **B)** Docker сообщает об ошибке · **C)** таблица создаётся дважды
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Обычно `exec` подключает терминал, но стандартный ввод — файл. `-T` отключает терминал. Ошибка возникает до отправки SQL серверу.
+
+</details>
+
+```console
+$ docker compose exec db psql -U bozor -d bozor < bozor.sql
+cannot attach stdin to a TTY-enabled container because stdin is not a terminal
+```
+
+`stdin` — стандартный ввод, `TTY` — терминал. Сообщение означает: нельзя подключить нетерминальный ввод к контейнеру с включённым терминалом.
+Исправление — вернуть `exec -T` в команду загрузки. Это не ошибка SQL внутри `bozor.sql`.
+
+## Где остаются данные после удаления контейнера?
+
+`docker compose down` останавливает и удаляет контейнер и сеть. Затем снова запускаем их через `up -d`.
+Предположите: останутся ли три товара?
+**A)** да, их сохраняет том · **B)** таблица тоже исчезнет · **C)** таблица останется, строки исчезнут
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Контейнер будет новым, но подключит прежний `pgdata`. B и C не учитывают, что таблица и строки хранятся в одном томе.
+
+</details>
+
+```console
+$ docker compose down
+[+] down 2/2
+ ✔ Container bozor-db-1  Removed                                            0.3s
+ ✔ Network bozor_default Removed                                            0.1s
+$ docker compose up -d
+[+] up 2/2
+ ✔ Network bozor_default Created                                            0.0s
+ ✔ Container bozor-db-1  Started                                            0.3s
+$ docker compose exec db psql -U bozor -d bozor -c 'SELECT name FROM products'
+ name  
+-------
+ olma
+ non
+ oʻrik
+(3 rows)
+```
+
+`Removed` — удалён. Второй `up` не создавал том: тот уже существовал.
+Перед повторным подключением снова проверьте готовность по журналу.
+
+Теперь `docker compose down -v`: `-v` удаляет и именованный том. Что выведет `\dt` после нового `up -d`?
+**A)** есть `products` · **B)** таблиц нет, база есть · **C)** нет и самой базы
+
+<details>
+<summary>Ответ</summary>
+
+**B.** В новом пустом томе `POSTGRES_DB: bozor` снова создаёт базу. `bozor.sql` автоматически не загружается; прежние таблица и строки удалены.
+
+</details>
+
+```console
+$ docker compose down -v
+[+] down 3/3
+ ✔ Container bozor-db-1  Removed                                            0.2s
+ ✔ Volume bozor_pgdata   Removed                                            0.0s
+ ✔ Network bozor_default Removed                                            0.1s
+$ docker compose up -d
+[+] up 3/3
+ ✔ Network bozor_default Created                                            0.0s
+ ✔ Volume bozor_pgdata   Created                                            0.0s
+ ✔ Container bozor-db-1  Started                                            0.3s
+$ docker compose exec db psql -U bozor -d bozor -c '\dt'
+Did not find any tables.
+```
+
+| Состояние | Контейнер | `pgdata` | `products` |
+|---|---|---|---|
+| после загрузки | работает | существует | 3 строки |
+| после `down` | удалён | сохранён | файлы сохранены |
+| снова `up -d` | новый | прежний | 3 строки |
+| после `down -v` | удалён | удалён | отсутствует |
+| снова `up -d` | новый | новый | отсутствует; база `bozor` пуста |
+
+Выполняйте `down -v`, когда готовы удалить эти учебные данные.
+
+## URL подключения
+
+Будущая Go-программа тоже подключится по хосту, порту, пользователю, паролю и имени базы. Их можно записать в **URL подключения**:
+
+`postgres://bozor:bozor@127.0.0.1:5482/bozor`
+
+| Часть | Значение |
+|---|---|
+| `postgres://` | схема подключения Postgres |
+| первый `bozor` | пользователь |
+| `bozor` после `:` | учебный пароль |
+| `@127.0.0.1` | адрес сервера на компьютере |
+| `:5482` | порт компьютера |
+| `/bozor` | имя базы |
+
+Если `psql` установлен на компьютере, проверьте URL. `\conninfo` показывает сведения о текущем подключении.
+Реальный результат после готовности нового сервера:
+
+```console
+$ psql postgres://bozor:bozor@127.0.0.1:5482/bozor -c '\conninfo'
+You are connected to database "bozor" as user "bozor" on host "127.0.0.1" at port "5482".
+```
+
+Ответ подтверждает базу `bozor`, пользователя `bozor`, хост `127.0.0.1` и порт `5482`.
+Подключение из Go — в [GB-5.05](/lab/youtube/gb#gb-5-05).
+
+## Глубже (необязательно): инициализация и путь тома
+
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` не перенастраивают существующую базу.
+Если изменить пароль в файле и выполнить `up`, база в прежнем томе сохранит старый пароль.
+Для создания этой учебной базы заново используют `down -v`, затем `up -d`: все прежние данные исчезнут.
+
+В образе Postgres 18 том подключается к `/var/lib/postgresql`; сами данные находятся в `/var/lib/postgresql/18/docker` внутри него.
+Образы версии 17 и старше используют `/var/lib/postgresql/data`. Меняя версию образа, проверяйте путь подключения в официальной документации.
+
+## Частые ошибки
+
+**1. Выбрать занятый порт хоста.** На компьютере `5432` уже использует другой Postgres. Заменим строку порта в корректном файле на такую:
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
+
+Перед опытом учебный контейнер удалили через `docker compose down -v`; другой Postgres не меняли.
+Предположите: **A)** Docker выберет другой порт · **B)** запуск завершится ошибкой · **C)** оба используют один порт
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Две программы не могут одновременно занять этот адрес и порт. Docker сам не заменяет порт, указанный в файле.
+
+</details>
+
+```console
+$ docker compose up -d
+[+] up 2/3
+ ✔ Network bozor_default Created                                            0.0s
+ ✔ Volume bozor_pgdata   Created                                            0.0s
+ ⠸ Container bozor-db-1  Starting                                           0.3s
+Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint bozor-db-1 (d5f82e1d23b64670c093ff3a29d3df035adf9fae65ddd66435cd7e2a561d7b90): failed to bind host port 127.0.0.1:5432/tcp: address already in use
+```
+
+Это сообщение об ошибке от Docker daemon — фоновой программы Docker.
+`up 2/3` и вращающийся знак показывают незавершённый запуск. Длинная строка в скобках — идентификатор сетевого подключения.
+Читайте с конца: `failed to bind host port` — не удалось привязать порт компьютера; `address already in use` — адрес занят.
+`127.0.0.1:5432/tcp` указывает точные адрес, порт и протокол.
+
+Исправление: сначала удалите неудачно запущенный учебный проект через `docker compose down -v`.
+Верните строку порта к `"127.0.0.1:5482:5432"`, затем выполните `docker compose up -d`.
+Изменилось только левое число; внутри контейнера Postgres по-прежнему слушает `5432`.
+
+**2. Считать, что `down` удаляет данные.** В разделе «Где остаются данные после удаления контейнера?» три строки вернулись.
+Для намеренного удаления данных нужен `down -v`.
+
+**3. Забыть `-T` при вводе из файла.** Реальная ошибка в разделе psql возникает до SQL. Исправление: `exec -T`.
+
+**4. Считать, что пароль в YAML меняет существующую базу.** Правило раздела «Глубже»: environment инициализирует только пустую папку данных.
+
+## Проверьте себя
+
+**1.** Какой порт в `127.0.0.1:5482:5432` принадлежит контейнеру?
+
+<details>
+<summary>Ответ</summary>
+
+Правый, `5432`. Клиент на компьютере подключается к `5482`; Docker направляет подключение к `5432` внутри контейнера.
+
+</details>
+
+**2.** Чем отличаются `down` и `down -v`?
+
+<details>
+<summary>Ответ</summary>
+
+Оба удаляют контейнер и сеть. `down` сохраняет именованный том, `down -v` удаляет его вместе с данными.
+
+</details>
+
+**3.** После загрузки трёх товаров выполнили `down -v`, затем `up -d`. Что выведет `\dt`?
+**A)** три товара · **B)** таблицы не найдены · **C)** база не найдена
+
+<details>
+<summary>Ответ</summary>
+
+**B: `Did not find any tables.`** База `bozor` создана заново, но `bozor.sql` не загружен повторно. `\dt` перечисляет таблицы, а не строки.
+
+</details>
+
+**4.** Из [GB-4.07](/lab/youtube/gb/gb-4-07/ru): какой флаг `go test` обнаруживает гонку данных?
+
+<details>
+<summary>Ответ</summary>
+
+`-race`. Race detector проверяет гонки в выполняющемся коде. Ему нужны cgo и компилятор C, поэтому с `CGO_ENABLED=0` этот флаг не используется.
+
+</details>
+
+## Домашнее задание
+
+🟢 **Основное задание:** добавьте второй сервис из [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-02-postgres-compose/TASK.md).
+Стартовые файлы — в [папке курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose), ответ — в [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose/solution).
+
+1. Добавьте `db-test` внутри `services:` на одном уровне с `db`.
+2. `POSTGRES_DB` — `bozor_test`; пользователь и учебный пароль — `bozor`.
+3. Порт хоста `5483`, порт контейнера `5432`: `"127.0.0.1:5483:5432"`.
+4. Подключите отдельный том `pgtest:/var/lib/postgresql`, объявите `pgtest:` во внешнем `volumes:`.
+5. Запустите сервисы, загрузите `bozor.sql` в основную базу и работайте, пока не пройдёт `go test ./...`.
+
+Не меняйте `tekshiruv_test.go`. Он читает настройки из `docker compose config` и отправляет запросы обоим серверам через `psql`.
+`config` проверяет файл и выводит итоговую конфигурацию. Тест ждёт подключения до 30 секунд.
+Перед загрузкой самостоятельно проверьте готовность по журналу. Загружайте `bozor.sql` только один раз в каждую новую базу.
+
+```bash
+docker compose config
+docker compose up -d
+docker compose logs db | tail -n 1
+docker compose exec -T db psql -U bozor -d bozor < bozor.sql
+CGO_ENABLED=0 go test ./...
+```
+
+В стартовом файле нет `db-test`, поэтому тест завершается неудачей. Перед проверкой ответа удалите основной проект:
+`docker compose down -v`. `solution/` использует те же порты хоста.
+
+<details>
+<summary>Ответ</summary>
+
+У `db-test` должны быть отдельные порт и том. Один том дал бы двум серверам одни файлы базы.
+Ниже полный `solution/compose.yaml`. Новое `name: gb502-solution` явно задаёт имя проекта, чтобы не пересекаться с другими папками `solution`.
+
+```yaml filename="solution/compose.yaml" showLineNumbers
+name: gb502-solution # papka nomi "solution" boshqa darslarning solution/ papkalari bilan toʻqnashmasligi uchun
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: bozor
+      POSTGRES_PASSWORD: bozor
+      POSTGRES_DB: bozor
+    ports:
+      - "127.0.0.1:5482:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  db-test:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: bozor
+      POSTGRES_PASSWORD: bozor
+      POSTGRES_DB: bozor_test
+    ports:
+      - "127.0.0.1:5483:5432"
+    volumes:
+      - pgtest:/var/lib/postgresql
+
+volumes:
+  pgdata:
+  pgtest:
+```
+
+Новый блок `db-test` повторяет правила `db`; изменены только имя сервиса, база, порт хоста и имя тома.
+Нижний `pgtest:` объявляет второй том; текст после `#` — комментарий. У `solution/` есть собственный `go.mod`.
+Для проверки выполните `cd solution`, затем те же пять команд в этой папке.
+Повторный запуск теста решения:
+
+```console
+$ CGO_ENABLED=0 go test ./...
+ok  	github.com/abdurahmon27/bozor	0.305s
+```
+
+`ok` — тест прошёл; далее имя модуля и время выполнения.
+В проверке видео было `1.159s`; время этого запуска приведено выше. Это не нагрузочный тест, поэтому отношение времён не означает выигрыш производительности.
+
+</details>
+
+Закончив, удалите контейнеры и тома текущего проекта. Если вы в папке ответа, выполните команду там:
+
+```bash
+docker compose down -v
+```
+
+## Источники
+
+- [Папка курса и README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose)
+
+- [Документация PostgreSQL 18](https://www.postgresql.org/docs/18/index.html)
+
+- [Архитектура Postgres](https://www.postgresql.org/docs/18/tutorial-arch.html)
+
+- [Управление конкурентным доступом](https://www.postgresql.org/docs/18/mvcc.html)
+
+- [Официальный образ Postgres: environment и PGDATA](https://hub.docker.com/_/postgres)
+
+- [Путь тома Postgres 18: PR #1259](https://github.com/docker-library/postgres/pull/1259)
+
+- [Описание сервисов Compose](https://docs.docker.com/reference/compose-file/services/)
+
+- [Порты](https://docs.docker.com/reference/compose-file/services/#ports)
+
+- [Краткая запись портов](https://docs.docker.com/reference/compose-file/services/#short-syntax-3)
+
+- [Описание томов Compose](https://docs.docker.com/reference/compose-file/volumes/)
+
+- [Тома Docker](https://docs.docker.com/engine/storage/volumes/)
+
+- [Публикация портов](https://docs.docker.com/engine/network/port-publishing/)
+
+- [Команды Compose](https://docs.docker.com/reference/cli/docker/compose/)
+
+- [up](https://docs.docker.com/reference/cli/docker/compose/up/)
+
+- [down и -v](https://docs.docker.com/reference/cli/docker/compose/down/)
+
+- [exec и -T](https://docs.docker.com/reference/cli/docker/compose/exec/)
+
+- [logs](https://docs.docker.com/reference/cli/docker/compose/logs/)
+
+- [psql: команды и флаги](https://www.postgresql.org/docs/18/app-psql.html)
+
+- [Команды SQL](https://www.postgresql.org/docs/18/sql-commands.html)
+
+- [Ограничения: PRIMARY KEY и NOT NULL](https://www.postgresql.org/docs/18/ddl-constraints.html)
+
+- [Типы индексов](https://www.postgresql.org/docs/18/indexes-types.html)
+
+- [Ответ INSERT](https://www.postgresql.org/docs/18/sql-insert.html)
+
+- [SELECT](https://www.postgresql.org/docs/18/sql-select.html)
+
+- [Формат URL подключения](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNSTRING-URIS)
+
+- [Go race detector](https://go.dev/doc/articles/race_detector)
+
+Результаты получены с `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, Docker Engine 29.8.1, Docker Compose 5.4.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27.
+Проверка URL с хоста выполнена через `psql 15.19`. После проверки все учебные серверы, контейнеры и тома удалены.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-02-postgres-compose)
+
+---
+
+← Предыдущий урок: [GB-5.01](/lab/youtube/gb#gb-5-01) · Следующий урок: [GB-5.03](/lab/youtube/gb/gb-5-03/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>
