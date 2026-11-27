@@ -1,0 +1,688 @@
+---
+title: "Миграции goose: изменение схемы с версиями"
+date: "2026/11/27"
+description: "Управляйте схемой Postgres через SQL-файлы с номерами: goose up, status, down, ошибка NOT NULL и исправление с DEFAULT."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-06) · **Русский** · [English](/lab/youtube/gb/gb-5-06/en)  
+Урок GB-5.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+`orders.sql` уже создал таблицы. Что произойдёт, если выполнить его при следующем обновлении сервера? Как обновить схему, сохранив данные?
+
+**Одна идея:** каждое изменение схемы хранится в SQL-файле с номером. База хранит применённые версии в `goose_db_version`; goose применяет недостающие файлы.
+Обычно каждый файл выполняется в одной транзакции: при ошибке изменения этого файла откатываются.
+
+После урока вы:
+
+- установите goose и выполните `status`, `up`, `down`;
+- прочитаете состояние базы из таблицы версий;
+- исправите ошибку добавления столбца в заполненную таблицу с помощью `DEFAULT`;
+- напишете четвёртую миграцию и проверите её тестами.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| файл миграции | SQL-файл с номером, изменяющий схему | migration file |
+| goose | инструмент, сравнивающий файлы с применёнными версиями в базе | goose |
+| неудачная миграция | невыполненное изменение, откатившееся в обычной транзакции | failed migration |
+
+**ALTER TABLE** меняет структуру существующей таблицы. **`\dt`** выводит список таблиц в psql.
+Здесь схема означает структуру таблиц; `public` — именованная схема, в которой находятся таблицы.
+
+## Что нужно знать заранее
+
+- [GB-5.05 · Go → Postgres](/lab/youtube/gb/gb-5-05/ru): адрес подключения и `pgx.ErrNoRows`.
+- [GB-5.03 · SQL-таблица](/lab/youtube/gb/gb-5-03/ru): `products`, типы, `NOT NULL`, `CHECK`, `DEFAULT`.
+- [GB-5.04 · Связанные таблицы и NULL](/lab/youtube/gb/gb-5-04/ru): `orders`, `order_items`, `REFERENCES`, отличие NULL от пустой строки.
+- [GB-5.02 · Лаборатория Postgres](/lab/youtube/gb/gb-5-02/ru): Compose, volume, порт и `psql`.
+- [GB-3.03 · Инструменты команды](/lab/youtube/gb/gb-3-03/ru): `go install`, `PATH`.
+- [GB-2.06 · Пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-1.02 · Переменная](/lab/youtube/gb/gb-1-02/ru), [GB-1.08 · Тест](/lab/youtube/gb/gb-1-08/ru): модуль, `var`, `go test`.
+
+Нужны Docker, Compose и Go 1.27.4. Go Playground не выполняет этот опыт с Postgres.
+Работайте во временной копии папки курса `lessons/gb-5-06-goose-migratsiya`.
+В исходной папке третья миграция уже исправлена. Для повторения видео уберите `00003_orders_status.sql` только из копии; ниже мы создадим его заново.
+Убедитесь, что порт `5486` свободен; иначе измените порт Compose в копии и оба адреса подключения.
+
+Все следующие команды выполняются в одном терминале, в этой копии. `export` экспортирует значения в окружение следующих команд.
+`COMPOSE_PROJECT_NAME` отделяет эксперимент от других проектов. Здесь имя `gb506docs`; в видео — `bozor`, в исходной папке — `gb506`.
+`CGO_ENABLED=0` собирает без внешнего C-компилятора. `GOTOOLCHAIN` задаёт версию Go.
+Имена в данных вымышленные; `bozor-lab` — пароль только для локальной лаборатории.
+
+```bash
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+export COMPOSE_PROJECT_NAME=gb506docs
+```
+
+Вопрос из предыдущего урока: строка для `Get(ctx, 99)` не найдена. Что вернёт `Scan`?
+**A)** `pgx.ErrNoRows` · **B)** `nil` и пустой `Product` · **C)** `panic`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `pgx.ErrNoRows`, текст — `no rows in result set` («в результате нет строк»). Store превращает её в свой `ErrNotFound`. Отсутствие строки не означает успех или `panic`.
+
+</details>
+
+## Повторный запуск SQL-файла вручную
+
+`docker compose up -d --wait` запускает базу в фоне и ждёт готовности.
+`exec db psql` запускает клиент в контейнере `db`. `-f` читает указанный файл; `/lab/` — путь к нашей копии внутри контейнера.
+Сначала создайте начальное состояние видео:
+
+```console
+$ docker compose up -d --wait
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Creating 
+ Volume gb506docs_pgdata Creating 
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Created 
+ Volume gb506docs_pgdata Created 
+ Network gb506docs_default Created 
+ Network gb506docs_default Created 
+ Container gb506docs-db-1 Creating 
+ Container gb506docs-db-1 Created 
+ Container gb506docs-db-1 Starting 
+ Container gb506docs-db-1 Started 
+ Container gb506docs-db-1 Waiting 
+ Container gb506docs-db-1 Healthy 
+```
+
+```console
+$ docker compose exec db psql -f /lab/products.sql -f /lab/orders.sql
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+```
+
+`Creating`, `Created`, `Starting`, `Started`, `Waiting`, `Healthy` — этапы от создания до готовности.
+`Network` — сеть проекта, `Volume` — хранилище данных базы. Повторяющиеся строки прогресса тоже взяты из реального вывода.
+`CREATE TABLE` означает, что таблица создана. `INSERT 0 4` — записаны четыре строки; `0` — неиспользуемое здесь поле OID.
+
+Что будет при повторном выполнении `orders.sql`? **A)** две таблицы пересоздадутся · **B)** две ошибки «таблица уже существует» · **C)** goose запишет новую версию.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Эти имена уже заняты для `CREATE TABLE`. Goose ещё не вызывался; выполнение файла через psql не записывает версию.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/orders.sql
+psql:/lab/orders.sql:5: ERROR:  relation "orders" already exists
+psql:/lab/orders.sql:12: ERROR:  relation "order_items" already exists
+```
+
+`orders.sql:5` и `:12` — строки файла. `relation … already exists` означает, что таблица с таким именем уже есть.
+Код выхода этого вызова — `0`: psql обычно продолжает после SQL-ошибки. Для автоматизации используйте `-v ON_ERROR_STOP=1`, чтобы остановиться при ошибке.
+Очистите только эту экспериментальную базу: `down -v` удаляет контейнер, сеть и именованный volume. Следующий `up` создаёт пустую базу.
+
+```console
+$ docker compose down -v
+ Container gb506docs-db-1 Stopping 
+ Container gb506docs-db-1 Stopped 
+ Container gb506docs-db-1 Removing 
+ Container gb506docs-db-1 Removed 
+ Volume gb506docs_pgdata Removing 
+ Network gb506docs_default Removing 
+ Volume gb506docs_pgdata Removed 
+ Network gb506docs_default Removed 
+```
+
+```console
+$ docker compose up -d --wait
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Creating 
+ Volume gb506docs_pgdata Creating 
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Created 
+ Volume gb506docs_pgdata Created 
+ Network gb506docs_default Created 
+ Network gb506docs_default Created 
+ Container gb506docs-db-1 Creating 
+ Container gb506docs-db-1 Created 
+ Container gb506docs-db-1 Starting 
+ Container gb506docs-db-1 Started 
+ Container gb506docs-db-1 Waiting 
+ Container gb506docs-db-1 Healthy 
+```
+
+`Stopping`, `Stopped`, `Removing`, `Removed` — остановка и удаление. Не удаляйте рабочую базу ради обновления схемы.
+
+## Файлы миграций и goose
+
+Каждое изменение — отдельный **файл миграции**. Номер задаёт порядок; goose сравнивает файлы с версиями в базе.
+
+| До | Действие | После |
+|---|---|---|
+| файлы 1, 2; в базе начальная 0 | `goose up` | 1, 2 применены; версия 2 |
+| файлы 1, 2; в базе 1, 2 | `goose up` | без изменений |
+| файлы 1, 2, 3; в базе 1, 2 | `goose up` | выполняется только 3 |
+
+Установите точную версию goose. В пути модуля `v3` — старшая версия, `cmd/goose` — пакет команды, `@v3.30.2` — устанавливаемая версия.
+`go install` записывает исполняемый файл в `GOBIN`, а если он не задан — обычно в `~/go/bin`. Эта папка должна быть в `PATH`.
+
+```console
+$ go install github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+```console
+$ goose -version
+goose version: v3.30.2
+```
+
+При этом повторном запуске установка ничего не вывела; первый запуск может печатать сообщения о загрузке. `-version` показывает установленную версию.
+Goose нужны три значения: `GOOSE_DRIVER` — тип базы; `GOOSE_DBSTRING` — адрес подключения; `GOOSE_MIGRATION_DIR` — папка файлов.
+Один `export` может задать несколько значений.
+
+```bash
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:5486/bozor
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5486/bozor
+```
+
+`DATABASE_URL` читают последующие Go-тесты; goose использует свой `GOOSE_DBSTRING`.
+Части URL: `bozor` — пользователь, `bozor-lab` — пароль лаборатории, `localhost:5486` — адрес и порт, последний `bozor` — имя базы.
+`ls migrations` перечисляет файлы:
+
+```console
+$ ls migrations
+00001_products.sql
+00002_orders.sql
+```
+
+```sql filename="migrations/00001_products.sql" showLineNumbers
+-- +goose Up
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text    NOT NULL UNIQUE CHECK (name <> ''),
+    price  bigint  NOT NULL CHECK (price > 0),
+    stock  integer NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    active boolean NOT NULL DEFAULT true
+);
+
+-- +goose Down
+DROP TABLE products;
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | В SQL `--` — комментарий; для goose `-- +goose Up` начинает раздел применения |
+| 2 | `CREATE TABLE products (` открывает определение таблицы и столбцов |
+| 3–5 | `id` — большое целое число; база выдаёт номер; первичный ключ делает его уникальным |
+| 6 | `name` — текст; NULL, повторы и пустой текст запрещены |
+| 7 | `price` — большое целое число в тийинах; NULL и неположительные значения запрещены |
+| 8 | `stock` — целое число, по умолчанию 0; отрицательное значение и NULL запрещены |
+| 9 | `active` — логическое значение, по умолчанию true; NULL запрещён |
+| 10 | `);` завершает определение таблицы и SQL-команду |
+| 12–13 | `Down` начинает раздел отката; `DROP TABLE` удаляет таблицу |
+
+`<>` означает «не равно»; `''` — пустой текст. Второй файл создаёт связанные таблицы:
+
+```sql filename="migrations/00002_orders.sql" showLineNumbers
+-- +goose Up
+CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer text   NOT NULL,
+    note     text
+);
+CREATE TABLE order_items (
+    id         bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id   bigint  NOT NULL REFERENCES orders (id),
+    product_id bigint  NOT NULL REFERENCES products (id),
+    quantity   integer NOT NULL CHECK (quantity > 0),
+    unit_price bigint  NOT NULL CHECK (unit_price > 0)
+);
+
+-- +goose Down
+DROP TABLE order_items;
+DROP TABLE orders;
+```
+
+Строки 2–6: `orders` хранит заказы; `customer` — имя клиента, `note` — необязательная заметка.
+Строки 7–13: `order_items` хранит позиции; `order_id` и `product_id` — внешние ключи, задающие ссылки на заказы и товары.
+Количество `quantity` и цена единицы `unit_price` должны быть положительными.
+Строки 15–17: сначала удаляется ссылающаяся таблица `order_items`, затем `orders`. Первая миграция откатывается после второй.
+
+## Состояние, Up и таблица версий
+
+`goose status` показывает состояние каждого файла. `Applied At` — время применения; `Migration` — файл.
+`Pending` означает «ещё не применён». Все блоки console ниже выполнены заново; префиксы даты сохранены точно.
+
+```console
+$ goose status
+2026/11/27 20:34:28     Applied At                  Migration
+2026/11/27 20:34:28     =======================================
+2026/11/27 20:34:28     Pending                  -- 00001_products.sql
+2026/11/27 20:34:28     Pending                  -- 00002_orders.sql
+```
+
+`goose up` выполняет неприменённые файлы по номерам. Какие выполнятся в этой пустой базе?
+**A)** только 2 · **B)** сначала 1, затем 2 · **C)** ни один.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Оба имеют статус `Pending`. Последний номер обозначает новейшую версию, а не указание выполнить только этот файл.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00001_products.sql (8.94ms)
+2026/11/27 20:34:28 OK   00002_orders.sql (9.83ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 2
+```
+
+`OK` означает, что файл применён; в скобках длительность, `ms` — миллисекунды. Последняя строка сообщает текущую версию базы: `2`.
+`psql -c` выполняет одну команду. `\dt` перечисляет таблицы:
+
+```console
+$ docker compose exec db psql -c '\dt'
+              List of tables
+ Schema |       Name       | Type  | Owner 
+--------+------------------+-------+-------
+ public | goose_db_version | table | bozor
+ public | order_items      | table | bozor
+ public | orders           | table | bozor
+ public | products         | table | bozor
+(4 rows)
+```
+
+`Schema` — именованная группа (`public`); `Name` — имя таблицы; `Type` — `table` («таблица»); `Owner` — владелец.
+Есть три таблицы проекта и таблица goose `goose_db_version`. `(4 rows)` — четыре строки результата.
+Прочитайте версии, упорядочив записи по `id`:
+
+```console
+$ docker compose exec db psql -c 'SELECT id, version_id, is_applied FROM goose_db_version ORDER BY id'
+ id | version_id | is_applied 
+----+------------+------------
+  1 |          0 | t
+  2 |          1 | t
+  3 |          2 | t
+(3 rows)
+```
+
+`id` — ключ записи; `version_id` — номер миграции; `t` в `is_applied` означает true, «применена».
+`0` — начальная запись goose, а не файл миграции. Поэтому двум файлам соответствуют три записи.
+
+Повторите тот же `goose up`. **A)** ошибка существующей таблицы · **B)** без изменений · **C)** таблицы пересоздадутся.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Goose видит, что обе версии применены. Ответ A относится к повторному SQL-файлу вручную; C означал бы потерю данных.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 goose: no migrations to run. current version: 2
+```
+
+`no migrations to run` означает, что новых файлов нет. При таком управлении схемой `up` можно повторять при каждом deploy.
+Это не гарантирует исправление схемы, изменённой вручную, или координацию нескольких одновременных deploy.
+
+## Ошибка NOT NULL в заполненной таблице
+
+`seed.sql` добавляет четыре товара, три заказа и четыре позиции заказов:
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+`N` в каждом `INSERT 0 N` — число записанных строк.
+Заказу нужен статус. `goose create` создаёт шаблон; `-s` выбирает последовательный номер, `orders_status` — имя, `sql` — тип файла.
+Без `-s` имя начинается с метки времени; выберите один способ для проекта.
+
+```console
+$ goose create -s orders_status sql
+2026/11/27 20:34:28 Created new file: migrations/00003_orders_status.sql
+```
+
+```console
+$ ls migrations
+00001_products.sql
+00002_orders.sql
+00003_orders_status.sql
+```
+
+`Created new file` означает, что новый файл создан. Замените примерные `SELECT` в шаблоне. Сначала намеренно ошибочный вариант:
+
+```sql
+-- +goose Up
+ALTER TABLE orders ADD COLUMN status text NOT NULL;
+
+-- +goose Down
+ALTER TABLE orders DROP COLUMN status;
+```
+
+Строка 1 — Up. Строка 2: `ALTER TABLE orders` меняет существующую таблицу; `ADD COLUMN` добавляет текстовый столбец `status`.
+`NOT NULL` запрещает NULL. Строки 4–5 — Down; `DROP COLUMN` удаляет столбец.
+Если не задать `DEFAULT`, существующие строки получают NULL в новом столбце. NULL отличается от пустого текста.
+
+Уже есть три заказа. Что произойдёт? **A)** статус станет `''` · **B)** база откажет · **C)** NULL будет принят.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Три существующие строки получили бы NULL, что запрещено `NOT NULL`. Для A пустой текст нигде не задан; C противоречит ограничению.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 goose run: ERROR 00003_orders_status.sql: failed to run SQL migration: failed to execute SQL query "ALTER TABLE orders ADD COLUMN status text NOT NULL;": ERROR: column "status" of relation "orders" contains null values (SQLSTATE 23502)
+```
+
+Код выхода goose — `1`. `ERROR 00003_orders_status.sql` называет файл; далее показан невыполненный SQL.
+`column "status" of relation "orders" contains null values` означает, что столбец status таблицы orders содержит NULL.
+`SQLSTATE 23502` — код Postgres `not_null_violation`, нарушение NOT NULL.
+
+**Транзакция** сохраняет либо все свои команды, либо ни одной. Подробнее в [GB-5.07](/lab/youtube/gb/gb-5-07/ru).
+Обычно goose выполняет каждый файл в одной транзакции. Это не одна транзакция на все файлы одного `up`.
+
+| Этап | Файлы 1–2 | Файл 3 | orders.status |
+|---|---|---|---|
+| до ошибки | сохранены | не начат | отсутствует |
+| ошибка | сохранены | откатывается | отсутствует |
+| следующая попытка | не выполняются снова | выполняется снова | зависит от успеха |
+
+Промежуточный вопрос: что с `orders` после ошибки? **A)** status есть с NULL · **B)** status отсутствует · **C)** таблица изменена частично.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Изменение этого файла не сохранено. Здесь `ALTER TABLE` тоже выполняется атомарно; в файле с несколькими командами транзакция откатывает и предыдущие команды.
+
+</details>
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders LIMIT 1'
+ id | customer | note 
+----+----------+------
+  1 | Dilnoza  | 
+(1 row)
+```
+
+```console
+$ goose status
+2026/11/27 20:34:28     Applied At                  Migration
+2026/11/27 20:34:28     =======================================
+2026/11/27 20:34:28     Fri Nov 27 15:34:28 2026 -- 00001_products.sql
+2026/11/27 20:34:28     Fri Nov 27 15:34:28 2026 -- 00002_orders.sql
+2026/11/27 20:34:28     Pending                  -- 00003_orders_status.sql
+```
+
+Есть только `id`, `customer`, `note`. `00003` остаётся `Pending`.
+Дата `Applied At` зависит от часового пояса базы, префикс строки — от окружения CLI; здесь они отличаются.
+С `-- +goose NO TRANSACTION` обычная гарантия не действует: команды до ошибки могут сохраниться.
+В файлах этого урока такой аннотации нет.
+
+## Исправляем неприменённый файл
+
+Правило: не меняйте миграцию, уже применённую к любой базе. Goose не проверяет изменение содержимого и сам не выполнит её заново.
+Иначе разные базы получат разные схемы под одним номером. Для изменения создавайте новый файл с новым номером.
+Этот третий файл ещё ни к одной базе не применён, поэтому исправим его:
+
+```sql filename="migrations/00003_orders_status.sql" showLineNumbers
+-- +goose Up
+ALTER TABLE orders
+    ADD COLUMN status text NOT NULL DEFAULT 'yangi' CHECK (status <> '');
+
+-- +goose Down
+ALTER TABLE orders DROP COLUMN status;
+```
+
+Новое — строка 3. `DEFAULT 'yangi'` задаёт значение и существующим заказам, и новым записям без явно указанного статуса.
+`yangi` означает «новый». `CHECK (status <> '')` запрещает пустой текст; это отдельное от `NOT NULL` правило.
+Сколько файлов теперь применится? **A)** все три · **B)** только 3 · **C)** ни одного.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Первые два файла сохранены. Третий после ошибки остался неприменённым; исправление позволяет повторить попытку.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.12ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 3
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer, status FROM orders'
+ id | customer | status 
+----+----------+--------
+  1 | Dilnoza  | yangi
+  2 | Jasur    | yangi
+  3 | Malika   | yangi
+(3 rows)
+```
+
+У всех трёх существующих заказов статус `yangi`. Этот запрос не гарантирует порядок: если он нужен, добавьте `ORDER BY id`.
+
+Времена из видео ниже **цитируются**; рядом измерения, повторённые для этой страницы.
+
+| Действие | Видео, ms | Этот запуск, ms | Этот / видео |
+|---|---|---|---|
+| Up 00001 | 10.27 | 8.94 | 0.87× |
+| Up 00002 | 7.37 | 9.83 | 1.33× |
+| Up 00003 | 7.18 | 4.12 | 0.57× |
+| Down 00003 | 5.05 | 4.71 | 0.93× |
+
+На загруженном компьютере миллисекунды меняются. Отношения показывают различие одного запуска, а не гарантию производительности.
+Существенно поведение: выполнен только нужный файл, ошибка не сохранила изменение, повторная попытка сработала.
+
+## Down: откат последней миграции
+
+`goose down` выполняет раздел `Down` последней применённой миграции. Сколько файлов откатится при версии 3?
+**A)** все · **B)** последний · **C)** ни одного.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Только `DROP COLUMN status` из файла 3. `docker compose down -v` удаляет всю экспериментальную базу; goose down выполняет этот SQL.
+
+</details>
+
+```console
+$ goose down
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.71ms)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders LIMIT 1'
+ id | customer | note 
+----+----------+------
+  1 | Dilnoza  | 
+(1 row)
+```
+
+`status` отсутствует, прежние три столбца на месте. `DROP COLUMN` удаляет и данные статуса; Down не заменяет резервную копию.
+В рабочей базе часто пишут новую исправляющую миграцию. Down удобен при разработке и тестировании.
+Повторите `up`: файл 3 применится снова, статусы снова получат DEFAULT.
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.02ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 3
+```
+
+## Глубже (необязательно): SQL внутри binary
+
+На сервере может не быть отдельной команды goose. Go умеет включать файлы в binary при компиляции.
+Фрагмент `migrate.go`; это не отдельная программа:
+
+```go
+//go:embed migrations/*.sql
+var files embed.FS
+```
+
+Строка 1 — директива `//go:embed`. `migrations/*.sql` выбирает SQL-файлы этой папки; `*` — переменная часть имени.
+Строка 2 объявляет переменную `files` типа `embed.FS` через `var`. Этот тип позволяет читать встроенные файлы; полный файл импортирует `embed`.
+
+SQL-файлы с номерами распространяются вместе с binary. При изменении файла binary нужно пересобрать.
+`NewProvider` из папки использует goose как библиотеку и координирует несколько экземпляров с помощью сессионной блокировки Postgres.
+API библиотеки и вызов при deploy разбираются в [GB-8.06](/lab/youtube/gb#gb-8-06); сейчас готовый `migrate.go` используется через тесты.
+
+## Частые ошибки
+
+1. **Редактировать применённый файл.** Goose видит версию, а не изменение содержимого. Второй `up` выше не обнаружит новую работу. Исправление: новый файл с новым номером.
+2. **NOT NULL без DEFAULT в заполненной таблице.** Полная ошибка `23502` показана выше; `DEFAULT 'yangi'` в `00003` задаёт значение существующим строкам.
+3. **Считать NULL и пустой текст одинаковыми.** `NOT NULL` не запрещает `''`. Добавьте `CHECK (status <> '')`.
+4. **Ожидать восстановления данных от Down.** `DROP COLUMN` удаляет прежние статусы. Повторный Up восстанавливает только DEFAULT.
+5. **Считать ошибку одного файла откатом всех файлов.** После ошибки файла 3 файлы 1 и 2 остаются применёнными. Граница транзакции — один файл.
+
+## Проверьте себя
+
+**1.** Где goose хранит применённые версии? Почему двум файлам соответствуют три записи?
+
+<details>
+<summary>Ответ</summary>
+
+В `goose_db_version`. `0` — начальная запись, `1` и `2` — версии файлов.
+
+</details>
+
+**2.** Почему неудачная миграция не оставляет таблицу изменённой частично? Каково исключение?
+
+<details>
+<summary>Ответ</summary>
+
+Обычно один файл выполняется в одной транзакции. При ошибке откатывается этот файл. `NO TRANSACTION` отключает защиту.
+
+</details>
+
+**3.** Версия 3. `goose down`, затем `goose up`. **A)** заново выполняются 1–3 · **B)** откатывается и применяется только 3 · **C)** up выдаёт ошибку.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Down откатывает последний файл; Up снова видит неприменённый файл 3. Прежние данные статуса не возвращаются.
+
+</details>
+
+**4.** Из GB-5.03: сохранится ли строка с ценой `0` при `CHECK (price > 0)`?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Условие ложно; база отклонит строку с ошибкой нарушения CHECK.
+
+</details>
+
+## Домашнее задание
+
+🟢 **Напишите одну миграцию.** Выполните [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-06-goose-migratsiya/TASK.md) из [папки курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya):
+
+1. Создайте `migrations/00004_products_category.sql`; `goose create -s products_category sql` тоже создаёт шаблон.
+2. Up: `products.category` типа `text`, `NOT NULL DEFAULT 'boshqa'`, `CHECK (category <> '')`.
+3. Down: удалите этот столбец. Не меняйте `00001`–`00003` и `migrate_test.go`.
+
+Убранный для повторения видео третий файл теперь должен содержать исправление. Пока проверьте тест стартового варианта:
+
+```console
+$ CGO_ENABLED=0 go test .
+--- FAIL: TestCategoryMigration (0.01s)
+    migrate_test.go:171: 4-migratsiya yoʻq: migrations/ papkasida 00004_ bilan boshlanadigan .sql fayl yarating (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.136s
+FAIL
+```
+
+Это ожидаемая ошибка: `migrate_test.go:171` сообщает об отсутствии четвёртого файла.
+В чистой временной схеме тест применяет 1–3, записывает товары, применяет 4, проверяет DEFAULT и CHECK, делает Down и снова Up.
+В конце эта схема удаляется; данные `public` не затрагиваются. Без PostgreSQL тест не пропускается, а сообщает ошибку подключения.
+Добавив файл, работайте до успешного `CGO_ENABLED=0 go test .`. Содержимое применённых файлов тоже проверяется.
+Откройте [ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya/solution) после своей попытки.
+
+<details>
+<summary>Ответ</summary>
+
+Повторите форму `00003` с другим именем таблицы и столбца. `boshqa` означает «другое», стандартную категорию:
+
+```sql filename="solution/migrations/00004_products_category.sql" showLineNumbers
+-- +goose Up
+ALTER TABLE products
+    ADD COLUMN category text NOT NULL DEFAULT 'boshqa' CHECK (category <> '');
+
+-- +goose Down
+ALTER TABLE products DROP COLUMN category;
+```
+
+`DEFAULT` заполняет существующие товары. `NOT NULL` запрещает NULL, CHECK — пустой текст.
+Down удаляет столбец; следующий Up снова задаёт DEFAULT. Тест проверяет именно эти состояния.
+
+</details>
+
+Для отдельной проверки ответа перейдите в папку командой `cd solution`. Следующая команда выполнена внутри solution:
+
+```console
+$ CGO_ENABLED=0 go test .
+ok  	github.com/abdurahmon27/bozor	0.225s
+```
+
+`ok` означает, что тесты прошли; далее путь модуля и время в секундах. Перед очисткой вернитесь в корень экспериментальной копии.
+В конце удалите контейнер и volume:
+
+```console
+$ docker compose down -v
+ Container gb506docs-db-1 Stopping 
+ Container gb506docs-db-1 Stopped 
+ Container gb506docs-db-1 Removing 
+ Container gb506docs-db-1 Removed 
+ Volume gb506docs_pgdata Removing 
+ Network gb506docs_default Removing 
+ Volume gb506docs_pgdata Removed 
+ Network gb506docs_default Removed 
+```
+
+## Источники
+
+- [goose](https://pressly.github.io/goose/): инструмент миграций; [команды CLI](https://pressly.github.io/goose/documentation/cli-commands/), [переменные окружения](https://pressly.github.io/goose/documentation/environment-variables/).
+- [SQL-аннотации и транзакции](https://pressly.github.io/goose/documentation/annotations/): Up, Down, NO TRANSACTION.
+- [Исходный код goose v3.30.2](https://github.com/pressly/goose/tree/v3.30.2): `internal/sqlparser/parser.go`, `create.go`, таблица версий и транзакции.
+- [go install](https://pkg.go.dev/cmd/go#hdr-Compile_and_install_packages_and_dependencies), [embed](https://pkg.go.dev/embed).
+- [pgx.ErrNoRows](https://pkg.go.dev/github.com/jackc/pgx/v5#pkg-variables).
+- PostgreSQL 18: [CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html), [INSERT](https://www.postgresql.org/docs/18/sql-insert.html), [ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html), [коды ошибок](https://www.postgresql.org/docs/18/errcodes-appendix.html), [psql](https://www.postgresql.org/docs/18/app-psql.html).
+- [Docker Compose down](https://docs.docker.com/reference/cli/docker/compose/down/).
+- [README курса и записанные выводы видео](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya).
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, goose `v3.30.2`, pgx `v5.13.0`, PostgreSQL `18.7`, Docker Compose `5.4.0`, 2026-11-27.
+Только времена видео цитируются; остальные выводы console получены заново для этой страницы.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya)
+
+---
+
+← Предыдущий урок: [GB-5.05](/lab/youtube/gb/gb-5-05/ru) · Следующий урок: [GB-5.07](/lab/youtube/gb/gb-5-07/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>
