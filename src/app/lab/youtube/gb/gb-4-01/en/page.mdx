@@ -1,0 +1,763 @@
+---
+title: "An HTTP request is text: one exchange with curl -v"
+date: "2026/11/27"
+description: "Read an HTTP request and response in curl -v output: method, path, headers, status code, body, Content-Length and the 415 error; then write parseRequestLine in Go."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-01) · [Русский](/lab/youtube/gb/gb-4-01/ru) · **English**  
+Lesson GB-4.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The bozor catalog now lives on a server. A phone app asked for product number 99 and got an error instead of an answer. The reason is written in the two texts that the app
+and the server exchanged. Today we read those two texts.
+
+**One idea:** an HTTP exchange is two texts. The client sends the request text, the server returns the response text. Both have the same shape: a first line, headers of the form `name: value`,
+an empty line, a body. The first line of a request is `method path version`; the first line of a response is `version status-code reason`. The first digit of the status code names the class:
+`2xx` — success, `4xx` — the error is in the request, `5xx` — the error is on the server. `Content-Type` says what format the body has, `Content-Length` says how long it is, in **bytes**.
+
+By the end of the lesson you will:
+
+- read a request's method, path and headers, and a response's status code, headers and body in `curl -v` output;
+- send the same request by hand with `printf` and `nc`: curl sends exactly this text;
+- explain why `Content-Length` counts bytes, not characters, and why the server returns `415` when `-H` is missing;
+- write two Go functions, `parseRequestLine` (splits a request line) and `statusClass` (names a status class), and make `go test` pass.
+
+Three core new words today:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| request and response (HTTP exchange) | the text the client sends and the text the server returns | HTTP exchange (request, response) |
+| status code | the three-digit number on the first line of a response: how the request ended | status code |
+| header | an extra line of the form `name: value`: it says how to read the body | header |
+
+Helper words: **client** and **server**, **body** (the main part of a message), `curl` (a program that sends requests from the terminal), `printf` with `nc` (sending a request by hand).
+
+## Before you start
+
+This lesson builds on [GB-3.06 · Checkpoint: bozor CLI v0](/lab/youtube/gb#gb-3-06): the bozor catalog, `bozor.json` and the `Price` field. You also need:
+
+- [GB-3.02 · JSON and struct tags](/lab/youtube/gb/gb-3-02/en): `int64` becomes a number in JSON, `Product` fields become JSON keys.
+- [GB-2.10 · UTF-8: byte, rune and Uzbek text](/lab/youtube/gb/gb-2-10/en): the character `ʻ` is one character but two bytes.
+- [GB-1.03 · Integers and money](/lab/youtube/gb/gb-1-03/en): `int64` and tiyin.
+- [GB-1.07 · Functions and your first error](/lab/youtube/gb/gb-1-07/en): a function that returns `(result, error)` and `if err != nil`.
+- [GB-1.08 · First test: go test](/lab/youtube/gb/gb-1-08/en): `go test` and `tekshiruv_test.go`.
+- [GB-3.01 · Files, bufio and io.Reader](/lab/youtube/gb/gb-3-01/en): splitting text with `strings.Split`.
+- [GB-3.04 · Generics: when a type parameter helps](/lab/youtube/gb/gb-3-04/en): the question at the end comes from there.
+
+**How to run the code.** The lesson's code is in a folder of the course repository:
+[lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn). Download it and open the terminal in that folder
+(`cd` moves the terminal to another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-01-http-matn
+```
+
+The folder has the starter `main.go` (the task is there), `tekshiruv_test.go` (checks the task), `TASK.md` (the assignment), `solution/` (the answer) and `_video/server/main.go`.
+The last one is the **server** from the video: the bozor catalog over HTTP. We do not look at its code in this lesson; you will write it yourself in [GB-4.04 · The first server, line by line](/lab/youtube/gb#gb-4-04).
+For now it is a black box: we only send it requests with `curl`. Start the server in a separate terminal and leave it running during the lesson:
+
+```bash
+go run ./_video/server
+```
+
+If the port is busy, pass the address as an argument (`go run ./_video/server localhost:9000`) and replace `8765` in the commands below. The module is written for Go 1.27 (`go 1.27` in `go.mod`):
+if you have an older Go, `go` downloads the needed version itself. Results come from `go1.27.4 linux/amd64`, with `CGO_ENABLED=0` and `curl 8.22.0`. I also re-ran every command from the video
+against this server; I point out differences, such as the `Date` line, where they appear.
+
+One question from the previous module. bozor stores the catalog in a JSON file. `Product`'s `Price` field is an `int64` with the value `1_200_000` tiyin. How is the price written in JSON?
+
+**A)** `"price": 1200000` · **B)** `"price": "1200000"` · **C)** `"price": "1 200 000"`
+
+<details>
+<summary>Answer</summary>
+
+**A: a number without quotes.** `int64` becomes a number in JSON, not a string ([GB-3.02](/lab/youtube/gb/gb-3-02/en)). A string would be in quotes, for example `"olma"` ("apple").
+If you chose **B**, you took the number for a string; **C** — a JSON number has no spaces. The server sends the app exactly this JSON; today we will see it inside a response.
+
+</details>
+
+Today there are three things. The first is the exchange: what parts a request and a response have. The second is the status code: how the request ended and on whose side the error is.
+The third is headers: they say how to read the body.
+
+## Client, server and address
+
+The catalog server is a program that accepts requests and returns responses. It runs on this same computer. The side that sends a request (for example, a phone app) is called the **client**.
+The rules of their conversation are the **HTTP protocol**: they define how a request and a response are written.
+
+The server's address is one line: `http://localhost:8765/products/1`.
+
+| Part | Meaning |
+|---|---|
+| `http://` | the protocol: client and server talk by HTTP rules |
+| `localhost` | this same computer |
+| `:8765` | the **port**: the network number of one program on the computer; the server listens on this number |
+| `/products/1` | the **path**: what is wanted — product number 1 (`products` — "products") |
+
+## The first request: curl -v
+
+We send it a request with `curl`. `curl` is a client program that sends HTTP requests from the terminal. The `-v` flag (verbose) also shows the lines that were sent and received.
+In this terminal, against the server (I started it myself, used it, and stopped it):
+
+```console
+$ curl -v http://localhost:8765/products/1
+* Host localhost:8765 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:8765...
+* connect to ::1 port 8765 from ::1 port 45334 failed: Connection refused
+*   Trying 127.0.0.1:8765...
+* Established connection to localhost (127.0.0.1 port 8765) from 127.0.0.1 port 41116 
+* using HTTP/1.x
+> GET /products/1 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+* Request completely sent off
+< HTTP/1.1 200 OK
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:46 GMT
+< Content-Length: 49
+< 
+* Connection #0 to host localhost:8765 left intact
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+The output has three kinds of lines:
+
+| Line starts with | What it is |
+|---|---|
+| `*` | information about the connection (address resolved, connection opened): not the HTTP text itself |
+| `>` | a line of the **request** that curl sent |
+| `<` | a line of the server's **response**; at the end the line without a mark is the body, the product itself |
+
+Here the server listens only on the IPv4 address (`127.0.0.1`): curl first tried `::1` (IPv6), was refused, and moved on to `127.0.0.1`. The `*` lines depend on the machine, so from now on I
+remove them (and curl's `[N bytes data]` lines); they are hidden in the video too. Everything else is unchanged. The `Date` value is different every time: `06:37:46` in the video, `07:22:46` GMT in my run.
+All steps ran within one second, so `Date` looks the same across consecutive commands.
+
+## The request text, line by line
+
+Only the `>` lines are the request itself:
+
+```http
+GET /products/1 HTTP/1.1
+Host: localhost:8765
+User-Agent: curl/8.22.0
+Accept: */*
+
+```
+
+The first line is the **request line**. It has three parts separated by a single space:
+
+| Part | Value | Meaning |
+|---|---|---|
+| **method** | `GET` | what to do: here "get" |
+| path | `/products/1` | what exactly is wanted |
+| protocol version | `HTTP/1.1` | HTTP, one point one |
+
+After it come the **headers**: each is a name, a colon, a value.
+
+| Line | Meaning |
+|---|---|
+| `Host: localhost:8765` | which server the request is addressed to |
+| `User-Agent: curl/8.22.0` | who sent the request: curl and its version |
+| `Accept: */*` | what kind of response it accepts: star, slash, star — any |
+
+At the end there is an **empty line**: it means "the headers are over". This request has no body, so nothing follows the empty line.
+
+## The response text, line by line
+
+Now the response — the `<` lines and the product below them:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:22:46 GMT
+Content-Length: 49
+
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+The first line is the **status line**. It also has three parts:
+
+| Part | Value | Meaning |
+|---|---|---|
+| protocol version | `HTTP/1.1` | HTTP, one point one |
+| **status code** | `200` | a three-digit number: how the request ended |
+| reason text | `OK` | a note for people; a program looks at the code and ignores the text |
+
+The headers are like in the request: name, colon, value.
+
+| Line | Meaning |
+|---|---|
+| `Content-Type: application/json` | the format of the body: `application/json` — JSON |
+| `Date: …` | when the server made the response, in Greenwich time (GMT) |
+| `Content-Length: 49` | how many **bytes** the body has: 49 |
+
+Then an empty line: the headers are over, the body begins. The body is the product itself: `{"id":1,"name":"olma","price":1200000,"stock":40}`. `price` is a number without quotes:
+the answer to the earlier question is visible right here.
+
+## Two texts, one shape
+
+The request and the response have the same shape:
+
+| Part | In the request | In the response |
+|---|---|---|
+| first line | `GET /products/1 HTTP/1.1` (method, path, version) | `HTTP/1.1 200 OK` (version, status code, reason) |
+| headers | `Host: …`, `User-Agent: …`, `Accept: …` | `Content-Type: …`, `Date: …`, `Content-Length: …` |
+| empty line | the headers are over | the headers are over |
+| body | none in this request | `{"id":1,…}` |
+
+Only the first line differs: method and path in the request, status code in the response. The receiver relies on this shape: it reads headers up to the empty line, then reads as many
+bytes of body as `Content-Length` says. A body may also be absent.
+
+## Writing it by hand: printf and nc
+
+curl only sends this text. We check that by hand, with one command of three parts:
+
+1. `printf` — a terminal command: prints the given text. `\r\n` inside the text is the line end: in HTTP every line ends with these two bytes (CR and LF).
+2. `|` (vertical bar) — passes the output of the left command to the command on the right.
+3. `nc` (netcat) — connects to the given host and port, sends the text it receives and prints the response.
+
+```console
+$ printf 'GET /products/1 HTTP/1.1\r\nHost: localhost:8765\r\nConnection: close\r\n\r\n' | nc localhost 8765
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:22:38 GMT
+Content-Length: 49
+Connection: close
+
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+The text inside single quotes goes to the command as one argument. It has three lines and an empty line at the end: the request line, `Host` and `Connection: close`
+(close the connection after the response). The result is the very response curl showed, with the server's `Connection: close` line added. No curl, only text.
+
+Why is `Connection: close` needed? Without it the server keeps the connection open, and `nc` keeps waiting even after the response. I checked this: with `timeout 3` (stops the program after 3 seconds)
+the response is printed, and then the command is stopped with exit code 124. This command is not in the course folder; I ran it myself:
+
+```console
+$ printf 'GET /products/1 HTTP/1.1\r\nHost: localhost:8765\r\n\r\n' | timeout 3 nc localhost 8765; echo " chiqish kodi: $?"
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:23:58 GMT
+Content-Length: 49
+
+{"id":1,"name":"olma","price":1200000,"stock":40} chiqish kodi: 124
+```
+
+`nc` programs differ: this is OpenBSD netcat, and the GNU variant may have different flags.
+
+## Status code: on whose side is the error
+
+The **status code** is the three-digit number on the first line of a response. Its first digit names the **class**:
+
+| Class | Meaning | Examples |
+|---|---|---|
+| `2xx` | success | `200 OK` — the requested thing came back; `201 Created` — something new was created |
+| `4xx` | the error is **in the request** | `400 Bad Request` — the request is malformed (for example, broken JSON); `404 Not Found` — the server found no such thing |
+| `5xx` | the error is **on the server** | `500 Internal Server Error` |
+
+There are also classes `1xx` and `3xx`; you will see them in the task.
+
+Predict. The app asked for product 99, but bozor has only two products. The request is well formed. What is on the first line of the response?
+
+**A)** `HTTP/1.1 200 OK`, empty body · **B)** `HTTP/1.1 404 Not Found` · **C)** `HTTP/1.1 400 Bad Request`
+
+<details>
+<summary>Answer</summary>
+
+**B: `404 Not Found`.** The request is well formed, so not `400`: there is simply no such product. If you chose **C**, you took "asked for something that does not exist" for "the request is broken";
+`400` comes when the request itself is wrong. If you chose **A**, you mixed the success class with an error: we do not return `2xx` for a thing that does not exist.
+
+</details>
+
+Here is that request: 99 at the end.
+
+```console
+$ curl -v http://localhost:8765/products/99
+> GET /products/99 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+< HTTP/1.1 404 Not Found
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 30
+< 
+{"error":"mahsulot topilmadi"}
+```
+
+The body is JSON too: under the `error` key is the error text (`"mahsulot topilmadi"` — "product not found"); the app takes it from here. The error from the start of the lesson was the same one. At work your app behaves like this:
+first it looks at the status code, then it reads the body. If the code is a success, the body is the data you need. If it is an error, the body is the error text.
+
+A short question. The app saw `503` on the first line of the response. On whose side is the error?
+
+**A)** in the request: the client made a mistake · **B)** on the server · **C)** cannot tell
+
+<details>
+<summary>Answer</summary>
+
+**B: on the server.** A `5xx` code says: the server made a mistake or could not carry out the request (`503` — "Service Unavailable", the service cannot answer right now). The first digit shows on whose side the error is,
+and the exact code shows what happened. **A** is the `4xx` class; **C** — you can tell, that is exactly what the class is for.
+
+</details>
+
+The server has another response too. The catalog knows only `GET /products/{id}` and `POST /products`. If we ask with another method, the server returns `405`. This is not in the video,
+it is in the course README; I ran it too (`-X` — you name the method yourself):
+
+```console
+$ curl -v -X DELETE http://localhost:8765/products/1
+> DELETE /products/1 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+< HTTP/1.1 405 Method Not Allowed
+< Allow: GET, HEAD
+< Content-Type: text/plain; charset=utf-8
+< X-Content-Type-Options: nosniff
+< Date: Fri, 27 Nov 2026 07:24:01 GMT
+< Content-Length: 19
+< 
+Method Not Allowed
+```
+
+`405` is also in the `4xx` class: the error is in the request (the path exists, but not with this method). The `Allow` header says which methods are possible.
+
+## Sending a body: POST and Content-Length
+
+Now the body is in the request itself. To add a new product the method is `POST`: it gives the server a body, and the server creates a new product from it. This body is the product's JSON.
+Two headers tell the body's format and its size in bytes: `Content-Type` and `Content-Length`.
+
+Here is the body:
+
+```json
+{"name":"oʻrik","price":3500000,"stock":5}
+```
+
+That is 42 characters: the curved mark (`ʻ`) in the letter `oʻ` of the word `oʻrik` ("plum") is also one character. Predict. The request header has `Content-Length`: it is the length of the body in **bytes**.
+The body is 42 characters. What will `Content-Length` be?
+
+**A)** 42 · **B)** 43 · **C)** 44
+
+<details>
+<summary>Answer</summary>
+
+**B: 43.** `Content-Length` counts bytes, not characters, and `ʻ` takes two bytes in UTF-8 ([GB-2.10](/lab/youtube/gb/gb-2-10/en)). If you chose **A**, you treated characters and bytes as the same;
+**C** — only one character is two bytes, not all of them. Let us check (this command is not in the course folder; `wc -m` counts characters in a UTF-8 locale, `wc -c` counts bytes):
+
+```console
+$ printf '{"name":"oʻrik","price":3500000,"stock":5}' | wc -m -c
+     42      43
+```
+
+</details>
+
+Here is the request. `-d` gives the body, `-H` adds a header: `Content-Type` says the body is JSON. Double quotes also wrap one argument. The server returned `201 Created`:
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' -H "Content-Type: application/json" http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 43
+> 
+< HTTP/1.1 201 Created
+< Content-Type: application/json
+< Location: /products/3
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 50
+< 
+{"id":3,"name":"oʻrik","price":3500000,"stock":5}
+```
+
+In the request: the first line is now `POST /products HTTP/1.1`, there are two new headers (`Content-Type`, `Content-Length: 43`), and after the empty line comes the body (curl does not show it with `>`).
+In the response: `201 Created` — a new product was created. The `Location` header names the new product's path: `/products/3`. In the body the product now has an `id`: the server gave it itself.
+The response's `Content-Length: 50`: there is `oʻ` here too, 49 characters and 50 bytes. In the video the `id` is 3, because the server had two products.
+
+## The classic mistake: Content-Type forgotten
+
+Predict. We send the same `POST` without `-H`: no header, the same JSON body. What does the server return?
+
+**A)** `201 Created` · **B)** `4xx`: the error is in the request · **C)** `5xx`: the error is on the server
+
+<details>
+<summary>Answer</summary>
+
+**B: `4xx`.** The body was right, the header was wrong: the server does not know which format arrived. If you chose **A**, you thought the server would guess — but it looks at `Content-Type`.
+**C** — the server made no mistake in its own work, the request was wrong.
+
+</details>
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Length: 43
+> Content-Type: application/x-www-form-urlencoded
+> 
+< HTTP/1.1 415 Unsupported Media Type
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 57
+< 
+{"error":"Content-Type application/json boʻlishi kerak"}
+```
+
+Without `-H`, curl puts in a `Content-Type` itself: `application/x-www-form-urlencoded` — a format for sending form fields as `name=value`, not JSON. The server returns `415`: the body type
+is not supported. It starts with `4`, so the error is in the request: the body was right, the header was not. In the response body the server wrote the reason.
+
+The fix is `Content-Type: application/json` with `-H`. Now the server returns `201`. The server remembers the previous successful `POST`, so this time the `id` is 4 and `Location: /products/4`:
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' -H "Content-Type: application/json" http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 43
+> 
+< HTTP/1.1 201 Created
+< Content-Type: application/json
+< Location: /products/4
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 50
+< 
+{"id":4,"name":"oʻrik","price":3500000,"stock":5}
+```
+
+## Common mistakes
+
+**1. "A response came back, so everything is fine."** Even if the error is `4xx` or `5xx`, the server sends a correct HTTP response: the connection worked, the text arrived. For curl this is a success:
+it ends with exit code 0 even on `404`. Only with the `-f` (`--fail`) flag does curl return exit code 22 when the status code is an error. I ran both:
+
+```console
+$ curl -s http://localhost:8765/products/99; echo " chiqish kodi: $?"
+{"error":"mahsulot topilmadi"} chiqish kodi: 0
+$ curl -sf http://localhost:8765/products/99; echo "chiqish kodi: $?"
+chiqish kodi: 22
+```
+
+(`-s` is silent mode: curl does not print its own progress messages.) The conclusion: look at the status code, not at the exit code or at "did a response come".
+
+**2. Forgetting `-H "Content-Type: application/json"`.** The result is `415 Unsupported Media Type`; how to read and fix it is shown above, in the section "The classic mistake: Content-Type forgotten".
+
+**3. Taking `Content-Length` for a character count.** The `oʻrik` product has 42 characters, but `Content-Length: 43`: the explanation is above, in the section "Sending a body: POST and Content-Length".
+
+**4. Forgetting `Connection: close` in `printf | nc`.** `nc` keeps waiting even after the response; in the `timeout 3` example above the exit code is 124.
+
+**5. Forgetting the line-ending `\r\n` in Go.** An HTTP line ends with `\r\n`. `strings.Split` does not remove them, so `Proto` stays `"HTTP/1.1\r\n"`. Here is the
+wrong version of `parseRequestLine`: one line was removed from the function in `solution/main.go` — `line = strings.TrimRight(line, "\r\n")`; the rest of the file (`Request`, `statusClass`, `main`) is the same. This folder is not
+in the course repository; I created it separately (`go.mod` and `tekshiruv_test.go` are the same as in the course):
+
+```go
+func parseRequestLine(line string) (Request, error) {
+	parts := strings.Split(line, " ")
+	if len(parts) != 3 {
+		return Request{}, fmt.Errorf("soʻrov qatori uch qismdan iborat boʻlishi kerak, hozir %d: %q", len(parts), line)
+	}
+	method, path, proto := parts[0], parts[1], parts[2]
+	if method == "" {
+		return Request{}, errors.New("method boʻsh")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return Request{}, fmt.Errorf("yoʻl / bilan boshlanishi kerak: %q", path)
+	}
+	if !strings.HasPrefix(proto, "HTTP/") {
+		return Request{}, fmt.Errorf("versiya HTTP/ bilan boshlanishi kerak: %q", proto)
+	}
+	return Request{Method: method, Path: path, Proto: proto}, nil
+}
+```
+
+```console
+$ go test .
+--- FAIL: TestVazifaParseRequestLine (0.00s)
+    --- FAIL: TestVazifaParseRequestLine/qator_oxiri_crlf (0.00s)
+        tekshiruv_test.go:43: parseRequestLine("GET /products/1 HTTP/1.1\r\n") = {Method:GET Path:/products/1 Proto:HTTP/1.1
+            }; kutilgan {Method:GET Path:/products/1 Proto:HTTP/1.1} (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaParseRequestLine/qator_oxiri_cr (0.00s)
+        tekshiruv_test.go:43: parseRequestLine("POST /products HTTP/1.1\r") = {Method:POST Path:/products Proto:HTTP/1.1}; kutilgan {Method:POST Path:/products Proto:HTTP/1.1} (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+How to read it: `tekshiruv_test.go:43` — the error is on line 43 of the test file; the left side is what the function returned, `kutilgan` ("expected") is what the test wanted. In the second case both sides look the same: the `\r` character
+is invisible in the terminal (it sits at the end of `Proto` on the left). In the first case the `\n` broke the line. The fix is `strings.TrimRight(line, "\r\n")`.
+
+## Check yourself
+
+**1.** What are the three parts of a request line?
+
+<details>
+<summary>Answer</summary>
+
+Method, path and protocol version: `GET`, `/products/1`, `HTTP/1.1`. The parts are separated by a single space.
+
+</details>
+
+**2.** Does `Content-Length` count characters or bytes?
+
+<details>
+<summary>Answer</summary>
+
+Bytes. The JSON of the `oʻrik` product has 42 characters and 43 bytes: `ʻ` takes two bytes in UTF-8, so `Content-Length: 43`.
+
+</details>
+
+**3.** From the previous module ([GB-3.04](/lab/youtube/gb/gb-3-04/en)): what is the `T` in square brackets of a generic function? For example, `func F[T any](…)`.
+
+<details>
+<summary>Answer</summary>
+
+A type parameter: a name for the type that the caller chooses. When `F` is called, a concrete type (the type argument) replaces `T`.
+
+</details>
+
+**4.** Predict: what does `go run ./solution` (in the answer folder) print? The program calls `parseRequestLine("GET /products/1 HTTP/1.1")`, then asks for the class of `404`.
+
+<details>
+<summary>Answer</summary>
+
+Two lines. The first is the three parts separated by spaces; the second is `404` and the class name. I ran it:
+
+```console
+$ go run ./solution
+GET /products/1 HTTP/1.1
+404 mijoz xatosi
+```
+
+`404` is the `4xx` class; `statusClass` names it `mijoz xatosi` ("client error"): the error is in the request.
+
+</details>
+
+## Homework
+
+The assignment is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-01-http-matn/TASK.md) in the course folder; the folder is
+[lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn). The level marks (🟢🟡) are not in the course folder: I added them.
+
+- 🟢 **Step 2, `statusClass(code int) string`.** Return the class name for a status code: `100–199` → `axborot`, `200–299` → `muvaffaqiyat`, `300–399` → `yoʻnaltirish`,
+  `400–499` → `mijoz xatosi`, `500–599` → `server xatosi`, anything else → `nomaʼlum`. The `ʻ` in `yoʻnaltirish` is U+02BB, the `ʼ` in `nomaʼlum` is U+02BC: copy both from `tekshiruv_test.go`.
+- 🟡 **Step 1, `parseRequestLine(line string) (Request, error)`.** Split `"GET /products/1 HTTP/1.1"` into `Request{"GET", "/products/1", "HTTP/1.1"}`. In three cases return `Request{}` and an error:
+  the line does not have **exactly three** parts separated by a space (empty line, two parts, four parts, two spaces in a row); the path does not start with `/`; the version does not start with `HTTP/`.
+  `?limit=2` stays inside the path. The `\r` and `\n` at the end of the line must not enter the parts (`strings.TrimRight(line, "\r\n")`).
+- 🟢 **Extra (no test).** Start the server and give `parseRequestLine` the first `>` line of the `curl -v http://localhost:8765/products/1` output.
+
+The starter `main.go` — the task is here. You write only the bodies of two functions:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+// Request — HTTP soʻrovning birinchi qatoridan olingan uch qism (curl -v'dagi "> GET /products/1 HTTP/1.1").
+type Request struct {
+	Method string // "GET"
+	Path   string // "/products/1"
+	Proto  string // "HTTP/1.1"
+}
+
+// parseRequestLine "GET /products/1 HTTP/1.1" kabi qatorni qismlarga ajratadi (TASK.md, 1-qadam).
+func parseRequestLine(line string) (Request, error) {
+	return Request{}, errors.New("parseRequestLine hali yozilmagan")
+}
+
+// statusClass status kodi qaysi sinfga kirishini aytadi (TASK.md, 2-qadam).
+func statusClass(code int) string {
+	return ""
+}
+
+func main() {
+	req, err := parseRequestLine("GET /products/1 HTTP/1.1")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println(req.Method, req.Path, req.Proto)
+	fmt.Println(404, statusClass(404))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3–6 | `import ( "errors"; "fmt" )` | two standard packages: `errors.New` creates an error, `fmt` prints to the screen |
+| 9–13 | `type Request struct { … }` | a type for the three parts of a request line: `Method`, `Path`, `Proto` ([GB-2.03](/lab/youtube/gb/gb-2-03/en)) |
+| 16–18 | `func parseRequestLine(line string) (Request, error)` | empty for now: always returns an error; you write the body |
+| 21–23 | `func statusClass(code int) string` | returns an empty string for now; you write the body |
+| 25–33 | `func main()` | calls `parseRequestLine` with one line: on an error it prints `xato:`; otherwise the three parts and the class of `404` |
+
+To check, run `go test .` in this folder; you can also run the formatter and `go vet` first. On the starter code the formatter and `go vet` print nothing:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+The starter `main.go` runs like this, and the test fails (I ran it; output shortened, `…` marks omitted lines):
+
+```console
+$ go run .
+xato: parseRequestLine hali yozilmagan
+$ go test .
+--- FAIL: TestVazifaParseRequestLine (0.00s)
+    --- FAIL: TestVazifaParseRequestLine/get_mahsulot (0.00s)
+        tekshiruv_test.go:39: parseRequestLine("GET /products/1 HTTP/1.1"): xato kutilmagan, keldi: parseRequestLine hali yozilmagan (TASK.md, 1-qadam)
+…
+--- FAIL: TestVazifaStatusClass (0.00s)
+    tekshiruv_test.go:70: statusClass(200) = ""; kutilgan "muvaffaqiyat" (TASK.md, 2-qadam)
+…
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+The message names the step (`TASK.md, 1-qadam`, "step 1"). Do not change `tekshiruv_test.go`. Keep working until you see `ok`. Hints: `strings.Split(line, " ")` splits the line on a space,
+two spaces in a row give an empty part (so `len(parts) != 3` catches this case too); `strings.HasPrefix(s, "/")` — does `s` start with this text; for `statusClass` use
+a `switch` or an `if` chain, with `nomaʼlum` at the very end.
+
+<details>
+<summary>Answer: solution/main.go</summary>
+
+Try it yourself first. The answer is `solution/main.go` in the course repository:
+
+```go filename="solution/main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// Request — HTTP soʻrovning birinchi qatoridan olingan uch qism (curl -v'dagi "> GET /products/1 HTTP/1.1").
+type Request struct {
+	Method string // "GET"
+	Path   string // "/products/1"
+	Proto  string // "HTTP/1.1"
+}
+
+// parseRequestLine "GET /products/1 HTTP/1.1" kabi qatorni qismlarga ajratadi (TASK.md, 1-qadam).
+func parseRequestLine(line string) (Request, error) {
+	line = strings.TrimRight(line, "\r\n") // HTTP qatori \r\n bilan tugaydi
+	parts := strings.Split(line, " ")
+	if len(parts) != 3 {
+		return Request{}, fmt.Errorf("soʻrov qatori uch qismdan iborat boʻlishi kerak, hozir %d: %q", len(parts), line)
+	}
+	method, path, proto := parts[0], parts[1], parts[2]
+	if method == "" {
+		return Request{}, errors.New("method boʻsh")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return Request{}, fmt.Errorf("yoʻl / bilan boshlanishi kerak: %q", path)
+	}
+	if !strings.HasPrefix(proto, "HTTP/") {
+		return Request{}, fmt.Errorf("versiya HTTP/ bilan boshlanishi kerak: %q", proto)
+	}
+	return Request{Method: method, Path: path, Proto: proto}, nil
+}
+
+// statusClass status kodi qaysi sinfga kirishini aytadi (TASK.md, 2-qadam).
+func statusClass(code int) string {
+	switch {
+	case code >= 100 && code < 200:
+		return "axborot"
+	case code >= 200 && code < 300:
+		return "muvaffaqiyat"
+	case code >= 300 && code < 400:
+		return "yoʻnaltirish"
+	case code >= 400 && code < 500:
+		return "mijoz xatosi"
+	case code >= 500 && code < 600:
+		return "server xatosi"
+	}
+	return "nomaʼlum"
+}
+
+func main() {
+	req, err := parseRequestLine("GET /products/1 HTTP/1.1")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println(req.Method, req.Path, req.Proto)
+	fmt.Println(404, statusClass(404))
+}
+```
+
+New lines:
+
+| Line | Code | What it does |
+|---|---|---|
+| 18 | `line = strings.TrimRight(line, "\r\n")` | removes the `\r` and `\n` at the end of the line: an HTTP line ends with `\r\n` |
+| 19 | `parts := strings.Split(line, " ")` | splits the line on a space |
+| 20–22 | `if len(parts) != 3 { … }` | if there are not exactly three parts — an error: the empty line, two and four parts and two spaces are caught here |
+| 23 | `method, path, proto := parts[0], parts[1], parts[2]` | puts the three parts into named variables |
+| 24–26 | `if method == "" { … }` | an error if the method is empty |
+| 27–29 | `if !strings.HasPrefix(path, "/") { … }` | an error if the path does not start with `/` |
+| 30–32 | `if !strings.HasPrefix(proto, "HTTP/") { … }` | an error if the version does not start with `HTTP/` |
+| 33 | `return Request{…}, nil` | all fine: the three parts and a `nil` error |
+| 38–50 | `switch { case code >= 100 && code < 200: … }` | a `switch` without an expression: the first condition that matches returns the class name; if none matches, the last `return "nomaʼlum"` |
+
+Result:
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.002s
+```
+
+`ok` — both tests passed. `solution/` holds the same `tekshiruv_test.go`, so the answer passes the same test that checks your own `main.go`.
+
+</details>
+
+## Sources
+
+- [RFC 9112: HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112) — message format (§2.1), CRLF (§2.2), request line (§3), status line and reason phrase (§4), headers (§5), body (§6)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — client and server, `Host`, `Accept`, `Date`, `Connection`, `POST` (§9.3.3), `Location`
+- [RFC 9110 §15: status codes](https://www.rfc-editor.org/rfc/rfc9110#name-status-codes) — the classes and `200`, `201`, `400`, `404`, `405`, `415`, `503`
+- [RFC 9110 §8.3 Content-Type and §8.6 Content-Length](https://www.rfc-editor.org/rfc/rfc9110#name-content-type) — `Content-Length` is a count of octets (bytes)
+- [curl: manpage](https://curl.se/docs/manpage.html) — `-v/--verbose`, `-d/--data`, `-H/--header`, `-f/--fail`, `-s/--silent`, `-X/--request`
+- [pkg.go.dev: encoding/json](https://pkg.go.dev/encoding/json#Marshal) — `int64` becomes a number in JSON (the question from the previous module)
+- [pkg.go.dev: strings](https://pkg.go.dev/strings) — `Split`, `HasPrefix`, `TrimRight`
+- [pkg.go.dev: net/http](https://pkg.go.dev/net/http) — the video's server is written with this package (line by line in GB-4.04)
+- [Course folder: lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+Results are from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, `curl 8.22.0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+---
+
+← Previous lesson: [GB-3.06](/lab/youtube/gb#gb-3-06) · Next lesson: [GB-4.02](/lab/youtube/gb#gb-4-02) → · [All lessons](/lab/youtube/gb)
+
+</div>
