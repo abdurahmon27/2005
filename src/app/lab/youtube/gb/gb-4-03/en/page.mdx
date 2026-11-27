@@ -1,0 +1,837 @@
+---
+title: "A handler is a plain function: testing it with httptest"
+date: "2026/11/27"
+description: "Call an HTTP handler without starting a server, using httptest, and check the status, a header and the JSON body inside an ordinary go test."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-03"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-03) · [Русский](/lab/youtube/gb/gb-4-03/ru) · **English**  
+Lesson GB-4.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-03) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The bozor catalog is served over HTTP. If you start the server and check by hand with `curl` after every change, the check is slow and it never repeats.
+The question: how can you test the code that builds the response with one `go test`, without starting a server?
+
+**The one idea:** a handler is a plain function with the signature `func(w http.ResponseWriter, r *http.Request)`. The server reads the request text into a `*http.Request` struct, calls this function,
+and turns whatever was written to `w` into the response text. So you can call a handler without a server: `httptest.NewRequest` builds the request, and `httptest.NewRecorder` builds a `w` that keeps what is written to it.
+The order of a response: headers → status → body. If `WriteHeader` is not called, the first `Write` sets the status to `200`; `Header().Set` and `WriteHeader` after a `Write` have no effect.
+
+By the end of the lesson you will:
+
+- read the signature `func(w http.ResponseWriter, r *http.Request)` and say what `w` and `r` are;
+- call a handler without a server, a port or `curl`, using `httptest.NewRequest` and `httptest.NewRecorder`, and check the status, a header and the JSON body;
+- explain the order of a response (headers → status → body) and why the status is `200` when `WriteHeader` is missing;
+- write the `catalogHandler` handler and make `go test .` pass.
+
+The three main new words of the lesson:
+
+| Word | Plain meaning | In English |
+|---|---|---|
+| handler | a function the server calls on every request: it receives the request and writes the response to `w` | handler |
+| `httptest.NewRequest` and `httptest.NewRecorder` | making the incoming request and the place for the response ourselves: calling without a server | httptest request, recorder |
+| response order | headers, then status, then body; after the first `Write` the earlier parts cannot change | response order |
+
+Helper words: `json.NewEncoder(w).Encode(v)` (writes a value to `w` as JSON) and `http.HandlerFunc` with `httptest.NewServer` (the last, optional section).
+Every other new name gets one sentence where it first appears.
+
+## Before you start
+
+This lesson builds on:
+
+- [GB-4.02 · The HTTP client](/lab/youtube/gb/gb-4-02/en): `http.Get`, `err` versus status, `resp.Body`, `Decode`. The last section reads the test file from that lesson.
+- [GB-4.01 · An HTTP request is text](/lab/youtube/gb/gb-4-01/en): the request line `GET /products/1 HTTP/1.1`, headers, `Content-Type`, status codes, `405`.
+- [GB-3.02 · JSON and struct tags](/lab/youtube/gb/gb-3-02/en): `Product`, the `json:"id"` tags, `encoding/json`.
+- [GB-2.07 · interface and io.Writer](/lab/youtube/gb/gb-2-07/en): `io.Writer`, `fmt.Fprintln`, interface.
+- [GB-2.04 · Pointers](/lab/youtube/gb/gb-2-04/en): `*T`.
+- [GB-1.08 · The first test: go test](/lab/youtube/gb/gb-1-08/en): `func TestXxx(t *testing.T)`, `t.Errorf`, `go test -v`, `-run`.
+- [GB-1.03 · Integers and money](/lab/youtube/gb/gb-1-03/en): the price in tiyin.
+- [GB-3.06 · Checkpoint: bozor CLI v0](/lab/youtube/gb#gb-3-06): the last question comes from this lesson.
+
+**How to run the code.** The lesson code is in a folder of the course repository:
+[lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest). Download it and open the terminal in that folder
+(`cd` moves the terminal into another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-03-handler-httptest
+```
+
+The folder holds `main.go` and `handler_test.go` (the code at the end of the video), `tekshiruv_test.go` (it checks the task), `TASK.md` (the task), `solution/` (the answer) and `_video/`, a separate
+folder for every step of the video (`01-request`, `02-recorder`, …). The folder has its own `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`) and no outside modules.
+
+The script that runs a step the way the video does: `./_video/run.sh <step> <command>`. It copies the step's files into a temporary `bozor/` folder together with this `go.mod`, runs the command there,
+and prints the exit code at the end (`(chiqish kodi: 0)`, "chiqish kodi" means "exit code"): `0` means the command finished without an error, `1` means it failed. That last line is the script's output, not the program's.
+
+The results come from `go1.27.4 linux/amd64` with `CGO_ENABLED=0`; I re-ran every command too. The module targets Go 1.27: if your Go is older, `go` downloads the right version itself.
+
+One question about the previous lesson. The server answered `503 Service Unavailable`. What is the `err` returned by `http.Get`?
+
+**A)** `nil`; the status is in `resp` · **B)** `err != nil` · **C)** the program calls `panic`
+
+<details>
+<summary>Answer</summary>
+
+**A: `err` is `nil`, and the status is in `resp.StatusCode`.** The server answered, so there is no network error; `503` is data inside the response ([GB-4.02](/lab/youtube/gb/gb-4-02/en)). If you chose **B**, you mixed up
+a status error with a network error; and `http.Get` does not `panic` here. That was the client side: send a request, read the response. Today is the other side: the function that receives the request and builds the response.
+
+</details>
+
+## What the server does with one request
+
+The request text is the same as in [GB-4.01](/lab/youtube/gb/gb-4-01/en): the first line `GET /products/1 HTTP/1.1`, then headers and a body. For every request the server does three things:
+
+| Step | What happens |
+|---|---|
+| 1 | the server reads the request text that arrived over the network into a Go struct, `http.Request` |
+| 2 | the server calls **our function**: it passes the request and a place to write the response |
+| 3 | whatever the function wrote becomes the response text |
+
+```text
+request text                    server                         our code
+GET /products/1 HTTP/1.1  ──►   1. reads the text into
+Host: …                            http.Request
+                                2. calls handler(w, r) ──────►  func(w, r) { … writes to w }
+response text             ◄──   3. sends what was written
+HTTP/1.1 200 OK …                  to w as the response
+```
+
+Today we work only on the function in the middle. This function is called a **handler**.
+
+## The handler signature: w and r
+
+Here is the smallest handler. For now we only read it, we do not run it:
+
+```go
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+```
+
+The first line of a function is its **signature**: the name, the parameters and the result type.
+
+| Part | Meaning |
+|---|---|
+| `func` | a function declaration ([GB-1.07](/lab/youtube/gb/gb-1-07/en)) |
+| `healthHandler` | the function name. We chose it: a handler that checks the server is alive |
+| `w http.ResponseWriter` | the first parameter: named `w`, of type `http.ResponseWriter`. The response is written to it |
+| `r *http.Request` | the second parameter: named `r`, of type `*http.Request`. The incoming request. The star is a pointer to a struct ([GB-2.04](/lab/youtube/gb/gb-2-04/en)): the request is not copied |
+| (no result type) | the function returns nothing. A response is not returned: it is written to `w` |
+
+`http` is the name of the `net/http` package; `ResponseWriter` and `Request` are types from that package. The server expects a handler with exactly this signature: the names `w` and `r` are a habit, the types and their order are the rule.
+
+## ResponseWriter: where the response is written
+
+The type of `w`, `http.ResponseWriter`, is an **interface**, as in [GB-2.07](/lab/youtube/gb/gb-2-07/en). In the `net/http` package it is declared like this (comments removed):
+
+```go
+type ResponseWriter interface {
+	Header() Header
+	Write([]byte) (int, error)
+	WriteHeader(statusCode int)
+}
+```
+
+Three methods:
+
+| Method | What it does |
+|---|---|
+| `Header()` | returns the table of response headers; its type is also called `Header`. We put headers into this table |
+| `Write([]byte)` | writes bytes to the response body |
+| `WriteHeader(statusCode int)` | sets the status code |
+
+`ResponseWriter` has a `Write` method, so it is an `io.Writer` too. That is why `fmt.Fprintln(w, "ok")` works: it writes `ok` and a newline to `w`.
+That is the whole body of `healthHandler`.
+
+An important rule: **if `WriteHeader` is not called, the first `Write` sets the status to `200`** ([the ResponseWriter docs](https://pkg.go.dev/net/http#ResponseWriter)).
+`healthHandler` never sets a status, so its response will have `200`. We will see it in a moment.
+
+## httptest.NewRequest: building the request ourselves
+
+The function is ready. But who gives it `w` and `r`? Normally the server: we write it in [GB-4.04 · The first server, line by line](/lab/youtube/gb#gb-4-04).
+But a handler is a plain function, so we can call it too. All it needs is `w` and `r`. The `net/http/httptest` package builds them for us.
+
+The request first. This program builds `r` and looks inside it:
+
+```go filename="_video/01-request/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/products/1", nil)
+	fmt.Println(req.Method, req.URL.Path, req.Proto)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `req := httptest.NewRequest(http.MethodGet, "/products/1", nil)` | builds a request and returns a `*http.Request`; the result is in `req`. The first argument is the method: `http.MethodGet` is the text `"GET"`. The second is the path, from the request line in [GB-4.01](/lab/youtube/gb/gb-4-01/en). The third is the body: `nil`, meaning none |
+| 11 | `fmt.Println(req.Method, req.URL.Path, req.Proto)` | looks inside the request: `Method` is the method, `URL.Path` the path, `Proto` the protocol version |
+
+Predict: what does `go run .` print?
+
+**A)** `GET /products/1 HTTP/1.1` · **B)** `GET /products/1` · **C)** `/products/1 GET`
+
+<details>
+<summary>Answer</summary>
+
+**A.** `Println` prints its arguments separated by one space: method, path, version. In **B** you forgot the version (`Proto`): there is a third argument too.
+In **C** you swapped the order: `Println` writes the arguments in the order given, and here `Method` comes first.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-request go run .
+GET /products/1 HTTP/1.1
+(chiqish kodi: 0)
+```
+
+This is exactly the request line from `curl -v`. `http.Request` is the Go form of that text.
+
+## httptest.NewRecorder: calling the handler like a function
+
+Now the place for the response. `httptest.NewRecorder()` is also a `ResponseWriter`: it sends nothing anywhere and keeps what was written. We read what it kept through `rec.Code` (the status) and `rec.Body` (the body).
+The whole program:
+
+```go filename="_video/02-recorder/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	fmt.Printf("%d %q\n", rec.Code, rec.Body.String())
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 9–11 | `func healthHandler(…) { fmt.Fprintln(w, "ok") }` | the handler from the previous section |
+| 14 | `req := httptest.NewRequest(http.MethodGet, "/health", nil)` | the request; the path is now `/health` |
+| 15 | `rec := httptest.NewRecorder()` | a `ResponseWriter` that keeps what is written |
+| 16 | `healthHandler(rec, req)` | the whole trick is here: we call the handler like a plain function. We pass `rec` instead of `w` and `req` instead of `r` |
+| 17 | `fmt.Printf("%d %q\n", rec.Code, rec.Body.String())` | `rec.Code` is the status, `rec.Body.String()` is the body that was written, as text. `%d` is a number, `%q` is text in quotes with hidden characters shown |
+
+The handler never set a status. What is `rec.Code`?
+
+**A)** `0` · **B)** `200` · **C)** `500`
+
+<details>
+<summary>Answer</summary>
+
+**B: `200`.** The rule above: if `WriteHeader` is not called, the first `Write` sets the status to `200`. If you chose **A**, you assumed "an unset status is zero";
+**C**: where nothing went wrong, `500` does not appear.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-recorder go run .
+200 "ok\n"
+(chiqish kodi: 0)
+```
+
+`200` is the status. The body is `ok` and a newline: `Fprintln` added it; `%q` showed it as `\n`.
+
+On a real server the first `Write` sends `200`; and the recorder starts at `200`, so the result is the same. We needed no server, no port and no `curl`: this is a plain function call.
+
+## The first test: TestHealth
+
+Let us turn this call into a test. The `handler_test.go` file, in the shape from [GB-1.08](/lab/youtube/gb/gb-1-08/en), in the same package as `healthHandler` (`package main`):
+
+```go filename="_video/03-test/handler_test.go" showLineNumbers
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestHealth(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != "ok\n" {
+		t.Errorf("body %q, kutilgan %q", got, "ok\n")
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 9 | `func TestHealth(t *testing.T) {` | the test function ([GB-1.08](/lab/youtube/gb/gb-1-08/en)) |
+| 10–12 | `req`, `rec`, `healthHandler(rec, req)` | the three lines from the previous section: request, recorder, call |
+| 13–15 | `if rec.Code != http.StatusOK { t.Errorf(…) }` | is the status `200`? `http.StatusOK` is the name of `200`. If not, the test writes an error message |
+| 16–18 | `if got := rec.Body.String(); got != "ok\n" { t.Errorf(…) }` | is the body exactly `ok` and a newline? `Fprintln` adds a newline, so the expected value is `"ok\n"`, not `"ok"` |
+
+Will the test pass? Both conditions hold, so it will:
+
+```console
+$ ./_video/run.sh 03-test go test -v
+=== RUN   TestHealth
+--- PASS: TestHealth (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+`PASS` and `ok`: the test passed. No server, no port, no `curl`. The time is a few thousandths of a second: the video showed `0.002s`, and the run above is mine. The number depends on how busy the machine is
+(any run may print `0.002s` or `0.003s`); what matters is the order of magnitude: milliseconds, because nothing starts and there is no network.
+
+## A handler that returns data: productHandler
+
+`healthHandler` only says `ok`. Now a handler that returns a product. The whole file (`Product` is the struct from [GB-3.02](/lab/youtube/gb/gb-3-02/en), the price is in tiyin):
+
+```go filename="_video/04-product/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+// Product — katalogdagi bitta mahsulot (GB-3.02).
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+var olma = Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}
+
+// healthHandler — server tirikligini tekshirish: har soʻrovga «ok».
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+// productHandler — GET'ga olma mahsulotini JSON qilib beradi, boshqa metodga 405.
+func productHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(olma) // Encode xatosi: log'ga yozish GB-8.02'da
+}
+
+// main serverni ishga tushirmaydi (u GB-4.04'da): handler'ni oddiy funksiya kabi chaqirib, javobni chiqaradi.
+func main() {
+	req := httptest.NewRequest(http.MethodGet, "/products/1", nil)
+	rec := httptest.NewRecorder()
+	productHandler(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+```
+
+**The product (line 18).** `var olma = Product{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40}` is the `Product` value the handler returns (`olma` means "apple"). The price is in tiyin: `1_200_000` tiyin ([GB-1.03](/lab/youtube/gb/gb-1-03/en)).
+
+**The header (line 32).** `w.Header().Set("Content-Type", "application/json")`: `w.Header()` returns the header table, `Set` puts a value into it. `application/json` says the body is JSON
+([GB-4.01](/lab/youtube/gb/gb-4-01/en)). We set the header **before** the body; the reason is in the section "Response order".
+
+**The body (line 33).** `json.NewEncoder(w).Encode(olma)`: we give `NewEncoder` the `w`. It is the reverse of `Decode`: it writes JSON to any `io.Writer`. `Encode` writes `olma` (the `Product` declared in this file) to `w`.
+We do not check the `Encode` error yet: writing it to a log comes in [GB-8.02](/lab/youtube/gb#gb-8-02).
+
+**The method (lines 27–31).** A handler can read from `r` too: `r.Method` is the first word of the request line. If it is not `GET`, the response is `405` (Method Not Allowed): the `Allow` header says which method is allowed
+(`http.MethodGet`); [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed), the HTTP standard, makes it mandatory in a `405` response. `WriteHeader(http.StatusMethodNotAllowed)` sets the status: `405`.
+`return` ends the function right there, so no body is written. In [GB-4.05](/lab/youtube/gb#gb-4-05) `ServeMux` checks the method itself; here we wrote it by hand to show reading from `r`.
+
+**main (lines 37–42).** It calls the handler for `/products/1` with `GET` and prints the status and the body. `%s` is text; `Encode` adds a newline at the end, so `Printf` needs no `\n`.
+
+Predict: what does `go run .` print?
+
+**A)** `200 {"ID":1,"Name":"olma","Price":12000,"Stock":40}` · **B)** `200 {"id":1,"name":"olma","price":1200000,"stock":40}` · **C)** `200 {"name":"olma"}`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The keys come from the `json` tags on `Product`, in lowercase ([GB-3.02](/lab/youtube/gb/gb-3-02/en)); the price is stored in tiyin: `1200000`. In **A** you forgot the tags (the keys would be capitalised) and converted the price
+to som: `Encode` converts nothing. **C**: `Encode` writes the whole struct, not just `Name`.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-product go run .
+200 {"id":1,"name":"olma","price":1200000,"stock":40}
+(chiqish kodi: 0)
+```
+
+The status is `200`: we never called `WriteHeader`, the first `Write` set it. Now the test. `TestProduct` does not compare the body line by line: it reads the body into a `Product`.
+
+```go
+func TestProduct(t *testing.T) {
+	rec := httptest.NewRecorder()
+	productHandler(rec, httptest.NewRequest(http.MethodGet, "/products/1", nil))
+	var got Product
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("body JSON emas: %v", err)
+	}
+	if got != olma {
+		t.Errorf("mahsulot %v, kutilgan %v", got, olma)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–2 | `rec := …; productHandler(rec, httptest.NewRequest(…))` | the recorder and the call; the request is built right in the argument with `NewRequest` |
+| 3 | `var got Product` | an empty variable for the product we read back |
+| 4–6 | `if err := json.NewDecoder(rec.Body).Decode(&got); err != nil { t.Fatalf(…) }` | the `Decode` from [GB-4.02](/lab/youtube/gb/gb-4-02/en), only the source is `rec.Body`. If the body is not JSON, `t.Fatalf` stops the test here |
+| 7–9 | `if got != olma { t.Errorf(…) }` | we compare the structs `got` and `olma` with one `!=`: Go compares structs field by field |
+
+`TestProductMetod` checks the `405` path (`Metod` means "method"):
+
+```go
+func TestProductMetod(t *testing.T) {
+	rec := httptest.NewRecorder()
+	productHandler(rec, httptest.NewRequest(http.MethodPost, "/products/1", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rec.Result().Header.Get("Allow"); got != "GET" {
+		t.Errorf("Allow %q, kutilgan %q", got, "GET")
+	}
+}
+```
+
+The request is `POST`; we expect status `405` and `Allow: GET`. The header is read from `rec.Result().Header`. `Result()` builds an ordinary `*http.Response` from what the recorder kept (the same type as `resp` in [GB-4.02](/lab/youtube/gb/gb-4-02/en));
+its headers are a snapshot taken at the first `Write` or `WriteHeader`. `rec.Header()` is a live table: a header the handler set after `Write` would show up in it, although the client never receives it
+([the httptest docs](https://pkg.go.dev/net/http/httptest#ResponseRecorder.Result)).
+
+`-run Product` runs the tests whose names contain `Product`: `TestProduct` and `TestProductMetod`. Both pass:
+
+```console
+$ ./_video/run.sh 04-product go test -v -run Product
+=== RUN   TestProduct
+--- PASS: TestProduct (0.00s)
+=== RUN   TestProductMetod
+--- PASS: TestProductMetod (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+In the video the last line showed `0.003s`; above is my run: the same milliseconds, the difference comes from machine load.
+
+## Response order: headers, status, body
+
+In a handler the order matters. Three steps, in this sequence:
+
+| Step | Call | What happens |
+|---|---|---|
+| 1 | `w.Header().Set(…)` | headers are collected in the table; nothing has been sent yet |
+| 2 | `w.WriteHeader(…)` | the status is set (if not called: `200`) |
+| 3 | `w.Write(…)` or `Encode` | the body is written |
+
+On the first `Write` the headers and the status are **sent**. Any later `Header().Set` or `WriteHeader` changes nothing:
+what has been sent cannot be taken back ([the ResponseWriter docs](https://pkg.go.dev/net/http#ResponseWriter)).
+
+```text
+Header().Set(…)  ─►  WriteHeader(…)  ─►  Write(…) / Encode(…)  ─►  sent
+  headers             status               body                     at the first Write
+
+                                                   later Set / WriteHeader: no effect
+```
+
+That is why in `productHandler` `Content-Type` is set before `Encode`, and `Allow` before `WriteHeader`. What happens when the order is broken is in the section "Common mistakes".
+
+## Going deeper (optional): http.Handler, HandlerFunc and NewServer
+
+The test file in [GB-4.02](/lab/youtube/gb/gb-4-02/en) used `http.HandlerFunc` and `httptest.NewServer`. Now you can read it.
+
+The server expects a handler of type `http.Handler`. It is an **interface with one method**: `ServeHTTP(ResponseWriter, *Request)`. Our function has no such method.
+`http.HandlerFunc` is a **function type**: `type HandlerFunc func(ResponseWriter, *Request)`. It has a `ServeHTTP` method, and that method calls the function inside it. So `http.HandlerFunc(f)` turns
+a plain function into a `Handler` ([the HandlerFunc docs](https://pkg.go.dev/net/http#HandlerFunc)).
+
+`httptest.NewServer` opens a **real** server on a free port on this computer. The whole program:
+
+```go filename="_video/07-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Println(resp.Status)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10–12 | `srv := httptest.NewServer(http.HandlerFunc(func(w …, r …) { … }))` | a function literal with `w` and `r`, the shape of our handler; `HandlerFunc` makes it a `Handler`; `NewServer` opens the server. The parentheses close in order: the function, `HandlerFunc`, `NewServer` |
+| 13 | `defer srv.Close()` | as in [GB-2.09](/lab/youtube/gb/gb-2-09/en): `srv.Close()` runs when the function ends |
+| 14–19 | `resp, err := http.Get(srv.URL)` and the error check | `srv.URL` is the server's address; the client sends it a real request ([GB-4.02](/lab/youtube/gb/gb-4-02/en)) |
+| 20 | `fmt.Println(resp.Status)` | prints the status line of the response |
+
+What does it print? `A)` `200 OK` · `B)` `ok` · `C)` an error.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `resp.Status` is the status code and its reason text: `200 OK`. The body (`ok`) is not printed by this line. `ok` (B) is the body the handler wrote, and there is no error (C): the server started and answered.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-server go run .
+200 OK
+(chiqish kodi: 0)
+```
+
+The client sent a real request and our handler answered. When to use which:
+
+| What we test | What we need | Why |
+|---|---|---|
+| the handler itself | `httptest.NewRecorder` | fast, no port needed |
+| client code (for example from [GB-4.02](/lab/youtube/gb/gb-4-02/en)) | `httptest.NewServer` | the client talks to a real server |
+
+The test server is on this same computer, so a plain `http.Get` is enough; calling an external server needs a `Timeout` ([GB-4.02](/lab/youtube/gb/gb-4-02/en)).
+
+## Common mistakes
+
+**1. The body first, the status after.** The most common mistake. Here is `notFoundHandler`: `Fprintln` writes the body, and then we set `404` with `WriteHeader`.
+
+```go filename="_video/05-tartib/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "topilmadi")
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func main() {}
+```
+
+Its test (`TestNotFound`) runs with `go test` and expects status `404`:
+
+```go filename="_video/05-tartib/handler_test.go" showLineNumbers
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestNotFound(t *testing.T) {
+	rec := httptest.NewRecorder()
+	notFoundHandler(rec, httptest.NewRequest(http.MethodGet, "/yoq", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status %d, kutilgan %d", rec.Code, http.StatusNotFound)
+	}
+}
+```
+
+What is `rec.Code`?
+
+**A)** `404` · **B)** `200` · **C)** `panic`
+
+<details>
+<summary>Answer</summary>
+
+**B: `200`.** `Fprintln` had already sent `200` at the first `Write`; the later `WriteHeader(404)` changes nothing. If you chose **A**, you thought the last call wins:
+in fact the first one does. **C**: this mistake does not stop the program, it is silently ignored.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-tartib go test
+--- FAIL: TestNotFound (0.00s)
+    handler_test.go:13: status 200, kutilgan 404
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.003s
+(chiqish kodi: 1)
+```
+
+How to read it: `--- FAIL: TestNotFound` is the failed test; `handler_test.go:13` means the error is on line 13 of the test file (`t.Errorf`); `status 200, kutilgan 404` shows the status the handler gave on the left and the one the test expected on the right
+(`kutilgan` means "expected"). `exit status 1` means the test binary ended with an error, the last `FAIL` means the package failed ([GB-1.08](/lab/youtube/gb/gb-1-08/en)). The test caught the mistake.
+
+The fix: `WriteHeader` first, then the body ([`_video/06-tartib-fix/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/_video/06-tartib-fix/main.go)):
+
+```go
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprintln(w, "topilmadi")
+}
+```
+
+Will the test pass? Yes, the status is `404`:
+
+```console
+$ ./_video/run.sh 06-tartib-fix go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+**On a real server this mistake goes by silently.** Without a test nothing fails: the client gets `200` and the server only writes a line to its log. To show it, I ran this handler through `httptest.NewServer`.
+This example is not in the course folder: I created it in a separate folder (with the course's `go.mod`); here is the whole code:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "topilmadi")
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Println(resp.Status)
+}
+```
+
+```console
+$ go run .
+2026/11/27 15:39:02 http: superfluous response.WriteHeader call from main.main.func1 (main.go:12)
+200 OK
+```
+
+The first line is the server's log (`log` starts a line with the time; the time differs every run): `superfluous response.WriteHeader call` means a redundant call; `main.go:12` is the line where `WriteHeader` stands.
+The second line is what the client saw: `200 OK`, not `404`.
+
+**2. Thinking you need a server to test a handler.** A handler is a plain function: `httptest.NewRecorder` is enough, no port is opened, and the test runs in milliseconds. `httptest.NewServer` is needed only
+to test client code (the last section).
+
+## Check yourself
+
+**1.** What is the signature of a handler, and where is the response written?
+
+<details>
+<summary>Answer</summary>
+
+`func(w http.ResponseWriter, r *http.Request)`; the function returns nothing. The response is written to `w`, and `r` is the incoming request.
+
+</details>
+
+**2.** What is the status if the handler never calls `WriteHeader`?
+
+<details>
+<summary>Answer</summary>
+
+`200`: the first `Write` sets the status to `200`.
+
+</details>
+
+**3.** From the previous module ([GB-3.06](/lab/youtube/gb#gb-3-06)): when saving `bozor.json` we first write a temporary file and then `rename` it. Why?
+
+<details>
+<summary>Answer</summary>
+
+So that no half-written file is left: `rename` replaces the file in one step.
+
+</details>
+
+**4.** Predict: if we call `healthHandler` with `http.MethodPost` on the path `/health`, what are `rec.Code` and `rec.Body.String()`? The handler never looks at `r`.
+
+<details>
+<summary>Answer</summary>
+
+`200 "ok\n"`: `healthHandler` reads nothing from `r`, so the method does not matter. I ran it. This example is not in the course folder; here is the whole code:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+func main() {
+	req := httptest.NewRequest(http.MethodPost, "/health", nil)
+	rec := httptest.NewRecorder()
+	healthHandler(rec, req)
+	fmt.Printf("%d %q\n", rec.Code, rec.Body.String())
+}
+```
+
+```console
+$ go run .
+200 "ok\n"
+```
+
+The difference from `productHandler`: that one checks `r.Method`, so it answers `405` to `POST`.
+
+</details>
+
+## Homework
+
+The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/TASK.md) of the course folder; the folder:
+[lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest). The level marks (🟢🟡) are not in the course folder: I added them.
+`main.go` has `catalog` (`[]Product`: `olma` "apple", `non` "bread", `oʻrik` "apricot"), and `catalogHandler` is empty. Write it; do not change `Product`, `healthHandler`, `productHandler`, `main` or `handler_test.go`.
+
+- 🟢 **Step 1, GET.** Write `catalog` as a JSON array: first the header `Content-Type: application/json`, then `json.NewEncoder(w).Encode(...)` (as in `productHandler`).
+- 🟡 **Step 2, another method.** If the method is not `GET`: the header `Allow: GET`, then `w.WriteHeader(http.StatusMethodNotAllowed)`, then `return`. No body. The header goes **before** `WriteHeader`.
+- 🟡 **Step 3, an empty catalog.** If `catalog` is empty (`nil`), the response must still be `[]`, not `null`: a nil slice is `null` in JSON ([GB-3.06](/lab/youtube/gb#gb-3-06)). You need an empty slice that is not `nil`: `[]Product{}`.
+
+To check, run `go test .` in this folder. Do not change `tekshiruv_test.go`: it calls `catalogHandler` without a server, through `httptest.NewRecorder`, the way you did in the lesson. On the starter, the format check and `go vet` print nothing:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+The test fails like this (my run). Every message says in Uzbek what was expected:
+
+```console
+$ go test .
+--- FAIL: TestVazifaGET (0.00s)
+    tekshiruv_test.go:29: GET: Content-Type «», kutilgan «application/json»: sarlavhani Encode'dan OLDIN qoʻying
+    tekshiruv_test.go:33: GET: body JSON massiv emas (EOF): catalog'ni json.NewEncoder(w).Encode bilan yozing, hozirgi body: ""
+--- FAIL: TestVazifaMetod (0.00s)
+    --- FAIL: TestVazifaMetod/POST (0.00s)
+        tekshiruv_test.go:45: POST: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: POST: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+    --- FAIL: TestVazifaMetod/PUT (0.00s)
+        tekshiruv_test.go:45: PUT: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: PUT: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+    --- FAIL: TestVazifaMetod/DELETE (0.00s)
+        tekshiruv_test.go:45: DELETE: status 200, kutilgan 405 (http.StatusMethodNotAllowed): WriteHeader'ni chaqiring va return qiling
+        tekshiruv_test.go:48: DELETE: Allow «», kutilgan «GET»: sarlavhani WriteHeader'dan OLDIN qoʻying
+--- FAIL: TestVazifaBosh (0.00s)
+    tekshiruv_test.go:63: catalog boʻsh: body «», kutilgan «[]» (nil slice JSON'da null boʻladi: boʻsh, lekin nil boʻlmagan slice kerak)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+Keep working until you see `ok`. Hints:
+
+- Copy `productHandler` and pass `catalog` instead of `olma`; the `if r.Method != http.MethodGet { … }` block stays as it is.
+- The order: `w.Header().Set(…)` → `w.WriteHeader(…)` → body. A header set after `Write`/`Encode` is lost.
+- Step 3: `products := catalog`, then `if products == nil { products = []Product{} }` and `Encode(products)`.
+
+<details>
+<summary>Answer: catalogHandler from solution/main.go</summary>
+
+Try it yourself first. The answer is [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-03-handler-httptest/solution/main.go) in the course repository; `catalogHandler`:
+
+```go
+func catalogHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	products := catalog
+	if products == nil {
+		products = []Product{} // nil slice JSON'da null boʻlardi
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(products) // Encode xatosi: log'ga yozish GB-8.02'da
+}
+```
+
+Line by line:
+
+| Line | Code | What it does |
+|---|---|---|
+| 2–6 | `if r.Method != http.MethodGet { … return }` | step 2: the `Allow` header, then `405`, then `return`: the same block as in `productHandler` |
+| 7 | `products := catalog` | takes `catalog` under a new name |
+| 8–10 | `if products == nil { products = []Product{} }` | step 3: instead of a `nil` slice, an empty slice that is not `nil`: it is `[]` in JSON |
+| 11 | `w.Header().Set("Content-Type", "application/json")` | step 1: the header before the body |
+| 12 | `json.NewEncoder(w).Encode(products)` | step 1: writes the array to `w` |
+
+Check:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+`ok`: the tests that check `catalogHandler` without a server passed. `solution/` holds the same test files, so the answer passes the same tests.
+(`-count=1` turns off Go's test cache, so the result is computed again every time.)
+
+</details>
+
+## Sources
+
+- [pkg.go.dev: net/http — ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter) — `Header`, `Write`, `WriteHeader`; if `WriteHeader` is not called the first `Write` sends `200`; changing headers after `Write`/`WriteHeader` has no effect
+- [pkg.go.dev: net/http — Handler](https://pkg.go.dev/net/http#Handler), [HandlerFunc](https://pkg.go.dev/net/http#HandlerFunc), [Request](https://pkg.go.dev/net/http#Request)
+- [pkg.go.dev: net/http/httptest](https://pkg.go.dev/net/http/httptest) — `NewRequest`, `NewRecorder` (`Code`, `Body`, `Result`), `NewServer`
+- [pkg.go.dev: encoding/json — NewEncoder](https://pkg.go.dev/encoding/json#NewEncoder) and [Marshal](https://pkg.go.dev/encoding/json#Marshal) — `Encode`, tags, a nil slice as `null`
+- [RFC 9110 §15.5.6: 405 Method Not Allowed](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed) — `Allow` is mandatory in a `405` response
+- [Course folder: lessons/gb-4-03-handler-httptest](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+Results are from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-03-handler-httptest)
+
+---
+
+← Previous lesson: [GB-4.02](/lab/youtube/gb/gb-4-02/en) · Next lesson: [GB-4.04](/lab/youtube/gb#gb-4-04) → · [All lessons](/lab/youtube/gb)
+
+</div>
