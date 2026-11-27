@@ -1,0 +1,950 @@
+---
+title: "Your first server, line by line: ServeMux and ListenAndServe"
+date: "2026/11/27"
+description: "Connect your handlers to a port: ServeMux, HandleFunc and ListenAndServe explained line by line; check the server with curl and read the port-in-use error."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-04"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-04) · [Русский](/lab/youtube/gb/gb-4-04/ru) · **English**  
+Lesson GB-4.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-04) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The bozor handlers passed their tests in GB-4.03. But `curl http://localhost:8765/health` now answers `Failed to connect`: nobody is listening on port 8765.
+The question: how do we connect the handlers to a port, and why does a connected program not finish?
+
+**The one idea:** a server has two parts. `ServeMux` is a path → handler table: `mux.HandleFunc(pattern, handler)` adds one entry to the table,
+and the handler is passed without parentheses (the function itself, not a call to it). A pattern without a trailing slash matches exactly that path; if no pattern matches, `ServeMux` writes `404 page not found` itself.
+`ListenAndServe(addr, handler)` opens the port, waits for connections and calls `mux.ServeHTTP(w, r)` for every request. While the server runs, this loop never ends:
+the function returns **only when the server has stopped**, and its return value is always an error. `http.ListenAndServe` is a shortcut: it builds `&http.Server{Addr, Handler}` and calls its `ListenAndServe` method.
+
+By the end of the lesson you will:
+
+- build a path → handler table with `http.NewServeMux` and `mux.HandleFunc` and explain every line;
+- explain that `http.ListenAndServe(":8765", mux)` opens the port, why it does not return, and why, when it does, it always returns an error;
+- check a running server from a second terminal with `curl`, stop it with `Ctrl+C`, and read the `bind: address already in use` error;
+- write the `newServer(addr) *http.Server` function yourself and make `go test .` pass.
+
+The three core new words of the lesson:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| `ServeMux` | a table that picks a handler by the request path: path → handler | ServeMux (multiplexer) |
+| `ListenAndServe` | the function that opens the port, waits for connections and calls the handler; it does not return while the server runs | ListenAndServe |
+| the server from outside | a running server is a separate process: `curl` in a second terminal checks it, `Ctrl+C` stops it; if the port is busy, an error appears | port, `address already in use` |
+
+Helper words: `http.HandleFunc` with `nil` (the shared `DefaultServeMux`) and the `http.Server` struct with `ReadHeaderTimeout`. Every other new name gets one sentence where it first appears.
+
+## Before you start
+
+This lesson builds on:
+
+- [GB-4.03 · A handler is an ordinary function](/lab/youtube/gb/gb-4-03/en): the signature `func(w http.ResponseWriter, r *http.Request)`, `healthHandler`, `productHandler`, `catalogHandler`, `http.Handler` and `ServeHTTP`.
+- [GB-4.02 · An HTTP client in Go](/lab/youtube/gb/gb-4-02/en): the second terminal, the port, `Ctrl+C` → `signal: interrupt`, `time.Second`, the `&T{…}` literal.
+- [GB-4.01 · An HTTP request is text](/lab/youtube/gb/gb-4-01/en): `curl`, `curl -v`, the request line `GET /health HTTP/1.1`, the status line `HTTP/1.1 404 Not Found`, `Content-Length`.
+- [GB-1.07 · A function and your first error](/lab/youtube/gb/gb-1-07/en): `fmt.Fprintln(os.Stderr, …)`, `os.Exit(1)`, `echo $?`, `exit status 1`.
+- [GB-1.01 · Your first program](/lab/youtube/gb/gb-1-01/en): `package main`, `func main`, `go run .`; an unused import is a compile error.
+- [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03/en) and [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04/en): the `T{Field: value}` literal, `&x` and `*T`.
+- [GB-2.10 · UTF-8: byte, rune and Uzbek text](/lab/youtube/gb/gb-2-10/en): the `oʻ` sign takes two bytes; the last question is about that.
+
+**How to run the code.** The lesson code is a folder in the course repository:
+[lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server). Download it and open a terminal in that folder
+(`cd` moves the terminal into another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-04-birinchi-server
+```
+
+The folder holds: `main.go` (the GB-4.03 handlers and a finished `main`; `newServer` is still empty — that is the task), `tekshiruv_test.go` (it checks the task), `TASK.md` (the task), `solution/` (the answer) and `_video/`.
+`_video/` has the `main.go` of every step of the video (`02-server`, `03-xato-yoq`, …) and their shared `handlers.go`: the three handlers from GB-4.03.
+The folder has its own `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`) and no external modules. If you have an older Go installed, `go` downloads the right version itself.
+
+To build the server from the video yourself, we make a separate folder. `mkdir -p` creates a folder, `cp` copies files:
+
+```bash
+mkdir -p ~/bozor-04
+cp go.mod _video/handlers.go _video/02-server/main.go ~/bozor-04/
+cd ~/bozor-04
+```
+
+(One script does the same: `./_video/run.sh 02-server go run .`. At the end it prints its own line `(chiqish kodi: N)`: that is not output of the program.)
+The results come from `go1.27.4 linux/amd64` with `CGO_ENABLED=0` and `curl 8.22.0`; I re-ran every command in this lesson too.
+I started the server on port 8765 and stopped it each time; if that port is busy on your computer, the last sections (port in use) show what happens.
+
+One question from the previous lesson. A handler first wrote the body with `fmt.Fprintln(w, …)`, then called `w.WriteHeader(404)`. Which status does the client receive?
+
+**A)** `404` · **B)** `200` · **C)** `500`
+
+<details>
+<summary>Answer</summary>
+
+**B: `200`.** The first `Write` fixes the status as `200`; a later `WriteHeader` has no effect ([GB-4.03](/lab/youtube/gb/gb-4-03/en), "response order"). If you chose **A**, you thought `WriteHeader` has the last word: in fact it must be called **before** the body.
+In GB-4.03, `httptest.NewRecorder` caught this answer. Today there is a real network connection behind `w`: `curl` receives the response.
+
+</details>
+
+## The problem: nobody listens on the port
+
+See the current state with your own eyes. No server is running; we send `curl` to `/health`:
+
+```console
+$ curl http://localhost:8765/health
+curl: (7) Failed to connect to localhost:8765 after 0 ms: Could not connect to server
+```
+
+Reading the message:
+
+| Part | Meaning |
+|---|---|
+| `curl: (7)` | `curl`'s own message; `7` is `curl`'s "could not connect" error code (the exit code is `7` too) |
+| `Failed to connect` | the connection could not be made |
+| `to localhost:8765` | `localhost` is this computer, `8765` is the **port**: the number of the program's address ([GB-4.02](/lab/youtube/gb/gb-4-02/en)) |
+| `after 0 ms` | after 0 milliseconds: nothing was waited for, the connection was refused at once |
+| `Could not connect to server` | the server could not be reached |
+
+(In the video the middle of this line is hidden with `…`; here it is complete.) Both parts say one thing: no program is waiting for connections on this port.
+
+The handlers exist, but nobody calls them. A server needs two things:
+
+1. a table that says which handler to call for the request path;
+2. a program that opens the port, waits for connections and, when a request arrives, consults that table.
+
+The first is `ServeMux`, the second is `ListenAndServe`. First, let us see how one request passes through a server.
+
+## How one request passes through a server
+
+| Step | What happens |
+|---|---|
+| 1 | a connection arrives at the port (`:8765`) |
+| 2 | the server reads the request text: the first line is `GET /health HTTP/1.1` ([GB-4.01](/lab/youtube/gb/gb-4-01/en)) |
+| 3 | `ServeMux` looks at the request path (`/health`) and finds a handler in the table |
+| 4 | `healthHandler(w, r)` is called ([GB-4.03](/lab/youtube/gb/gb-4-03/en)) |
+| 5 | whatever the handler wrote to `w` becomes the response text and goes back to `curl` |
+
+```text
+curl                      server (our program)
+
+GET /health HTTP/1.1  ──► connection arrives at port :8765
+                          reads the request text
+                          ServeMux: "/health" → healthHandler
+                          healthHandler(w, r)  ── writes "ok" to w
+HTTP/1.1 200 OK  ◄──────  response text
+ok
+```
+
+Today we write steps 2–3 (`ServeMux`) and step 1 (`ListenAndServe`).
+
+## Ready-made parts: the GB-4.03 handlers
+
+`main.go` already has everything from GB-4.03: the `Product` struct, `olma`, `catalog` and three handlers. Their insides do not change in this lesson, so we only look at the signatures (`{ … }` stands for a hidden body):
+
+```go
+func healthHandler(w http.ResponseWriter, r *http.Request) { … }
+func catalogHandler(w http.ResponseWriter, r *http.Request) { … }
+func productHandler(w http.ResponseWriter, r *http.Request) { … }
+```
+
+| Handler | What it returns |
+|---|---|
+| `healthHandler` | writes `ok` (the server is alive) |
+| `catalogHandler` | returns the catalog as a JSON array: the GB-4.03 task, solved here |
+| `productHandler` | returns one product, `olma`, as JSON |
+
+(Note: `{ … }` is shorthand on this page, not Go syntax.) Today we write only the `main` function.
+
+## ServeMux: the path → handler table
+
+The first line of `main` is `func main() {` ([GB-1.01](/lab/youtube/gb/gb-1-01/en)). The next line is:
+
+```go
+	mux := http.NewServeMux()
+```
+
+| Part | Meaning |
+|---|---|
+| `http` | the name of the `net/http` package |
+| `NewServeMux()` | a function of that package: creates a new **empty** `ServeMux` |
+| `:=` | creates a new variable and gives it the result ([GB-1.02](/lab/youtube/gb/gb-1-02/en)) |
+| `mux` | the variable's name: we chose it |
+
+**`ServeMux`** gets its name from the word *multiplexer*: it distributes many requests arriving at one entry point among handlers, depending on the path. In practice it is a table: each entry has a path and a handler. Right now it is empty.
+
+The second line adds the first entry:
+
+```go
+	mux.HandleFunc("/health", healthHandler)
+```
+
+| Part | Meaning |
+|---|---|
+| `mux.HandleFunc(...)` | a method of `mux`: adds one entry to the table |
+| `"/health"` | the first argument is the **pattern**: which path it matches |
+| `healthHandler` | the second argument is the handler to call when that path arrives |
+
+Notice that `healthHandler` has **no parentheses**. If we wrote `healthHandler(w, r)`, the function would be called right here, right now. We do not call the function now: we hand **the function itself** to `mux`.
+`mux` will call it later, on every `/health` request, with that request's `w` and `r`. What happens if you add parentheses is shown in "Common mistakes".
+
+The third line is the second entry:
+
+```go
+	mux.HandleFunc("/products", catalogHandler)
+```
+
+Now the table has two entries. It is not a server yet: the port is not open and nobody is listening.
+
+| Pattern | Handler |
+|---|---|
+| `"/health"` | `healthHandler` |
+| `"/products"` | `catalogHandler` |
+| any other path | ? |
+
+What happens when a path that is not in the table arrives, we will test a little later.
+
+## ListenAndServe: open the port and wait
+
+The next line prints the address on screen:
+
+```go
+	fmt.Println("bozor API: http://localhost:8765")
+```
+
+`fmt.Println` ([GB-1.01](/lab/youtube/gb/gb-1-01/en)) prints text; `http://localhost:8765` is the address to which `curl` sends requests. The line after it is the heart of the program:
+
+```go
+	err := http.ListenAndServe(":8765", mux)
+```
+
+`ListenAndServe` means *Listen and Serve*. It takes two arguments:
+
+| Argument | Meaning |
+|---|---|
+| `":8765"` | the **address**: a colon and the port number. No host is written |
+| `mux` | the **handler**: who will deal with each request |
+
+**The address.** If no host is written, the server listens on **all** network addresses of this computer; `localhost` is among them. So other computers on the same network can connect too.
+If only this computer should connect, you write `"localhost:8765"`. (`ss -ltn` shows this case as `*:8765`: the asterisk means "all addresses".)
+
+**The handler.** The second argument of `ListenAndServe` has the type `http.Handler`: any value that has a `ServeHTTP` method ([GB-4.03](/lab/youtube/gb/gb-4-03/en)).
+`ServeMux` has a `ServeHTTP` method, so it is an `http.Handler` too. For each request the server calls `mux.ServeHTTP(w, r)`, and `mux`, by the path, calls our handler.
+
+**The result.** `ListenAndServe` returns one value: an `error`. We store it in `err`. The next two lines (as in [GB-1.07](/lab/youtube/gb/gb-1-07/en)):
+
+```go
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+```
+
+The first writes the error to stderr, the second ends the program with code `1`. These two lines run only if `ListenAndServe` returns, that is, when — we will see in a moment.
+
+Here is the whole program (`~/bozor-04/main.go`):
+
+```go filename="_video/02-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | this file is in package `main` ([GB-1.01](/lab/youtube/gb/gb-1-01/en)). All `.go` files in one folder form one package: `healthHandler` from `handlers.go` is visible here |
+| 3–7 | `import (…)` | `fmt` (printing), `net/http` (the server), `os` (`Stderr`, `Exit`) |
+| 9 | `func main() {` | the program starts here |
+| 10 | `mux := http.NewServeMux()` | an empty path table |
+| 11 | `mux.HandleFunc("/health", healthHandler)` | a table entry: `/health` → `healthHandler` |
+| 12 | `mux.HandleFunc("/products", catalogHandler)` | a table entry: `/products` → `catalogHandler` |
+| 14 | `fmt.Println(…)` | prints the address on screen |
+| 15 | `err := http.ListenAndServe(":8765", mux)` | opens the port and serves requests; if it returns, gives the error to `err` |
+| 16 | `fmt.Fprintln(os.Stderr, "xato:", err)` | writes the error to stderr |
+| 17 | `os.Exit(1)` | ends the program with code `1` |
+
+### Predict: what does `go run .` do?
+
+If you write `go run .` in the first terminal, in the `~/bozor-04` folder, what happens?
+
+**A)** the address is printed and the program ends · **B)** the address is printed and the terminal stays busy · **C)** `xato: …` appears
+
+<details>
+<summary>Answer</summary>
+
+**B.** `ListenAndServe` tries to open the port; the port is free, so there is no error; the server starts and waits for connections. The function does not return, so lines 16–17 never get their turn.
+If you chose **A**, you took `ListenAndServe` for an ordinary function: called, does its job, returns. This function does not return while the server runs. If you chose **C**, you thought the port was busy; with a free port there is no error (a busy port is covered in the last sections).
+
+</details>
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+```
+
+The address was printed, but the command line (`$`) did not come back: the program is inside `ListenAndServe`, waiting for requests. Here is what is going on:
+
+| Step | Inside `ListenAndServe` |
+|---|---|
+| 1 | the port opens (`:8765`) |
+| 2 | waits for a connection: listens |
+| 3 | a connection arrives — serves it: `mux.ServeHTTP(w, r)` |
+| 4 | waits again: back to step 2 |
+| — | the loop does not end: there is no way out of the function |
+
+The function returns **only when the server has stopped**: if the port did not open (for example, it was busy) or the program itself stopped the server (that is in [GB-8.03](/lab/youtube/gb#gb-8-03)). The returned value is **always an error**: the Go documentation says so
+(*"ListenAndServe always returns a non-nil error"*). That is why lines 16–17 run only when the server stops working. Each connection is served separately; requests arriving at the same time are in [GB-4.07](/lab/youtube/gb#gb-4-07).
+
+## Checking the server from a second terminal
+
+The first terminal is busy, so we open a second one. In it we send the very `curl` from the start:
+
+```console
+$ curl http://localhost:8765/health
+ok
+```
+
+Without `-v`, `curl` prints only the body: `ok` — `healthHandler` answered. Now the catalog:
+
+```console
+$ curl http://localhost:8765/products
+[{"id":1,"name":"olma","price":1200000,"stock":40},{"id":2,"name":"non","price":400000,"stock":120},{"id":3,"name":"oʻrik","price":3500000,"stock":5}]
+```
+
+Three products, a JSON array ([GB-3.02](/lab/youtube/gb/gb-3-02/en); the price is in tiyin). This is the answer of `catalogHandler`.
+
+Remember: the line that printed the address does not prove the server is running: it is printed **before** `ListenAndServe`. What proves the server is running is the answer from `curl`.
+(The server does not write each request to the first terminal: nothing appears there. Logging is in [GB-8.02](/lab/youtube/gb#gb-8-02).)
+
+You can also ask the operating system whether the port is open. This command is not in the video: `ss` shows open connections (`-l` listening ones, `-t` TCP, `-n` with numbers), `grep 8765` keeps only the lines with this port:
+
+```console
+$ ss -ltn | grep 8765
+LISTEN 0      4096               *:8765             *:*
+```
+
+`LISTEN` means the port is being listened on, `*:8765` means on all addresses, port 8765.
+
+### Predict: a path that is not in the table
+
+The table has `/health` and `/products`. What does `curl http://localhost:8765/products/1` return?
+
+**A)** the whole catalog: `/products` matches · **B)** `404 page not found` · **C)** `405 Method Not Allowed`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The pattern `"/products"` has no trailing slash: it matches exactly the path `/products`, not `/products/1`. If no pattern matches, `ServeMux` writes the `404` response itself.
+If you chose **A**, you thought a pattern means "every path that starts with this"; that rule exists only for a pattern with a trailing slash (below). **C**: `405` appears when the path is found but the method does not fit; here the path itself was not found.
+
+</details>
+
+`-i` tells `curl` to print the response status line and headers too:
+
+```console
+$ curl -i http://localhost:8765/products/1
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Fri, 27 Nov 2026 11:23:51 GMT
+Content-Length: 19
+
+404 page not found
+```
+
+(Your `Date` will differ. In the video the header lines are hidden with `…`.)
+
+| Line | Meaning |
+|---|---|
+| `HTTP/1.1 404 Not Found` | the status line ([GB-4.01](/lab/youtube/gb/gb-4-01/en)): code `404`, reason `Not Found` |
+| `Content-Type: text/plain; charset=utf-8` | the body is plain text |
+| `X-Content-Type-Options: nosniff` | a security header that `ServeMux` adds to its error response; we do not touch it in this lesson |
+| `Date: …` | the time of the response |
+| `Content-Length: 19` | the body length in bytes: `404 page not found` is 18 characters + the line ending = 19 bytes |
+| (empty line) | the headers are over, the body starts |
+| `404 page not found` | the body: `ServeMux`'s own message |
+
+None of our handlers wrote this response: no pattern matched, so `ServeMux` answered by itself.
+
+### The pattern rule
+
+| Pattern | Which paths it matches |
+|---|---|
+| `"/products"` (no trailing slash) | exactly `/products` only |
+| `"/products/"` (trailing slash) | every path that starts with it: `/products/1`, `/products/abc/def` … |
+| no method written (all our patterns) | any method |
+
+The proof of the last row: `POST` also reaches `catalogHandler`, and it accepts only `GET`:
+
+```console
+$ curl -i -X POST http://localhost:8765/products
+HTTP/1.1 405 Method Not Allowed
+Allow: GET
+Date: Fri, 27 Nov 2026 11:23:51 GMT
+Content-Length: 0
+
+```
+
+`-X POST` sets the method to `POST`. `catalogHandler` wrote `405` and `Allow: GET` ([GB-4.03](/lab/youtube/gb/gb-4-03/en)); the path was found, the method did not fit. The empty line at the end is the empty body.
+How to write the method into the pattern itself and take all IDs with one pattern (`/products/{id}`) is in [GB-4.05](/lab/youtube/gb#gb-4-05).
+
+Let us test a pattern with a trailing slash too. This is the **whole** `main.go` of that program; `handlers.go` is the same as before. It is not in the course folder: I wrote and ran it separately (scratch folder: `scratchpad/gb404/extra2`):
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/products/", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+The table has one entry: `"/products/"` → `catalogHandler`. The requests:
+
+```console
+$ curl -i http://localhost:8765/products/1
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 11:25:41 GMT
+Content-Length: 152
+
+[{"id":1,"name":"olma","price":1200000,"stock":40},{"id":2,"name":"non","price":400000,"stock":120},{"id":3,"name":"oʻrik","price":3500000,"stock":5}]
+```
+
+`/products/1` starts with `/products/`, so `catalogHandler` answered (it does not look at the path, so it returns everything). `/products/a/b` got `200` too. And `/products` itself:
+
+```console
+$ curl -i http://localhost:8765/products
+HTTP/1.1 307 Temporary Redirect
+Content-Type: text/html; charset=utf-8
+Location: /products/
+Date: Fri, 27 Nov 2026 11:25:41 GMT
+Content-Length: 46
+
+<a href="/products/">Temporary Redirect</a>.
+```
+
+When a pattern with a trailing slash is registered and a path without the slash arrives, `ServeMux` redirects the client to `Location: /products/` (the documentation says so). The main point of this lesson: a pattern without a slash is one path, a pattern with a slash is a whole "branch".
+In the video's server the pattern has no slash and nothing is registered for `/products/1`, so it is `404`. In the ready-made server of GB-4.01 that path existed; in ours it does not.
+
+### Stopping the server
+
+In the first terminal press `Ctrl+C` (as in [GB-4.02](/lab/youtube/gb/gb-4-02/en)):
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+^Csignal: interrupt
+```
+
+`^C` is how the terminal itself shows the key; `signal: interrupt` means the program received an interrupt signal and stopped, and the port is free. In the second terminal, the same `curl` again:
+
+```console
+$ curl http://localhost:8765/health
+curl: (7) Failed to connect to localhost:8765 after 0 ms: Could not connect to server
+```
+
+`Failed to connect` again: the state we started from. The server exists only while the program runs.
+
+## DefaultServeMux: why many examples have no `mux`
+
+Many examples have no `mux`. `http.HandleFunc` is called directly, and `ListenAndServe` gets `nil` instead of a handler. Here is such a program (the other files are as before):
+
+```go filename="_video/05-default/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+// Koʻp misollardagi shakl: http.HandleFunc va nil — DefaultServeMux (umumiy, global mux).
+func main() {
+	http.HandleFunc("/health", healthHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", nil)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+This code works (I ran it):
+
+```console
+$ curl http://localhost:8765/health
+ok
+$ curl http://localhost:8765/products
+404 page not found
+```
+
+`/products` gave `404` because in this version we did not register it. But **where** did `http.HandleFunc` write the path?
+`http.HandleFunc` writes the path into **`DefaultServeMux`**: one shared `ServeMux` inside the `net/http` package. When the second argument of `ListenAndServe` is `nil`, the server uses exactly that `DefaultServeMux`.
+
+It is shared: **any package** linked into the program can write its own paths into it. For example, the profiler package `net/http/pprof` adds the paths `/debug/pprof/…` by itself:
+they show the program's memory and its command line (source: [pkg.go.dev/net/http/pprof](https://pkg.go.dev/net/http/pprof); I did not run this, I quote the documentation).
+In our own `mux` there are only the paths we wrote. That is why in real work we create our own `ServeMux`.
+
+## http.Server: what is inside ListenAndServe
+
+Now let us look at the code of `ListenAndServe` itself: the `net/http` source, `go1.27.4`, `src/net/http/server.go` (comments removed). This is the package's own code, so there is no `http.` before `Server` and `Handler`:
+
+```go
+func ListenAndServe(addr string, handler Handler) error {
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServe()
+}
+```
+
+| Line | Meaning |
+|---|---|
+| 1 | the function takes an address and a handler and returns an `error`: this is our call |
+| 2 | builds a `Server` struct with the fields `Addr` (the address) and `Handler`; `&` makes a pointer to it ([GB-2.04](/lab/youtube/gb/gb-2-04/en)), `Server{…}` is a struct literal ([GB-2.03](/lab/youtube/gb/gb-2-03/en)). The result is in the variable `server` |
+| 3 | calls the `ListenAndServe` **method** of `Server` and returns its result |
+
+So the function we used is a shortcut. In real work a server is usually written in this form, because more settings get added to the struct:
+
+```go
+	srv := &http.Server{
+		Addr:    ":8765",
+		Handler: mux,
+	}
+	fmt.Println("bozor API: http://localhost:8765")
+	err := srv.ListenAndServe()
+```
+
+`srv` is a pointer to a `Server`; `srv.ListenAndServe()` does the same job: opens the port and waits for connections. Now we add a third field to the struct:
+
+```go filename="_video/06-http-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	srv := &http.Server{
+		Addr:              ":8765",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	fmt.Println("bozor API: http://localhost:8765")
+	err := srv.ListenAndServe()
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7 | `"time"` | the `time` package: `time.Second` comes from here ([GB-4.02](/lab/youtube/gb/gb-4-02/en)) |
+| 15 | `srv := &http.Server{` | builds an `http.Server` struct and stores a pointer to it in `srv` |
+| 16 | `Addr: ":8765",` | the address: the first argument of `ListenAndServe(":8765", …)` |
+| 17 | `Handler: mux,` | the handler: the second argument |
+| 18 | `ReadHeaderTimeout: 5 * time.Second,` | how long the client has to finish sending the request headers: 5 seconds |
+| 19 | `}` | the struct literal is over (in a multi-line literal every field is followed by a comma) |
+| 21 | `err := srv.ListenAndServe()` | the same as `http.ListenAndServe`: port, waiting, error |
+
+If `ReadHeaderTimeout` is zero (and no `ReadTimeout` is set), the server waits for the headers **forever** — like the client `Timeout` of [GB-4.02](/lab/youtube/gb/gb-4-02/en) when it is zero.
+`5 * time.Second` is five seconds: if the headers do not arrive, the server closes the connection. Does it work? We test it with a connection that sends nothing.
+
+### Measurement: a silent connection
+
+A TCP connection that sends nothing. This command is not shown in the video (only its numbers are said); it is in the course README. Run it in the second terminal while the server runs in the first:
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+```
+
+| Part | Meaning |
+|---|---|
+| `exec 3<>/dev/tcp/127.0.0.1/8765` | opens a TCP connection to port 8765 (`3` is the file number); sends nothing |
+| `s=$SECONDS` | remembers the start time |
+| `timeout 12 cat <&3` | reads the bytes the server sends, but cuts the wait after 12 seconds |
+| `echo "kod $? · …"` | the exit code of `cat` and the seconds that passed |
+
+`kod 0` means `cat` finished by itself, so the server closed the connection; `kod 124` means `timeout` cut it after 12 seconds, so the connection was still open.
+With `06-http-server` (`ReadHeaderTimeout: 5 * time.Second`) running:
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+kod 0 · 5 s
+```
+
+With `02-server` (no limit):
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+kod 124 · 12 s
+```
+
+The video names two numbers: 5 seconds and 12 seconds. On my machine it is the same: **5 s** and **12 s**. These numbers do not depend on the speed of the computer; what matters is the ratio: the server closed the connection by itself after 5 seconds, while without a limit the connection stayed open as long as we waited.
+(12 seconds is not a property of the server, it is my `timeout 12`: "it was still not closed after 12 seconds".) Every open connection takes up server resources, which is why the limit matters.
+
+Two limits. First, this limit covers only reading the request headers. A connection that sent one request and then went quiet is not limited by it: waiting for the next request is limited by `IdleTimeout` (if that is 0, by `ReadTimeout`), and if both are zero the wait is unlimited.
+I did not measure that case; the source is the course README and `server.go` ([pkg.go.dev: Server](https://pkg.go.dev/net/http#Server)). Second, the other timeouts and stopping the server properly are in [GB-8.03](/lab/youtube/gb#gb-8-03).
+
+## Common mistakes
+
+### 1. Throwing away the `ListenAndServe` error
+
+The most common mistake: the result of `ListenAndServe` is not checked, the returned error is thrown away. In the first terminal the correct server (`02-server`) is running again. In the second terminal there is the broken copy.
+It is in a separate folder: there are no `err` lines, and no `os` import either (why — below):
+
+```go filename="_video/03-xato-yoq/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	http.ListenAndServe(":8765", mux) // XATO: qaytgan error tashlab yuborildi
+}
+```
+
+The port is busy now: the server from the first terminal is on it. What happens if we run `go run .` with the broken copy in the second terminal?
+
+**A)** the second server runs too · **B)** the program ends silently, with no message · **C)** `panic`
+
+<details>
+<summary>Answer</summary>
+
+**B.** Only one program can listen on one address and port at the same time; the second `ListenAndServe` cannot start and returns an error. But the error is thrown away, and `main` has ended.
+**A** is impossible: the port is busy. **C** is wrong too: the error is not a `panic`, it is an ordinary returned value; if we do not check it, nothing happens.
+
+</details>
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+$ echo $?
+0
+```
+
+The program ended at once. The address line is printed before `ListenAndServe`, so it proves nothing. `echo $?` ([GB-1.07](/lab/youtube/gb/gb-1-07/en)) shows the exit code of the last command: `0` means success.
+The server is not running, but nothing says so. In real work it looks like this: the program seems to have ended without errors, and requests do not arrive anywhere.
+
+The correct copy (the error is checked, as in `02-server`) answers like this in the same situation:
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+xato: listen tcp :8765: bind: address already in use
+exit status 1
+```
+
+We read the line part by part:
+
+| Part | Meaning |
+|---|---|
+| `xato:` | the start of our own line `fmt.Fprintln(os.Stderr, "xato:", err)` |
+| `listen tcp :8765` | an attempt to open a TCP port; TCP is the connection protocol that HTTP runs over, `:8765` is our address |
+| `bind` | the operating system call that attaches the port to the program ([bind(2)](https://man7.org/linux/man-pages/man2/bind.2.html)) |
+| `address already in use` | the address is busy |
+| `exit status 1` | the message from `go run`: the program ended through `os.Exit(1)` |
+
+Who holds the port (not in the video):
+
+```console
+$ ss -ltnp 'sport = :8765'
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      4096               *:8765            *:*    users:(("bozor",pid=1037182,fd=3))
+```
+
+`users:(("bozor",pid=…))` means the `bozor` program holds the port (`pid` is the process number, yours will differ). The rule: `ListenAndServe` returned, so the server is not running.
+Always print the error and exit with a non-zero code. If the port is busy, stop the old server or give another port. When a program fails to start on a server in real work, this is the first line to look at.
+
+### 2. The thrown-away error and the `os` import
+
+Why did the broken copy have no `os` import? Because if you delete the `err` lines but keep the import, Go refuses to run the program ([GB-1.01](/lab/youtube/gb/gb-1-01/en)). I tried it.
+This code is not in the course folder (scratch folder: `scratchpad/gb404/extra1`); `handlers.go` is as before, and `main.go` is entirely this:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	http.ListenAndServe(":8765", mux)
+}
+```
+
+```console
+$ go run .
+# github.com/abdurahmon27/bozor
+./main.go:6:2: "os" imported and not used
+```
+
+How to read it: file `main.go`, line 6, column 2: `"os"` is imported but not used. The fix: remove `os` — or, better, check the error and use `os` (the correct copy above).
+
+### 3. Parentheses after the handler
+
+`mux.HandleFunc("/health", healthHandler())` — with parentheses the function is not given to the table, it is called on this very line. I tried it (scratch folder: `scratchpad/gb404/extra3`; the entire `main.go`):
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler())
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+```console
+$ go run .
+# github.com/abdurahmon27/bozor
+./main.go:11:28: not enough arguments in call to healthHandler
+	have ()
+	want (http.ResponseWriter, *http.Request)
+./main.go:11:28: healthHandler() (no value) used as value
+```
+
+How to read it: line 11, column 28: `healthHandler` is called with no arguments: *not enough arguments*; *have ()* means what was given: nothing; *want (…)* means what was expected: `w` and `r`.
+The second line: the function returns nothing (*no value*), yet you try to use its result as a value (to hand it to the table). The fix: remove the parentheses.
+
+### 4. A pattern without a slash is not a whole branch
+
+`"/products"` does not accept `/products/1` (`404`). We saw this above (the section "The pattern rule"). The fix is a pattern with a trailing slash (`"/products/"`) or the `{id}` of [GB-4.05](/lab/youtube/gb#gb-4-05).
+
+## Check yourself
+
+**1.** When does `ListenAndServe` return?
+
+<details>
+<summary>Answer</summary>
+
+Only when the server has stopped: if the port did not open, or the program itself stopped the server. The returned value is always an error.
+
+</details>
+
+**2.** The table has only `"/products"`. What does `/products/1` get?
+
+<details>
+<summary>Answer</summary>
+
+`404 page not found`: a pattern without a trailing slash matches exactly that path.
+
+</details>
+
+**3.** From [GB-4.01](/lab/youtube/gb/gb-4-01/en): does `Content-Length` count characters or bytes? Check it on the `/products` response.
+
+<details>
+<summary>Answer</summary>
+
+Bytes. `oʻrik` is five characters but six bytes: the sign `ʻ` (U+02BB) takes two bytes ([GB-2.10](/lab/youtube/gb/gb-2-10/en)). I measured it while the server was running; these commands are not in the course folder:
+
+```console
+$ curl -s http://localhost:8765/products | wc -c
+152
+$ curl -s http://localhost:8765/products | LC_ALL=C.UTF-8 wc -m
+151
+```
+
+`wc -c` counts bytes, `wc -m` counts characters (`-s` is `curl`'s silent mode). 152 bytes, 151 characters: the difference is the second byte of `ʻ`. `Content-Length: 152` says the same (see the `/products/1` response above).
+
+</details>
+
+**4.** Predict: the table has `"/health"`. What does `curl -i http://localhost:8765/health/` (with a trailing slash!) print on its first line?
+
+<details>
+<summary>Answer</summary>
+
+`HTTP/1.1 404 Not Found`. The pattern `"/health"` has no trailing slash: it matches only `/health`, not `/health/`. I ran it:
+
+```console
+$ curl -i http://localhost:8765/health/ | head -1
+HTTP/1.1 404 Not Found
+```
+
+(`| head -1` keeps only the first line of the response.) The whole response is like the one for `/products/1`: the body is `404 page not found`.
+
+</details>
+
+**5.** Can another computer connect to the address `":8765"`? What do you write so that only this computer can connect?
+
+<details>
+<summary>Answer</summary>
+
+Yes: no host is written, the server listens on all addresses, and another computer on the same network can connect. For this computer only, `"localhost:8765"`. In a container, on the contrary, you need exactly all addresses (module GB-8).
+
+</details>
+
+## Homework
+
+The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-04-birinchi-server/TASK.md) of the course folder; the folder:
+[lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server). The level marks (🟢🟡) are not in the course folder: I added them.
+In the video the server was built inside `main`. Now you write the same thing yourself in the function `newServer(addr string) *http.Server` in `main.go`, so that the test can check the returned `*http.Server` without opening a port. `main` is ready: it calls `newServer(":8765")` and then `srv.ListenAndServe()`. Change nothing else.
+
+- 🟢 **Step 1, the path table.** Create a new `ServeMux` and add three entries: `/health` → `healthHandler`, `/products` → `catalogHandler`, `/products/1` → `productHandler` (`olma`). `/products/2` must stay `404`: only exactly `/products/1` matches.
+- 🟡 **Step 2, the server.** Return an `*http.Server`: `Addr` is the `addr` that came into the function, `Handler` is your `mux`, `ReadHeaderTimeout` is 5 seconds. Add `"time"` to the `import (…)` at the top of the file.
+
+Right now `newServer` is empty and returns `nil`, so `go run .` fails at once (I ran it on a copy of the course folder):
+
+```console
+$ go run .
+xato: newServer hali yozilmagan (TASK.md)
+exit status 1
+```
+
+To check, run `go test .` in this folder. Do not change `tekshiruv_test.go`. Right now it fails like this; each message says in Uzbek what was expected:
+
+```console
+$ go test .
+--- FAIL: TestVazifaYollar (0.00s)
+    tekshiruv_test.go:51: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+--- FAIL: TestVazifaOlma (0.00s)
+    tekshiruv_test.go:63: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+--- FAIL: TestVazifaTimeout (0.00s)
+    tekshiruv_test.go:80: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+The test calls `newServer("127.0.0.1:0")` (`127.0.0.1` is this computer, `:0` means the operating system picks a free port; this address is only read from the `Addr` field), opens the returned server's `Handler` with `httptest.NewServer`, sends real requests ([GB-4.03](/lab/youtube/gb/gb-4-03/en)) and reads the `ReadHeaderTimeout` field directly.
+Work until you see `ok`. After the test passes, also look by hand: `go run .`, and in the second terminal `curl http://localhost:8765/products/1` must return `olma`, while `curl -i http://localhost:8765/products/2` must return `404 page not found`; stop the server with `Ctrl+C`.
+
+Hints:
+
+- Step 1: the "ServeMux" section above. Pass the handler without parentheses: we do not call the function, we hand over the function itself.
+- If you write `/products/1` with a trailing slash (`/products/`), the pattern matches every path that starts with `/products/`, and `/products/2` returns `olma` too: the test catches this.
+- Step 2: the `http.Server` struct literal above. If you write just `5`, that is not 5 seconds but 5 nanoseconds: `time.Duration` counts in nanoseconds. The test catches this too.
+
+<details>
+<summary>Answer: newServer from solution/main.go</summary>
+
+Try it yourself first. The answer is in the course repository, [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-04-birinchi-server/solution/main.go); `newServer`:
+
+```go
+func newServer(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+	mux.HandleFunc("/products/1", productHandler) // {id} bilan hamma ID uchun bitta pattern: GB-4.05
+
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second, // soʻrov sarlavhalari 5 s'da kelmasa, ulanish yopiladi
+	}
+}
+```
+
+Line by line:
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `mux := http.NewServeMux()` | an empty path table |
+| 3–5 | `mux.HandleFunc(…)` | three entries: `/health`, `/products`, `/products/1`; handlers without parentheses. `/products/1` has no trailing slash: `/products/2` is `404` |
+| 7 | `return &http.Server{` | builds the `Server` struct and returns a pointer to it |
+| 8 | `Addr: addr,` | the address is the function's parameter (`main` passes `":8765"`, the test passes `"127.0.0.1:0"`) |
+| 9 | `Handler: mux,` | `mux` is the handler |
+| 10 | `ReadHeaderTimeout: 5 * time.Second,` | 5 seconds; `5 * time.Second` is a `Duration` |
+
+Check (`-count=1` turns off Go's test cache):
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.004s
+```
+
+`ok` means all three tests passed. `solution/` has the same test file, so the answer passes the same tests.
+
+</details>
+
+## Sources
+
+- [pkg.go.dev: net/http — ListenAndServe](https://pkg.go.dev/net/http#ListenAndServe) — `ListenAndServe` uses `DefaultServeMux` when the handler is nil; it always returns a non-nil error
+- [pkg.go.dev: net/http — Server](https://pkg.go.dev/net/http#Server) and [Server.ListenAndServe](https://pkg.go.dev/net/http#Server.ListenAndServe) — `Addr`, `Handler`, `ReadHeaderTimeout` ("If zero, the value of ReadTimeout is used…")
+- [pkg.go.dev: net/http — ServeMux](https://pkg.go.dev/net/http#ServeMux), [NewServeMux](https://pkg.go.dev/net/http#NewServeMux), [ServeMux.HandleFunc](https://pkg.go.dev/net/http#ServeMux.HandleFunc), [pattern rules](https://pkg.go.dev/net/http#hdr-Patterns-ServeMux) — a pattern without a trailing slash is one path, with a trailing slash a whole branch; if the branch root arrives without the slash, `ServeMux` redirects
+- [pkg.go.dev: net/http — HandleFunc and DefaultServeMux](https://pkg.go.dev/net/http#HandleFunc), [net/http/pprof](https://pkg.go.dev/net/http/pprof)
+- [pkg.go.dev: net — Listen](https://pkg.go.dev/net#Listen) — an empty host means all addresses
+- [bind(2): EADDRINUSE](https://man7.org/linux/man-pages/man2/bind.2.html) — the address is in use
+- [Go source: net/http/server.go, go1.27.4](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/net/http/server.go) — the body of `ListenAndServe`
+- [curl: --include and exit codes](https://curl.se/docs/manpage.html) — `-i`; exit code `7` means it could not connect
+- [Course folder: lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+Results are from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, `curl 8.22.0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+---
+
+← Previous lesson: [GB-4.03](/lab/youtube/gb/gb-4-03/en) · Next lesson: [GB-4.05](/lab/youtube/gb#gb-4-05) → · [All lessons](/lab/youtube/gb)
+
+</div>

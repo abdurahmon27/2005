@@ -1,0 +1,974 @@
+---
+title: "Ввод и вывод JSON: лимит, валидация и ответ с ошибкой"
+date: "2026/11/27"
+description: "Вы безопасно читаете тело POST в Go: лимит размера (413), отказ от лишних ключей (400), проверка значений (422) и единый JSON-формат ошибки."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-06) · **Русский** · [English](/lab/youtube/gb/gb-4-06/en)  
+Урок GB-4.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Тело запроса `POST /products`, который добавляет в bozor новый товар, пишет клиент. Он может прислать слишком большое тело, добавить лишний ключ или написать в цене минус пять.
+Вопрос: как сервер отвечает на каждый из этих случаев — точно и в одном и том же формате?
+
+**Главная идея:** тело `POST` пишет клиент, поэтому это недоверенный ввод. Обработчик читает его **строго**: `http.MaxBytesReader` ограничивает размер (`413`), `DisallowUnknownFields` отклоняет лишний ключ (`400`).
+После чтения он проверяет **значения** (`422` и `fields`), а каждая ошибка возвращается в одном JSON-формате: `{"error": {"code", "message", "fields"}}`.
+`400` — тело не соответствует нашей форме; `422` — форма верна, но значение нарушает правило.
+
+К концу урока вы:
+
+- напишете `writeError`, который возвращает любую ошибку в одном JSON-формате;
+- ограничите размер тела через `http.MaxBytesReader` и, распознав превышение лимита через `errors.As`, вернёте `413`;
+- отклоните лишний ключ через `DisallowUnknownFields` и объясните границу между `400` и `422`;
+- напишете `validateOrder` и `createOrder` для `POST /orders` и добьётесь, чтобы `go test .` прошёл.
+
+Три основных новых понятия сегодня:
+
+| Понятие | Простой смысл | По-английски |
+|---|---|---|
+| формат ошибки | любой ответ с ошибкой имеет одну структуру: внутри `error` ключи `code`, `message`, `fields` | error response shape |
+| строгое чтение | чтение тела с лимитом размера и запретом лишних ключей: `http.MaxBytesReader`, `DisallowUnknownFields` | strict decoding |
+| валидация | сравнение значений с правилами после чтения тела: `400` — форма, `422` — значение | validation |
+
+Вспомогательные: `201 Created` (новый ресурс создан) и забытый `return` (в разделе об ошибках). Остальные новые имена я поясню одним предложением по ходу.
+
+## Что нужно знать заранее
+
+Урок опирается на:
+
+- [GB-4.05 · Route'lar va `{id}`](/lab/youtube/gb#gb-4-05): паттерны `METHOD /path`, `404` и `405`. Вопрос для повторения — из этого урока.
+- [GB-4.04 · Birinchi server, qatorma-qator](/lab/youtube/gb/gb-4-04/ru): `ServeMux`, `HandleFunc`. Содержимое `newMux` сегодня не показываю: оно собрано из этих двух функций.
+- [GB-4.03 · Handler — oddiy funksiya](/lab/youtube/gb/gb-4-03/ru): `w` и `r`, `httptest.NewRequest`, `NewRecorder`, порядок ответа (заголовки → статус → тело).
+- [GB-4.02 · Go'da HTTP client](/lab/youtube/gb/gb-4-02/ru): `json.NewDecoder(...).Decode(&v)`.
+- [GB-4.01 · HTTP soʻrov — bu matn](/lab/youtube/gb/gb-4-01/ru): классы кодов статуса, `405` и `Allow`.
+- [GB-3.02 · JSON va struct tag'lar](/lab/youtube/gb/gb-3-02/ru): `Product`, теги `json:"..."`, `omitempty`.
+- [GB-2.08 · Error'lar chuqur](/lab/youtube/gb/gb-2-08/ru): `errors.As` и цель-указатель.
+- [GB-2.07 · Interface](/lab/youtube/gb/gb-2-07/ru): `any`, `http.Handler`. [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/ru): `map[string]string`. [GB-2.10 · UTF-8](/lab/youtube/gb/gb-2-10/ru): `strings.Repeat`.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса:
+[lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body). Скачайте его и откройте терминал в этой папке
+(`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-06-json-body
+```
+
+В папке: `main.go` (код в конце видео), `handler_test.go` (тесты `POST /products`), `tekshiruv_test.go` (проверяет задание), `TASK.md` (задание), `solution/` (ответ) и `_video/` — отдельная папка для каждого шага видео (`01-oddiy`, `02-qatiy`, …).
+У папки свой `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`), внешних модулей нет. Программа не запускает сервер: запросы отправляются через `httptest`, как в [GB-4.03](/lab/youtube/gb/gb-4-03/ru).
+
+Скрипт, который запускает шаг так же, как в видео: `./_video/run.sh <шаг> <команда>`. Он копирует `main.go` из папки шага во временную папку `bozor/` вместе с этим `go.mod`, выполняет там команду
+и в конце печатает код выхода (`(chiqish kodi: 0)`): `0` — команда завершилась без ошибки. Эта последняя строка — вывод скрипта, а не программы.
+
+Результаты получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0`; каждую команду я запускал заново. Модуль написан для Go 1.27: если у вас установлен более старый Go, `go` сам скачает нужную версию.
+
+Один вопрос по прошлому уроку. В мультиплексоре есть только паттерн `GET /products/{id}`. Пришёл запрос `POST /products/1`. Какой ответ?
+
+**A)** `404` · **B)** `405` и заголовок `Allow` · **C)** `400`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Путь найден (`/products/1` подходит под паттерн), но метод не подходит, поэтому `405 Method Not Allowed`; заголовок `Allow` перечисляет допустимые методы ([GB-4.05](/lab/youtube/gb#gb-4-05), [RFC 9110 §15.5.6](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed)). В папке этого урока маршрута `GET /products/{id}` нет, поэтому результат здесь заново не запускался: он взят из урока GB-4.05.
+Если вы выбрали **A**, вы забыли, что `404` бывает, когда путь не найден совсем; в **C** вы подумали о теле, а в этом запросе нет ни тела, ни `400`. Сегодня `POST` с телом.
+
+</details>
+
+## Единый формат ошибки
+
+Клиентский код сначала смотрит на статус, потом читает из JSON, что именно за ошибка. Если каждый эндпоинт возвращает ошибку в своём виде, клиенту нужен отдельный код для каждого эндпоинта. Поэтому все ошибки имеют один формат:
+
+```text
+{"error": {
+  "code": "validation_failed",
+  "message": "qiymatlar notoʻgʻri",
+  "fields": {"price": "0 dan katta boʻlsin"}
+}}
+```
+
+| Ключ | Кто читает | Что это |
+|---|---|---|
+| `error` | клиентский код | внешний ключ: показывает, что ответ — ошибка |
+| `code` | машина | короткое неизменное имя: `bad_json`, `too_large`, `validation_failed` |
+| `message` | человек | читаемый текст |
+| `fields` | форма на клиенте | какое поле и почему неверно: ключ — имя поля, значение — причина. Есть только в ошибке валидации |
+
+В Go этот формат — **структура** (struct). Её имя `apiError`, имя выбрали мы:
+
+```go
+type apiError struct {
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Fields  map[string]string `json:"fields,omitempty"`
+}
+```
+
+Номера строк ниже — номера внутри этого фрагмента:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `type apiError struct {` | объявление нового типа: `struct` — набор именованных полей ([GB-2.03](/lab/youtube/gb/gb-2-03/ru)) |
+| 2–3 | `Code string`, `Message string` | два текстовых поля. Тег в обратных кавычках `json:"code"` задаёт имя ключа в JSON — `code` ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)) |
+| 4 | `Fields map[string]string` | `map`: ключ — имя поля, значение — причина ([GB-2.02](/lab/youtube/gb/gb-2-02/ru)). `omitempty` в теге: если map пуст, ключ `fields` вообще не записывается |
+
+Запись ответа — в одном месте, в `writeJSON`. Порядок как в [GB-4.03](/lab/youtube/gb/gb-4-03/ru): заголовок, затем статус, затем тело:
+
+```go
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func writeJSON(w http.ResponseWriter, status int, v any) {` | статус теперь параметр: каждый вызывающий выбирает свой. `v any` — любое значение ([GB-2.07](/lab/youtube/gb/gb-2-07/ru)) |
+| 2 | `w.Header().Set("Content-Type", "application/json")` | 1: заголовок сообщает, что тело — JSON |
+| 3 | `w.WriteHeader(status)` | 2: статус |
+| 4 | `json.NewEncoder(w).Encode(v)` | 3: записывает `v` в `w` как JSON. Ошибку, которую возвращает `Encode`, в этом уроке не проверяем: запись в лог разберём в [GB-8.02](/lab/youtube/gb#gb-8-02) |
+
+Ошибку в этот формат оборачивает `writeError`:
+
+```go
+func writeError(w http.ResponseWriter, status int, e apiError) {
+	writeJSON(w, status, map[string]apiError{"error": e})
+}
+```
+
+`map[string]apiError{"error": e}` — map из одного ключа: ключ `error`, значение `e`. `Encode` превращает его в `{"error": {...}}`. Теперь все ошибки выходят из этой функции.
+
+## POST /products: первый обработчик
+
+Поля, которые передаёт клиент, лежат в отдельной структуре `productInput`. Её отличие от `Product` — нет `ID`: его выдаёт сервер, а не клиент.
+
+```go
+type productInput struct {
+	Name  string `json:"name"`
+	Price int64  `json:"price"`
+	Stock int    `json:"stock"`
+}
+```
+
+Обработчик:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func createProduct(w http.ResponseWriter, r *http.Request) {` | обработчик ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)) |
+| 2 | `var in productInput` | пустой `productInput`; имя переменной — `in` |
+| 3 | `if err := json.NewDecoder(r.Body).Decode(&in); err != nil {` | читает тело в `in` ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)). Если ошибка — блок выполняется |
+| 4 | `writeError(w, http.StatusBadRequest, apiError{...})` | `400` (`http.StatusBadRequest`), `code` — `bad_json` (имя выбрали мы), `message` — `err.Error()`, то есть текст ошибки |
+| 5 | `return` | ответ уже записан: выходим из функции |
+| 7 | `writeJSON(w, http.StatusCreated, addProduct(in))` | если всё хорошо: `201` и созданный товар |
+
+`201 Created` ([RFC 9110 §15.3.2](https://www.rfc-editor.org/rfc/rfc9110#name-201-created)) — новый ресурс, то есть новый товар, создан; в теле он приходит с `ID`, который выдал сервер. `addProduct` добавляет товар в каталог; его внутренности сегодня не показываю. Он небезопасен, если два запроса придут одновременно: это мы увидим в [GB-4.07](/lab/youtube/gb#gb-4-07) с `-race`.
+
+Функция `send` отправляет запросы без сервера (шаги из [GB-4.03](/lab/youtube/gb/gb-4-03/ru) в одной функции):
+
+```go
+func send(h http.Handler, method, path, body string) {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+```
+
+`h http.Handler` — мультиплексор тоже handler ([GB-2.07](/lab/youtube/gb/gb-2-07/ru)). `strings.NewReader(body)` подключает текст тела к запросу. Остальные три строки — как в [GB-4.03](/lab/youtube/gb/gb-4-03/ru): recorder, `ServeHTTP`, печать статуса и тела.
+Вот вся программа; два запроса — в `main`:
+
+```go filename="_video/01-oddiy/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+// Product — katalogdagi bitta mahsulot (GB-3.02).
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+var catalog = []Product{
+	{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+	{ID: 2, Name: "non", Price: 400_000, Stock: 120},
+	{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+}
+
+type productInput struct {
+	Name  string `json:"name"`
+	Price int64  `json:"price"`
+	Stock int    `json:"stock"`
+}
+
+type apiError struct {
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Fields  map[string]string `json:"fields,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, e apiError) {
+	writeJSON(w, status, map[string]apiError{"error": e})
+}
+
+func addProduct(in productInput) Product {
+	var last int64
+	for _, p := range catalog {
+		last = max(last, p.ID)
+	}
+	p := Product{ID: last + 1, Name: in.Name, Price: in.Price, Stock: in.Stock}
+	catalog = append(catalog, p)
+	return p
+}
+
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /products", createProduct)
+	return mux
+}
+
+func send(h http.Handler, method, path, body string) {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+
+func main() {
+	mux := newMux()
+	send(mux, http.MethodPost, "/products", `{"name":"choy","price":2500000,"stock":30}`)
+	send(mux, http.MethodPost, "/products", `{"name":`)
+}
+```
+
+| Строка | Что |
+|---|---|
+| 3–9 | импорты: новых пакетов нет, всё из прошлых уроков |
+| 11–23 | `Product` и `catalog` ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)): в каталоге 3 товара, поэтому `ID` нового будет 4 |
+| 25–45 | `productInput`, `apiError`, `writeJSON`, `writeError`: объяснены выше |
+| 47–55 | `addProduct`: добавляет в каталог, `ID` = наибольший `ID` + 1 (сегодня внутренности не нужны) |
+| 57–64 | `createProduct`: выше |
+| 66–70 | `newMux`: собирает маршруты; `POST /products` привязан к `createProduct` ([GB-4.04](/lab/youtube/gb/gb-4-04/ru), [GB-4.05](/lab/youtube/gb#gb-4-05)) |
+| 72–77 | `send`: выше |
+| 79–83 | `main`: первый запрос — корректное тело, второй — сломанный JSON: нет конца (`{"name":`) |
+
+Предскажите: что выведет `go run .`?
+
+**A)** `201`, `201` · **B)** `201`, `400` · **C)** `400`, `400`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Первое тело полное и корректное: `201`, новый товар. Второе обрывается после `"name":` — JSON закончился неожиданно, `Decode` возвращает ошибку, обработчик пишет `400`. В **A** вы решили, что и сломанный JSON принимается; в **C** — что и корректное тело считается ошибкой.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-oddiy go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":30}
+400 {"error":{"code":"bad_json","message":"unexpected EOF"}}
+(chiqish kodi: 0)
+```
+
+Первая строка: `201`, четвёртый товар в каталоге, `"id":4` — его выдал сервер. Вторая строка: `400` и `unexpected EOF` (EOF — end of file, «ввод закончился»): JSON оборвался. Ключа `fields` нет: сработал `omitempty`.
+
+| Запрос | Тело | `Decode` | Ответ |
+|---|---|---|---|
+| 1 | `{"name":"choy","price":2500000,"stock":30}` | успешно | `201` + товар |
+| 2 | `{"name":` | `unexpected EOF` | `400` + `bad_json` |
+
+## Лишний ключ молча отбрасывается
+
+Теперь тело корректно, но в нём есть ключ, которого нет в `productInput`: `rang` («цвет») со значением `qora` («чёрный»):
+
+```text
+{"name":"choy","price":2500000,"rang":"qora"}
+```
+
+Предскажите: какой статус будет с текущим кодом?
+
+**A)** `201` · **B)** `400` · **C)** `422`
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Обычный `Decode` молча отбрасывает ключ, которого нет в структуре ([документация `json.Unmarshal`](https://pkg.go.dev/encoding/json#Unmarshal)). Ошибки нет, значит `201`. Выбравшие **B** и **C** ждали ошибки, но проблема именно в том, что её здесь нет.
+
+</details>
+
+```console
+$ ./_video/run.sh 01b-rang go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":0}
+(chiqish kodi: 0)
+```
+
+`201`, но `"stock":0`: в запросе `stock` не было, а `rang` пропал. Клиент думает, что `rang` сохранён, а сервер его так и не увидел. Клиент, ошибившийся в имени ключа, никогда об этом не узнает.
+
+Исправление: берём `Decoder` в отдельную переменную (`dec`) и вызываем `DisallowUnknownFields()`. После этого для ключа, которого нет в структуре, `Decode` возвращает ошибку. `Decode` теперь вызывается у `dec`:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+| Строка | Что изменилось |
+|---|---|
+| 3 | `dec := json.NewDecoder(r.Body)`: decoder теперь в переменной |
+| 4 | `dec.DisallowUnknownFields()`: лишний ключ — ошибка ([документация](https://pkg.go.dev/encoding/json#Decoder.DisallowUnknownFields)) |
+| 5 | `dec.Decode(&in)`: как раньше, но у `dec` |
+
+Тот же запрос:
+
+```console
+$ ./_video/run.sh 02-qatiy go run .
+400 {"error":{"code":"bad_json","message":"json: unknown field \"rang\""}}
+(chiqish kodi: 0)
+```
+
+`400`, в `message` есть имя ключа: `json: unknown field "rang"`. Клиент знает, что исправлять. `\"` внутри — это кавычка самого JSON: так `"` записывается внутри текста `message`.
+
+Здесь становится ясен смысл `400` в нашем курсе: **тело не соответствует нашей форме**. Три случая:
+
+| Случай | Пример | Ответ |
+|---|---|---|
+| JSON сломан | `{"name":` | `400`, `unexpected EOF` |
+| лишний ключ | `"rang":"qora"` | `400`, `unknown field "rang"` |
+| другой тип | число вместо `name` | `400` (текст сообщения — в разделе «Глубже») |
+
+Если клиент присылает `ID`, это тоже `400`: в `productInput` нет `id`, значит это тоже лишний ключ (этот случай проверяется в `handler_test.go`, ниже). Это договорённость курса, а не предписание RFC: одно и то же правило применяем во всех эндпоинтах.
+
+## Лимит размера: http.MaxBytesReader
+
+Теперь размер. `Decode` читает одно JSON-значение целиком в память. Если клиент пришлёт очень большое значение, сервер сохранит всё. Без лимита один запрос может занять память сервера.
+Для этого в Go есть `http.MaxBytesReader`: он оборачивает тело и после заданного числа байт возвращает ошибку ([документация](https://pkg.go.dev/net/http#MaxBytesReader)).
+
+```text
+без лимита:        тело ──► Decode ──► значение целиком в памяти (размер не ограничен)
+
+MaxBytesReader:    тело ──► MaxBytesReader(1024) ──► Decode
+                            после 1024 байт ошибка чтения ──► Decode возвращает ошибку
+```
+
+Добавляем в обработчик одну строку: заменяем `r.Body` обёрнутым телом.
+
+```go
+r.Body = http.MaxBytesReader(w, r.Body, 1024)
+```
+
+У `MaxBytesReader` три аргумента; запишем их по строке на аргумент:
+
+```go
+r.Body = http.MaxBytesReader(
+	w,
+	r.Body,
+	1024,
+)
+```
+
+(Это только для показа; в папке вызов в одной строке.)
+
+| Аргумент | Смысл |
+|---|---|
+| `w` | куда пишется ответ: при превышении лимита сервер, если возможно, закрывает соединение |
+| `r.Body` | оборачиваемое тело |
+| `1024` | лимит в байтах: 1024 байта. Настоящий JSON товара — всего 42 байта |
+
+Проверка: в поле `name` 2000 букв `a`. `strings.Repeat("a", 2000)` ([GB-2.10](/lab/youtube/gb/gb-2-10/ru)) строит текст из 2000 букв `a`; всё тело — 2011 байт, примерно вдвое больше лимита:
+
+```go
+big := `{"name":"` + strings.Repeat("a", 2000) + `"}`
+send(mux, http.MethodPost, "/products", big)
+```
+
+Пока ошибка `Decode` даёт общий `400` (старый блок в `createProduct`).
+Предскажите: тело 2000 байт, лимит 1024. Какой статус?
+
+**A)** `201` · **B)** `400` · **C)** `413`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Текущий код отвечает `400` на любую ошибку `Decode`, в том числе на превышение лимита. Лимит работает (не **A**: тело не принято), но `413` в коде пока нет (**C** — следующий шаг).
+
+</details>
+
+```console
+$ ./_video/run.sh 03-limit go run .
+400 {"error":{"code":"bad_json","message":"http: request body too large"}}
+(chiqish kodi: 0)
+```
+
+`400` и `http: request body too large`: лимит сработал. Но у этой ошибки **особый тип**, поэтому и статус клиенту нужен особый: `413` — тело больше, чем сервер готов принять ([RFC 9110 §15.5.14](https://www.rfc-editor.org/rfc/rfc9110#name-413-content-too-large)).
+
+При превышении лимита `Decode` возвращает `*http.MaxBytesError` ([документация](https://pkg.go.dev/net/http#MaxBytesError)). Достаём его через `errors.As` ([GB-2.08](/lab/youtube/gb/gb-2-08/ru)):
+
+```go
+	if err := dec.Decode(&in); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, apiError{Code: "too_large", Message: fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)})
+			return
+		}
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `var tooBig *http.MaxBytesError` | цель: переменная типа `*http.MaxBytesError`. Сначала пустая (`nil`) |
+| 3 | `if errors.As(err, &tooBig) {` | есть ли в `err` этот тип? В `As` передаётся **адрес** цели (`&tooBig`); если тип найден, он записывается в цель |
+| 4 | `writeError(w, http.StatusRequestEntityTooLarge, apiError{...})` | `413` (имя константы в Go — `StatusRequestEntityTooLarge`), `code` — `too_large` |
+| 4 | `fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)` | подставляет в сообщение значение лимита: `tooBig.Limit` — `1024` |
+| 7 | `writeError(w, http.StatusBadRequest, ...)` | любая другая ошибка — по-прежнему `400` |
+
+Те же два запроса: первый — тело в 2011 байт, второй — сломанный JSON:
+
+```console
+$ ./_video/run.sh 04-413 go run .
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+400 {"error":{"code":"bad_json","message":"unexpected EOF"}}
+(chiqish kodi: 0)
+```
+
+`413` и `body 1024 baytdan oshmasin`; сломанный JSON по-прежнему `400`. `code` в ответе (`too_large`) предназначен клиентскому коду, `message` — человеку.
+
+## decodeJSON: три шага в одной функции
+
+Лимит, строгое чтение и ответ с ошибкой нужны каждому `POST`-обработчику. Выносим их в функцию `decodeJSON`:
+
+```go
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	return true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeError(w, http.StatusRequestEntityTooLarge, apiError{Code: "too_large", Message: fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)})
+		return
+	}
+	writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {` | `dst any` — в какую структуру читать, решает вызывающий (`&in`). Результат `bool`: `true` — тело прочитано, `false` — ошибка, ответ уже записан |
+| 2–4 | `MaxBytesReader`, `NewDecoder`, `DisallowUnknownFields` | лимит и строгое чтение: три строки, что выше |
+| 5–8 | `if err := dec.Decode(dst); err != nil { writeDecodeError(w, err); return false }` | при ошибке ответ пишет `writeDecodeError`, возвращается `false` |
+| 9 | `return true` | ошибки нет: тело прочитано в `dst` |
+| 12–19 | `writeDecodeError` | прежняя проверка `MaxBytesError`: `413` или `400` |
+
+Увидев `false`, вызывающий ничего не пишет и делает `return`: ответ готов:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+Теперь работа с телом в обработчике — три строки. Три запроса: корректное тело, лишний ключ (`rang`), большое тело:
+
+```console
+$ ./_video/run.sh 05-ajrat go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":30}
+400 {"error":{"code":"bad_json","message":"json: unknown field \"rang\""}}
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+(chiqish kodi: 0)
+```
+
+`201`, `400` и `413`: три пути, а в обработчике всё это три строки.
+
+**Одна ловушка.** `Decode` читает только **первое** JSON-значение; байты после него он не читает, значит и лимита они не касаются. В теле `{"name":"non","price":400000}{"x":1}` второе значение молча отбросилось бы (этот случай — в разделе «Глубже»).
+Поэтому в `decodeJSON` добавляем ещё один `Decode` — в пустую структуру. В `main.go` из папки `decodeJSON` выглядит так:
+
+```go
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	// Decode faqat birinchi JSON qiymatni oʻqiydi: undan keyin hech narsa boʻlmasligi kerak (limit ham shunga tegadi).
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("body'da bitta JSON boʻlishi kerak")
+		}
+		writeDecodeError(w, err)
+		return false
+	}
+	return true
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10 | `if err := dec.Decode(&struct{}{}); err != io.EOF {` | ещё один `Decode`, в пустую структуру. `io.EOF` — «ввод закончился»: значит, лишнего в теле нет. Если ошибка **не** `io.EOF`, в теле есть что-то ещё |
+| 11–13 | `if err == nil { err = errors.New(...) }` | если `nil`, второе значение было: сообщение пишем сами |
+| 14 | `writeDecodeError(w, err)` | если ошибка другая — ошибка чтения, например лимит: `413` или `400` |
+
+Два пробных запроса в `main`:
+
+```go
+send(mux, http.MethodPost, "/products", `{"name":"non","price":400000}{"x":1}`)
+send(mux, http.MethodPost, "/products", `{"name":"non","price":400000}`+strings.Repeat(" ", 2000))
+```
+
+В первом два значения, во втором — корректное значение и 2000 пробелов:
+
+```console
+$ ./_video/run.sh 11-tail go run .
+400 {"error":{"code":"bad_json","message":"json: unknown field \"x\""}}
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+(chiqish kodi: 0)
+```
+
+Первый запрос: `400` (в сообщении `unknown field "x"`: второе значение читается тем же decoder, то есть по правилу о лишних ключах). Второй запрос: `413`: пробелы тоже считаются в лимит, второй `Decode` их читает и выходит за 1024 байта.
+
+| Тело | Первый `Decode` | Второй `Decode` | Ответ |
+|---|---|---|---|
+| одно корректное значение | успешно | `io.EOF` | работа продолжается |
+| два значения | успешно | ошибка или `nil` | `400` |
+| значение + 2000 пробелов | успешно | `MaxBytesError` | `413` |
+| лишний ключ, сломанный JSON | ошибка | — | `400` |
+| тело больше 1024 байт | `MaxBytesError` | — | `413` |
+
+## Проверка значений: 400 и 422
+
+Тело прочитано, форма верна. Но значение может быть неверным: `name` пустое, цена минус пять. Такое тело для JSON безупречно, а `400` — для тел, которые не удалось прочитать. Для этого есть `422`: запрос понятен, но его содержимое обработать нельзя ([RFC 9110 §15.5.21](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content)).
+Какие поля неверны, возвращаем в `fields`.
+
+| | `400` | `422` |
+|---|---|---|
+| Вопрос | тело соответствует форме? | значение соответствует правилу? |
+| Пример | сломанный JSON, лишний ключ, другой тип | `{"name":"","price":-5}` |
+| `fields` | нет | есть: поле → причина |
+
+RFC сам не делит «форму» и «значение»: это договорённость курса (некоторые API на все случаи отвечают `400`). Важно одно — чтобы во всём API было одинаково.
+
+`validate` принимает `productInput` и возвращает таблицу: ключ — имя поля, значение — причина. Полная версия из папки:
+
+```go
+func validate(in productInput) map[string]string {
+	f := map[string]string{}
+	if in.Name == "" {
+		f["name"] = "boʻsh boʻlmasin"
+	}
+	if in.Price <= 0 {
+		f["price"] = "0 dan katta boʻlsin"
+	}
+	if in.Stock < 0 {
+		f["stock"] = "manfiy boʻlmasin"
+	}
+	return f
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `f := map[string]string{}` | пустая таблица ([GB-2.02](/lab/youtube/gb/gb-2-02/ru)) |
+| 3–5 | `if in.Name == "" { f["name"] = "..." }` | если имя пусто, в ключ `name` записывается причина |
+| 6–8 | `if in.Price <= 0 { f["price"] = "..." }` | цена должна быть больше нуля; иначе `price` |
+| 9–11 | `if in.Stock < 0 { f["stock"] = "..." }` | третье правило: остаток не должен быть отрицательным |
+| 12 | `return f` | пустая таблица — всё в порядке |
+
+Функция не останавливается на первой ошибке: все неверные поля возвращаются в одном ответе. В обработчике, после `decodeJSON`:
+
+```go
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+```
+
+Вызывается `validate(in)`, а `len(f) > 0` проверяет, что таблица не пуста ([GB-2.02](/lab/youtube/gb/gb-2-02/ru)). Если не пуста: `422` (в Go имя — `http.StatusUnprocessableEntity`), `code` — `validation_failed`, `Fields` — эта таблица; затем `return`.
+
+Предскажите: тело `{"name":"","price":-5}` — `name` пусто, `price` минус пять, `stock` вообще нет. Сколько ключей будет в `fields`?
+
+**A)** один: `name` · **B)** два: `name` и `price` · **C)** три: ещё и `stock`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `validate` не останавливается на первой ошибке: в таблицу попадают и `name`, и `price` (в **A** вы решили, что она остановится на первой). `stock` не передали, то есть он равен **нулевому значению** (`0`) ([спецификация Go](https://go.dev/ref/spec#The_zero_value)), а ноль — допустимый остаток: `stock < 0` неверно (в **C** вы сочли ошибкой непереданное поле).
+
+</details>
+
+```console
+$ ./_video/run.sh 06-tekshiruv go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+(chiqish kodi: 0)
+```
+
+`422`, в `fields` два ключа: `name` и `price`; `stock` нет. `message` — для человека, `code` — для машины, `fields` показывает, какое поле формы подсветить красным.
+
+Все эти пути (`201`, `400`, `413`, `422`) записаны тестами в `handler_test.go` из папки; на стартовом коде они проходят:
+
+```console
+$ go test -count=1 -run TestCreateProduct -v .
+=== RUN   TestCreateProduct
+--- PASS: TestCreateProduct (0.00s)
+=== RUN   TestCreateProductXato
+--- PASS: TestCreateProductXato (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.003s
+```
+
+## Глубже (необязательно): тонкости стандартного пакета
+
+В видео этого раздела нет; это дополнения из README папки курса, вместе с тем, что я перезапустил.
+
+**Имена ключей сопоставляются без учёта регистра.** `encoding/json` сопоставляет имя ключа без учёта регистра ([документация `Unmarshal`](https://pkg.go.dev/encoding/json#Unmarshal)): `NAME` подойдёт к `name`. В Go 1.27 `encoding/json` построен поверх нового `encoding/json/v2`; в собственном API v2 регистр имён различается ([Go 1.27 release notes](https://go.dev/doc/go1.27), [GB-3.02](/lab/youtube/gb/gb-3-02/ru), «Глубже»).
+Курс остаётся на API `encoding/json`. Шаг ниже — состояние `decodeJSON` **до** проверки одного значения (до `11-tail`):
+
+```console
+$ ./_video/run.sh 10-qoshimcha go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":0}
+201 {"id":5,"name":"non","price":400000,"stock":0}
+5 mahsulot
+(chiqish kodi: 0)
+```
+
+`main` в этом шаге отправляет два запроса: `{"NAME":"choy","PRICE":2500000}` и `{"name":"non","price":400000}{"x":1}`, а в конце печатает `fmt.Println(len(catalog), "mahsulot")`. Результат: первый запрос — `201` (`NAME` и `PRICE` приняты), второй — тоже `201`: второе значение молча отброшено. Каталог вырос с 3 до 5. Именно это и предотвращает проверка одного значения.
+
+**Непереданное поле и ноль.** `fields` не отличает непереданный `stock` от `0`: для этого нужно поле-указатель, например `*int`. В этом уроке `stock: 0` — допустимое значение.
+
+**`message` может раскрывать внутренние имена.** `message` в `400` — это собственный текст ошибки `Decode`. Иногда он раскрывает имена из Go; пример из README (здесь я его заново не запускал): `json: cannot unmarshal number into Go struct field productInput.name of type string`. В продакшене для каждого класса ошибок возвращают фиксированный текст; здесь для простоты — собственный текст ошибки.
+
+**Другие упрощения** (README): любая ошибка чтения (в том числе обрыв клиента) — `400`; `Content-Type` не проверяется; в ответе `201` нет заголовка `Location` ([RFC 9110 §15.3.2](https://www.rfc-editor.org/rfc/rfc9110#name-201-created) указывает созданный ресурс через `Location` или URI запроса).
+
+**Граница: собственные ответы мультиплексора.** Формат ошибки — только для наших обработчиков. Свои ответы `404` и `405` мультиплексор пока отдаёт простым текстом:
+
+```console
+$ ./_video/run.sh 09-mux go run .
+404 404 page not found
+405 Method Not Allowed
+(chiqish kodi: 0)
+```
+
+Шаг отправляет два запроса: `GET /yoq` (такого маршрута нет) и `GET /products` (путь есть, но привязан только `POST`). Первый ответ — `404`, текст `404 page not found`; второй — `405`, текст `Method Not Allowed`: оба не JSON. Привести их к единому формату — задача не этого урока.
+
+## Частые ошибки
+
+### 1. После `writeError` нет `return`
+
+`writeError` пишет ответ, но **не останавливает** функцию. Код идёт дальше. Вот обработчик без `return`:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+Предскажите: тело `{"name":"","price":-5}`. Какой будет статус, и добавится ли новый товар в каталог?
+
+**A)** `422`, каталог не меняется · **B)** `422`, товар добавлен · **C)** `201`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Статус `422`: учитывается первый `WriteHeader` ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)). Но `return` нет, поэтому следующая строка `writeJSON(w, http.StatusCreated, addProduct(in))` тоже выполняется: товар добавляется, в тело пишется второй JSON. В **A** вы решили, что ошибка сама делает `return`; в **C** — что второй `WriteHeader(201)` меняет статус, но он игнорируется.
+
+</details>
+
+Шаг в конце `main` дополнительно печатает `fmt.Println(len(catalog), "mahsulot")`:
+
+```console
+$ ./_video/run.sh 08-return go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+{"id":4,"name":"","price":-5,"stock":0}
+4 mahsulot
+(chiqish kodi: 0)
+```
+
+Первая строка — `422` и JSON с ошибкой. Вторая — **второй** JSON: `{"id":4,"name":"","price":-5,"stock":0}`, товар с пустым именем. Последняя строка: каталог вырос с 3 до 4. Ошибки нет, компилятор молчит, но неверный товар сохранён.
+На настоящем сервере в логе появится ещё одна строка: `http: superfluous response.WriteHeader call` (README; `httptest.NewRecorder` в лог не пишет, поэтому здесь её не видно). Исправление: `return` после `writeError`. `decodeJSON` от этой ошибки не защищает: он гарантирует только собственный `return false`.
+
+### 2. В `errors.As` передана сама цель, а не её адрес
+
+В [GB-2.08](/lab/youtube/gb/gb-2-08/ru): второй аргумент `errors.As` — **адрес** цели (`&tooBig`). Если передать саму `tooBig`, компилятор молчит, а `go vet` ловит. Этой программы нет в папке курса: это отдельная проверка (в пустой папке выполните `go mod init scratch` и запишите в `main.go`):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	var err error = &http.MaxBytesError{Limit: 1024}
+	var tooBig *http.MaxBytesError
+	fmt.Println(errors.As(err, tooBig))
+}
+```
+
+```console
+$ go vet .
+main.go:12:14: second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type
+```
+
+`go vet` указывает файл, строку и столбец (`main.go:12:14`) и сообщает: второй аргумент должен быть **указателем** на тип, реализующий `error`. А `go run .` при запуске падает с `panic: errors: target must be a non-nil pointer`. Исправление: `errors.As(err, &tooBig)`.
+
+### 3. Лишний ключ принимается молча
+
+Без `DisallowUnknownFields` ключ вроде `rang` отбрасывается без ошибки, а ответ — `201`. Смотрите раздел «Лишний ключ молча отбрасывается». Исправление: `dec.DisallowUnknownFields()`.
+
+### 4. Читается только первое значение
+
+Один `Decode` не читает второе значение в теле и не проверяет его размер. Смотрите раздел «decodeJSON: три шага в одной функции». Исправление: второй `Decode` и проверка `io.EOF`.
+
+## Проверьте себя
+
+**1.** В чём разница между `400` и `422`?
+
+<details>
+<summary>Ответ</summary>
+
+`400` — тело не соответствует нашей форме: JSON сломан, ключ лишний или тип другой; тело не удалось прочитать. `422` — форма верна, JSON прочитан, но значение нарушает правило (цена минус пять); в ответе `fields`. Это договорённость курса.
+
+</details>
+
+**2.** Зачем нужен `http.MaxBytesReader` и какой статус возвращается при превышении лимита?
+
+<details>
+<summary>Ответ</summary>
+
+`Decode` читает одно значение целиком в память; без лимита клиент может прислать тело любого размера. `MaxBytesReader` оборачивает тело и после лимита возвращает `*http.MaxBytesError`; распознав его через `errors.As`, мы пишем `413`.
+
+</details>
+
+**3.** (Из [GB-4.03](/lab/youtube/gb/gb-4-03/ru).) Обработчик записал тело, а **после** вызвал `w.WriteHeader(http.StatusNotFound)`. Какой статус увидит клиент?
+
+<details>
+<summary>Ответ</summary>
+
+`200`. Первый `Write` уже отправил статус (если он не задан, то `200`) и заголовки; последующий `WriteHeader` игнорируется. Это же правило сохранило `422` в обработчике без `return`.
+
+</details>
+
+**4.** Предскажите: тело `{"name":"choy","price":2500000,"stock":-1}`. Каков ответ?
+
+<details>
+<summary>Ответ</summary>
+
+Форма верна, `name` и `price` в порядке, отрицателен только `stock`: `422`, в `fields` один ключ — `stock`. Шаг `07-stock`:
+
+```console
+$ ./_video/run.sh 07-stock go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"stock":"manfiy boʻlmasin"}}}
+(chiqish kodi: 0)
+```
+
+Если вы ответили `400` вместо `422`, вы спутали ошибку значения с ошибкой формы: JSON был прочитан.
+
+</details>
+
+## Домашнее задание
+
+Задание лежит в файле [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-06-json-body/TASK.md) в папке курса; папка:
+[lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body). Отметку уровня (🟡) для необязательного шага поставил сам `TASK.md`; остальные уровни расставил я.
+
+В `main.go` маршрут `POST /orders` уже подключён к `newMux()`, но `validateOrder` ничего не проверяет, а `createOrder` ничего не пишет (ответ `200` и пустое тело). Тело запроса клиента: `{"product_id": 1, "quantity": 3}`.
+
+- 🟢 **Шаг 1, `validateOrder`.** `product_id` больше нуля, `quantity` от 1 до 100. Для неверного поля положите в таблицу ключ (имя в JSON: `"product_id"`, `"quantity"`) и причину; не останавливайтесь на первой ошибке. Если всё в порядке — пустая таблица.
+- 🟡 **Шаг 2, `createOrder`: чтение и проверка.** Прочитайте тело через `decodeJSON` (при `false` сразу `return`), затем `validateOrder`: если таблица не пуста — `422`, `code: "validation_failed"`, `Fields` — эта таблица; `return`.
+- 🟡 **Шаг 3, `createOrder`: товар.** Найдите в `catalog` товар с `ID == in.ProductID`; если не найден — `404`, `code: "not_found"`; если найден — `201` и `Order{ProductID, Quantity, Total}`, `Total` — цена × количество (в тийинах, `int64`). Все ошибки через `writeError`, успех через `writeJSON`.
+- 🟡 **Необязательно.** Добавьте к `quantity` проверку `stock`: если остатка не хватает — `409` (`http.StatusConflict`), `code: "insufficient_stock"`; тест для этого напишите сами (так сказано в `TASK.md`).
+
+Не меняйте `Product`, `decodeJSON`, `writeJSON`, `writeError`, `createProduct`, `newMux`, `send`, `main` и файлы тестов. На стартовом коде форматирование и `go vet` ничего не выводят:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Ничего не вывелось: и формат, и `go vet` чисты. Тест задания падает так (я его запускал; каждое сообщение по-узбекски говорит, чего ожидали):
+
+```console
+$ go test .
+--- FAIL: TestVazifaBuyurtma (0.00s)
+    tekshiruv_test.go:23: buyurtma: status 200, kutilgan 201 (http.StatusCreated): decodeJSON, tekshiruv va writeJSON(w, http.StatusCreated, Order{…}) yozing; body: ""
+--- FAIL: TestVazifaTekshiruv (0.00s)
+    tekshiruv_test.go:55: ikkalasi notoʻgʻri: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: dona juda koʻp: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: dona manfiy: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: maydonlar yoʻq: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+--- FAIL: TestVazifaTopilmadi (0.00s)
+    tekshiruv_test.go:81: mahsulot katalogda yoʻq: status 200, kutilgan 404 (http.StatusNotFound); body: ""
+--- FAIL: TestVazifaBodyQoidalari (0.00s)
+    tekshiruv_test.go:101: nomaʼlum kalit: status 200, kutilgan 400: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+    tekshiruv_test.go:101: buzuq JSON: status 200, kutilgan 400: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+    tekshiruv_test.go:101: katta body: status 200, kutilgan 413: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+Работайте, пока не появится `ok`. Подсказки:
+
+- Скопируйте `createProduct`: часть с `decodeJSON` и `validate` почти не меняется, только `productInput` заменяется на `orderInput`, а `validate` — на `validateOrder`.
+- Не забудьте `return`: тест падает, если в теле есть второй JSON.
+- Итоговая цена: `p.Price * int64(in.Quantity)` (`Quantity` — `int`, `Price` — `int64`).
+- Поиск: `for _, p := range catalog { … }`; при нахождении запишите ответ и сделайте `return`, `404` — после цикла.
+
+<details>
+<summary>Ответ: validateOrder и createOrder из solution/main.go</summary>
+
+Сначала попробуйте сами. Ответ — [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-06-json-body/solution/main.go):
+
+```go
+func validateOrder(in orderInput) map[string]string {
+	f := map[string]string{}
+	if in.ProductID <= 0 {
+		f["product_id"] = "0 dan katta boʻlsin"
+	}
+	if in.Quantity < 1 || in.Quantity > 100 {
+		f["quantity"] = "1 dan 100 gacha boʻlsin"
+	}
+	return f
+}
+```
+
+```go
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	for _, p := range catalog {
+		if p.ID == in.ProductID {
+			writeJSON(w, http.StatusCreated, Order{ProductID: p.ID, Quantity: in.Quantity, Total: p.Price * int64(in.Quantity)})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: "mahsulot topilmadi"})
+}
+```
+
+| Строка (внутри блоков) | Что делает |
+|---|---|
+| `validateOrder` 3–8 | два правила: `product_id <= 0` и `quantity` вне 1..100; проверяются оба, поэтому две ошибки могут вернуться вместе |
+| `createOrder` 2–5 | `decodeJSON`: лимит, строгое чтение, одно значение; при ошибке ответ уже записан, `return` |
+| `createOrder` 6–9 | если таблица `validateOrder` не пуста — `422` и `return` |
+| `createOrder` 10–15 | поиск `ID` в каталоге; если найден — `201` и `Order`, `Total = p.Price * int64(in.Quantity)`, `return` |
+| `createOrder` 16 | после цикла: не найден — `404`, `code: "not_found"` |
+
+Проверка:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+`ok` — ответ прошёл `tekshiruv_test.go` (в `solution/` те же файлы тестов).
+
+</details>
+
+## Источники
+
+- [pkg.go.dev: net/http — MaxBytesReader](https://pkg.go.dev/net/http#MaxBytesReader), [MaxBytesError](https://pkg.go.dev/net/http#MaxBytesError) — оборачивает тело, после лимита `*MaxBytesError`; по возможности закрывает соединение
+- [pkg.go.dev: net/http — константы статусов](https://pkg.go.dev/net/http#pkg-constants) — `StatusBadRequest`, `StatusCreated`, `StatusRequestEntityTooLarge`, `StatusUnprocessableEntity`
+- [pkg.go.dev: net/http — ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter) — первый `WriteHeader`/`Write` отправляет статус
+- [pkg.go.dev: encoding/json — Decoder.DisallowUnknownFields](https://pkg.go.dev/encoding/json#Decoder.DisallowUnknownFields), [Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal) — неизвестный ключ отбрасывается, имя сопоставляется без учёта регистра
+- [pkg.go.dev: encoding/json — Decoder.Decode](https://pkg.go.dev/encoding/json#Decoder.Decode) — читает только следующее значение
+- [Go 1.27 release notes](https://go.dev/doc/go1.27) — `encoding/json/v2`
+- [Спецификация Go: нулевое значение](https://go.dev/ref/spec#The_zero_value)
+- [RFC 9110 §15.5.1: 400 Bad Request](https://www.rfc-editor.org/rfc/rfc9110#name-400-bad-request), [§15.5.14: 413 Content Too Large](https://www.rfc-editor.org/rfc/rfc9110#name-413-content-too-large), [§15.5.21: 422 Unprocessable Content](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content), [§15.3.2: 201 Created](https://www.rfc-editor.org/rfc/rfc9110#name-201-created)
+- [Папка курса: lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+---
+
+← Предыдущий урок: [GB-4.05](/lab/youtube/gb#gb-4-05) · Следующий урок: [GB-4.07](/lab/youtube/gb#gb-4-07) → · [Все уроки](/lab/youtube/gb)
+
+</div>

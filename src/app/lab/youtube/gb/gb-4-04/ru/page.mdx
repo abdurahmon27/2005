@@ -1,0 +1,950 @@
+---
+title: "Первый сервер строка за строкой: ServeMux и ListenAndServe"
+date: "2026/11/27"
+description: "Подключаете обработчики к порту: ServeMux, HandleFunc и ListenAndServe разобраны построчно; проверяете сервер через curl и читаете ошибку занятого порта."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-04"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-04) · **Русский** · [English](/lab/youtube/gb/gb-4-04/en)  
+Урок GB-4.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-04) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Обработчики bozor прошли тест в GB-4.03. Но `curl http://localhost:8765/health` сейчас отвечает `Failed to connect`: на порту 8765 никто не слушает.
+Вопрос: как подключить обработчики к порту и почему подключённая программа не завершается?
+
+**Главная идея:** сервер состоит из двух частей. `ServeMux` — таблица «путь → обработчик»: `mux.HandleFunc(pattern, handler)` добавляет в таблицу одну запись,
+обработчик передаётся без скобок (сама функция, а не её вызов). Паттерн без слеша в конце подходит только точно этому пути; если подходящего паттерна нет, `ServeMux` сам пишет `404 page not found`.
+`ListenAndServe(addr, handler)` открывает порт, ждёт соединения и на каждый запрос вызывает `mux.ServeHTTP(w, r)`. Пока сервер работает, этот цикл не заканчивается:
+функция возвращается **только когда сервер остановился**, и возвращаемое значение — всегда ошибка. `http.ListenAndServe` — короткий путь: он создаёт `&http.Server{Addr, Handler}` и вызывает его метод `ListenAndServe`.
+
+К концу урока вы:
+
+- построите таблицу «путь → обработчик» через `http.NewServeMux` и `mux.HandleFunc` и объясните каждую строку;
+- объясните, что `http.ListenAndServe(":8765", mux)` открывает порт, почему не возвращается и почему, если вернулась, то всегда с ошибкой;
+- проверите работающий сервер из второго терминала через `curl`, остановите его через `Ctrl+C` и прочитаете ошибку `bind: address already in use`;
+- сами напишете функцию `newServer(addr) *http.Server` и добьётесь, чтобы `go test .` прошёл.
+
+Три основных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| `ServeMux` | таблица, которая по пути запроса выбирает обработчик: путь → обработчик | ServeMux (multiplexer) |
+| `ListenAndServe` | функция, которая открывает порт, ждёт соединения и вызывает обработчик; пока сервер работает, не возвращается | ListenAndServe |
+| сервер снаружи | работающий сервер — отдельный процесс: его проверяет `curl` во втором терминале, останавливает `Ctrl+C`; если порт занят, будет ошибка | port, `address already in use` |
+
+Вспомогательные слова: `http.HandleFunc` с `nil` (общий `DefaultServeMux`) и структура `http.Server` с `ReadHeaderTimeout`. Остальным новым именам по ходу дам по одной фразе.
+
+## Что нужно знать заранее
+
+Урок опирается на:
+
+- [GB-4.03 · Обработчик — обычная функция](/lab/youtube/gb/gb-4-03/ru): сигнатура `func(w http.ResponseWriter, r *http.Request)`, `healthHandler`, `productHandler`, `catalogHandler`, `http.Handler` и `ServeHTTP`.
+- [GB-4.02 · HTTP-клиент в Go](/lab/youtube/gb/gb-4-02/ru): второй терминал, порт, `Ctrl+C` → `signal: interrupt`, `time.Second`, запись `&T{…}`.
+- [GB-4.01 · HTTP-запрос — это текст](/lab/youtube/gb/gb-4-01/ru): `curl`, `curl -v`, строка запроса `GET /health HTTP/1.1`, строка статуса `HTTP/1.1 404 Not Found`, `Content-Length`.
+- [GB-1.07 · Функция и первая ошибка](/lab/youtube/gb/gb-1-07/ru): `fmt.Fprintln(os.Stderr, …)`, `os.Exit(1)`, `echo $?`, `exit status 1`.
+- [GB-1.01 · Первая программа](/lab/youtube/gb/gb-1-01/ru): `package main`, `func main`, `go run .`; неиспользуемый импорт — ошибка компиляции.
+- [GB-2.03 · Структура](/lab/youtube/gb/gb-2-03/ru) и [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru): запись `T{Поле: значение}`, `&x` и `*T`.
+- [GB-2.10 · UTF-8: байт, руна и узбекский текст](/lab/youtube/gb/gb-2-10/ru): знак `oʻ` занимает два байта; последний вопрос — об этом.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса:
+[lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server). Скачайте её и откройте терминал в этой папке
+(`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-04-birinchi-server
+```
+
+В папке: `main.go` (обработчики из GB-4.03 и готовая `main`; `newServer` пока пустая — это задание), `tekshiruv_test.go` (проверяет задание), `TASK.md` (задание), `solution/` (ответ) и `_video/`.
+В `_video/` лежит `main.go` каждого шага из видео (`02-server`, `03-xato-yoq`, …) и их общий `handlers.go`: три обработчика из GB-4.03.
+У папки свой `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`), внешних модулей нет. Если у вас стоит более старый Go, `go` сам скачает нужную версию.
+
+Чтобы собрать сервер из видео самим, сделаем отдельную папку. `mkdir -p` создаёт папку, `cp` копирует файлы:
+
+```bash
+mkdir -p ~/bozor-04
+cp go.mod _video/handlers.go _video/02-server/main.go ~/bozor-04/
+cd ~/bozor-04
+```
+
+(То же делает один скрипт: `./_video/run.sh 02-server go run .`. В конце он печатает свою строку `(chiqish kodi: N)`: это не вывод программы.)
+Результаты получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0` и `curl 8.22.0`; все команды урока я тоже перезапустил.
+Сервер я запускал на порту 8765 и каждый раз останавливал; если на вашем компьютере этот порт занят, вы увидите, что тогда происходит, в конце урока (занятый порт).
+
+Один вопрос с прошлого урока. Обработчик сначала записал body через `fmt.Fprintln(w, …)`, потом вызвал `w.WriteHeader(404)`. Какой статус получит клиент?
+
+**A)** `404` · **B)** `200` · **C)** `500`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `200`.** Первый `Write` фиксирует статус `200`; последующий `WriteHeader` уже ни на что не влияет ([GB-4.03](/lab/youtube/gb/gb-4-03/ru), «порядок ответа»). Если вы выбрали **A**, вы решили, что `WriteHeader` — последнее слово: на самом деле его нужно вызвать **до** body.
+В GB-4.03 этот ответ перехватывал `httptest.NewRecorder`. Сегодня за `w` будет настоящее сетевое соединение: ответ получит `curl`.
+
+</details>
+
+## Проблема: на порту никто не слушает
+
+Посмотрите на текущее состояние своими глазами. Никакой сервер не запущен; отправляем `curl` на `/health`:
+
+```console
+$ curl http://localhost:8765/health
+curl: (7) Failed to connect to localhost:8765 after 0 ms: Could not connect to server
+```
+
+Читаем сообщение:
+
+| Часть | Смысл |
+|---|---|
+| `curl: (7)` | собственное сообщение `curl`; `7` — код ошибки `curl` «не удалось соединиться» (код выхода тоже `7`) |
+| `Failed to connect` | соединиться не удалось |
+| `to localhost:8765` | `localhost` — этот компьютер, `8765` — **порт**: номер адреса программы ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)) |
+| `after 0 ms` | через 0 миллисекунд: ответа не ждали, соединение сразу отклонено |
+| `Could not connect to server` | к серверу подключиться не удалось |
+
+(В видео середина этой строки скрыта через `…`; здесь она целиком.) Обе части говорят одно: на этом порту никакая программа не ждёт соединений.
+
+Обработчики есть, но их никто не вызывает. Чтобы получился сервер, нужно две вещи:
+
+1. таблица, которая по пути запроса говорит, какой обработчик вызвать;
+2. программа, которая открывает порт, ждёт соединений и при запросе обращается к этой таблице.
+
+Первое — `ServeMux`, второе — `ListenAndServe`. Сначала посмотрим, как один запрос проходит через сервер.
+
+## Как один запрос проходит через сервер
+
+| Шаг | Что происходит |
+|---|---|
+| 1 | на порт приходит соединение (`:8765`) |
+| 2 | сервер читает текст запроса: первая строка `GET /health HTTP/1.1` ([GB-4.01](/lab/youtube/gb/gb-4-01/ru)) |
+| 3 | `ServeMux` смотрит на путь запроса (`/health`) и находит в таблице обработчик |
+| 4 | вызывается `healthHandler(w, r)` ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)) |
+| 5 | всё, что обработчик записал в `w`, становится текстом ответа и возвращается к `curl` |
+
+```text
+curl                      сервер (наша программа)
+
+GET /health HTTP/1.1  ──► соединение на порт :8765
+                          читает текст запроса
+                          ServeMux: "/health" → healthHandler
+                          healthHandler(w, r)  ── пишет в w "ok"
+HTTP/1.1 200 OK  ◄──────  текст ответа
+ok
+```
+
+Сегодня напишем шаги 2–3 (`ServeMux`) и шаг 1 (`ListenAndServe`).
+
+## Готовые части: обработчики из GB-4.03
+
+В `main.go` есть всё из GB-4.03: структура `Product`, `olma`, `catalog` и три обработчика. В этом уроке их внутренности не меняются, поэтому посмотрим только сигнатуры (`{ … }` — скрытое тело):
+
+```go
+func healthHandler(w http.ResponseWriter, r *http.Request) { … }
+func catalogHandler(w http.ResponseWriter, r *http.Request) { … }
+func productHandler(w http.ResponseWriter, r *http.Request) { … }
+```
+
+| Обработчик | Что отдаёт |
+|---|---|
+| `healthHandler` | пишет `ok` (сервер жив) |
+| `catalogHandler` | отдаёт каталог как JSON-массив: задание GB-4.03, здесь уже решённое |
+| `productHandler` | отдаёт один товар, `olma`, в JSON |
+
+(Примечание: `{ … }` — сокращение на этой странице, а не запись на Go.) Сегодня пишем только функцию `main`.
+
+## ServeMux: таблица «путь → обработчик»
+
+Первая строка `main` — `func main() {` ([GB-1.01](/lab/youtube/gb/gb-1-01/ru)). Следующая за ней:
+
+```go
+	mux := http.NewServeMux()
+```
+
+| Часть | Смысл |
+|---|---|
+| `http` | имя пакета `net/http` |
+| `NewServeMux()` | функция этого пакета: создаёт новый **пустой** `ServeMux` |
+| `:=` | создаёт новую переменную и записывает в неё результат ([GB-1.02](/lab/youtube/gb/gb-1-02/ru)) |
+| `mux` | имя переменной: имя выбрали мы |
+
+Название **`ServeMux`** — от слова *multiplexer*: он распределяет много запросов с одного входа по обработчикам в зависимости от пути. На практике это таблица: в каждой записи путь и обработчик. Сейчас она пуста.
+
+Вторая строка добавляет первую запись:
+
+```go
+	mux.HandleFunc("/health", healthHandler)
+```
+
+| Часть | Смысл |
+|---|---|
+| `mux.HandleFunc(...)` | метод `mux`: добавляет в таблицу одну запись |
+| `"/health"` | первый аргумент — **паттерн** (pattern): какому пути он подходит |
+| `healthHandler` | второй аргумент — обработчик, который вызовется, когда придёт этот путь |
+
+Обратите внимание: `healthHandler` **без скобок**. Если написать `healthHandler(w, r)`, функция была бы вызвана прямо здесь и сейчас. Мы же сейчас не вызываем функцию: мы передаём в `mux` **саму** функцию.
+`mux` вызовет её позже, при каждом запросе `/health`, с `w` и `r` этого запроса. Что будет, если поставить скобки, увидите в разделе «Частые ошибки».
+
+Третья строка — вторая запись:
+
+```go
+	mux.HandleFunc("/products", catalogHandler)
+```
+
+Теперь в таблице две записи. Это ещё не сервер: порт не открыт, никто не слушает.
+
+| Паттерн | Обработчик |
+|---|---|
+| `"/health"` | `healthHandler` |
+| `"/products"` | `catalogHandler` |
+| другой путь | ? |
+
+Что будет, если придёт путь, которого нет в таблице, проверим чуть позже.
+
+## ListenAndServe: открыть порт и ждать
+
+Следующая строка выводит адрес на экран:
+
+```go
+	fmt.Println("bozor API: http://localhost:8765")
+```
+
+`fmt.Println` ([GB-1.01](/lab/youtube/gb/gb-1-01/ru)) печатает текст; `http://localhost:8765` — адрес, на который `curl` отправляет запросы. Следующая строка — сердце программы:
+
+```go
+	err := http.ListenAndServe(":8765", mux)
+```
+
+`ListenAndServe` — *Listen and Serve*: «слушай и обслуживай». У неё два аргумента:
+
+| Аргумент | Смысл |
+|---|---|
+| `":8765"` | **адрес**: двоеточие и номер порта. Хост не указан |
+| `mux` | **обработчик**: кто будет разбирать каждый запрос |
+
+**Адрес.** Если хост не указан, сервер слушает на **всех** сетевых адресах этого компьютера; `localhost` среди них тоже. Значит, подключаться могут и другие компьютеры той же сети.
+Если нужно, чтобы подключался только этот компьютер, пишут `"localhost:8765"`. (`ss -ltn` покажет этот случай как `*:8765`: звёздочка — «все адреса».)
+
+**Обработчик.** Второй аргумент `ListenAndServe` имеет тип `http.Handler`: это любое значение, у которого есть метод `ServeHTTP` ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)).
+У `ServeMux` метод `ServeHTTP` есть, значит, он тоже `http.Handler`. На каждый запрос сервер вызывает `mux.ServeHTTP(w, r)`, а `mux` — по пути — наш обработчик.
+
+**Результат.** `ListenAndServe` возвращает одно значение — `error`. Мы записываем его в `err`. Следующие две строки (как в [GB-1.07](/lab/youtube/gb/gb-1-07/ru)):
+
+```go
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+```
+
+Первая пишет ошибку в stderr, вторая завершает программу с кодом `1`. Эти две строки выполняются, только если `ListenAndServe` вернулась, то есть когда — разберём чуть ниже.
+
+Вот вся программа (`~/bozor-04/main.go`):
+
+```go filename="_video/02-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `package main` | этот файл в пакете `main` ([GB-1.01](/lab/youtube/gb/gb-1-01/ru)). Все `.go`-файлы одной папки — один пакет: `healthHandler` из `handlers.go` виден здесь |
+| 3–7 | `import (…)` | `fmt` (вывод), `net/http` (сервер), `os` (`Stderr`, `Exit`) |
+| 9 | `func main() {` | отсюда начинается программа |
+| 10 | `mux := http.NewServeMux()` | пустая таблица путей |
+| 11 | `mux.HandleFunc("/health", healthHandler)` | запись в таблицу: `/health` → `healthHandler` |
+| 12 | `mux.HandleFunc("/products", catalogHandler)` | запись в таблицу: `/products` → `catalogHandler` |
+| 14 | `fmt.Println(…)` | печатает адрес на экран |
+| 15 | `err := http.ListenAndServe(":8765", mux)` | открывает порт и обслуживает запросы; если вернулась — отдаёт ошибку в `err` |
+| 16 | `fmt.Fprintln(os.Stderr, "xato:", err)` | пишет ошибку в stderr |
+| 17 | `os.Exit(1)` | завершает программу с кодом `1` |
+
+### Предсказание: что сделает `go run .`?
+
+Если в первом терминале, в папке `~/bozor-04`, написать `go run .`, что произойдёт?
+
+**A)** адрес напечатается, программа завершится · **B)** адрес напечатается, терминал останется занят · **C)** появится `xato: …`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `ListenAndServe` пробует открыть порт; порт свободен, значит, ошибки нет; сервер запускается и ждёт соединений. Функция не возвращается, поэтому до строк 16–17 очередь не доходит.
+Если вы выбрали **A**, вы посчитали `ListenAndServe` обычной функцией: вызвали, она сделала дело и вернулась. Эта же функция, пока сервер работает, не возвращается. Если выбрали **C**, вы решили, что порт занят; при свободном порте ошибки нет (занятый порт — в последних разделах).
+
+</details>
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+```
+
+Адрес напечатался, но строка команд (`$`) не вернулась: программа внутри `ListenAndServe` ждёт запросов. Вот что происходит:
+
+| Шаг | Внутри `ListenAndServe` |
+|---|---|
+| 1 | порт открывается (`:8765`) |
+| 2 | ждёт соединения: слушает |
+| 3 | пришло соединение — обслуживает: `mux.ServeHTTP(w, r)` |
+| 4 | снова ждёт: возвращается к шагу 2 |
+| — | цикл не заканчивается: из функции не выйти |
+
+Функция возвращается **только когда сервер остановился**: если порт не открылся (например, занят) или программа сама остановила сервер (это в [GB-8.03](/lab/youtube/gb#gb-8-03)). Возвращаемое значение — **всегда ошибка**: так сказано в документации Go
+(*«ListenAndServe always returns a non-nil error»*). Поэтому строки 16–17 выполняются, только когда сервер перестал работать. Каждое соединение обслуживается отдельно; запросы, пришедшие одновременно, — в [GB-4.07](/lab/youtube/gb#gb-4-07).
+
+## Проверяем сервер из второго терминала
+
+Первый терминал занят, поэтому открываем второй. В нём отправляем тот самый `curl` из начала:
+
+```console
+$ curl http://localhost:8765/health
+ok
+```
+
+Без `-v` `curl` печатает только body: `ok` — `healthHandler` ответил. Теперь каталог:
+
+```console
+$ curl http://localhost:8765/products
+[{"id":1,"name":"olma","price":1200000,"stock":40},{"id":2,"name":"non","price":400000,"stock":120},{"id":3,"name":"oʻrik","price":3500000,"stock":5}]
+```
+
+Три товара, JSON-массив ([GB-3.02](/lab/youtube/gb/gb-3-02/ru); цена в тийинах). Это ответ `catalogHandler`.
+
+Запомните: строка с адресом не доказывает, что сервер работает: она печатается **до** `ListenAndServe`. Что сервер работает, доказывает ответ `curl`.
+(Сервер не пишет каждый запрос в первый терминал: там ничего не появляется. Логи — в [GB-8.02](/lab/youtube/gb#gb-8-02).)
+
+Можно спросить и у операционной системы, открыт ли порт. Этой команды в видео нет: `ss` показывает открытые соединения (`-l` — слушающие, `-t` — TCP, `-n` — числами), `grep 8765` оставляет только строки с этим портом:
+
+```console
+$ ss -ltn | grep 8765
+LISTEN 0      4096               *:8765             *:*
+```
+
+`LISTEN` — порт слушается, `*:8765` — на всех адресах, порт 8765.
+
+### Предсказание: пути нет в таблице
+
+В таблице есть `/health` и `/products`. Что вернёт `curl http://localhost:8765/products/1`?
+
+**A)** весь каталог: подходит `/products` · **B)** `404 page not found` · **C)** `405 Method Not Allowed`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Паттерн `"/products"` без слеша в конце: он подходит только точно пути `/products`, а не `/products/1`. Если подходящего паттерна нет, `ServeMux` сам пишет ответ `404`.
+Если вы выбрали **A**, вы решили, что паттерн — это «все пути, которые с этого начинаются»; такое правило есть только у паттерна со слешем в конце (ниже). **C**: `405` появляется, когда путь найден, а метод не подходит; здесь не нашёлся сам путь.
+
+</details>
+
+`-i` говорит `curl` печатать ещё и строку статуса и заголовки ответа:
+
+```console
+$ curl -i http://localhost:8765/products/1
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Fri, 27 Nov 2026 11:23:51 GMT
+Content-Length: 19
+
+404 page not found
+```
+
+(`Date` у вас будет другой. В видео строки заголовков скрыты через `…`.)
+
+| Строка | Смысл |
+|---|---|
+| `HTTP/1.1 404 Not Found` | строка статуса ([GB-4.01](/lab/youtube/gb/gb-4-01/ru)): код `404`, причина `Not Found` |
+| `Content-Type: text/plain; charset=utf-8` | body — обычный текст |
+| `X-Content-Type-Options: nosniff` | защитный заголовок, который `ServeMux` добавляет к ответу-ошибке; в этом уроке его не трогаем |
+| `Date: …` | время ответа |
+| `Content-Length: 19` | длина body в байтах: `404 page not found` — 18 символов + конец строки = 19 байт |
+| (пустая строка) | заголовки закончились, начинается body |
+| `404 page not found` | body: собственное сообщение `ServeMux` |
+
+Этот ответ не писал ни один наш обработчик: подходящего паттерна не нашлось, и `ServeMux` ответил сам.
+
+### Правило паттернов
+
+| Паттерн | Каким путям подходит |
+|---|---|
+| `"/products"` (слеша в конце нет) | только точно `/products` |
+| `"/products/"` (слеш в конце есть) | всем путям, которые с этого начинаются: `/products/1`, `/products/abc/def` … |
+| метод не указан (все наши паттерны такие) | любому методу |
+
+Доказательство последней строки: `POST` тоже попадает в `catalogHandler`, а он принимает только `GET`:
+
+```console
+$ curl -i -X POST http://localhost:8765/products
+HTTP/1.1 405 Method Not Allowed
+Allow: GET
+Date: Fri, 27 Nov 2026 11:23:51 GMT
+Content-Length: 0
+
+```
+
+`-X POST` задаёт метод `POST`. `405` и `Allow: GET` написал `catalogHandler` ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)); путь нашёлся, метод не подошёл. Пустая строка в конце — пустое body.
+Как указать метод прямо в паттерне и взять все ID одним паттерном (`/products/{id}`) — в [GB-4.05](/lab/youtube/gb#gb-4-05).
+
+Проверим и паттерн со слешем. Это **вся** `main.go` программы; `handlers.go` прежний. В папке курса её нет: я написал и запустил её отдельно (черновая папка: `scratchpad/gb404/extra2`):
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/products/", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+В таблице одна запись: `"/products/"` → `catalogHandler`. Запросы:
+
+```console
+$ curl -i http://localhost:8765/products/1
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 11:25:41 GMT
+Content-Length: 152
+
+[{"id":1,"name":"olma","price":1200000,"stock":40},{"id":2,"name":"non","price":400000,"stock":120},{"id":3,"name":"oʻrik","price":3500000,"stock":5}]
+```
+
+`/products/1` начинается с `/products/`, поэтому ответил `catalogHandler` (путь он не смотрит, поэтому отдаёт всё). `/products/a/b` тоже получил `200`. А сам `/products`:
+
+```console
+$ curl -i http://localhost:8765/products
+HTTP/1.1 307 Temporary Redirect
+Content-Type: text/html; charset=utf-8
+Location: /products/
+Date: Fri, 27 Nov 2026 11:25:41 GMT
+Content-Length: 46
+
+<a href="/products/">Temporary Redirect</a>.
+```
+
+Если зарегистрирован паттерн со слешем, а пришёл путь без слеша, `ServeMux` перенаправляет клиента на `Location: /products/` (так сказано в документации). Главное в этом уроке: паттерн без слеша — один путь, со слешем — вся «ветка».
+В сервере из видео паттерн без слеша, и для `/products/1` ничего нет, поэтому `404`. В готовом сервере из GB-4.01 этот путь был, у нас его нет.
+
+### Останавливаем сервер
+
+В первом терминале нажмите `Ctrl+C` (как в [GB-4.02](/lab/youtube/gb/gb-4-02/ru)):
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+^Csignal: interrupt
+```
+
+`^C` — обозначение клавиши, которое показывает сам терминал; `signal: interrupt` — программа получила сигнал прерывания и остановилась, порт освободился. Во втором терминале снова тот же `curl`:
+
+```console
+$ curl http://localhost:8765/health
+curl: (7) Failed to connect to localhost:8765 after 0 ms: Could not connect to server
+```
+
+Снова `Failed to connect`: состояние, с которого мы начали. Сервер есть, только пока работает программа.
+
+## DefaultServeMux: почему во многих примерах нет `mux`
+
+Во многих примерах `mux` нет. `http.HandleFunc` вызывается напрямую, а в `ListenAndServe` вместо обработчика передают `nil`. Вот такая программа (остальные файлы прежние):
+
+```go filename="_video/05-default/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+// Koʻp misollardagi shakl: http.HandleFunc va nil — DefaultServeMux (umumiy, global mux).
+func main() {
+	http.HandleFunc("/health", healthHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", nil)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+Этот код работает (я запускал):
+
+```console
+$ curl http://localhost:8765/health
+ok
+$ curl http://localhost:8765/products
+404 page not found
+```
+
+`/products` дал `404`, потому что в этом варианте мы его не зарегистрировали. Но **куда** `http.HandleFunc` записал путь?
+`http.HandleFunc` записывает путь в **`DefaultServeMux`**: один общий `ServeMux` внутри пакета `net/http`. Если второй аргумент `ListenAndServe` равен `nil`, сервер использует именно этот `DefaultServeMux`.
+
+Он общий: **любой пакет**, подключённый к программе, может записать в него свой путь. Например, профилировщик `net/http/pprof` сам добавляет пути `/debug/pprof/…`:
+они показывают память программы и её командную строку (источник: [pkg.go.dev/net/http/pprof](https://pkg.go.dev/net/http/pprof); я этого не запускал, а привожу из документации).
+В нашем `mux` есть только пути, которые написали мы. Поэтому в работе создают собственный `ServeMux`.
+
+## http.Server: что внутри ListenAndServe
+
+Теперь заглянем в код самой `ListenAndServe`: исходники `net/http`, `go1.27.4`, `src/net/http/server.go` (комментарии убраны). Это код самого пакета, поэтому перед `Server` и `Handler` нет `http.`:
+
+```go
+func ListenAndServe(addr string, handler Handler) error {
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServe()
+}
+```
+
+| Строка | Смысл |
+|---|---|
+| 1 | функция принимает адрес и обработчик, возвращает `error`: это наш вызов |
+| 2 | создаёт структуру `Server` с полями `Addr` (адрес) и `Handler`; `&` — указатель на неё ([GB-2.04](/lab/youtube/gb/gb-2-04/ru)), `Server{…}` — запись структуры ([GB-2.03](/lab/youtube/gb/gb-2-03/ru)). Результат в переменной `server` |
+| 3 | вызывает **метод** `ListenAndServe` структуры `Server` и возвращает его результат |
+
+Значит, функция, которой мы пользовались, — короткий путь. В работе сервер обычно пишут в такой форме, потому что в структуру добавляются ещё настройки:
+
+```go
+	srv := &http.Server{
+		Addr:    ":8765",
+		Handler: mux,
+	}
+	fmt.Println("bozor API: http://localhost:8765")
+	err := srv.ListenAndServe()
+```
+
+`srv` — указатель на `Server`; `srv.ListenAndServe()` делает то же самое: открывает порт и ждёт соединений. Теперь добавим в структуру третье поле:
+
+```go filename="_video/06-http-server/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	srv := &http.Server{
+		Addr:              ":8765",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	fmt.Println("bozor API: http://localhost:8765")
+	err := srv.ListenAndServe()
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7 | `"time"` | пакет `time`: отсюда `time.Second` ([GB-4.02](/lab/youtube/gb/gb-4-02/ru)) |
+| 15 | `srv := &http.Server{` | создаёт структуру `http.Server` и записывает указатель на неё в `srv` |
+| 16 | `Addr: ":8765",` | адрес: первый аргумент `ListenAndServe(":8765", …)` |
+| 17 | `Handler: mux,` | обработчик: второй аргумент |
+| 18 | `ReadHeaderTimeout: 5 * time.Second,` | за какое время клиент должен успеть прислать заголовки запроса: 5 секунд |
+| 19 | `}` | запись структуры закончилась (в многострочной записи после каждого поля запятая) |
+| 21 | `err := srv.ListenAndServe()` | то же, что `http.ListenAndServe`: порт, ожидание, ошибка |
+
+Если `ReadHeaderTimeout` равен нулю (и `ReadTimeout` не задан), сервер ждёт заголовки **бесконечно** — как клиентский `Timeout` из [GB-4.02](/lab/youtube/gb/gb-4-02/ru), равный нулю.
+`5 * time.Second` — пять секунд: если заголовки не пришли, сервер закрывает соединение. Работает ли это? Проверим на соединении, которое ничего не присылает.
+
+### Измерение: молчащее соединение
+
+TCP-соединение, которое ничего не отправляет. Эта команда не показана в видео (там названы только числа), она есть в README курса; запускается во втором терминале, пока в первом работает сервер:
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+```
+
+| Часть | Смысл |
+|---|---|
+| `exec 3<>/dev/tcp/127.0.0.1/8765` | открывает TCP-соединение с портом 8765 (`3` — номер файла); ничего не отправляет |
+| `s=$SECONDS` | запоминает время начала |
+| `timeout 12 cat <&3` | читает байты от сервера, но обрывает чтение через 12 секунд |
+| `echo "kod $? · …"` | код выхода `cat` и прошедшие секунды |
+
+`kod 0` — `cat` завершился сам, то есть сервер закрыл соединение; `kod 124` — `timeout` оборвал через 12 секунд, то есть соединение всё ещё было открыто.
+Сервер `06-http-server` (`ReadHeaderTimeout: 5 * time.Second`) работает:
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+kod 0 · 5 s
+```
+
+С `02-server` (срока нет):
+
+```console
+$ bash -c 'exec 3<>/dev/tcp/127.0.0.1/8765; s=$SECONDS; timeout 12 cat <&3; echo "kod $? · $((SECONDS-s)) s"'
+kod 124 · 12 s
+```
+
+В видео называются два числа: 5 секунд и 12 секунд. На моём компьютере то же самое: **5 s** и **12 s**. Эти числа не зависят от скорости компьютера; важно соотношение: сервер сам закрыл соединение через 5 секунд, а без срока соединение оставалось открытым столько, сколько мы ждали.
+(12 секунд — не свойство сервера, а мой `timeout 12`: «и за 12 секунд не закрылось».) Каждое открытое соединение занимает ресурсы сервера, поэтому срок нужен.
+
+Два ограничения. Первое: этот срок ограничивает только чтение заголовков запроса. Соединение, которое отправило один запрос и замолчало, он не ограничивает: ожидание следующего запроса ограничивает `IdleTimeout` (если он 0 — `ReadTimeout`), а если оба равны нулю — ожидание бесконечно.
+Этот случай я не измерял; источник — README курса и `server.go` ([pkg.go.dev: Server](https://pkg.go.dev/net/http#Server)). Второе: остальные сроки и правильная остановка сервера — в [GB-8.03](/lab/youtube/gb#gb-8-03).
+
+## Частые ошибки
+
+### 1. Отбросить ошибку `ListenAndServe`
+
+Самая частая ошибка: результат `ListenAndServe` не проверяют, возвращённую ошибку выбрасывают. В первом терминале снова работает правильный сервер (`02-server`). А во втором — испорченная копия.
+Она лежит в отдельной папке: строк с `err` нет, импорта `os` тоже нет (почему — ниже):
+
+```go filename="_video/03-xato-yoq/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	http.ListenAndServe(":8765", mux) // XATO: qaytgan error tashlab yuborildi
+}
+```
+
+Порт сейчас занят: на нём сервер из первого терминала. Что будет, если во втором терминале запустить `go run .` с испорченной копией?
+
+**A)** второй сервер тоже запустится · **B)** программа тихо завершится, без сообщения · **C)** `panic`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Один адрес и порт одновременно может слушать только одна программа; второй `ListenAndServe` не может запуститься и возвращает ошибку. Но ошибка выброшена, а `main` закончилась.
+**A** невозможно: порт занят. **C** тоже нет: ошибка — не `panic`, а обычное возвращённое значение; если её не проверить, ничего не произойдёт.
+
+</details>
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+$ echo $?
+0
+```
+
+Программа сразу завершилась. Строка с адресом печатается до `ListenAndServe`, поэтому она ничего не доказывает. `echo $?` ([GB-1.07](/lab/youtube/gb/gb-1-07/ru)) показывает код выхода последней команды: `0` — успех.
+Сервер не работает, но ничто об этом не говорит. В работе это выглядит так: программа будто бы завершилась без ошибок, а запросы никуда не приходят.
+
+Правильная копия (ошибка проверяется, как в `02-server`) в этой же ситуации отвечает так:
+
+```console
+$ go run .
+bozor API: http://localhost:8765
+xato: listen tcp :8765: bind: address already in use
+exit status 1
+```
+
+Разберём строку по частям:
+
+| Часть | Смысл |
+|---|---|
+| `xato:` | начало нашей строки `fmt.Fprintln(os.Stderr, "xato:", err)` |
+| `listen tcp :8765` | попытка открыть TCP-порт; TCP — протокол соединения, поверх которого работает HTTP, `:8765` — наш адрес |
+| `bind` | вызов операционной системы, который привязывает порт к программе ([bind(2)](https://man7.org/linux/man-pages/man2/bind.2.html)) |
+| `address already in use` | адрес занят |
+| `exit status 1` | сообщение `go run`: программа завершилась через `os.Exit(1)` |
+
+Кто занял порт (в видео этого нет):
+
+```console
+$ ss -ltnp 'sport = :8765'
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      4096               *:8765            *:*    users:(("bozor",pid=1037182,fd=3))
+```
+
+`users:(("bozor",pid=…))` — порт занят программой `bozor` (`pid` — номер процесса, у вас другой). Правило: вернулась `ListenAndServe` — значит, сервер не работает.
+Ошибку всегда выводите и завершайтесь с ненулевым кодом. Если порт занят, остановите старый сервер или возьмите другой порт. Если в работе программа не стартовала на сервере, смотреть в первую очередь надо на эту строку.
+
+### 2. Отброшенная ошибка и импорт `os`
+
+Почему в испорченной копии не было импорта `os`? Потому что если удалить строки с `err`, а импорт оставить, Go не запустит программу ([GB-1.01](/lab/youtube/gb/gb-1-01/ru)). Я это проверил.
+Этого кода нет в папке курса (черновая папка: `scratchpad/gb404/extra1`); `handlers.go` прежний, `main.go` целиком такой:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	http.ListenAndServe(":8765", mux)
+}
+```
+
+```console
+$ go run .
+# github.com/abdurahmon27/bozor
+./main.go:6:2: "os" imported and not used
+```
+
+Как читать: файл `main.go`, строка 6, столбец 2: `"os"` импортирован, но не используется. Исправление: убрать `os` — или, правильнее, проверить ошибку и использовать `os` (правильная копия выше).
+
+### 3. Скобки после обработчика
+
+`mux.HandleFunc("/health", healthHandler())` — со скобками функция не передаётся в таблицу, а вызывается прямо в этой строке. Я это проверил (черновая папка: `scratchpad/gb404/extra3`; `main.go` целиком):
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler())
+	mux.HandleFunc("/products", catalogHandler)
+
+	fmt.Println("bozor API: http://localhost:8765")
+	err := http.ListenAndServe(":8765", mux)
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+```console
+$ go run .
+# github.com/abdurahmon27/bozor
+./main.go:11:28: not enough arguments in call to healthHandler
+	have ()
+	want (http.ResponseWriter, *http.Request)
+./main.go:11:28: healthHandler() (no value) used as value
+```
+
+Как читать: строка 11, столбец 28: `healthHandler` вызвана без аргументов: *not enough arguments* — аргументов не хватает; *have ()* — передано: ничего; *want (…)* — ожидалось: `w` и `r`.
+Вторая строка: функция ничего не возвращает (*no value*), а вы пытаетесь использовать результат как значение (передать в таблицу). Исправление: уберите скобки.
+
+### 4. Паттерн без слеша — это не вся ветка
+
+`"/products"` не принимает `/products/1` (`404`). Мы это видели выше (раздел «Правило паттернов»). Исправление — паттерн со слешем (`"/products/"`) или `{id}` из [GB-4.05](/lab/youtube/gb#gb-4-05).
+
+## Проверьте себя
+
+**1.** Когда `ListenAndServe` возвращается?
+
+<details>
+<summary>Ответ</summary>
+
+Только когда сервер остановился: если порт не открылся или программа сама остановила сервер. Возвращаемое значение — всегда ошибка.
+
+</details>
+
+**2.** В таблице только `"/products"`. Что получит `/products/1`?
+
+<details>
+<summary>Ответ</summary>
+
+`404 page not found`: паттерн без слеша в конце подходит только точно этому пути.
+
+</details>
+
+**3.** Из [GB-4.01](/lab/youtube/gb/gb-4-01/ru): `Content-Length` считает символы или байты? Проверьте на ответе `/products`.
+
+<details>
+<summary>Ответ</summary>
+
+Байты. В слове `oʻrik` пять символов, но шесть байтов: знак `ʻ` (U+02BB) занимает два байта ([GB-2.10](/lab/youtube/gb/gb-2-10/ru)). Я измерил это, пока работал сервер; этих команд нет в папке курса:
+
+```console
+$ curl -s http://localhost:8765/products | wc -c
+152
+$ curl -s http://localhost:8765/products | LC_ALL=C.UTF-8 wc -m
+151
+```
+
+`wc -c` считает байты, `wc -m` — символы (`-s` — тихий режим `curl`). 152 байта, 151 символ: разница — второй байт знака `ʻ`. `Content-Length: 152` говорит то же (см. ответ `/products/1` выше).
+
+</details>
+
+**4.** Предсказание: в таблице есть `"/health"`. Что `curl -i http://localhost:8765/health/` (со слешем в конце!) выведет в первой строке?
+
+<details>
+<summary>Ответ</summary>
+
+`HTTP/1.1 404 Not Found`. Паттерн `"/health"` без слеша в конце: он подходит только `/health`, а не `/health/`. Я запускал:
+
+```console
+$ curl -i http://localhost:8765/health/ | head -1
+HTTP/1.1 404 Not Found
+```
+
+(`| head -1` оставляет только первую строку ответа.) Весь ответ — как у `/products/1`: тело `404 page not found`.
+
+</details>
+
+**5.** Может ли к адресу `":8765"` подключиться другой компьютер? Что написать, чтобы подключаться мог только этот компьютер?
+
+<details>
+<summary>Ответ</summary>
+
+Да: хост не указан, сервер слушает на всех адресах, и другой компьютер той же сети подключится. Только для этого компьютера — `"localhost:8765"`. В контейнере, наоборот, нужны именно все адреса (модуль GB-8).
+
+</details>
+
+## Домашнее задание
+
+Задание — в файле [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-04-birinchi-server/TASK.md) папки курса; папка:
+[lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server). Значков сложности (🟢🟡) в папке курса нет: их поставил я.
+В видео сервер собирался внутри `main`. Теперь то же самое вы пишете сами в функции `newServer(addr string) *http.Server` в `main.go`: так тест сможет проверить возвращённый `*http.Server`, не открывая порт. `main` готова: она вызывает `newServer(":8765")` и затем `srv.ListenAndServe()`. Остальное не меняйте.
+
+- 🟢 **Шаг 1, таблица путей.** Создайте новый `ServeMux` и добавьте три записи: `/health` → `healthHandler`, `/products` → `catalogHandler`, `/products/1` → `productHandler` (`olma`). `/products/2` должен остаться `404`: подходит только точно `/products/1`.
+- 🟡 **Шаг 2, сервер.** Верните `*http.Server`: `Addr` — пришедший в функцию `addr`, `Handler` — ваш `mux`, `ReadHeaderTimeout` — 5 секунд. Добавьте `"time"` в `import (…)` в начале файла.
+
+Сейчас `newServer` пуста и возвращает `nil`, поэтому `go run .` сразу выдаёт ошибку (я запускал на копии папки курса):
+
+```console
+$ go run .
+xato: newServer hali yozilmagan (TASK.md)
+exit status 1
+```
+
+Проверка — `go test .` в этой папке. Файл `tekshiruv_test.go` не меняйте. Сейчас он падает так; каждое сообщение по-узбекски говорит, чего ожидали:
+
+```console
+$ go test .
+--- FAIL: TestVazifaYollar (0.00s)
+    tekshiruv_test.go:51: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+--- FAIL: TestVazifaOlma (0.00s)
+    tekshiruv_test.go:63: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+--- FAIL: TestVazifaTimeout (0.00s)
+    tekshiruv_test.go:80: newServer nil qaytardi: mux'ni yasab, &http.Server{…} qaytaring (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+Тест вызывает `newServer("127.0.0.1:0")` (`127.0.0.1` — этот компьютер, `:0` — свободный порт выберет операционная система; этот адрес только читается из поля `Addr`), запускает `Handler` возвращённого сервера через `httptest.NewServer`, отправляет настоящие запросы ([GB-4.03](/lab/youtube/gb/gb-4-03/ru)) и напрямую читает поле `ReadHeaderTimeout`.
+Работайте до `ok`. Когда тест пройдёт, посмотрите и вручную: `go run .`, во втором терминале `curl http://localhost:8765/products/1` должен вернуть `olma`, а `curl -i http://localhost:8765/products/2` — `404 page not found`; остановите сервер через `Ctrl+C`.
+
+Подсказки:
+
+- Шаг 1: раздел «ServeMux» выше. Обработчик передавайте без скобок: мы не вызываем функцию, а передаём её саму.
+- Если написать `/products/1` со слешем в конце (`/products/`), паттерн подойдёт всем путям, начинающимся с `/products/`, и `/products/2` тоже вернёт `olma`: тест это поймает.
+- Шаг 2: запись структуры `http.Server` выше. Если написать просто `5`, это не 5 секунд, а 5 наносекунд: `time.Duration` считает в наносекундах. Тест поймает и это.
+
+<details>
+<summary>Ответ: newServer из solution/main.go</summary>
+
+Сначала попробуйте сами. Ответ — в репозитории курса, [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-04-birinchi-server/solution/main.go); `newServer`:
+
+```go
+func newServer(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/products", catalogHandler)
+	mux.HandleFunc("/products/1", productHandler) // {id} bilan hamma ID uchun bitta pattern: GB-4.05
+
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second, // soʻrov sarlavhalari 5 s'da kelmasa, ulanish yopiladi
+	}
+}
+```
+
+Строка за строкой:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `mux := http.NewServeMux()` | пустая таблица путей |
+| 3–5 | `mux.HandleFunc(…)` | три записи: `/health`, `/products`, `/products/1`; обработчики без скобок. `/products/1` без слеша в конце: `/products/2` — `404` |
+| 7 | `return &http.Server{` | создаёт структуру `Server` и возвращает указатель на неё |
+| 8 | `Addr: addr,` | адрес — параметр функции (`main` передаёт `":8765"`, тест — `"127.0.0.1:0"`) |
+| 9 | `Handler: mux,` | `mux` — обработчик |
+| 10 | `ReadHeaderTimeout: 5 * time.Second,` | 5 секунд; `5 * time.Second` — `Duration` |
+
+Проверка (`-count=1` отключает кэш тестов Go):
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.004s
+```
+
+`ok` — все три теста прошли. В `solution/` лежит тот же тестовый файл, поэтому ответ проходит те же тесты.
+
+</details>
+
+## Источники
+
+- [pkg.go.dev: net/http — ListenAndServe](https://pkg.go.dev/net/http#ListenAndServe) — `ListenAndServe` при nil-обработчике использует `DefaultServeMux`; всегда возвращает ошибку, не равную `nil`
+- [pkg.go.dev: net/http — Server](https://pkg.go.dev/net/http#Server) и [Server.ListenAndServe](https://pkg.go.dev/net/http#Server.ListenAndServe) — `Addr`, `Handler`, `ReadHeaderTimeout` ("If zero, the value of ReadTimeout is used…")
+- [pkg.go.dev: net/http — ServeMux](https://pkg.go.dev/net/http#ServeMux), [NewServeMux](https://pkg.go.dev/net/http#NewServeMux), [ServeMux.HandleFunc](https://pkg.go.dev/net/http#ServeMux.HandleFunc), [правила паттернов](https://pkg.go.dev/net/http#hdr-Patterns-ServeMux) — паттерн без слеша — один путь, со слешем — вся ветка; если корень ветки пришёл без слеша, `ServeMux` перенаправляет
+- [pkg.go.dev: net/http — HandleFunc и DefaultServeMux](https://pkg.go.dev/net/http#HandleFunc), [net/http/pprof](https://pkg.go.dev/net/http/pprof)
+- [pkg.go.dev: net — Listen](https://pkg.go.dev/net#Listen) — пустой хост: все адреса
+- [bind(2): EADDRINUSE](https://man7.org/linux/man-pages/man2/bind.2.html) — адрес занят
+- [Исходники Go: net/http/server.go, go1.27.4](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/net/http/server.go) — тело `ListenAndServe`
+- [curl: --include и коды выхода](https://curl.se/docs/manpage.html) — `-i`; код выхода `7` — соединиться не удалось
+- [Папка курса: lessons/gb-4-04-birinchi-server](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, `curl 8.22.0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-04-birinchi-server)
+
+---
+
+← Предыдущий урок: [GB-4.03](/lab/youtube/gb/gb-4-03/ru) · Следующий урок: [GB-4.05](/lab/youtube/gb#gb-4-05) → · [Все уроки](/lab/youtube/gb)
+
+</div>

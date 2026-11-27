@@ -1,0 +1,974 @@
+---
+title: "JSON in and out: size limit, validation and the error response"
+date: "2026/11/27"
+description: "Read a POST body safely in Go: a size limit (413), rejecting unknown keys (400), checking values (422) and one JSON error shape for every failure."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-06"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-06) · [Русский](/lab/youtube/gb/gb-4-06/ru) · **English**  
+Lesson GB-4.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-06) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The client writes the body of the `POST /products` request that adds a new product to bozor. It can send a body that is far too large, add an extra key, or write minus five as the price.
+The question: how does the server answer each of these cases clearly, and always in the same shape?
+
+**The one idea:** the client writes the `POST` body, so it is input you cannot trust. The handler reads it **strictly**: `http.MaxBytesReader` limits the size (`413`), `DisallowUnknownFields` rejects an extra key (`400`).
+After reading, it checks the **values** (`422` with `fields`), and every error comes back in one JSON shape: `{"error": {"code", "message", "fields"}}`.
+`400` means the body does not match our shape; `422` means the shape is right but a value breaks a rule.
+
+By the end you will:
+
+- write a `writeError` that returns every error in one JSON shape;
+- limit the body size with `http.MaxBytesReader`, recognize the exceeded limit with `errors.As` and return `413`;
+- reject an extra key with `DisallowUnknownFields` and explain the line between `400` and `422`;
+- write `validateOrder` and `createOrder` for `POST /orders` and make `go test .` pass.
+
+Today's three core new terms:
+
+| Term | Plain meaning | English |
+|---|---|---|
+| error shape | every error response has one structure: inside `error` the keys `code`, `message`, `fields` | error response shape |
+| strict decoding | reading the body with a size limit and a ban on extra keys: `http.MaxBytesReader`, `DisallowUnknownFields` | strict decoding |
+| validation | comparing values with the rules after the body is read: `400` is shape, `422` is value | validation |
+
+Helpers: `201 Created` (a new resource was created) and a forgotten `return` (in the mistakes section). Every other new name gets one sentence where it appears.
+
+## Before you start
+
+This lesson builds on:
+
+- [GB-4.05 · Route'lar va `{id}`](/lab/youtube/gb#gb-4-05): `METHOD /path` patterns, `404` and `405`. The recall question is from this lesson.
+- [GB-4.04 · Birinchi server, qatorma-qator](/lab/youtube/gb/gb-4-04/en): `ServeMux`, `HandleFunc`. I do not show the inside of `newMux` today: it is built from these two functions.
+- [GB-4.03 · Handler — oddiy funksiya](/lab/youtube/gb/gb-4-03/en): `w` and `r`, `httptest.NewRequest`, `NewRecorder`, the response order (headers → status → body).
+- [GB-4.02 · Go'da HTTP client](/lab/youtube/gb/gb-4-02/en): `json.NewDecoder(...).Decode(&v)`.
+- [GB-4.01 · HTTP soʻrov — bu matn](/lab/youtube/gb/gb-4-01/en): status code classes, `405` and `Allow`.
+- [GB-3.02 · JSON va struct tag'lar](/lab/youtube/gb/gb-3-02/en): `Product`, `json:"..."` tags, `omitempty`.
+- [GB-2.08 · Error'lar chuqur](/lab/youtube/gb/gb-2-08/en): `errors.As` and a pointer target.
+- [GB-2.07 · Interface](/lab/youtube/gb/gb-2-07/en): `any`, `http.Handler`. [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/en): `map[string]string`. [GB-2.10 · UTF-8](/lab/youtube/gb/gb-2-10/en): `strings.Repeat`.
+
+**How to run the code.** The lesson code is a folder in the course repository:
+[lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body). Download it and open a terminal in that folder
+(`cd` moves the terminal into another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-06-json-body
+```
+
+The folder has `main.go` (the code at the end of the video), `handler_test.go` (tests for `POST /products`), `tekshiruv_test.go` (checks the homework), `TASK.md` (the homework), `solution/` (the answer) and `_video/` — a separate folder for every step of the video (`01-oddiy`, `02-qatiy`, …).
+The folder has its own `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.27`) and no external modules. The program does not start a server: it sends requests through `httptest`, as in [GB-4.03](/lab/youtube/gb/gb-4-03/en).
+
+A script runs a step exactly as the video does: `./_video/run.sh <step> <command>`. It copies `main.go` from the step folder into a temporary `bozor/` folder together with this `go.mod`, runs the command there
+and prints the exit code at the end (`(chiqish kodi: 0)`): `0` means the command finished without an error. That last line is the script's output, not the program's.
+
+The results are from `go1.27.4 linux/amd64` with `CGO_ENABLED=0`; I re-ran every command myself. The module is written for Go 1.27: if an older Go is installed, `go` downloads the right version itself.
+
+One question from the previous lesson. The mux has only the pattern `GET /products/{id}`. A request `POST /products/1` arrives. What is the answer?
+
+**A)** `404` · **B)** `405` and an `Allow` header · **C)** `400`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The path was found (`/products/1` matches the pattern), but the method does not match, so the answer is `405 Method Not Allowed`; the `Allow` header lists the allowed methods ([GB-4.05](/lab/youtube/gb#gb-4-05), [RFC 9110 §15.5.6](https://www.rfc-editor.org/rfc/rfc9110#name-405-method-not-allowed)). This lesson's folder has no `GET /products/{id}` route, so the result was not re-run here: it is quoted from GB-4.05.
+If you chose **A**, you forgot that `404` appears when the path is not found at all; with **C** you thought about the body, but this request has neither a body nor a `400`. Today: `POST`, with a body.
+
+</details>
+
+## One error shape
+
+Client code looks at the status first, then reads from the JSON what the error is. If every endpoint returns errors in its own form, the client needs separate code for each endpoint. So every error has one shape:
+
+```text
+{"error": {
+  "code": "validation_failed",
+  "message": "qiymatlar notoʻgʻri",
+  "fields": {"price": "0 dan katta boʻlsin"}
+}}
+```
+
+| Key | Who reads it | What it is |
+|---|---|---|
+| `error` | client code | the outer key: shows that the response is an error |
+| `code` | a machine | a short, stable name: `bad_json`, `too_large`, `validation_failed` |
+| `message` | a person | readable text |
+| `fields` | a form on the client | which field is wrong and why: key — field name, value — reason. Present only in a validation error |
+
+In Go this shape is a **struct**. Its name is `apiError`; we chose the name:
+
+```go
+type apiError struct {
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Fields  map[string]string `json:"fields,omitempty"`
+}
+```
+
+The numbers below are line numbers inside this fragment:
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `type apiError struct {` | declares a new type: `struct` — a set of named fields ([GB-2.03](/lab/youtube/gb/gb-2-03/en)) |
+| 2–3 | `Code string`, `Message string` | two text fields. The tag in backticks, `json:"code"`, sets the JSON key name to `code` ([GB-3.02](/lab/youtube/gb/gb-3-02/en)) |
+| 4 | `Fields map[string]string` | a `map`: key — field name, value — reason ([GB-2.02](/lab/youtube/gb/gb-2-02/en)). `omitempty` in the tag: if the map is empty, the `fields` key is not written at all |
+
+Writing the response lives in one place, `writeJSON`. The order is as in [GB-4.03](/lab/youtube/gb/gb-4-03/en): header, then status, then body:
+
+```go
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func writeJSON(w http.ResponseWriter, status int, v any) {` | the status is now a parameter: each caller picks its own. `v any` — any value ([GB-2.07](/lab/youtube/gb/gb-2-07/en)) |
+| 2 | `w.Header().Set("Content-Type", "application/json")` | 1: the header says the body is JSON |
+| 3 | `w.WriteHeader(status)` | 2: the status |
+| 4 | `json.NewEncoder(w).Encode(v)` | 3: writes `v` to `w` as JSON. We do not check the error `Encode` returns in this lesson: we handle logging in [GB-8.02](/lab/youtube/gb#gb-8-02) |
+
+`writeError` wraps an error into this shape:
+
+```go
+func writeError(w http.ResponseWriter, status int, e apiError) {
+	writeJSON(w, status, map[string]apiError{"error": e})
+}
+```
+
+`map[string]apiError{"error": e}` is a map with one key: the key is `error`, the value is `e`. `Encode` turns it into `{"error": {...}}`. Now every error leaves through this function.
+
+## POST /products: the first handler
+
+The fields the client supplies live in a separate struct, `productInput`. It differs from `Product` by having no `ID`: the server assigns it, not the client.
+
+```go
+type productInput struct {
+	Name  string `json:"name"`
+	Price int64  `json:"price"`
+	Stock int    `json:"stock"`
+}
+```
+
+The handler:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func createProduct(w http.ResponseWriter, r *http.Request) {` | a handler ([GB-4.03](/lab/youtube/gb/gb-4-03/en)) |
+| 2 | `var in productInput` | an empty `productInput`; the variable is named `in` |
+| 3 | `if err := json.NewDecoder(r.Body).Decode(&in); err != nil {` | reads the body into `in` ([GB-4.02](/lab/youtube/gb/gb-4-02/en)). On an error, the block runs |
+| 4 | `writeError(w, http.StatusBadRequest, apiError{...})` | `400` (`http.StatusBadRequest`), `code` is `bad_json` (a name we chose), `message` is `err.Error()`, the text of the error |
+| 5 | `return` | the response is already written: leave the function |
+| 7 | `writeJSON(w, http.StatusCreated, addProduct(in))` | if all is well: `201` and the created product |
+
+`201 Created` ([RFC 9110 §15.3.2](https://www.rfc-editor.org/rfc/rfc9110#name-201-created)) means a new resource, here a new product, was created; the body carries it with the `ID` the server assigned. `addProduct` adds the product to the catalog; I do not show its inside today. It is not safe if two requests arrive at the same time: we will see that in [GB-4.07](/lab/youtube/gb#gb-4-07) with `-race`.
+
+`send` delivers requests without a server (the steps from [GB-4.03](/lab/youtube/gb/gb-4-03/en) in one function):
+
+```go
+func send(h http.Handler, method, path, body string) {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+```
+
+`h http.Handler` — the mux is a handler too ([GB-2.07](/lab/youtube/gb/gb-2-07/en)). `strings.NewReader(body)` attaches the body text to the request. The other three lines are as in [GB-4.03](/lab/youtube/gb/gb-4-03/en): the recorder, `ServeHTTP`, printing the status and body.
+Here is the whole program; the two requests are in `main`:
+
+```go filename="_video/01-oddiy/main.go" showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+// Product — katalogdagi bitta mahsulot (GB-3.02).
+type Product struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Price int64  `json:"price"` // tiyin
+	Stock int    `json:"stock"`
+}
+
+var catalog = []Product{
+	{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+	{ID: 2, Name: "non", Price: 400_000, Stock: 120},
+	{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+}
+
+type productInput struct {
+	Name  string `json:"name"`
+	Price int64  `json:"price"`
+	Stock int    `json:"stock"`
+}
+
+type apiError struct {
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Fields  map[string]string `json:"fields,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, e apiError) {
+	writeJSON(w, status, map[string]apiError{"error": e})
+}
+
+func addProduct(in productInput) Product {
+	var last int64
+	for _, p := range catalog {
+		last = max(last, p.ID)
+	}
+	p := Product{ID: last + 1, Name: in.Name, Price: in.Price, Stock: in.Stock}
+	catalog = append(catalog, p)
+	return p
+}
+
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /products", createProduct)
+	return mux
+}
+
+func send(h http.Handler, method, path, body string) {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	fmt.Printf("%d %s", rec.Code, rec.Body.String())
+}
+
+func main() {
+	mux := newMux()
+	send(mux, http.MethodPost, "/products", `{"name":"choy","price":2500000,"stock":30}`)
+	send(mux, http.MethodPost, "/products", `{"name":`)
+}
+```
+
+| Line | What |
+|---|---|
+| 3–9 | imports: no new packages, all from earlier lessons |
+| 11–23 | `Product` and `catalog` ([GB-3.02](/lab/youtube/gb/gb-3-02/en)): the catalog has 3 products, so the new one gets `ID` 4 |
+| 25–45 | `productInput`, `apiError`, `writeJSON`, `writeError`: explained above |
+| 47–55 | `addProduct`: adds to the catalog, `ID` = largest `ID` + 1 (its inside is not needed today) |
+| 57–64 | `createProduct`: above |
+| 66–70 | `newMux`: builds the routes; `POST /products` is wired to `createProduct` ([GB-4.04](/lab/youtube/gb/gb-4-04/en), [GB-4.05](/lab/youtube/gb#gb-4-05)) |
+| 72–77 | `send`: above |
+| 79–83 | `main`: the first request has a valid body, the second a broken JSON with no end (`{"name":`) |
+
+Predict: what does `go run .` print?
+
+**A)** `201`, `201` · **B)** `201`, `400` · **C)** `400`, `400`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The first body is complete and valid: `201`, a new product. The second stops after `"name":` — the JSON ended unexpectedly, `Decode` returns an error, and the handler writes `400`. With **A** you assumed the broken JSON is accepted too; with **C**, that the valid body counts as an error.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-oddiy go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":30}
+400 {"error":{"code":"bad_json","message":"unexpected EOF"}}
+(chiqish kodi: 0)
+```
+
+The first line: `201`, the fourth product in the catalog, `"id":4` — the server assigned it. The second line: `400` and `unexpected EOF` (EOF means end of file, "the input ended"): the JSON stopped early. There is no `fields` key: `omitempty` did its job.
+
+| Request | Body | `Decode` | Response |
+|---|---|---|---|
+| 1 | `{"name":"choy","price":2500000,"stock":30}` | succeeds | `201` + product |
+| 2 | `{"name":` | `unexpected EOF` | `400` + `bad_json` |
+
+## An extra key is silently dropped
+
+Now the body is valid, but it contains a key that `productInput` does not have: `rang` ("color") with the value `qora` ("black"):
+
+```text
+{"name":"choy","price":2500000,"rang":"qora"}
+```
+
+Predict: what is the status with the current code?
+
+**A)** `201` · **B)** `400` · **C)** `422`
+
+<details>
+<summary>Answer</summary>
+
+**A.** The plain `Decode` silently drops a key that the struct does not have ([`json.Unmarshal` documentation](https://pkg.go.dev/encoding/json#Unmarshal)). There is no error, so `201`. Those who chose **B** or **C** expected an error, but that is exactly the problem: there is none here.
+
+</details>
+
+```console
+$ ./_video/run.sh 01b-rang go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":0}
+(chiqish kodi: 0)
+```
+
+`201`, but `"stock":0`: the request had no `stock`, and `rang` has vanished. The client believes `rang` was saved, but the server never saw it. A client that misspells a key name will never find out.
+
+The fix: put the `Decoder` into its own variable (`dec`) and call `DisallowUnknownFields()`. After that, `Decode` returns an error for a key the struct does not have. `Decode` is now called on `dec`:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+| Line | What changed |
+|---|---|
+| 3 | `dec := json.NewDecoder(r.Body)`: the decoder is now in a variable |
+| 4 | `dec.DisallowUnknownFields()`: an extra key is an error ([documentation](https://pkg.go.dev/encoding/json#Decoder.DisallowUnknownFields)) |
+| 5 | `dec.Decode(&in)`: as before, but on `dec` |
+
+The same request:
+
+```console
+$ ./_video/run.sh 02-qatiy go run .
+400 {"error":{"code":"bad_json","message":"json: unknown field \"rang\""}}
+(chiqish kodi: 0)
+```
+
+`400`, and `message` contains the key name: `json: unknown field "rang"`. The client knows what to fix. The `\"` inside is the JSON's own quote character: that is how `"` is written inside the `message` text.
+
+Here the course meaning of `400` becomes exact: **the body does not match our shape**. Three cases:
+
+| Case | Example | Response |
+|---|---|---|
+| broken JSON | `{"name":` | `400`, `unexpected EOF` |
+| extra key | `"rang":"qora"` | `400`, `unknown field "rang"` |
+| different type | a number instead of `name` | `400` (the message text: in the "Going deeper" section) |
+
+If the client sends an `ID`, that is also `400`: `productInput` has no `id`, so it is an extra key too (this case is checked in `handler_test.go`, below). This is a course convention, not an RFC rule: we apply the same rule in every endpoint.
+
+## The size limit: http.MaxBytesReader
+
+Now the size. `Decode` reads one JSON value completely into memory. If a client sends a very large value, the server stores all of it. Without a limit, one request can take the server's memory.
+Go provides `http.MaxBytesReader` for this: it wraps the body and returns an error after a given number of bytes ([documentation](https://pkg.go.dev/net/http#MaxBytesReader)).
+
+```text
+no limit:          body ──► Decode ──► the whole value in memory (size not limited)
+
+MaxBytesReader:    body ──► MaxBytesReader(1024) ──► Decode
+                            after 1024 bytes a read error ──► Decode returns an error
+```
+
+We add one line to the handler: replace `r.Body` with the wrapped body.
+
+```go
+r.Body = http.MaxBytesReader(w, r.Body, 1024)
+```
+
+`MaxBytesReader` takes three arguments; here they are one per line:
+
+```go
+r.Body = http.MaxBytesReader(
+	w,
+	r.Body,
+	1024,
+)
+```
+
+(This is only for display; in the folder the call is on one line.)
+
+| Argument | Meaning |
+|---|---|
+| `w` | where the response is written: if the limit is exceeded, the server closes the connection when possible |
+| `r.Body` | the body to wrap |
+| `1024` | the limit in bytes: 1024 bytes. A real product JSON is only 42 bytes |
+
+A test: 2000 letters `a` in the `name` field. `strings.Repeat("a", 2000)` ([GB-2.10](/lab/youtube/gb/gb-2-10/en)) builds a text of 2000 letters `a`; the whole body is 2011 bytes, about twice the limit:
+
+```go
+big := `{"name":"` + strings.Repeat("a", 2000) + `"}`
+send(mux, http.MethodPost, "/products", big)
+```
+
+For now, an error from `Decode` gives a general `400` (the old block in `createProduct`).
+Predict: a 2000-byte body, limit 1024. What is the status?
+
+**A)** `201` · **B)** `400` · **C)** `413`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The current code answers `400` to every `Decode` error, the exceeded limit included. The limit works (not **A**: the body was not accepted), but the code has no `413` yet (**C** is the next step).
+
+</details>
+
+```console
+$ ./_video/run.sh 03-limit go run .
+400 {"error":{"code":"bad_json","message":"http: request body too large"}}
+(chiqish kodi: 0)
+```
+
+`400` and `http: request body too large`: the limit worked. But this error has a **specific type**, so the client needs a specific status too: `413` — the body is larger than the server is willing to accept ([RFC 9110 §15.5.14](https://www.rfc-editor.org/rfc/rfc9110#name-413-content-too-large)).
+
+When the limit is exceeded, `Decode` returns `*http.MaxBytesError` ([documentation](https://pkg.go.dev/net/http#MaxBytesError)). We pick it out with `errors.As` ([GB-2.08](/lab/youtube/gb/gb-2-08/en)):
+
+```go
+	if err := dec.Decode(&in); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, apiError{Code: "too_large", Message: fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)})
+			return
+		}
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+		return
+	}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `var tooBig *http.MaxBytesError` | the target: a variable of type `*http.MaxBytesError`. At first it is empty (`nil`) |
+| 3 | `if errors.As(err, &tooBig) {` | does `err` contain this type? `As` receives the **address** of the target (`&tooBig`); if the type is found, it is stored in the target |
+| 4 | `writeError(w, http.StatusRequestEntityTooLarge, apiError{...})` | `413` (the Go constant is named `StatusRequestEntityTooLarge`), `code` is `too_large` |
+| 4 | `fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)` | puts the limit value into the message: `tooBig.Limit` is `1024` |
+| 7 | `writeError(w, http.StatusBadRequest, ...)` | any other error is still `400` |
+
+The same two requests: the first is the 2011-byte body, the second is the broken JSON:
+
+```console
+$ ./_video/run.sh 04-413 go run .
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+400 {"error":{"code":"bad_json","message":"unexpected EOF"}}
+(chiqish kodi: 0)
+```
+
+`413` and `body 1024 baytdan oshmasin`; the broken JSON is still `400`. The `code` in the response (`too_large`) is for client code, the `message` for a person.
+
+## decodeJSON: three steps in one function
+
+The limit, strict decoding and the error response are needed by every `POST` handler. We move them into a `decodeJSON` function:
+
+```go
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	return true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeError(w, http.StatusRequestEntityTooLarge, apiError{Code: "too_large", Message: fmt.Sprintf("body %d baytdan oshmasin", tooBig.Limit)})
+		return
+	}
+	writeError(w, http.StatusBadRequest, apiError{Code: "bad_json", Message: err.Error()})
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {` | `dst any` — which struct to read into is up to the caller (`&in`). The result is a `bool`: `true` — the body was read, `false` — an error, the response is already written |
+| 2–4 | `MaxBytesReader`, `NewDecoder`, `DisallowUnknownFields` | the limit and strict decoding: the three lines from above |
+| 5–8 | `if err := dec.Decode(dst); err != nil { writeDecodeError(w, err); return false }` | on an error, `writeDecodeError` writes the response and `false` is returned |
+| 9 | `return true` | no error: the body was read into `dst` |
+| 12–19 | `writeDecodeError` | the earlier `MaxBytesError` check: `413` or `400` |
+
+When the caller sees `false`, it writes nothing and just does `return` — the response is ready:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+Now working with the body in the handler takes three lines. Three requests: a valid body, an extra key (`rang`), a large body:
+
+```console
+$ ./_video/run.sh 05-ajrat go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":30}
+400 {"error":{"code":"bad_json","message":"json: unknown field \"rang\""}}
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+(chiqish kodi: 0)
+```
+
+`201`, `400` and `413`: three paths, and in the handler it is all three lines.
+
+**One trap.** `Decode` reads only the **first** JSON value; it does not read the bytes after it, so the limit does not touch them either. In the body `{"name":"non","price":400000}{"x":1}` the second value would be silently dropped (this case is in the "Going deeper" section).
+So we add one more `Decode` to `decodeJSON`, into an empty struct. In the folder's `main.go`, `decodeJSON` looks like this:
+
+```go
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeDecodeError(w, err)
+		return false
+	}
+	// Decode faqat birinchi JSON qiymatni oʻqiydi: undan keyin hech narsa boʻlmasligi kerak (limit ham shunga tegadi).
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("body'da bitta JSON boʻlishi kerak")
+		}
+		writeDecodeError(w, err)
+		return false
+	}
+	return true
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 10 | `if err := dec.Decode(&struct{}{}); err != io.EOF {` | one more `Decode`, into an empty struct. `io.EOF` means "the input ended": there is nothing extra in the body. If the error is **not** `io.EOF`, there is something more in the body |
+| 11–13 | `if err == nil { err = errors.New(...) }` | if it is `nil`, a second value was there: we write the message ourselves |
+| 14 | `writeDecodeError(w, err)` | for any other error — a read error, for example the limit: `413` or `400` |
+
+Two test requests in `main`:
+
+```go
+send(mux, http.MethodPost, "/products", `{"name":"non","price":400000}{"x":1}`)
+send(mux, http.MethodPost, "/products", `{"name":"non","price":400000}`+strings.Repeat(" ", 2000))
+```
+
+The first has two values, the second a valid value and 2000 spaces:
+
+```console
+$ ./_video/run.sh 11-tail go run .
+400 {"error":{"code":"bad_json","message":"json: unknown field \"x\""}}
+413 {"error":{"code":"too_large","message":"body 1024 baytdan oshmasin"}}
+(chiqish kodi: 0)
+```
+
+First request: `400` (the message says `unknown field "x"`: the second value is read by the same decoder, so under the extra-key rule). Second request: `413`: spaces count toward the limit too, the second `Decode` reads them and goes over 1024 bytes.
+
+| Body | First `Decode` | Second `Decode` | Response |
+|---|---|---|---|
+| one valid value | succeeds | `io.EOF` | processing continues |
+| two values | succeeds | an error or `nil` | `400` |
+| value + 2000 spaces | succeeds | `MaxBytesError` | `413` |
+| extra key, broken JSON | error | — | `400` |
+| body over 1024 bytes | `MaxBytesError` | — | `413` |
+
+## Checking values: 400 and 422
+
+The body is read and the shape is right. But a value can still be wrong: `name` is empty, the price is minus five. Such a body is perfect JSON, and `400` is for bodies that could not be read. That is what `422` is for: the request is understood, but its content cannot be processed ([RFC 9110 §15.5.21](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content)).
+We return which fields are wrong in `fields`.
+
+| | `400` | `422` |
+|---|---|---|
+| Question | does the body match the shape? | does the value match the rule? |
+| Example | broken JSON, extra key, different type | `{"name":"","price":-5}` |
+| `fields` | no | yes: field → reason |
+
+The RFC does not itself divide "shape" from "value": this is a course convention (some APIs answer `400` in every case). What matters is that the whole API behaves the same.
+
+`validate` takes a `productInput` and returns a table: key — field name, value — reason. The full version from the folder:
+
+```go
+func validate(in productInput) map[string]string {
+	f := map[string]string{}
+	if in.Name == "" {
+		f["name"] = "boʻsh boʻlmasin"
+	}
+	if in.Price <= 0 {
+		f["price"] = "0 dan katta boʻlsin"
+	}
+	if in.Stock < 0 {
+		f["stock"] = "manfiy boʻlmasin"
+	}
+	return f
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `f := map[string]string{}` | an empty table ([GB-2.02](/lab/youtube/gb/gb-2-02/en)) |
+| 3–5 | `if in.Name == "" { f["name"] = "..." }` | if the name is empty, the reason is written under the `name` key |
+| 6–8 | `if in.Price <= 0 { f["price"] = "..." }` | the price must be greater than zero; otherwise `price` |
+| 9–11 | `if in.Stock < 0 { f["stock"] = "..." }` | the third rule: the stock must not be negative |
+| 12 | `return f` | an empty table — all is fine |
+
+The function does not stop at the first error: every wrong field comes back in one response. In the handler, after `decodeJSON`:
+
+```go
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+```
+
+`validate(in)` is called, and `len(f) > 0` checks that the table is not empty ([GB-2.02](/lab/youtube/gb/gb-2-02/en)). If it is not empty: `422` (in Go the name is `http.StatusUnprocessableEntity`), `code` is `validation_failed`, `Fields` is that table; then `return`.
+
+Predict: the body is `{"name":"","price":-5}` — `name` is empty, `price` is minus five, `stock` is missing altogether. How many keys will `fields` have?
+
+**A)** one: `name` · **B)** two: `name` and `price` · **C)** three: `stock` too
+
+<details>
+<summary>Answer</summary>
+
+**B.** `validate` does not stop at the first error: both `name` and `price` land in the table (with **A** you assumed it stops at the first one). `stock` was not sent, so it is the **zero value** (`0`) ([Go spec](https://go.dev/ref/spec#The_zero_value)), and zero is a valid stock: `stock < 0` is false (with **C** you counted the missing field as an error).
+
+</details>
+
+```console
+$ ./_video/run.sh 06-tekshiruv go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+(chiqish kodi: 0)
+```
+
+`422`, and `fields` has two keys: `name` and `price`; there is no `stock`. `message` is for a person, `code` for a machine, and `fields` tells a form which field to highlight in red.
+
+All of these paths (`201`, `400`, `413`, `422`) are written as tests in the folder's `handler_test.go`; they pass on the starter code too:
+
+```console
+$ go test -count=1 -run TestCreateProduct -v .
+=== RUN   TestCreateProduct
+--- PASS: TestCreateProduct (0.00s)
+=== RUN   TestCreateProductXato
+--- PASS: TestCreateProductXato (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.003s
+```
+
+## Going deeper (optional): details of the standard package
+
+This section is not in the video; these are additions from the course folder's README, together with what I re-ran.
+
+**Key names match regardless of letter case.** `encoding/json` matches a key name regardless of case ([`Unmarshal` documentation](https://pkg.go.dev/encoding/json#Unmarshal)): `NAME` matches `name`. In Go 1.27, `encoding/json` is built on top of the new `encoding/json/v2`; in v2's own API the letter case of names matters ([Go 1.27 release notes](https://go.dev/doc/go1.27), [GB-3.02](/lab/youtube/gb/gb-3-02/en), "Going deeper").
+The course stays on the `encoding/json` API. The step below is `decodeJSON` **before** the single-value check (before `11-tail`):
+
+```console
+$ ./_video/run.sh 10-qoshimcha go run .
+201 {"id":4,"name":"choy","price":2500000,"stock":0}
+201 {"id":5,"name":"non","price":400000,"stock":0}
+5 mahsulot
+(chiqish kodi: 0)
+```
+
+This step's `main` sends two requests: `{"NAME":"choy","PRICE":2500000}` and `{"name":"non","price":400000}{"x":1}`, and at the end prints `fmt.Println(len(catalog), "mahsulot")`. The result: the first request is `201` (`NAME` and `PRICE` were accepted), the second is also `201`: the second value was silently dropped. The catalog grew from 3 to 5. The single-value check prevents exactly this.
+
+**A missing field and zero.** `fields` cannot tell a missing `stock` from `0`: that needs a pointer field such as `*int`. In this lesson `stock: 0` is a valid value.
+
+**`message` can reveal internal names.** The `message` in a `400` is the text of the `Decode` error itself. It sometimes shows Go names; an example from the README (I did not re-run it here): `json: cannot unmarshal number into Go struct field productInput.name of type string`. In production you return a fixed text for each class of error; here, for simplicity, it is the error's own text.
+
+**Other simplifications** (README): every read error (a client disconnect too) is `400`; `Content-Type` is not checked; the `201` response has no `Location` header ([RFC 9110 §15.3.2](https://www.rfc-editor.org/rfc/rfc9110#name-201-created) identifies the created resource by `Location` or by the request URI).
+
+**A limit: the mux's own responses.** The error shape applies only to our handlers. The mux's own `404` and `405` responses are still plain text:
+
+```console
+$ ./_video/run.sh 09-mux go run .
+404 404 page not found
+405 Method Not Allowed
+(chiqish kodi: 0)
+```
+
+The step sends two requests: `GET /yoq` (there is no such route) and `GET /products` (the path exists but is wired only to `POST`). The first response is `404` with the text `404 page not found`; the second is `405` with the text `Method Not Allowed`: neither is JSON. Bringing them into one shape is not this lesson's job.
+
+## Common mistakes
+
+### 1. No `return` after `writeError`
+
+`writeError` writes the response but does **not stop** the function. The code goes on. Here is a handler without `return`:
+
+```go
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+	}
+	writeJSON(w, http.StatusCreated, addProduct(in))
+}
+```
+
+Predict: the body is `{"name":"","price":-5}`. What is the status, and is a new product added to the catalog?
+
+**A)** `422`, the catalog is unchanged · **B)** `422`, a product was added · **C)** `201`
+
+<details>
+<summary>Answer</summary>
+
+**B.** The status is `422`: the first `WriteHeader` counts ([GB-4.03](/lab/youtube/gb/gb-4-03/en)). But there is no `return`, so the next line `writeJSON(w, http.StatusCreated, addProduct(in))` runs too: a product is added and a second JSON is written to the body. With **A** you assumed the error does `return` by itself; with **C**, that the second `WriteHeader(201)` changes the status, but it is ignored.
+
+</details>
+
+The step also prints `fmt.Println(len(catalog), "mahsulot")` at the end of `main`:
+
+```console
+$ ./_video/run.sh 08-return go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+{"id":4,"name":"","price":-5,"stock":0}
+4 mahsulot
+(chiqish kodi: 0)
+```
+
+The first line is `422` and the error JSON. The second line is a **second** JSON: `{"id":4,"name":"","price":-5,"stock":0}`, a product with an empty name. The last line: the catalog grew from 3 to 4. There is no error and the compiler is silent, yet a bad product was saved.
+On a real server the log gets one more line: `http: superfluous response.WriteHeader call` (README; `httptest.NewRecorder` writes no log, so you do not see it here). The fix: `return` after `writeError`. `decodeJSON` does not protect you from this mistake: it only guarantees its own `return false`.
+
+### 2. Passing the target itself to `errors.As`, not its address
+
+In [GB-2.08](/lab/youtube/gb/gb-2-08/en): the second argument of `errors.As` is the **address** of the target (`&tooBig`). If you pass `tooBig` itself, the compiler is silent but `go vet` catches it. This program is not in the course folder: it is a separate check (in an empty folder run `go mod init scratch` and put this in `main.go`):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+func main() {
+	var err error = &http.MaxBytesError{Limit: 1024}
+	var tooBig *http.MaxBytesError
+	fmt.Println(errors.As(err, tooBig))
+}
+```
+
+```console
+$ go vet .
+main.go:12:14: second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type
+```
+
+`go vet` names the file, line and column (`main.go:12:14`) and says: the second argument must be a **pointer** to a type that implements `error`. And `go run .` stops at run time with `panic: errors: target must be a non-nil pointer`. The fix: `errors.As(err, &tooBig)`.
+
+### 3. An extra key accepted silently
+
+Without `DisallowUnknownFields`, a key like `rang` is dropped without an error and the response is `201`. See the section "An extra key is silently dropped". The fix: `dec.DisallowUnknownFields()`.
+
+### 4. Only the first value is read
+
+A single `Decode` does not read a second value in the body and does not check its size. See the section "decodeJSON: three steps in one function". The fix: a second `Decode` and the `io.EOF` check.
+
+## Check yourself
+
+**1.** What is the difference between `400` and `422`?
+
+<details>
+<summary>Answer</summary>
+
+`400` — the body does not match our shape: the JSON is broken, a key is extra or a type is different; the body could not be read. `422` — the shape is right, the JSON was read, but a value breaks a rule (a price of minus five); the response has `fields`. This is a course convention.
+
+</details>
+
+**2.** Why do we need `http.MaxBytesReader`, and which status comes back when the limit is exceeded?
+
+<details>
+<summary>Answer</summary>
+
+`Decode` reads one value completely into memory; without a limit a client can send a body of any size. `MaxBytesReader` wraps the body and returns `*http.MaxBytesError` after the limit; we pick it out with `errors.As` and write `413`.
+
+</details>
+
+**3.** (From [GB-4.03](/lab/youtube/gb/gb-4-03/en).) A handler wrote the body and **then** called `w.WriteHeader(http.StatusNotFound)`. Which status does the client see?
+
+<details>
+<summary>Answer</summary>
+
+`200`. The first `Write` has already sent the status (`200` if none was set) and the headers; the later `WriteHeader` is ignored. The same rule kept `422` in the handler without `return`.
+
+</details>
+
+**4.** Predict: the body is `{"name":"choy","price":2500000,"stock":-1}`. What is the response?
+
+<details>
+<summary>Answer</summary>
+
+The shape is right, `name` and `price` are fine, only `stock` is negative: `422`, and `fields` has one key — `stock`. Step `07-stock`:
+
+```console
+$ ./_video/run.sh 07-stock go run .
+422 {"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"stock":"manfiy boʻlmasin"}}}
+(chiqish kodi: 0)
+```
+
+If you said `400` instead of `422`, you confused a value error with a shape error: the JSON was read.
+
+</details>
+
+## Homework
+
+The homework is in the course folder's file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-06-json-body/TASK.md); the folder:
+[lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body). `TASK.md` itself marks the optional step with 🟡; I added the other level marks.
+
+In `main.go` the `POST /orders` route is already wired into `newMux()`, but `validateOrder` checks nothing and `createOrder` writes nothing (the response is `200` with an empty body). The client body: `{"product_id": 1, "quantity": 3}`.
+
+- 🟢 **Step 1, `validateOrder`.** `product_id` greater than zero, `quantity` from 1 to 100. For a wrong field put a key (the JSON name: `"product_id"`, `"quantity"`) and a reason into the table; do not stop at the first error. If all is fine, return an empty table.
+- 🟡 **Step 2, `createOrder`: read and check.** Read the body with `decodeJSON` (on `false`, `return` at once), then `validateOrder`: if the table is not empty, `422`, `code: "validation_failed"`, `Fields` is that table; `return`.
+- 🟡 **Step 3, `createOrder`: the product.** Find the product with `ID == in.ProductID` in `catalog`; if it is not found, `404`, `code: "not_found"`; if found, `201` and `Order{ProductID, Quantity, Total}`, where `Total` is price × quantity (in tiyin, `int64`). Every error goes through `writeError`, success through `writeJSON`.
+- 🟡 **Optional.** Add a `stock` check on `quantity`: if the stock is not enough, `409` (`http.StatusConflict`), `code: "insufficient_stock"`; write a test for it yourself (that is what `TASK.md` says).
+
+Do not change `Product`, `decodeJSON`, `writeJSON`, `writeError`, `createProduct`, `newMux`, `send`, `main` or the test files. On the starter code, the formatter and `go vet` print nothing:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Nothing was printed: the formatting and `go vet` are both clean. The homework test fails like this (I ran it; each message says in Uzbek what was expected):
+
+```console
+$ go test .
+--- FAIL: TestVazifaBuyurtma (0.00s)
+    tekshiruv_test.go:23: buyurtma: status 200, kutilgan 201 (http.StatusCreated): decodeJSON, tekshiruv va writeJSON(w, http.StatusCreated, Order{…}) yozing; body: ""
+--- FAIL: TestVazifaTekshiruv (0.00s)
+    tekshiruv_test.go:55: ikkalasi notoʻgʻri: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: dona juda koʻp: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: dona manfiy: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+    tekshiruv_test.go:55: maydonlar yoʻq: status 200, kutilgan 422 (http.StatusUnprocessableEntity): qiymatlar notoʻgʻri, JSON esa toʻgʻri
+--- FAIL: TestVazifaTopilmadi (0.00s)
+    tekshiruv_test.go:81: mahsulot katalogda yoʻq: status 200, kutilgan 404 (http.StatusNotFound); body: ""
+--- FAIL: TestVazifaBodyQoidalari (0.00s)
+    tekshiruv_test.go:101: nomaʼlum kalit: status 200, kutilgan 400: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+    tekshiruv_test.go:101: buzuq JSON: status 200, kutilgan 400: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+    tekshiruv_test.go:101: katta body: status 200, kutilgan 413: createOrder body'ni decodeJSON bilan oʻqisin va xatoda return qilsin (videodagidek)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.003s
+FAIL
+```
+
+Keep working until `ok` appears. Hints:
+
+- Copy `createProduct`: the `decodeJSON` and `validate` part barely changes, only `productInput` becomes `orderInput` and `validate` becomes `validateOrder`.
+- Do not forget `return`: the test fails if the body has a second JSON.
+- The total price: `p.Price * int64(in.Quantity)` (`Quantity` is `int`, `Price` is `int64`).
+- Searching: `for _, p := range catalog { … }`; when found, write the response and `return`, and put `404` after the loop.
+
+<details>
+<summary>Answer: validateOrder and createOrder from solution/main.go</summary>
+
+Try it yourself first. The answer is [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-06-json-body/solution/main.go):
+
+```go
+func validateOrder(in orderInput) map[string]string {
+	f := map[string]string{}
+	if in.ProductID <= 0 {
+		f["product_id"] = "0 dan katta boʻlsin"
+	}
+	if in.Quantity < 1 || in.Quantity > 100 {
+		f["quantity"] = "1 dan 100 gacha boʻlsin"
+	}
+	return f
+}
+```
+
+```go
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	for _, p := range catalog {
+		if p.ID == in.ProductID {
+			writeJSON(w, http.StatusCreated, Order{ProductID: p.ID, Quantity: in.Quantity, Total: p.Price * int64(in.Quantity)})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: "mahsulot topilmadi"})
+}
+```
+
+| Line (inside the blocks) | What it does |
+|---|---|
+| `validateOrder` 3–8 | two rules: `product_id <= 0` and `quantity` outside 1..100; both are checked, so two errors can come back together |
+| `createOrder` 2–5 | `decodeJSON`: limit, strict decoding, one value; on an error the response is already written, `return` |
+| `createOrder` 6–9 | if the `validateOrder` table is not empty, `422` and `return` |
+| `createOrder` 10–15 | look for the `ID` in the catalog; if found, `201` and `Order`, `Total = p.Price * int64(in.Quantity)`, `return` |
+| `createOrder` 16 | after the loop: not found — `404`, `code: "not_found"` |
+
+Check:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+`ok` — the answer passed `tekshiruv_test.go` (`solution/` has the same test files).
+
+</details>
+
+## Sources
+
+- [pkg.go.dev: net/http — MaxBytesReader](https://pkg.go.dev/net/http#MaxBytesReader), [MaxBytesError](https://pkg.go.dev/net/http#MaxBytesError) — wraps the body, `*MaxBytesError` after the limit; closes the connection when possible
+- [pkg.go.dev: net/http — status constants](https://pkg.go.dev/net/http#pkg-constants) — `StatusBadRequest`, `StatusCreated`, `StatusRequestEntityTooLarge`, `StatusUnprocessableEntity`
+- [pkg.go.dev: net/http — ResponseWriter](https://pkg.go.dev/net/http#ResponseWriter) — the first `WriteHeader`/`Write` sends the status
+- [pkg.go.dev: encoding/json — Decoder.DisallowUnknownFields](https://pkg.go.dev/encoding/json#Decoder.DisallowUnknownFields), [Unmarshal](https://pkg.go.dev/encoding/json#Unmarshal) — an unknown key is dropped, names match regardless of case
+- [pkg.go.dev: encoding/json — Decoder.Decode](https://pkg.go.dev/encoding/json#Decoder.Decode) — reads only the next value
+- [Go 1.27 release notes](https://go.dev/doc/go1.27) — `encoding/json/v2`
+- [Go spec: the zero value](https://go.dev/ref/spec#The_zero_value)
+- [RFC 9110 §15.5.1: 400 Bad Request](https://www.rfc-editor.org/rfc/rfc9110#name-400-bad-request), [§15.5.14: 413 Content Too Large](https://www.rfc-editor.org/rfc/rfc9110#name-413-content-too-large), [§15.5.21: 422 Unprocessable Content](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content), [§15.3.2: 201 Created](https://www.rfc-editor.org/rfc/rfc9110#name-201-created)
+- [Course folder: lessons/gb-4-06-json-body](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-06-json-body)
+
+---
+
+← Previous lesson: [GB-4.05](/lab/youtube/gb#gb-4-05) · Next lesson: [GB-4.07](/lab/youtube/gb#gb-4-07) → · [All lessons](/lab/youtube/gb)
+
+</div>
