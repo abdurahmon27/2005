@@ -1,0 +1,763 @@
+---
+title: "HTTP-запрос — это текст: один обмен через curl -v"
+date: "2026/11/27"
+description: "Читаете HTTP-запрос и ответ в выводе curl -v: метод, путь, заголовки, код статуса, тело, Content-Length и ошибку 415; затем пишете на Go parseRequestLine."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-01) · **Русский** · [English](/lab/youtube/gb/gb-4-01/en)  
+Урок GB-4.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Каталог bozor теперь живёт на сервере. Мобильное приложение запросило товар с номером 99 и вместо ответа получило ошибку. Причина записана в двух текстах, которыми
+приложение и сервер обменялись. Сегодня мы эти два текста прочитаем.
+
+**Одна идея:** HTTP-обмен — это два текста. Клиент отправляет текст запроса, сервер возвращает текст ответа. У обоих одна форма: первая строка, заголовки вида `имя: значение`,
+пустая строка, тело. Первая строка запроса — `метод путь версия`, первая строка ответа — `версия код-статуса причина`. Первая цифра кода статуса называет класс: `2xx` — успех,
+`4xx` — ошибка в запросе, `5xx` — ошибка на сервере. `Content-Type` говорит, в каком формате тело, `Content-Length` — какой оно длины в **байтах**.
+
+К концу урока вы:
+
+- прочитаете в выводе `curl -v` метод, путь и заголовки запроса, а также код статуса, заголовки и тело ответа;
+- отправите тот же запрос вручную через `printf` и `nc`: curl отправляет именно этот текст;
+- объясните, почему `Content-Length` считает байты, а не символы, и почему без `-H` сервер возвращает `415`;
+- напишете на Go функции `parseRequestLine` (разбирает строку запроса) и `statusClass` (называет класс статуса) и добьётесь, чтобы `go test` прошёл.
+
+Три главных новых слова урока:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| запрос и ответ (HTTP-обмен) | текст, который отправляет клиент, и текст, который возвращает сервер | HTTP exchange (request, response) |
+| код статуса | трёхзначное число в первой строке ответа: чем закончился запрос | status code |
+| заголовок | дополнительная строка вида `имя: значение`: говорит, как читать тело | header |
+
+Вспомогательные слова: **клиент** и **сервер**, **тело** (body — основная часть сообщения), `curl` (программа, которая отправляет запросы из терминала), `printf` и `nc` (отправка запроса вручную).
+
+## Что нужно знать заранее
+
+Урок опирается на [GB-3.06 · Контрольная точка: bozor CLI v0](/lab/youtube/gb#gb-3-06): каталог bozor, `bozor.json` и поле `Price`. Понадобится и это:
+
+- [GB-3.02 · JSON и теги структур](/lab/youtube/gb/gb-3-02/ru): `int64` в JSON становится числом, поля `Product` становятся ключами JSON.
+- [GB-2.10 · UTF-8: байт, руна и узбекский текст](/lab/youtube/gb/gb-2-10/ru): символ `ʻ` — один символ, но два байта.
+- [GB-1.03 · Целые числа и деньги](/lab/youtube/gb/gb-1-03/ru): `int64` и тийины.
+- [GB-1.07 · Функция и первый error](/lab/youtube/gb/gb-1-07/ru): функция, возвращающая `(результат, error)`, и `if err != nil`.
+- [GB-1.08 · Первый тест: go test](/lab/youtube/gb/gb-1-08/ru): `go test` и `tekshiruv_test.go`.
+- [GB-3.01 · Файлы, bufio и io.Reader](/lab/youtube/gb/gb-3-01/ru): разбиение текста через `strings.Split`.
+- [GB-3.04 · Дженерики: когда параметр типа полезен](/lab/youtube/gb/gb-3-04/ru): вопрос в конце урока оттуда.
+
+**Как запустить код.** Код урока лежит в папке курсового репозитория:
+[lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn). Скачайте её и откройте терминал в этой папке
+(`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-4-01-http-matn
+```
+
+В папке лежат стартовый `main.go` (задание здесь), `tekshiruv_test.go` (проверяет задание), `TASK.md` (условие), `solution/` (решение) и `_video/server/main.go`.
+Последний — **сервер** из видео: каталог bozor по HTTP. Его внутренний код в этом уроке мы не смотрим, вы напишете его сами в уроке [GB-4.04 · Первый сервер, строка за строкой](/lab/youtube/gb#gb-4-04).
+Пока это чёрный ящик: мы только отправляем ему запросы через `curl`. Запустите сервер в отдельном терминале и оставьте его работать на время урока:
+
+```bash
+go run ./_video/server
+```
+
+Если порт занят, передайте адрес аргументом (`go run ./_video/server localhost:9000`) и замените `8765` в командах ниже. Модуль написан под Go 1.27 (`go 1.27` в `go.mod`):
+если у вас Go старее, `go` сам скачает нужную версию. Результаты получены на `go1.27.4 linux/amd64`, с `CGO_ENABLED=0` и `curl 8.22.0`. Все команды из видео я тоже заново
+запустил на этом сервере; отличия, например в строке `Date`, отмечаю на месте.
+
+Один вопрос из прошлого модуля. bozor хранит каталог в JSON-файле. Поле `Price` у `Product` — `int64`, значение `1_200_000` тийинов. Как цена записывается в JSON?
+
+**A)** `"price": 1200000` · **B)** `"price": "1200000"` · **C)** `"price": "1 200 000"`
+
+<details>
+<summary>Ответ</summary>
+
+**A: число без кавычек.** `int64` в JSON становится числом, а не строкой ([GB-3.02](/lab/youtube/gb/gb-3-02/ru)). Строка была бы в кавычках, например `"olma"` ("яблоко").
+Если вы выбрали **B**, вы приняли число за строку; **C** — в числе JSON пробелов нет. Сервер отправляет приложению именно такой JSON, сегодня мы увидим его внутри ответа.
+
+</details>
+
+Сегодня три вещи. Первая — обмен: из каких частей состоят запрос и ответ. Вторая — код статуса: чем закончился запрос и на чьей стороне ошибка.
+Третья — заголовки: они говорят, как читать тело.
+
+## Клиент, сервер и адрес
+
+Сервер каталога — программа, которая принимает запросы и возвращает ответы. Она работает на этом же компьютере. Сторона, которая отправляет запрос (например, мобильное приложение), называется **клиентом** (client).
+Правила их разговора — **протокол HTTP**: они определяют, как записываются запрос и ответ.
+
+Адрес сервера — одна строка: `http://localhost:8765/products/1`.
+
+| Часть | Смысл |
+|---|---|
+| `http://` | протокол: клиент и сервер говорят по правилам HTTP |
+| `localhost` | этот же компьютер |
+| `:8765` | **порт**: сетевой номер одной программы на компьютере; сервер слушает этот номер |
+| `/products/1` | **путь** (path): что нужно — товар с номером 1 (`products` — «товары») |
+
+## Первый запрос: curl -v
+
+Отправим ему запрос через `curl`. `curl` — клиентская программа, которая отправляет HTTP-запросы из терминала. Флаг `-v` (verbose, «подробно») показывает и отправленные, и полученные строки.
+В этом терминале, против сервера (я сам запустил его, воспользовался и остановил):
+
+```console
+$ curl -v http://localhost:8765/products/1
+* Host localhost:8765 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:8765...
+* connect to ::1 port 8765 from ::1 port 45334 failed: Connection refused
+*   Trying 127.0.0.1:8765...
+* Established connection to localhost (127.0.0.1 port 8765) from 127.0.0.1 port 41116 
+* using HTTP/1.x
+> GET /products/1 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+* Request completely sent off
+< HTTP/1.1 200 OK
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:46 GMT
+< Content-Length: 49
+< 
+* Connection #0 to host localhost:8765 left intact
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+В выводе три вида строк:
+
+| Начало строки | Что это |
+|---|---|
+| `*` | сведения о соединении (адрес найден, соединение открыто): не сам HTTP-текст |
+| `>` | строка **запроса**, который отправил curl |
+| `<` | строка **ответа** сервера; в конце строка без метки — тело, сам товар |
+
+Здесь сервер слушает только IPv4-адрес (`127.0.0.1`): curl сначала попробовал `::1` (IPv6), получил отказ и перешёл на `127.0.0.1`. Строки `*` зависят от машины, поэтому дальше я
+убираю их (и строки curl `[N bytes data]`); в видео они тоже скрыты. Остальное не изменено. Значение `Date` каждый раз другое: в видео `06:37:46`, в моём запуске `07:22:46` GMT.
+Все шаги выполнились за одну секунду, поэтому в последовательных командах `Date` выглядит одинаково.
+
+## Текст запроса строка за строкой
+
+Только строки `>` — это сам запрос:
+
+```http
+GET /products/1 HTTP/1.1
+Host: localhost:8765
+User-Agent: curl/8.22.0
+Accept: */*
+
+```
+
+Первая строка — **строка запроса**. В ней три части, разделённые одним пробелом:
+
+| Часть | Значение | Смысл |
+|---|---|---|
+| **метод** (method) | `GET` | что сделать: здесь «получить» |
+| путь | `/products/1` | что именно нужно |
+| версия протокола | `HTTP/1.1` | HTTP, один точка один |
+
+Дальше идут **заголовки** (header): каждый — имя, двоеточие, значение.
+
+| Строка | Смысл |
+|---|---|
+| `Host: localhost:8765` | какому серверу адресован запрос |
+| `User-Agent: curl/8.22.0` | кто отправил запрос: curl и его версия |
+| `Accept: */*` | какой тип ответа клиент готов принять: звёздочка, слеш, звёздочка — любой |
+
+В конце стоит **пустая строка**: она означает «заголовки закончились». В этом запросе тела нет, поэтому после пустой строки ничего нет.
+
+## Текст ответа строка за строкой
+
+Теперь ответ — строки `<` и товар под ними:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:22:46 GMT
+Content-Length: 49
+
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+Первая строка — **строка статуса**. Она тоже из трёх частей:
+
+| Часть | Значение | Смысл |
+|---|---|---|
+| версия протокола | `HTTP/1.1` | HTTP, один точка один |
+| **код статуса** | `200` | трёхзначное число: чем закончился запрос |
+| текст причины | `OK` | пояснение для человека; программа смотрит на код, а текст игнорирует |
+
+Заголовки такие же, как в запросе: имя, двоеточие, значение.
+
+| Строка | Смысл |
+|---|---|
+| `Content-Type: application/json` | в каком формате тело: `application/json` — JSON |
+| `Date: …` | когда сервер сформировал ответ, по гринвичскому времени (GMT) |
+| `Content-Length: 49` | сколько в теле **байт**: 49 |
+
+Затем пустая строка: заголовки закончились, начинается тело. Тело — сам товар: `{"id":1,"name":"olma","price":1200000,"stock":40}`. `price` — число без кавычек:
+ответ на прошлый вопрос виден прямо здесь.
+
+## Два текста, одна форма
+
+У запроса и ответа одна форма:
+
+| Часть | В запросе | В ответе |
+|---|---|---|
+| первая строка | `GET /products/1 HTTP/1.1` (метод, путь, версия) | `HTTP/1.1 200 OK` (версия, код статуса, причина) |
+| заголовки | `Host: …`, `User-Agent: …`, `Accept: …` | `Content-Type: …`, `Date: …`, `Content-Length: …` |
+| пустая строка | заголовки закончились | заголовки закончились |
+| тело | в этом запросе нет | `{"id":1,…}` |
+
+Отличается только первая строка: в запросе метод и путь, в ответе код статуса. Получатель опирается на эту форму: читает заголовки до пустой строки, затем читает
+столько байт тела, сколько указано в `Content-Length`. Тела может и не быть.
+
+## Пишем вручную: printf и nc
+
+curl всего лишь отправляет этот текст. Проверим это вручную, одной командой из трёх частей:
+
+1. `printf` — команда терминала: выводит заданный текст. `\r\n` внутри текста — конец строки: в HTTP каждая строка заканчивается этими двумя байтами (CR и LF).
+2. `|` (вертикальная черта) — передаёт вывод левой команды правой.
+3. `nc` (netcat) — подключается к указанному хосту и порту, отправляет полученный текст и выводит ответ.
+
+```console
+$ printf 'GET /products/1 HTTP/1.1\r\nHost: localhost:8765\r\nConnection: close\r\n\r\n' | nc localhost 8765
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:22:38 GMT
+Content-Length: 49
+Connection: close
+
+{"id":1,"name":"olma","price":1200000,"stock":40}
+```
+
+Текст в одинарных кавычках передаётся команде как один аргумент. В нём три строки и пустая строка в конце: строка запроса, `Host` и `Connection: close`
+(закрой соединение после ответа). Результат — тот самый ответ, который показал curl, только добавилась строка `Connection: close` от сервера. Никакого curl, только текст.
+
+Зачем нужен `Connection: close`? Без него сервер оставляет соединение открытым, и `nc` ждёт даже после ответа. Я это проверил: с `timeout 3` (останавливает программу через 3 секунды)
+ответ выводится, а затем команда прерывается с кодом выхода 124. Этой команды в папке курса нет, я запустил её сам:
+
+```console
+$ printf 'GET /products/1 HTTP/1.1\r\nHost: localhost:8765\r\n\r\n' | timeout 3 nc localhost 8765; echo " chiqish kodi: $?"
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Fri, 27 Nov 2026 07:23:58 GMT
+Content-Length: 49
+
+{"id":1,"name":"olma","price":1200000,"stock":40} chiqish kodi: 124
+```
+
+Программы `nc` бывают разные: здесь OpenBSD netcat, а у GNU-варианта флаги могут отличаться.
+
+## Код статуса: на чьей стороне ошибка
+
+**Код статуса** — трёхзначное число в первой строке ответа. Его первая цифра называет **класс**:
+
+| Класс | Смысл | Примеры |
+|---|---|---|
+| `2xx` | успех | `200 OK` — запрошенное возвращено; `201 Created` — создано новое |
+| `4xx` | ошибка **в запросе** | `400 Bad Request` — запрос составлен неверно (например, битый JSON); `404 Not Found` — сервер не нашёл такой вещи |
+| `5xx` | ошибка **на сервере** | `500 Internal Server Error` |
+
+Есть и классы `1xx` и `3xx`; их вы увидите в задании.
+
+Предскажите. Приложение запросило товар 99, а в bozor только два товара. Запрос составлен правильно. Что будет в первой строке ответа?
+
+**A)** `HTTP/1.1 200 OK`, тело пустое · **B)** `HTTP/1.1 404 Not Found` · **C)** `HTTP/1.1 400 Bad Request`
+
+<details>
+<summary>Ответ</summary>
+
+**B: `404 Not Found`.** Запрос составлен правильно, поэтому не `400`: такого товара просто нет. Если вы выбрали **C**, вы приняли «запросили несуществующее» за «запрос сломан»;
+`400` приходит, когда неверен сам запрос. Если вы выбрали **A**, вы смешали класс «успех» с ошибкой: для несуществующей вещи мы не отдаём `2xx`.
+
+</details>
+
+Вот этот запрос: в конце 99.
+
+```console
+$ curl -v http://localhost:8765/products/99
+> GET /products/99 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+< HTTP/1.1 404 Not Found
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 30
+< 
+{"error":"mahsulot topilmadi"}
+```
+
+Тело тоже JSON: под ключом `error` текст ошибки (`"mahsulot topilmadi"` — «товар не найден»), приложение берёт его отсюда. Ошибка из начала урока была такой же. В работе ваше приложение ведёт себя так:
+сначала смотрит на код статуса, потом читает тело. Если код — успех, тело содержит нужные данные. Если ошибка — тело содержит текст ошибки.
+
+Короткий вопрос. Приложение увидело в первой строке ответа `503`. На чьей стороне ошибка?
+
+**A)** в запросе: клиент ошибся · **B)** на сервере · **C)** сказать нельзя
+
+<details>
+<summary>Ответ</summary>
+
+**B: на сервере.** Код `5xx` говорит: сервер допустил ошибку или не смог выполнить запрос (`503` — «Service Unavailable», сервис сейчас не может ответить). Первая цифра показывает, на чьей стороне ошибка,
+а точный код — что произошло. **A** — это класс `4xx`; **C** — сказать можно, именно для этого и есть класс.
+
+</details>
+
+У сервера есть и другой ответ. Каталог знает только `GET /products/{id}` и `POST /products`. Если спросить другим методом, сервер вернёт `405`. В видео этого нет,
+это есть в README курса; я тоже запустил (`-X` — вы сами называете метод):
+
+```console
+$ curl -v -X DELETE http://localhost:8765/products/1
+> DELETE /products/1 HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> 
+< HTTP/1.1 405 Method Not Allowed
+< Allow: GET, HEAD
+< Content-Type: text/plain; charset=utf-8
+< X-Content-Type-Options: nosniff
+< Date: Fri, 27 Nov 2026 07:24:01 GMT
+< Content-Length: 19
+< 
+Method Not Allowed
+```
+
+`405` тоже из класса `4xx`: ошибка в запросе (путь есть, но не с этим методом). Заголовок `Allow` говорит, какие методы допустимы.
+
+## Отправляем тело: POST и Content-Length
+
+Теперь тело находится в самом запросе. Чтобы добавить новый товар, метод — `POST`: он передаёт серверу тело, и сервер создаёт из него новый товар. Это тело — JSON товара.
+Формат тела и его размер в байтах задают два заголовка: `Content-Type` и `Content-Length`.
+
+Вот тело:
+
+```json
+{"name":"oʻrik","price":3500000,"stock":5}
+```
+
+Это 42 символа: изогнутый знак (`ʻ`) в букве `oʻ` слова `oʻrik` («слива») — тоже один символ. Предскажите. В заголовке запроса есть `Content-Length`: это длина тела в **байтах**.
+Тело — 42 символа. Чему равен `Content-Length`?
+
+**A)** 42 · **B)** 43 · **C)** 44
+
+<details>
+<summary>Ответ</summary>
+
+**B: 43.** `Content-Length` считает байты, а не символы, а `ʻ` в UTF-8 занимает два байта ([GB-2.10](/lab/youtube/gb/gb-2-10/ru)). Если вы выбрали **A**, вы приравняли символы к байтам;
+**C** — двухбайтовый только один символ, не все. Проверим (этой команды в папке курса нет; `wc -m` в UTF-8-локали считает символы, `wc -c` — байты):
+
+```console
+$ printf '{"name":"oʻrik","price":3500000,"stock":5}' | wc -m -c
+     42      43
+```
+
+</details>
+
+Вот запрос. `-d` передаёт тело, `-H` добавляет заголовок: что тело — JSON, сообщает `Content-Type`. Двойные кавычки тоже оборачивают один аргумент. Сервер вернул `201 Created`:
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' -H "Content-Type: application/json" http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 43
+> 
+< HTTP/1.1 201 Created
+< Content-Type: application/json
+< Location: /products/3
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 50
+< 
+{"id":3,"name":"oʻrik","price":3500000,"stock":5}
+```
+
+В запросе: первая строка теперь `POST /products HTTP/1.1`, два новых заголовка (`Content-Type`, `Content-Length: 43`), а после пустой строки идёт тело (curl не показывает его с `>`).
+В ответе: `201 Created` — новый товар создан. Заголовок `Location` называет путь нового товара: `/products/3`. В теле товар теперь с `id`: его выдал сам сервер.
+`Content-Length: 50` в ответе: и здесь есть `oʻ`, 49 символов и 50 байт. В видео `id` равен 3, потому что на сервере было два товара.
+
+## Классическая ошибка: забыли Content-Type
+
+Предскажите. Отправим тот же `POST` без `-H`: заголовка нет, тело то же JSON. Что вернёт сервер?
+
+**A)** `201 Created` · **B)** `4xx`: ошибка в запросе · **C)** `5xx`: ошибка на сервере
+
+<details>
+<summary>Ответ</summary>
+
+**B: `4xx`.** Тело было верным, заголовок — неверным: сервер не знает, в каком формате пришли данные. Если вы выбрали **A**, вы решили, что сервер сам догадается — а он смотрит на `Content-Type`.
+**C** — сервер в своей работе не ошибся, ошибся запрос.
+
+</details>
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Length: 43
+> Content-Type: application/x-www-form-urlencoded
+> 
+< HTTP/1.1 415 Unsupported Media Type
+< Content-Type: application/json
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 57
+< 
+{"error":"Content-Type application/json boʻlishi kerak"}
+```
+
+Без `-H` curl сам подставляет `Content-Type`: `application/x-www-form-urlencoded` — формат отправки полей формы в виде `имя=значение`, не JSON. Сервер возвращает `415`: тип тела
+не поддерживается. Код начинается с `4`, значит, ошибка в запросе: тело было верным, заголовок — нет. В теле ответа сервер написал причину.
+
+Исправление — `Content-Type: application/json` через `-H`. Теперь сервер возвращает `201`. Сервер запомнил предыдущий успешный `POST`, поэтому в этот раз `id` равен 4, а `Location: /products/4`:
+
+```console
+$ curl -v -d '{"name":"oʻrik","price":3500000,"stock":5}' -H "Content-Type: application/json" http://localhost:8765/products
+> POST /products HTTP/1.1
+> Host: localhost:8765
+> User-Agent: curl/8.22.0
+> Accept: */*
+> Content-Type: application/json
+> Content-Length: 43
+> 
+< HTTP/1.1 201 Created
+< Content-Type: application/json
+< Location: /products/4
+< Date: Fri, 27 Nov 2026 07:22:38 GMT
+< Content-Length: 50
+< 
+{"id":4,"name":"oʻrik","price":3500000,"stock":5}
+```
+
+## Частые ошибки
+
+**1. «Ответ пришёл, значит, всё хорошо».** Даже если ошибка `4xx` или `5xx`, сервер отправляет корректный HTTP-ответ: соединение сработало, текст пришёл. Для curl это успех:
+на `404` он тоже завершается с кодом выхода 0. Только с флагом `-f` (`--fail`) curl при коде статуса-ошибке возвращает код выхода 22. Я запустил оба варианта:
+
+```console
+$ curl -s http://localhost:8765/products/99; echo " chiqish kodi: $?"
+{"error":"mahsulot topilmadi"} chiqish kodi: 0
+$ curl -sf http://localhost:8765/products/99; echo "chiqish kodi: $?"
+chiqish kodi: 22
+```
+
+(`-s` — тихий режим: curl не выводит свои промежуточные сообщения.) Вывод: смотрите на код статуса, а не на код выхода и не на «пришёл ли ответ».
+
+**2. Забыть `-H "Content-Type: application/json"`.** Результат — `415 Unsupported Media Type`; как это читать и исправлять, показано выше, в разделе «Классическая ошибка: забыли Content-Type».
+
+**3. Считать `Content-Length` числом символов.** В товаре `oʻrik` 42 символа, но `Content-Length: 43`: разбор — выше, в разделе «Отправляем тело: POST и Content-Length».
+
+**4. Забыть `Connection: close` в `printf | nc`.** `nc` ждёт даже после ответа; в примере с `timeout 3` выше код выхода 124.
+
+**5. Забыть `\r\n` в конце строки в Go.** Строка HTTP заканчивается на `\r\n`. `strings.Split` их не убирает, поэтому `Proto` остаётся `"HTTP/1.1\r\n"`. Вот
+неверный вариант `parseRequestLine`: из функции в `solution/main.go` убрана одна строка — `line = strings.TrimRight(line, "\r\n")`; остальная часть файла (`Request`, `statusClass`, `main`) та же. Этой папки нет
+в курсовом репозитории, я создал её отдельно (`go.mod` и `tekshiruv_test.go` — те же, что в курсе):
+
+```go
+func parseRequestLine(line string) (Request, error) {
+	parts := strings.Split(line, " ")
+	if len(parts) != 3 {
+		return Request{}, fmt.Errorf("soʻrov qatori uch qismdan iborat boʻlishi kerak, hozir %d: %q", len(parts), line)
+	}
+	method, path, proto := parts[0], parts[1], parts[2]
+	if method == "" {
+		return Request{}, errors.New("method boʻsh")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return Request{}, fmt.Errorf("yoʻl / bilan boshlanishi kerak: %q", path)
+	}
+	if !strings.HasPrefix(proto, "HTTP/") {
+		return Request{}, fmt.Errorf("versiya HTTP/ bilan boshlanishi kerak: %q", proto)
+	}
+	return Request{Method: method, Path: path, Proto: proto}, nil
+}
+```
+
+```console
+$ go test .
+--- FAIL: TestVazifaParseRequestLine (0.00s)
+    --- FAIL: TestVazifaParseRequestLine/qator_oxiri_crlf (0.00s)
+        tekshiruv_test.go:43: parseRequestLine("GET /products/1 HTTP/1.1\r\n") = {Method:GET Path:/products/1 Proto:HTTP/1.1
+            }; kutilgan {Method:GET Path:/products/1 Proto:HTTP/1.1} (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaParseRequestLine/qator_oxiri_cr (0.00s)
+        tekshiruv_test.go:43: parseRequestLine("POST /products HTTP/1.1\r") = {Method:POST Path:/products Proto:HTTP/1.1}; kutilgan {Method:POST Path:/products Proto:HTTP/1.1} (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+Как читать: `tekshiruv_test.go:43` — ошибка в 43-й строке файла теста; слева — что вернула функция, `kutilgan` («ожидалось») — что ждал тест. Во втором случае обе стороны выглядят одинаково: символ `\r`
+в терминале не виден (он стоит в конце `Proto` слева). В первом случае `\n` разорвал строку. Исправление — `strings.TrimRight(line, "\r\n")`.
+
+## Проверьте себя
+
+**1.** Из каких трёх частей состоит строка запроса?
+
+<details>
+<summary>Ответ</summary>
+
+Метод, путь и версия протокола: `GET`, `/products/1`, `HTTP/1.1`. Части разделены одним пробелом.
+
+</details>
+
+**2.** `Content-Length` считает символы или байты?
+
+<details>
+<summary>Ответ</summary>
+
+Байты. В JSON товара `oʻrik` 42 символа и 43 байта: `ʻ` в UTF-8 занимает два байта, поэтому `Content-Length: 43`.
+
+</details>
+
+**3.** Из прошлого модуля ([GB-3.04](/lab/youtube/gb/gb-3-04/ru)): что такое `T` в квадратных скобках generic-функции? Например, `func F[T any](…)`.
+
+<details>
+<summary>Ответ</summary>
+
+Параметр типа: имя для типа, который выбирает вызывающий. При вызове `F` вместо `T` подставляется конкретный тип (аргумент типа).
+
+</details>
+
+**4.** Предскажите: что выведет `go run ./solution` (в папке с решением)? Программа вызывает `parseRequestLine("GET /products/1 HTTP/1.1")`, а затем спрашивает класс для `404`.
+
+<details>
+<summary>Ответ</summary>
+
+Две строки. Первая — три части через пробел; вторая — `404` и название класса. Я запустил:
+
+```console
+$ go run ./solution
+GET /products/1 HTTP/1.1
+404 mijoz xatosi
+```
+
+`404` — класс `4xx`, `statusClass` называет его `mijoz xatosi` («ошибка клиента»): ошибка в запросе.
+
+</details>
+
+## Домашнее задание
+
+Условие лежит в файле [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-01-http-matn/TASK.md) в папке курса; папка:
+[lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn). Значков уровня (🟢🟡) в папке курса нет: их поставил я.
+
+- 🟢 **Шаг 2, `statusClass(code int) string`.** Верните название класса по коду статуса: `100–199` → `axborot`, `200–299` → `muvaffaqiyat`, `300–399` → `yoʻnaltirish`,
+  `400–499` → `mijoz xatosi`, `500–599` → `server xatosi`, остальное → `nomaʼlum`. `ʻ` в `yoʻnaltirish` — U+02BB, `ʼ` в `nomaʼlum` — U+02BC: скопируйте оба из `tekshiruv_test.go`.
+- 🟡 **Шаг 1, `parseRequestLine(line string) (Request, error)`.** Разберите `"GET /products/1 HTTP/1.1"` в `Request{"GET", "/products/1", "HTTP/1.1"}`. В трёх случаях верните `Request{}` и ошибку:
+  строка состоит не **ровно из трёх** частей, разделённых пробелом (пустая строка, две части, четыре части, два пробела подряд); путь не начинается с `/`; версия не начинается с `HTTP/`.
+  `?limit=2` остаётся внутри пути. `\r` и `\n` в конце строки не должны попадать в части (`strings.TrimRight(line, "\r\n")`).
+- 🟢 **Дополнительно (без теста).** Запустите сервер и передайте в `parseRequestLine` первую строку `>` из вывода `curl -v http://localhost:8765/products/1`.
+
+Стартовый `main.go` — задание здесь. Вы пишете только тела двух функций:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+// Request — HTTP soʻrovning birinchi qatoridan olingan uch qism (curl -v'dagi "> GET /products/1 HTTP/1.1").
+type Request struct {
+	Method string // "GET"
+	Path   string // "/products/1"
+	Proto  string // "HTTP/1.1"
+}
+
+// parseRequestLine "GET /products/1 HTTP/1.1" kabi qatorni qismlarga ajratadi (TASK.md, 1-qadam).
+func parseRequestLine(line string) (Request, error) {
+	return Request{}, errors.New("parseRequestLine hali yozilmagan")
+}
+
+// statusClass status kodi qaysi sinfga kirishini aytadi (TASK.md, 2-qadam).
+func statusClass(code int) string {
+	return ""
+}
+
+func main() {
+	req, err := parseRequestLine("GET /products/1 HTTP/1.1")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println(req.Method, req.Path, req.Proto)
+	fmt.Println(404, statusClass(404))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 3–6 | `import ( "errors"; "fmt" )` | два стандартных пакета: `errors.New` создаёт ошибку, `fmt` печатает на экран |
+| 9–13 | `type Request struct { … }` | тип для трёх частей строки запроса: `Method`, `Path`, `Proto` ([GB-2.03](/lab/youtube/gb/gb-2-03/ru)) |
+| 16–18 | `func parseRequestLine(line string) (Request, error)` | пока пустая: всегда возвращает ошибку; тело пишете вы |
+| 21–23 | `func statusClass(code int) string` | пока возвращает пустую строку; тело пишете вы |
+| 25–33 | `func main()` | вызывает `parseRequestLine` с одной строкой: при ошибке печатает `xato:`; иначе три части и класс `404` |
+
+Проверка — `go test .` в этой папке; заранее можно запустить и форматирование с `go vet`. На стартовом коде формат и `go vet` ничего не выводят:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Стартовый `main.go` работает так, а тест падает (я запустил; вывод сокращён, `…` — пропущенные строки):
+
+```console
+$ go run .
+xato: parseRequestLine hali yozilmagan
+$ go test .
+--- FAIL: TestVazifaParseRequestLine (0.00s)
+    --- FAIL: TestVazifaParseRequestLine/get_mahsulot (0.00s)
+        tekshiruv_test.go:39: parseRequestLine("GET /products/1 HTTP/1.1"): xato kutilmagan, keldi: parseRequestLine hali yozilmagan (TASK.md, 1-qadam)
+…
+--- FAIL: TestVazifaStatusClass (0.00s)
+    tekshiruv_test.go:70: statusClass(200) = ""; kutilgan "muvaffaqiyat" (TASK.md, 2-qadam)
+…
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+Сообщение называет шаг (`TASK.md, 1-qadam`). Не меняйте `tekshiruv_test.go`. Работайте, пока не появится `ok`. Подсказки: `strings.Split(line, " ")` делит строку по пробелу,
+два пробела подряд дают пустую часть (поэтому `len(parts) != 3` ловит и этот случай); `strings.HasPrefix(s, "/")` — начинается ли `s` с этого текста; для `statusClass` подойдёт
+`switch` или цепочка `if`, а в самом конце `nomaʼlum`.
+
+<details>
+<summary>Ответ: solution/main.go</summary>
+
+Сначала попробуйте сами. Решение — `solution/main.go` в курсовом репозитории:
+
+```go filename="solution/main.go" showLineNumbers
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// Request — HTTP soʻrovning birinchi qatoridan olingan uch qism (curl -v'dagi "> GET /products/1 HTTP/1.1").
+type Request struct {
+	Method string // "GET"
+	Path   string // "/products/1"
+	Proto  string // "HTTP/1.1"
+}
+
+// parseRequestLine "GET /products/1 HTTP/1.1" kabi qatorni qismlarga ajratadi (TASK.md, 1-qadam).
+func parseRequestLine(line string) (Request, error) {
+	line = strings.TrimRight(line, "\r\n") // HTTP qatori \r\n bilan tugaydi
+	parts := strings.Split(line, " ")
+	if len(parts) != 3 {
+		return Request{}, fmt.Errorf("soʻrov qatori uch qismdan iborat boʻlishi kerak, hozir %d: %q", len(parts), line)
+	}
+	method, path, proto := parts[0], parts[1], parts[2]
+	if method == "" {
+		return Request{}, errors.New("method boʻsh")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return Request{}, fmt.Errorf("yoʻl / bilan boshlanishi kerak: %q", path)
+	}
+	if !strings.HasPrefix(proto, "HTTP/") {
+		return Request{}, fmt.Errorf("versiya HTTP/ bilan boshlanishi kerak: %q", proto)
+	}
+	return Request{Method: method, Path: path, Proto: proto}, nil
+}
+
+// statusClass status kodi qaysi sinfga kirishini aytadi (TASK.md, 2-qadam).
+func statusClass(code int) string {
+	switch {
+	case code >= 100 && code < 200:
+		return "axborot"
+	case code >= 200 && code < 300:
+		return "muvaffaqiyat"
+	case code >= 300 && code < 400:
+		return "yoʻnaltirish"
+	case code >= 400 && code < 500:
+		return "mijoz xatosi"
+	case code >= 500 && code < 600:
+		return "server xatosi"
+	}
+	return "nomaʼlum"
+}
+
+func main() {
+	req, err := parseRequestLine("GET /products/1 HTTP/1.1")
+	if err != nil {
+		fmt.Println("xato:", err)
+		return
+	}
+	fmt.Println(req.Method, req.Path, req.Proto)
+	fmt.Println(404, statusClass(404))
+}
+```
+
+Новые строки:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 18 | `line = strings.TrimRight(line, "\r\n")` | убирает `\r` и `\n` в конце строки: строка HTTP заканчивается на `\r\n` |
+| 19 | `parts := strings.Split(line, " ")` | делит строку по пробелу |
+| 20–22 | `if len(parts) != 3 { … }` | если частей не ровно три — ошибка: пустая строка, две и четыре части и два пробела ловятся здесь |
+| 23 | `method, path, proto := parts[0], parts[1], parts[2]` | раскладывает три части по именованным переменным |
+| 24–26 | `if method == "" { … }` | ошибка, если метод пуст |
+| 27–29 | `if !strings.HasPrefix(path, "/") { … }` | ошибка, если путь не начинается с `/` |
+| 30–32 | `if !strings.HasPrefix(proto, "HTTP/") { … }` | ошибка, если версия не начинается с `HTTP/` |
+| 33 | `return Request{…}, nil` | всё в порядке: три части и ошибка `nil` |
+| 38–50 | `switch { case code >= 100 && code < 200: … }` | `switch` без выражения: первое подошедшее условие возвращает название класса; если не подошло ни одно — последний `return "nomaʼlum"` |
+
+Результат:
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.002s
+```
+
+`ok` — оба теста прошли. В `solution/` лежит тот же `tekshiruv_test.go`, поэтому решение проходит тот же тест, которым проверяется ваш `main.go`.
+
+</details>
+
+## Источники
+
+- [RFC 9112: HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112) — формат сообщения (§2.1), CRLF (§2.2), строка запроса (§3), строка статуса и текст причины (§4), заголовки (§5), тело (§6)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — клиент и сервер, `Host`, `Accept`, `Date`, `Connection`, `POST` (§9.3.3), `Location`
+- [RFC 9110 §15: коды статуса](https://www.rfc-editor.org/rfc/rfc9110#name-status-codes) — классы и `200`, `201`, `400`, `404`, `405`, `415`, `503`
+- [RFC 9110 §8.3 Content-Type и §8.6 Content-Length](https://www.rfc-editor.org/rfc/rfc9110#name-content-type) — `Content-Length` — число октетов (байтов)
+- [curl: manpage](https://curl.se/docs/manpage.html) — `-v/--verbose`, `-d/--data`, `-H/--header`, `-f/--fail`, `-s/--silent`, `-X/--request`
+- [pkg.go.dev: encoding/json](https://pkg.go.dev/encoding/json#Marshal) — `int64` в JSON становится числом (вопрос из прошлого модуля)
+- [pkg.go.dev: strings](https://pkg.go.dev/strings) — `Split`, `HasPrefix`, `TrimRight`
+- [pkg.go.dev: net/http](https://pkg.go.dev/net/http) — сервер из видео написан на этом пакете (строка за строкой в GB-4.04)
+- [Папка курса: lessons/gb-4-01-http-matn](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, `curl 8.22.0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-01-http-matn)
+
+---
+
+← Предыдущий урок: [GB-3.06](/lab/youtube/gb#gb-3-06) · Следующий урок: [GB-4.02](/lab/youtube/gb#gb-4-02) → · [Все уроки](/lab/youtube/gb)
+
+</div>

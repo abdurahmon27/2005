@@ -1,0 +1,971 @@
+---
+title: "Итераторы: range по функции, slices и maps"
+date: "2026/11/27"
+description: "Обходите каталог Store без доступа к внутреннему слайсу и без копирования: iter.Seq, range по функции, yield false при break, maps.Keys и slices.Sorted."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-3-05/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-3-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-3-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-3-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-3-05"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-3-05) · **Русский** · [English](/lab/youtube/gb/gb-3-05/en)  
+Урок GB-3.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-3-05) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-05-iterator)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+`Store` в bozor прячет товары в слайсе `products` с маленькой буквы, поэтому внешний код до него не дотянется. А `List()` при каждом вызове отдаёт полную копию каталога через `slices.Clone`. Если в каталоге 10 000 товаров и нужный стоит вторым, каждый поиск всё равно копирует весь каталог. Можно ли обойти каталог, не открывая слайс наружу и не копируя его?
+
+**Одна идея:** **итератор** — обычная функция, которая принимает функцию `yield` и отдаёт значения по одному через `yield(v)`. Когда вы пишете `for p := range st.All()`, компилятор превращает тело цикла в функцию и передаёт её итератору как `yield`. Итератор и тело работают **по очереди** в одной цепочке вызовов, промежуточного слайса нет. При `break` функция `yield` возвращает `false`, а остановка — дело итератора.
+
+К концу урока вы:
+
+- напишете для `Store` метод `All() iter.Seq[Product]` и обойдёте каталог через `for p := range st.All()` без доступа к внутреннему слайсу и без копирования;
+- увидите в выводе, как итератор и тело цикла работают по очереди, и объясните, как `break` останавливает итератор;
+- узнаете, что будет, если не проверять результат `yield` (паника `range function continued iteration …`), и исправите это;
+- прочитаете `go doc iter.Seq` и отсортируете ключи map одной строкой `slices.Sorted(maps.Keys(m))`.
+
+Три основных новых слова:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| итератор | функция, которая принимает функцию `yield` и отдаёт значения по одному в неё | iterator |
+| функция yield | функция, в которую итератор передаёт значение; в цикле `range` её роль выполняет тело цикла | yield function |
+| `iter.Seq[V]` | стандартное имя этого типа функции: `func(yield func(V) bool)` | iter.Seq |
+
+Вспомогательные слова объясняются одной фразой там, где встречаются: `slices.Collect`, пакет `iter`, живое представление (live view).
+
+## Что нужно знать заранее
+
+- [GB-3.04 · Generics: когда параметр типа приносит пользу](/lab/youtube/gb/gb-3-04/ru): тип функции `func(Product) bool`, анонимная функция, параметр типа `[T any]` в квадратных скобках. Сегодня эти скобки встретятся и *в типе*.
+- [GB-2.02 · Map: поиск, порядок `range` и slices.Sort](/lab/youtube/gb/gb-2-02/ru): литерал map, порядок `range` не гарантирован, ключи собирают в слайс и вызывают `slices.Sort`.
+- [GB-2.06 · Пакеты: internal/store и cmd/bozor](/lab/youtube/gb/gb-2-06/ru): `Store`, `products` с маленькой буквы, `List()` и `slices.Clone`.
+- [GB-2.09 · defer, panic и recover: зачем каждый](/lab/youtube/gb/gb-2-09/ru): анонимная функция видит внешние переменные, `defer`, паника и `exit status 2`.
+- [GB-2.05 · Методы: value receiver или pointer receiver](/lab/youtube/gb/gb-2-05/ru) и [GB-2.03 · Struct: строим типы Product и Order](/lab/youtube/gb/gb-2-03/ru): `func (s *Store) …`, `Product`, `type X int`.
+- [GB-1.06 · for, range, break и continue](/lab/youtube/gb/gb-1-06/ru) и [GB-1.05 · if и условия](/lab/youtube/gb/gb-1-05/ru): цикл, `break`, `!`.
+- [GB-3.03 · Командные инструменты: go vet, staticcheck и govulncheck](/lab/youtube/gb/gb-3-03/ru): `go vet`.
+- [GB-3.02 · JSON: Marshal и Unmarshal](/lab/youtube/gb/gb-3-02/ru): последний вопрос урока о нём.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса: [lessons/gb-3-05-iterator](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-05-iterator). Скачайте репозиторий и откройте терминал в этой папке (`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-3-05-iterator
+```
+
+Папка самостоятельна, со своим `go.mod`: `cmd/bozor` + `internal/store`. Каждый шаг из видео лежит в `_video/<шаг>/`. `./_video/run.sh <шаг> <команда>` копирует шаг во временную папку `bozor/` и выполняет там команду: ваша папка остаётся чистой. Скрипт в конце печатает свою строку `(chiqish kodi: N)` («код выхода: N»); на странице я её не привожу.
+
+Модуль написан на Go 1.27 (`go 1.27` в `go.mod`). Если у вас установлен более старый Go, `go` сам скачает нужную версию. Если в `go.mod` указано `go 1.22` или ниже, компилятор отвергнет `range` по функции: он есть только с Go 1.23. Результаты на странице получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0`.
+
+Три небольших примера, которых нет в папке курса (о них сказано в тексте), запущены в отдельных папках: их полный код приведён на этой странице.
+
+Вопрос по прошлому уроку. Вы передали в `Filter[T any](items []T, keep func(T) bool)` слайс заказов. Кто определяет `T` и когда?
+
+**A)** программист, который написал функцию · **B)** компилятор, при сборке · **C)** runtime, когда программа работает
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Компилятор выводит из аргумента, что `T` — заказ (вывод типов, type inference), и проверяет вызов при сборке. Если вы выбрали **A**, вы решили, что `T` фиксируется при написании функции: нет, функция одна, а `T` выбирает каждый вызов. **C** неверно: ошибка типа выдаётся при сборке, до запуска программы. Сегодня работаем со стандартным `iter.Seq`: у него тоже есть параметр типа.
+
+</details>
+
+## Проблема: List копирует при каждом вызове
+
+Первый шаг — состояние из GB-2.06 (`_video/00-list`). `main` добавляет в каталог четыре товара и ищет первый, которого мало осталось (остаток меньше 5).
+
+```go filename="_video/00-list/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	for _, p := range st.List() {
+		if p.Stock < 5 {
+			fmt.Println("birinchi kam qolgan:", p.Name)
+			break
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 10–14 | `var st store.Store` и четыре `st.Add(…)` | пустой каталог и четыре товара: `olma` (остаток 40), `non` (3), `choy` (8), `oʻrik` (2). `1_200_000` — цена в тийинах |
+| 16 | `for _, p := range st.List()` | `List()` возвращает копию каталога, `range` обходит эту копию |
+| 17–20 | `if p.Stock < 5 { … break }` | если остаток меньше 5, печатает название и выходит из цикла |
+
+`List` написан так:
+
+```go
+func (s *Store) List() []Product {
+	return slices.Clone(s.products)
+}
+```
+
+`slices.Clone` создаёт новую копию всего слайса. Это нужно: даже если внешний код изменит результат `List()`, каталог не пострадает.
+
+```console
+$ ./_video/run.sh 00-list go run ./cmd/bozor
+birinchi kam qolgan: non
+```
+
+Результат верный: `non`. Проблема в цене. Поиск закончился на втором товаре, но `List()` сначала скопировал **всё**. При 10 000 товаров каждый поиск копирует 10 000 `Product`. Измерим это чуть позже.
+
+Нужно: отдавать каталог по одному, без копии и не открывая `products`, и чтобы вызывающий мог остановиться там, где захочет.
+
+## Итератор: функция, принимающая yield
+
+Добавим `Store` метод `All` (`_video/01-range`). Он возвращает не слайс, а **функцию**:
+
+```go
+func (s *Store) All() func(yield func(Product) bool) {
+	return func(yield func(Product) bool) {
+		for _, p := range s.products {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func (s *Store) All() func(yield func(Product) bool)` | `All` — метод `*Store` (GB-2.05). Результат — функция. У неё один параметр `yield`, и сам `yield` тоже функция: принимает `Product`, возвращает `bool` (как `keep` из GB-3.04). `yield` — имя параметра, а не ключевое слово: так его называет документация Go |
+| 2 | `return func(yield func(Product) bool) {` | эту функцию мы возвращаем как анонимную функцию |
+| 3 | `for _, p := range s.products {` | анонимная функция видит внешний `s` (GB-2.09) и обходит `s.products` |
+| 4–6 | `if !yield(p) { return }` | каждый `p` отдаётся в `yield`. Если `yield` вернул `false`, делаем `return`: итератор на этом заканчивается |
+| 7–9 | `}` `}` `}` | закрываются `if`, `for` и анонимная функция (строка 9 — метод `All`) |
+
+Имя `All` принятое: так называют итератор по всей коллекции (`go doc iter`, «Naming Conventions»). Слайс наружу не выходит. В `yield` попадает **копия** каждого товара: `for _, p := range` делает то же самое (GB-2.01). Копируется один `Product`, а не весь каталог.
+
+**Итератор** — это и есть такая функция: она принимает функцию `yield` и отдаёт значения по одному в неё. Теперь в `main` обойдём результат `All()` через `range`:
+
+```go filename="_video/01-range/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	for p := range st.All() {
+		fmt.Println(p.Name, p.Stock)
+	}
+}
+```
+
+`for p := range st.All()` — с Go 1.23 `range` работает и по такой функции. Компилятор превращает тело цикла (`fmt.Println(p.Name, p.Stock)`) в функцию и передаёт её итератору как `yield`. Если тело дошло до конца, эта функция возвращает `true`: итератор продолжает.
+
+```console
+$ ./_video/run.sh 01-range go run ./cmd/bozor
+olma 40
+non 3
+choy 8
+oʻrik 2
+```
+
+Четыре товара в порядке каталога. Результат такой же, как у `List`, но ни один слайс не копировался.
+
+Что значит «компилятор превращает тело в функцию»? Это можно записать вручную. Этого примера нет в папке курса: скопируйте папку `_video/03-break` и замените только `cmd/bozor/main.go` (`All` там печатает текст на каждом шаге, поэтому вывод можно сравнить с выводом из следующего раздела):
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	// for p := range st.All() { … } oʻrniga: iteratorni oddiy funksiya kabi chaqiramiz
+	// va sikl tanasini oʻzimiz yield funksiyasi qilib beramiz.
+	st.All()(func(p store.Product) bool {
+		fmt.Println("sikl:", p.Name)
+		if p.Stock < 5 {
+			return false // break
+		}
+		return true // tana oxiriga yetdi
+	})
+	fmt.Println("sikldan keyin")
+}
+```
+
+Здесь результат `st.All()` вызывается как обычная функция: `st.All()(…)`. Мы сами передаём ей функцию — тело цикла — в роли `yield`. `return true` — «тело дошло до конца», `return false` — `break`.
+
+```console
+$ go run ./cmd/bozor
+iterator: olma beraman
+sikl: olma
+iterator: non beraman
+sikl: non
+iterator: yield false → toʻxtayman
+sikldan keyin
+```
+
+Этот вывод совпадает с выводом программы из шага `03-break`, написанной через `for … range` и `break` (увидите в следующем разделе). Значит, `range` — удобная запись этого вызова. Источники: Go wiki «Rangefunc Experiment» и файл компилятора `rewrite.go`: там `break` → `return false`, `continue` → `return true`.
+
+## Итератор и тело цикла работают по очереди
+
+Чтобы увидеть каждый шаг, временно добавим в `All` два `Println`, а тело цикла в `main` печатает «sikl:» («цикл:») и название (`_video/02-iz`):
+
+```go
+func (s *Store) All() func(yield func(Product) bool) {
+	return func(yield func(Product) bool) {
+		for _, p := range s.products {
+			fmt.Println("iterator:", p.Name, "beraman")
+			if !yield(p) {
+				fmt.Println("iterator: yield false → toʻxtayman")
+				return
+			}
+		}
+	}
+}
+```
+
+```go filename="_video/02-iz/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	for p := range st.All() {
+		fmt.Println("sikl:", p.Name)
+	}
+}
+```
+
+Первый `Println` — итератор перед `yield` говорит «beraman» («отдаю»). Второй печатается, только если `yield` вернул `false`: «toʻxtayman» («останавливаюсь»); сейчас `false` не будет. Тело цикла печатает «sikl:» и название товара.
+
+В каком порядке выведутся строки для четырёх товаров?
+
+**A)** сначала четыре строки итератора, потом четыре строки цикла · **B)** итератор, цикл, итератор, цикл, … · **C)** сначала четыре строки цикла, потом итератора
+
+<details>
+<summary>Ответ</summary>
+
+**B: по очереди.** Итератор отдаёт `olma` и вызывает `yield`; тело сразу печатает «sikl: olma»; когда `yield` вернулся, итератор переходит к `non`, и так далее. Если вы выбрали **A**, вы решили, что итератор сначала собирает все товары, а потом отдаёт их циклу: нет, ничего не накапливается. В варианте **C** тело работало бы раньше итератора, но значение телу даёт сам итератор.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-iz go run ./cmd/bozor
+iterator: olma beraman
+sikl: olma
+iterator: non beraman
+sikl: non
+iterator: choy beraman
+sikl: choy
+iterator: oʻrik beraman
+sikl: oʻrik
+```
+
+На машине это обычные вызовы функций. `main` вызывает итератор; итератор для каждого `p` вызывает `yield`; `yield` — тело цикла, которое сделал компилятор. Если тело дошло до конца, `yield` возвращает `true`, и итератор переходит к следующему `p`.
+
+| Шаг | Кто работает | На экран |
+|---|---|---|
+| 1 | `main` начинает `range st.All()`: вызывает итератор | — |
+| 2 | итератор: `p = olma`, текст перед `yield` | `iterator: olma beraman` |
+| 3 | итератор вызывает `yield(p)` — работает тело цикла | `sikl: olma` |
+| 4 | тело дошло до конца, `yield` возвращает `true` | — |
+| 5 | итератор переходит к `p = non`, шаг 2 повторяется | `iterator: non beraman` … |
+
+Цепочка вызовов в момент, когда работает тело (`p = non`):
+
+```text
+main
+ └─ итератор (функция внутри All)        p = non
+     └─ yield(p)  = тело цикла           «sikl: non»
+```
+
+Всё в одной цепочке вызовов: ни очереди, ни промежуточного слайса.
+
+## break: кто останавливает
+
+Теперь ищем первый товар, которого мало осталось: если остаток меньше 5, `break` (`_video/03-break`). Второй товар в каталоге — `non`, остаток 3. После цикла печатаем одну строку.
+
+```go filename="_video/03-break/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	for p := range st.All() {
+		fmt.Println("sikl:", p.Name)
+		if p.Stock < 5 {
+			break
+		}
+	}
+	fmt.Println("sikldan keyin")
+}
+```
+
+`All` прежний (с двумя `Println`). Что будет на экране после «sikl: non»?
+
+**A)** `iterator: choy beraman` · **B)** `iterator: yield false → toʻxtayman` · **C)** только `sikldan keyin`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `break` досрочно прерывает тело, и `yield` возвращает `false`. Итератор видит это в `if !yield(p)`, говорит «toʻxtayman» и делает `return`. Только после возврата итератора в `main` выполняется строка после цикла. Если вы выбрали **A**, вы решили, что `break` итератору не сообщается: сообщается, через `false`. **C** значило бы, что итератор молча убирается; но строку «toʻxtayman» печатает сам итератор.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-break go run ./cmd/bozor
+iterator: olma beraman
+sikl: olma
+iterator: non beraman
+sikl: non
+iterator: yield false → toʻxtayman
+sikldan keyin
+```
+
+`choy` и `oʻrik` не были прочитаны вообще. Последовательность:
+
+```text
+break                    в теле цикла
+ └─ yield → false        тело возвращается
+     └─ if !yield(p)     итератор: return
+         └─ range закончился   строка после цикла
+```
+
+Значит, `break` сам итератор не останавливает: он только **просит** через `false`. Остановка — дело итератора. Что будет, если итератор этого не сделает, вы увидите в разделе «Частые ошибки».
+
+## Измерение: List и All
+
+Измерим исходную ситуацию: каталог из 10 000 товаров, первый товар с малым остатком стоит вторым; ищем его через `List` и через `All` (`_video/09-olchov`). Бенчмарки разбираются в GB-11.01; сейчас важно только, что измеряется.
+
+```go filename="_video/09-olchov/internal/store/olchov_test.go" showLineNumbers
+package store
+
+import "testing"
+
+// 10 000 mahsulotli katalogda birinchi kam qolgan mahsulotni (2-oʻrinda) topish:
+// List bilan va All bilan. go test -bench . -benchmem ./internal/store
+func katta() *Store {
+	var st Store
+	for i := range 10_000 {
+		stock := 40
+		if i == 1 {
+			stock = 3
+		}
+		st.Add("olma", 1_200_000, stock)
+	}
+	return &st
+}
+
+func BenchmarkList(b *testing.B) {
+	st := katta()
+	for b.Loop() {
+		for _, p := range st.List() {
+			if p.Stock < 5 {
+				break
+			}
+		}
+	}
+}
+
+func BenchmarkAll(b *testing.B) {
+	st := katta()
+	for b.Loop() {
+		for p := range st.All() {
+			if p.Stock < 5 {
+				break
+			}
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 7–17 | `func katta() *Store` | строит каталог из 10 000 товаров: `for i := range 10_000` повторяет 10 000 раз, `i` — от 0 до 9 999. У всех остаток 40, только при `i == 1` (второй товар) — 3. `&st` — адрес каталога |
+| 19–28 | `BenchmarkList` | обходит копию из `List()`, при малом остатке `break` |
+| 30–39 | `BenchmarkAll` | то же самое, но через `st.All()` |
+
+`b.Loop()` — цикл, который повторяет тело бенчмарка нужное число раз; Go измеряет время одного повтора. Флаги команды: `-run '^$'` — не запускать обычные тесты; `-bench .` — все бенчмарки; `-benchmem` — ещё и память; `-count 3` — три прогона.
+
+```console
+$ ./_video/run.sh 09-olchov go test -run '^$' -bench . -benchmem -count 3 ./internal/store
+goos: linux
+goarch: amd64
+pkg: github.com/abdurahmon27/bozor/internal/store
+cpu: 12th Gen Intel(R) Core(TM) i5-12450H
+BenchmarkList-12    	   18070	     65348 ns/op	  401409 B/op	       1 allocs/op
+BenchmarkList-12    	   18663	     66183 ns/op	  401408 B/op	       1 allocs/op
+BenchmarkList-12    	   18715	     73931 ns/op	  401408 B/op	       1 allocs/op
+BenchmarkAll-12     	208540990	         5.803 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAll-12     	208200289	         5.590 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAll-12     	201270204	         6.370 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/abdurahmon27/bozor/internal/store	7.463s
+```
+
+Столбцы: `ns/op` — один повтор в наносекундах, `B/op` — байт выделено за повтор, `allocs/op` — число выделений. Сравнение с измерением из видео (медиана трёх прогонов):
+
+| | `List` | `All` | отношение |
+|---|---|---|---|
+| из видео (README) | 62 590 ns | 5.804 ns | ≈ 10 800 раз |
+| мой прогон (эта страница) | 66 183 ns | 5.803 ns | ≈ 11 400 раз |
+
+Абсолютное время зависит от машины и нагрузки: в моём прогоне машина была занята (load average ≈ 3.7), и между тремя прогонами `List` менялся от 65 348 до 73 931 ns. Важны отношение и байты: разница примерно в **10 000 раз**, `List` — 401 408 байт и 1 выделение, `All` — 0 байт и 0 выделений. 401 408 байт ≈ 10 000 × 40 байт (`Product`: 8 + 16 + 8 + 8).
+
+Разница от копирования и от ранней остановки: `All` касается только двух товаров. (Если бы нужный товар был в конце каталога, `All` обошёл бы всё, но всё равно ничего бы не копировал; такого измерения здесь нет.)
+
+`All` — не копия, а **живое представление** (live view): цикл читает каталог в его текущем состоянии. На практике так же: если store отдаёт данные итератором, вызывающий останавливается где нужно, а внутренний слайс наружу не выходит.
+
+## iter.Seq: имя типа функции
+
+Наш тип функции в стандартной библиотеке имеет имя:
+
+```console
+$ go doc iter.Seq
+package iter // import "iter"
+
+type Seq[V any] func(yield func(V) bool)
+    Seq is an iterator over sequences of individual values. When called as
+    seq(yield), seq calls yield(v) for each value v in the sequence, stopping
+    early if yield returns false. See the iter package documentation for more
+    details.
+```
+
+Документация: `Seq` — итератор по последовательности значений; при вызове `seq(yield)` он вызывает `yield(v)` для каждого `v` и досрочно останавливается, если `yield` вернул `false`. (Строка `package iter …` и последняя фраза «See the iter package documentation» тоже входят в вывод `go doc`.)
+
+Читаем первую строку:
+
+```go
+type Seq[V any] func(yield func(V) bool)
+```
+
+- `type Seq` — имя нового типа. `[V any]` в квадратных скобках — **параметр типа** `V`: `Seq` — тип с параметром типа. В GB-3.04 скобки стояли у функции, здесь — у типа.
+- Основа — `func(yield func(V) bool)`, точно как у нашей функции. Это похоже на `type OrderStatus int` из GB-2.03: именованный тип, основа — другой тип.
+- `Seq[Product]` — `V` заменён на `Product`: именно тот тип, который вернул `All`.
+
+Теперь сделаем результатом `All` тип `iter.Seq[Product]` (`_video/05-seq`; `iter` тоже импортируется):
+
+```go
+import (
+	"iter"
+	"slices"
+)
+```
+
+```go
+func (s *Store) All() iter.Seq[Product] {
+	return func(yield func(Product) bool) {
+		for _, p := range s.products {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+Тело не меняется. `iter.Seq[Product]` — именованный тип с основой `func`. Тип анонимной функции безымянный, основа та же: по спецификации Go она напрямую присваивается именованному типу (assignability). Сигнатура сообщает читателю, что это итератор. Результат тот же, что в `01-range`:
+
+```console
+$ ./_video/run.sh 05-seq go run ./cmd/bozor
+olma 40
+non 3
+choy 8
+oʻrik 2
+```
+
+В стандартной библиотеке лежит именно это тело: `slices.Values(s)` делает из слайса итератор (`src/slices/iter.go`, из GOROOT go1.27.4):
+
+```go
+func Values[Slice ~[]E, E any](s Slice) iter.Seq[E] {
+	return func(yield func(E) bool) {
+		for _, v := range s {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+```
+
+Поэтому `All` можно записать одной строкой. Этого варианта нет в папке курса, но он запущен (в копии `_video/05-seq` заменён только `All`; `go vet` молчит):
+
+```go
+func (s *Store) All() iter.Seq[Product] {
+	return slices.Values(s.products)
+}
+```
+
+```console
+$ go run ./cmd/bozor
+olma 40
+non 3
+choy 8
+oʻrik 2
+```
+
+## Ключи map: maps.Keys и slices.Sorted
+
+`range` по map не гарантирует порядок (GB-2.02), поэтому ключи собирали в слайс и вызывали `slices.Sort`. В заказе есть map `count`: название товара и количество штук (`_video/06-eski`).
+
+```go filename="_video/06-eski/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"slices"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	count := map[string]int{"olma": 3, "non": 2, "choy": 1}
+	var names []string
+	for name := range count {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		fmt.Println(name, count[name])
+	}
+}
+```
+
+```console
+$ ./_video/run.sh 06-eski go run ./cmd/bozor
+choy 1
+non 2
+olma 3
+```
+
+Пять строк нужны только ради порядка (от `var names` до `slices.Sort(names)`). С итераторами это одна строка (`_video/08-sorted`):
+
+```go filename="_video/08-sorted/cmd/bozor/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	count := map[string]int{"olma": 3, "non": 2, "choy": 1}
+	for _, name := range slices.Sorted(maps.Keys(count)) {
+		fmt.Println(name, count[name])
+	}
+}
+```
+
+```console
+$ ./_video/run.sh 08-sorted go run ./cmd/bozor
+choy 1
+non 2
+olma 3
+```
+
+- `maps.Keys(count)` — функция пакета `maps`: возвращает итератор по ключам map, то есть `iter.Seq[string]`.
+- `slices.Sorted(seq)` — собирает значения из `iter.Seq` по сортируемым значениям (числам или `string`) в **новый слайс** и сортирует его.
+
+`go doc` показывает сигнатуры обеих:
+
+```console
+$ go doc maps.Keys
+package maps // import "maps"
+
+func Keys[Map ~map[K]V, K comparable, V any](m Map) iter.Seq[K]
+    Keys returns an iterator over keys in m. The iteration order is not
+    specified and is not guaranteed to be the same from one call to the next.
+```
+
+```console
+$ go doc slices.Sorted
+package slices // import "slices"
+
+func Sorted[E cmp.Ordered](seq iter.Seq[E]) []E
+    Sorted collects values from seq into a new slice, sorts the slice, and
+    returns it. If seq is empty, the result is nil.
+```
+
+Части в квадратных скобках — параметры типа (GB-3.04); сейчас важен тип результата: `iter.Seq[K]`. Смысл `~map[K]V` и `cmp.Ordered`: `maps.Keys` принимает любой тип map, а `Sorted` — значения, которые можно сравнивать через `<`. Документация тоже говорит: порядок у `Keys` «not specified» («не определён»), поэтому нужен `Sorted`.
+
+Промежуточный вопрос. В `count` три ключа. Что выведет `len(maps.Keys(count))`?
+
+**A)** `3` · **B)** ошибка компиляции · **C)** `0`
+
+<details>
+<summary>Ответ</summary>
+
+**B: ошибка компиляции.** `maps.Keys` возвращает не слайс, а функцию. `len` работает со слайсами, map и строками. Если вы выбрали **A**, вы приняли `maps.Keys` за слайс ключей. В варианте **C** был бы пустой итератор, но компилятор до этого не доходит.
+
+</details>
+
+`_video/07-len` запускает эту программу:
+
+```console
+$ ./_video/run.sh 07-len go run ./cmd/bozor
+# github.com/abdurahmon27/bozor/cmd/bozor
+cmd/bozor/main.go:18:18: invalid argument: maps.Keys(count) (value of func type iter.Seq[string]) for built-in len
+```
+
+Первая строка — имя пакета (`# …/cmd/bozor`): компилятор сообщает, какой пакет собирает. Вторая — ошибка: `cmd/bozor/main.go:18:18` (файл, строка, столбец), «неверный аргумент для `len`: `maps.Keys(count)` — значение функционального типа `iter.Seq[string]`». Если нужно число ключей, хватит `len(count)`. Если нужен слайс — `slices.Collect`: она собирает значения итератора в новый слайс.
+
+```console
+$ go doc slices.Collect
+package slices // import "slices"
+
+func Collect[E any](seq iter.Seq[E]) []E
+    Collect collects values from seq into a new slice and returns it. If seq is
+    empty, the result is nil.
+```
+
+Сигнатура: параметр типа `E`, принимает `iter.Seq` из `E`, возвращает `[]E`.
+
+## Частые ошибки
+
+**Ошибка: не проверять результат `yield`.** Самая частая ошибка. В `All` нет `if`, `for` всегда отдаёт все товары (`_video/04-buzuq`; `main` — цикл с `break` из предыдущего раздела):
+
+```go
+func (s *Store) All() func(yield func(Product) bool) {
+	return func(yield func(Product) bool) {
+		for _, p := range s.products {
+			fmt.Println("iterator:", p.Name, "beraman")
+			yield(p)
+		}
+	}
+}
+```
+
+Код собирается. Что произойдёт после `break` на `non`?
+
+**A)** `break` проигнорируется, `choy` и `oʻrik` тоже пройдут через тело · **B)** итератор молча доработает · **C)** программа упадёт (паника)
+
+<details>
+<summary>Ответ</summary>
+
+**C.** После `break` `yield` вернул `false`, а итератор не обратил внимания и вызвал `yield` ещё раз для `choy`. Это нарушает правило, и runtime вызывает панику. **A** — думать, что `break` не зависит от итератора; **B** — молчаливого завершения не бывает: Go сообщает об этом паникой.
+
+</details>
+
+Сначала `go vet`:
+
+```console
+$ ./_video/run.sh 04-buzuq go vet ./...
+```
+
+Тихо: ни `go vet`, ни `go build` ошибку не видят. Запускаем (путь к папке каждый раз разный, поэтому я сократил его до `/tmp/…/`):
+
+```console
+$ ./_video/run.sh 04-buzuq go run ./cmd/bozor
+iterator: olma beraman
+sikl: olma
+iterator: non beraman
+sikl: non
+iterator: choy beraman
+panic: runtime error: range function continued iteration after function for loop body returned false
+
+goroutine 1 [running]:
+main.main-range1(...)
+	/tmp/…/bozor/cmd/bozor/main.go:16
+github.com/abdurahmon27/bozor/internal/store.(*Store).All.func1(...)
+	/tmp/…/bozor/internal/store/store.go:39
+main.main()
+	/tmp/…/bozor/cmd/bozor/main.go:16 +0x59a
+exit status 2
+```
+
+Порядок чтения:
+
+1. `iterator: choy beraman` — на `non` был `break`, но итератор перешёл к `choy` и вызвал `yield` снова (`sikl: choy` не напечатано).
+2. `panic: runtime error: range function continued iteration after function for loop body returned false` — «после того как тело цикла вернуло `false`, функция `range` продолжила итерацию». Сделанный компилятором `yield` помнит, что вернул `false`, и при повторном вызове паникует.
+3. Стек: `main.main-range1` — функция, которую компилятор сделал из тела первого цикла `range` в `main`; `store.go:39` — строка с вызовом `yield(p)`; `main.go:16` — строка `for p := range st.All()`.
+4. `exit status 2` — как у паники в GB-2.09.
+
+**Исправление:** после каждого `yield` проверяйте результат и при `false` сразу делайте `return` — так написан наш `All` (выше) и тело `slices.Values`. Правило спецификации Go: если тело цикла завершилось досрочно (например, `break`), `yield` возвращает `false`, и его нельзя вызывать снова. Редактор не поможет: в `gopls` есть такой анализатор (`yield may be called again after returning false`), но он проверяет только пакет, который импортирует `iter`, а `gopls` v0.22.0 здесь модуль `go 1.27` не анализировал, `gopls check` промолчал. Поэтому опирайтесь не на редактор, а на правило `if !yield(p) { return }`.
+
+**После `return` срабатывает `defer`.** Если итератор открыл файл и закрывает его через `defer`, файл закроется и при `break` в цикле: `yield` вернёт `false`, итератор сделает `return`, сработает его `defer`, и только потом закончится `range` (`_video/10-defer`; `katalog.txt` лежит в этой же папке; в демо ошибка открытия файла опущена):
+
+```go filename="_video/10-defer/cmd/bozor/main.go" showLineNumbers
+// Iterator ichidagi defer: sikl break qilsa ham, iterator return qilganda fayl yopiladi.
+// (Demo: ochish xatosi tashlab yuborilgan; ishda xatoni ham qaytaring.)
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"iter"
+	"os"
+)
+
+// lines faylni qatorma-qator beradi (GB-3.01'dagi bufio.Scanner).
+func lines(name string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		f, err := os.Open(name)
+		if err != nil {
+			return
+		}
+		defer func() {
+			f.Close()
+			fmt.Println("iterator: fayl yopildi")
+		}()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			if !yield(sc.Text()) {
+				return
+			}
+		}
+	}
+}
+
+func main() {
+	for line := range lines("katalog.txt") {
+		fmt.Println("sikl:", line)
+		break
+	}
+	fmt.Println("sikldan keyin")
+}
+```
+
+```console
+$ ./_video/run.sh 10-defer go run ./cmd/bozor
+sikl: 1;olma;12000;40
+iterator: fayl yopildi
+sikldan keyin
+```
+
+**Ошибка: считать `maps.Keys` слайсом.** В старом коде и в результатах поиска встречается `golang.org/x/exp/maps.Keys`: по README курса он возвращал слайс. Стандартный `maps.Keys` — итератор (ошибка `len` выше). Нужен слайс — `slices.Collect(maps.Keys(m))`, отсортированный — `slices.Sorted(maps.Keys(m))`.
+
+## Проверьте себя
+
+**1.** Как итератор узнаёт, что цикл `range` сделал `break`?
+
+<details>
+<summary>Ответ</summary>
+
+`yield` возвращает `false`. Итератор обязан после каждого `yield` проверить результат и при `false` сделать `return`, иначе паника.
+
+</details>
+
+**2.** Что возвращает `maps.Keys` и как отсортировать ключи?
+
+<details>
+<summary>Ответ</summary>
+
+Итератор `iter.Seq` по ключам (не слайс). `slices.Sorted(maps.Keys(m))` делает из него новый отсортированный слайс.
+
+</details>
+
+**3.** Что выведет `main` из `_video/03-break`, если заменить `break` на `continue` (а `Println` тела цикла поставить после `if`)? Код (в папке курса его нет; в копии `03-break` заменён только `main.go`):
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 3)
+	st.Add("choy", 2_500_000, 8)
+	st.Add("oʻrik", 3_500_000, 2)
+
+	for p := range st.All() {
+		if p.Stock < 5 {
+			continue
+		}
+		fmt.Println("sikl:", p.Name)
+	}
+	fmt.Println("sikldan keyin")
+}
+```
+
+<details>
+<summary>Ответ</summary>
+
+`continue` доводит тело до конца, `yield` возвращает `true`, итератор продолжает. Поэтому строки `iterator:` есть для всех четырёх товаров, а `sikl:` — только для `olma` и `choy` (у `non` и `oʻrik` остаток меньше 5, их пропускает `continue`). Строки «toʻxtayman» нет: `yield` ни разу не вернул `false`.
+
+```console
+$ go run ./cmd/bozor
+iterator: olma beraman
+sikl: olma
+iterator: non beraman
+iterator: choy beraman
+sikl: choy
+iterator: oʻrik beraman
+sikldan keyin
+```
+
+</details>
+
+**4.** (GB-3.02) Почему в `json.Unmarshal(data, &v)` передают `&` — адрес переменной?
+
+<details>
+<summary>Ответ</summary>
+
+`Unmarshal` заполняет значение через указатель. Если бы он заполнял копию, результат не дошёл бы до вызывающего.
+
+</details>
+
+## Домашнее задание
+
+Задание лежит в папке этого урока в репозитории курса: [lessons/gb-3-05-iterator](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-05-iterator), файл `TASK.md`. Ответ — в `solution/`: [solution/internal/store/store.go](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-3-05-iterator/solution/internal/store/store.go). Проверка: `go test ./...` в этой папке; работайте, пока не появится `ok`. Меняйте только тела `LowStock` и `SortedNames` в `internal/store/store.go`; `All`, `Names`, `Add`, `List` не трогайте, `tekshiruv_test.go` не меняйте.
+
+- 🟡 **Шаг 1: `LowStock(limit int) iter.Seq[Product]`.** Итератор, который отдаёт в порядке каталога товары с остатком (`Stock`) **меньше** (`<`) `limit`. При `break` он обязан сразу остановиться. Не собирайте копию: читайте `s.products` во время `range` (живое представление): тест берёт `LowStock(5)`, затем добавляет в каталог `anor` (остаток 1) и ждёт, что он тоже появится. На каталоге из видео `LowStock(5)` отдаёт `non` и `oʻrik`.
+- 🟢 **Шаг 2: `SortedNames() []string`.** Названия товаров по возрастанию (побайтово) в **новом** слайсе. Итератор `Names()` уже есть в папке: соберите из него `slices.Sorted`. Для каталога из видео: `[choy non olma oʻrik]`.
+
+Сейчас, в исходном состоянии, тест падает так:
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor/cmd/bozor	[no test files]
+--- FAIL: TestVazifaLowStock (0.00s)
+    --- FAIL: TestVazifaLowStock/beshdan_kam (0.00s)
+        tekshiruv_test.go:77: LowStock(5) [] berdi, kutilgan [non oʻrik]: qoldigʻi limit'dan kam (<) mahsulotlarni katalog tartibida bering (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaLowStock/ondan_kam (0.00s)
+        tekshiruv_test.go:77: LowStock(10) [] berdi, kutilgan [non choy oʻrik]: qoldigʻi limit'dan kam (<) mahsulotlarni katalog tartibida bering (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaLowStock/hammasi (0.00s)
+        tekshiruv_test.go:77: LowStock(100) [] berdi, kutilgan [olma non choy oʻrik]: qoldigʻi limit'dan kam (<) mahsulotlarni katalog tartibida bering (TASK.md, 1-qadam)
+    tekshiruv_test.go:94: for range st.LowStock(5) + break: birinchi mahsulot "", kutilgan "non" (TASK.md, 1-qadam)
+--- FAIL: TestVazifaSortedNames (0.00s)
+    tekshiruv_test.go:112: SortedNames() [] qaytardi, kutilgan [choy non olma oʻrik]: Names() iteratoridan slices.Sorted bilan yigʻing (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.002s
+FAIL
+```
+
+<details>
+<summary>Ответ и объяснение</summary>
+
+`LowStock` устроен так же, как `All`. Товар с достаточным остатком пропускаем через `continue` (GB-1.06), остальные отдаём в `yield` и после каждого `yield` проверяем результат:
+
+```go
+func (s *Store) LowStock(limit int) iter.Seq[Product] {
+	return func(yield func(Product) bool) {
+		for _, p := range s.products {
+			if p.Stock >= limit {
+				continue
+			}
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+`SortedNames` — одна строка поверх готового `Names()`:
+
+```go
+func (s *Store) SortedNames() []string {
+	return slices.Sorted(s.Names())
+}
+```
+
+`slices.Sorted` создаёт новый слайс, поэтому запись в него не меняет каталог. Замечание (`TASK.md`): `slices.Sorted(st.All())` не компилируется — `Product` нельзя сравнить через `<`; а `Names()` — это `iter.Seq[string]`. Проверка с ответом:
+
+```console
+$ cd solution && go test ./...
+?   	github.com/abdurahmon27/bozor/cmd/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+```
+
+</details>
+
+## Источники
+
+- Go 1.23 release notes: range over function iterators, пакет `iter` — [go.dev/doc/go1.23#language](https://go.dev/doc/go1.23#language)
+- Go spec: For statements with range clause (функции-итераторы, после `false` `yield` не вызывается) — [go.dev/ref/spec#For_range](https://go.dev/ref/spec#For_range)
+- Go spec: Function literals (closure) — [go.dev/ref/spec#Function_literals](https://go.dev/ref/spec#Function_literals)
+- pkg.go.dev `iter` (`Seq`, «conventionally named yield», Naming Conventions) — [pkg.go.dev/iter](https://pkg.go.dev/iter)
+- pkg.go.dev `maps` и `slices` (`maps.Keys`, `slices.Sorted`, `slices.Collect`, `slices.Values`, `slices.Clone`) — [pkg.go.dev/maps](https://pkg.go.dev/maps) · [pkg.go.dev/slices](https://pkg.go.dev/slices)
+- Go blog: Range Over Function Types (I. L. Taylor, 2024) — [go.dev/blog/range-functions](https://go.dev/blog/range-functions)
+- Go wiki: Rangefunc Experiment (как компилятор меняет тело цикла, `defer`, паника) — [go.dev/wiki/RangefuncExperiment](https://go.dev/wiki/RangefuncExperiment)
+- `src/runtime/panic.go` (`rangeDoneError`) — [github.com/golang/go/blob/go1.27.4/src/runtime/panic.go](https://github.com/golang/go/blob/go1.27.4/src/runtime/panic.go)
+- Папка курса и каждый шаг из видео — [lessons/gb-3-05-iterator](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-05-iterator)
+
+Результаты получены на `go1.27.4 linux/amd64`, 2026-11-27, `CGO_ENABLED=0`.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-05-iterator)
+
+---
+
+← Предыдущий урок: [GB-3.04](/lab/youtube/gb/gb-3-04/ru) · Следующий урок: [GB-3.06](/lab/youtube/gb#gb-3-06) → · [Все уроки](/lab/youtube/gb)
+
+</div>
