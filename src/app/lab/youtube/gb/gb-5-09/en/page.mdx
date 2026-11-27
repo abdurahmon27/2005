@@ -1,0 +1,1192 @@
+---
+title: "sqlc: you write SQL, Go code is generated"
+date: "2026/11/27"
+description: "Generate Go code from SQL, read its types and WithTx, and catch a wrong column name before running the program."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-09"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-09/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-09"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-09) · [Русский](/lab/youtube/gb/gb-5-09/ru) · **English**  
+Lesson GB-5.09 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-09) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+A column name in SQL is wrong. `go build` and `go vet` passed. Why does the program fail only when it queries the database?
+
+**One idea:** you write SQL; **sqlc** reads the schema and queries, then creates ordinary Go code for the checked queries.
+With this configuration it does not connect to the database. An unknown column produces an error during `sqlc generate`; runtime errors still need handling.
+
+After this lesson you will:
+
+- write the annotations in `query.sql` and the `sqlc.yaml` configuration;
+- read the types, `QueryRow`, `Scan`, and row loop in `db/`;
+- move `Store.Get`, `ListActive`, and `PlaceOrder` to generated methods;
+- distinguish stale `db/` files, forgotten generation, and expression type errors.
+
+| Term | Plain meaning | English term |
+|---|---|---|
+| query annotation | the Go method name and result shape in an SQL comment | query annotation |
+| generated code | Go files sqlc writes from SQL and the schema | generated code |
+| generation-time error | an error found while checking SQL before the program runs | generation-time error |
+
+## Before you start
+
+- [GB-5.08 · Conditional UPDATE](/lab/youtube/gb/gb-5-08/en): `RowsAffected` and the stock rule.
+- [GB-5.05 · pgx and pool](/lab/youtube/gb/gb-5-05/en): `$1`, `QueryRow`, `Query`, `Scan`, context, and `ErrNoRows`.
+- [GB-5.07 · Transaction](/lab/youtube/gb/gb-5-07/en), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/en): `Begin`, `Commit`, `Rollback`, `Up`/`Down`.
+- [GB-5.02 · Postgres lab](/lab/youtube/gb/gb-5-02/en), [GB-5.03 · Tables](/lab/youtube/gb/gb-5-03/en), [GB-5.04 · NULL and SUM](/lab/youtube/gb/gb-5-04/en).
+- [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01/en), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03/en), [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04/en), [GB-2.05 · Methods](/lab/youtube/gb/gb-2-05/en).
+- [GB-2.06 · Packages](/lab/youtube/gb/gb-2-06/en), [GB-2.07 · Interface](/lab/youtube/gb/gb-2-07/en), [GB-2.08 · Error](/lab/youtube/gb/gb-2-08/en), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/en).
+- [GB-1.01 · Go commands](/lab/youtube/gb/gb-1-01/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.03 · Types](/lab/youtube/gb/gb-1-03/en), [GB-1.05 · Condition](/lab/youtube/gb/gb-1-05/en), [GB-1.06 · Loop](/lab/youtube/gb/gb-1-06/en), [GB-1.07 · Function and error](/lab/youtube/gb/gb-1-07/en), [GB-1.08 · Test](/lab/youtube/gb/gb-1-08/en).
+- [GB-3.02 · JSON and raw string](/lab/youtube/gb/gb-3-02/en), [GB-3.03 · Installing tools](/lab/youtube/gb/gb-3-03/en): backticks, `go install`, and `PATH`.
+
+Recall GB-5.08: stock is `0`, and the condition is `WHERE id = 4 AND stock >= 1`. What does `RowsAffected()` return? **A)** `1` · **B)** `0` · **C)** CHECK error.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The condition is false, so no row was updated. No new value reached the CHECK constraint.
+
+</details>
+
+Work in a copy of `lessons/gb-5-09-sqlc`. Go Playground cannot run this local Postgres experiment.
+You need Go 1.27.4, Docker Compose, goose v3.30.2, and pgx v5.13.0. The module is independent; previous folders are unnecessary.
+This is the `Store` from the GB-5.07 solution. The separate `Buy`/`UseCoupon` lab from GB-5.08 is integrated in GB-5.10.
+
+These settings apply to all examples. `export` sets an environment variable; `CGO_ENABLED=0` disables C integration.
+`GOTOOLCHAIN` selects the Go version. Port `5409` was free during verification. If occupied, change both the copied Compose port and the URLs.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+docker compose up -d --wait
+export GOOSE_DRIVER=postgres
+export GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:5409/bozor
+export DATABASE_URL="$GOOSE_DBSTRING"
+```
+
+`up -d --wait` starts the database in the background and waits for readiness. The URL contains public test credentials for this lab only.
+Goose and the Go program use the same database. Our verification copy uses project `gb509written`; the course uses `gb509`, and the video uses `bozor`, explaining container name differences.
+On a fresh database, `goose up` applies three migrations:
+
+```console
+$ goose up
+2026/11/27 21:39:26 OK   00001_products.sql (4.04ms)
+2026/11/27 21:39:26 OK   00002_orders.sql (5.4ms)
+2026/11/27 21:39:26 OK   00003_orders_status.sql (1.6ms)
+2026/11/27 21:39:26 goose: successfully migrated database to version: 3
+```
+
+The prefix is the log timestamp; `OK` means the file was applied. The final `3` is the schema version.
+Quoted video measurements: `7.72 / 6.97 / 2.81 ms`; our rerun: `4.04 / 5.4 / 1.6 ms`.
+The old-to-new time ratios are about `1.9 / 1.3 / 1.8`. Load and caches change timings; the meaningful result is that all three migrations apply.
+
+The fixture data is in `seed.sql`. `exec db psql` runs the client in service `db`; `-f` reads the file inside the container:
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+The final number in `INSERT 0 n` counts inserted rows: products, orders, and order items. Apply the seed once.
+
+## Why does the SQL string pass the compiler?
+
+For the first experiment in your copy, replace `store.go` and `main.go` with these two files. The code is copied verbatim from the course.
+First preserve the final files as `.start` copies. Temporarily hide the test with suffix `.off`: the first stage has no `OrderItem` yet.
+Perform all these steps only in the lab copy.
+
+```bash
+cp store.go store.go.start
+cp main.go main.go.start
+cp query.sql query.sql.start
+mv store_test.go store_test.go.off
+cp _video/stages/01-store-qolda.go store.go
+cp _video/stages/01-main.go main.go
+```
+
+```go filename="_video/stages/01-store-qolda.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Videoning boshidagi holat: GB-5.05'dagi qoʻlda yozilgan Get, ustun nomida xato bilan (stock → qoldiq).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, qoldiq FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+```
+
+```go filename="_video/stages/01-main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+}
+```
+
+Lines of the first file:
+
+| Line | What it does |
+|---|---|
+| 1 | `package main`: the executable program package. |
+| 3–9 | Imports `context`, `errors`, and pgx packages; a blank line separates external packages. |
+| 11–17 | Comment and `Product` struct: ID, name, price in tiyin, stock. `int` is the domain type. |
+| 19 | `ErrNotFound` is an error value callers recognize with `errors.Is`. |
+| 21–23 | `Store` keeps the pool address; `*pgxpool.Pool` is a pointer. |
+| 25–29 | Method `Get` takes `ctx` and `id`, creates `p`, sends SQL, and scans into four `&p.…` addresses. |
+| 30–32 | If no row exists, returns an empty `Product{}` and `ErrNotFound`. |
+| 33–34 | Returns another result or error and closes the method. |
+
+Second file: 1–10 package and imports; 12 starts `main`; 13 base context; 14 creates a pool using the URL from the environment.
+15–18 print an error to stderr and exit through `os.Exit(1)`; 19 defers closing the pool.
+21 creates `Store`; 22 makes a five-second context; 23 releases the timer resource; 25 reads the product; 26 prints; 27 closes the function.
+Blank lines improve readability. `qoldiq` means “stock”, but the actual SQL column name is `stock`.
+
+Which command finds the error? **A)** `go build` · **B)** `go vet .` · **C)** `go run .`.
+
+<details>
+<summary>Answer</summary>
+
+**C.** SQL is an ordinary string to the Go compiler. `go vet` does not know this table either. A and B assume SQL schema validation.
+
+</details>
+
+```console
+$ go build
+$ go vet .
+$ go run .
+{0  0 0} ERROR: column "qoldiq" does not exist (SQLSTATE 42703)
+```
+
+The first two commands printed nothing and exited with `0`. `column … does not exist` means the named column is absent.
+`42703` is the Postgres `undefined_column` code. `Scan` wrote no values, so the empty `Product` was printed.
+The program only prints the error, so `go run` also exited with `0`: a successful exit does not guarantee a successful query.
+Fix: replace `qoldiq` with `stock` in SQL.
+
+## query.sql and sqlc.yaml
+
+We can let a tool write the repeated `QueryRow` and `Scan` for each query. `sqlc generate` creates this repeated Go code.
+Install the tool first. `cmd/sqlc` is the command package; `@v1.31.1` selects its version.
+The Go bin folder must be in `PATH`, as in GB-3.03:
+
+```console
+$ go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
+$ sqlc version
+v1.31.1
+```
+
+Installation printed nothing here. The video research records about four minutes for a cold install; our cached reinstall took three seconds.
+Those conditions do not support a speed comparison. No C compiler was needed: with `CGO_ENABLED=0`, sqlc uses the WebAssembly parser variant.
+This is precompiled parser code; it does not start a PostgreSQL server.
+
+For now, put only two queries in `query.sql` (`_video/stages/02-query.sql`):
+
+```sql filename="_video/stages/02-query.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+```
+
+```bash
+cp _video/stages/02-query.sql query.sql
+```
+
+`--` starts an SQL comment. A **query annotation** uses `name:` to name the Go method; `:one` returns one value and an error.
+`GetProduct` searches by `id = $1`. The value of `$1` arrives as a separate argument.
+`:many` returns a slice and an error. `ListActiveProducts` fetches active rows ordered by ID.
+For commands returning no rows, `:exec` returns only an error; we will use it in the transaction.
+
+The complete `sqlc.yaml`:
+
+```yaml filename="sqlc.yaml" showLineNumbers
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: query.sql
+    gen:
+      go:
+        package: db
+        out: db
+        sql_package: pgx/v5
+```
+
+| Line | Meaning |
+|---|---|
+| 1 | `version: "2"` is the configuration format, not the sqlc version; quotes make it a string. |
+| 2–3 | `sql` is a list; `-` introduces one element; `engine` selects Postgres syntax. |
+| 4 | `schema` reads table definitions from `migrations/`, skipping goose `Down` sections. |
+| 5 | `queries` is the query source. |
+| 6–7 | `gen.go` selects Go code generation. |
+| 8 | `package` names the generated package. |
+| 9 | `out` is the output folder. |
+| 10 | `sql_package: pgx/v5` selects the pgx v5 API. |
+
+Files are read by name; this is why the `00001_…` ordering matters. sqlc does not apply migrations to the database: goose does.
+
+| Before | Action | After |
+|---|---|---|
+| `migrations/` + `query.sql` | `sqlc generate` | `db/*.go` created |
+| Go program + `db/*.go` | `go run .` | SQL sent through pgx to Postgres |
+
+What does successful generation print? **A)** nothing · **B)** file list · **C)** `OK` and query count.
+
+<details>
+<summary>Answer</summary>
+
+**A.** This command is silent on success. B requires `ls db`; C confuses it with goose output.
+
+</details>
+
+```console
+$ sqlc generate
+$ ls db
+db.go
+models.go
+query.sql.go
+```
+
+`generate` printed nothing; `ls db` listed the files. `0.9 s` is quoted from the video research; our new measurement is `0.755 s`.
+The ratio is about `1.2`; this is no timing guarantee for a small schema. What matters is checking before the program runs.
+The Postgres parser parses SQL; sqlc finds missing columns using its own schema catalog. The database is uninvolved with this configuration.
+
+## models.go: types from the schema
+
+Which Go type represents `stock integer NOT NULL`? **A)** `int` · **B)** `int32` · **C)** `int64`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Postgres `integer` uses four bytes; sqlc generates `int32` for pgx. A is our domain choice; C matches `bigint`.
+
+</details>
+
+```go filename="db/models.go" showLineNumbers
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.31.1
+
+package db
+
+import (
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+type Order struct {
+	ID       int64
+	Customer string
+	Note     pgtype.Text
+	Status   string
+}
+
+type OrderItem struct {
+	ID        int64
+	OrderID   int64
+	ProductID int64
+	Quantity  int32
+	UnitPrice int64
+}
+
+type Product struct {
+	ID     int64
+	Name   string
+	Price  int64
+	Stock  int32
+	Active bool
+}
+```
+
+1–3 mark the generated file and sqlc version; 5 declares the package; 7–9 import `pgtype`.
+11–16 define `Order`: ID from `bigint`, `Customer` and `Status` from `text`, `Note` from nullable `text`.
+18–24 define `OrderItem`: three IDs and price are `int64`; quantity is `int32`.
+26–32 define `Product`: ID and price `int64`, name `string`, stock `int32`, active `bool`.
+
+`Note` needs **`pgtype.Text`**: a Go `string` cannot represent SQL `NULL`.
+Its `String` field holds text; `Valid` records whether a value exists. `Valid: false` means `NULL`; `Valid: true, String: ""` means empty text.
+`Status` comes from the third migration. `DO NOT EDIT` means generation will overwrite manual edits.
+
+## db.go and query.sql.go: ordinary Go
+
+```go filename="db/db.go" showLineNumbers
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.31.1
+
+package db
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+```
+
+1–3 mark the file; 5 declares the package; 7–12 are imports. 14–18 define the three methods required by `DBTX`.
+`Exec` returns `pgconn.CommandTag` and an error; `Query` returns `pgx.Rows` and an error; `QueryRow` returns `pgx.Row`.
+Interface parameters need no names. `...interface{}` means `...any`: any number of arguments.
+20–22 put the supplied DBTX into a new `Queries`; `&` returns its address. 24–26 store that DBTX in `Queries.db`.
+28–32 create a new `Queries` with `tx` in its `db` field.
+Both the pool and `pgx.Tx` have those three methods, so both satisfy this interface.
+
+Now two complete fragments from `db/query.sql.go`. These are not the whole file:
+
+```go
+const getProduct = `-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1
+`
+
+type GetProductRow struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int32
+}
+
+func (q *Queries) GetProduct(ctx context.Context, id int64) (GetProductRow, error) {
+	row := q.db.QueryRow(ctx, getProduct, id)
+	var i GetProductRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Price,
+		&i.Stock,
+	)
+	return i, err
+}
+```
+
+```go
+const listActiveProducts = `-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id
+`
+
+type ListActiveProductsRow struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int32
+}
+
+func (q *Queries) ListActiveProducts(ctx context.Context) ([]ListActiveProductsRow, error) {
+	rows, err := q.db.Query(ctx, listActiveProducts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListActiveProductsRow
+	for rows.Next() {
+		var i ListActiveProductsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Price,
+			&i.Stock,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+```
+
+In the `GetProduct` fragment, 1–4 are a `const` and a backtick raw string: SQL is stored without the semicolon.
+6–11 define `GetProductRow` for the four selected columns. Because `active` is omitted, this is not `db.Product`.
+13 is the method signature: `id int64` comes from `WHERE id = $1`. 14 calls `QueryRow`; 15 declares result variable `i`.
+16–21 scan addresses in SELECT order; multiline arguments have trailing commas. 22 returns the result and error; 23 closes the method.
+
+In the `ListActiveProducts` fragment: 1–5 query, 7–12 result struct, 14 signature.
+15–18 call `Query` and check its error; 19 defers `rows.Close`; 20 declares initially `nil` `items`.
+21–32 loop: new `i`, four `Scan` addresses, error return, and `append`.
+33–35 check `rows.Err()` at the end; 36–37 return the result and close.
+With no rows, the loop never runs and `items` stays `nil`. Generated code is ordinary pgx: errors still exist.
+
+## Store now calls generated methods
+
+Install the second-stage files in your copy. The only `main.go` change is `store := NewStore(pool)`; the other lines are unchanged.
+
+```bash
+cp _video/stages/02-store-get.go store.go
+cp _video/stages/02-main-get.go main.go
+```
+
+```go filename="_video/stages/02-store-get.go" showLineNumbers
+// Video bosqichi: Get va ListActive sqlc orqali (query.sql: 02-query.sql).
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/abdurahmon27/bozor/db"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — bozor jadvallariga Go'dan kirish. pool — transaction ochish uchun (Begin),
+// q — sqlc query.sql'dan generatsiya qilgan soʻrovlar (db papkasi).
+type Store struct {
+	pool *pgxpool.Pool
+	q    *db.Queries
+}
+
+// NewStore pool ustida Store yaratadi: db.New pool'ni sqlc soʻrovlariga ulaydi.
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool, q: db.New(pool)}
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	r, err := s.q.GetProduct(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	if err != nil {
+		return Product{}, err
+	}
+	return Product{ID: r.ID, Name: r.Name, Price: r.Price, Stock: int(r.Stock)}, nil
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi. Mahsulot yoʻq boʻlsa boʻsh (nil emas) slice qaytaradi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.q.ListActiveProducts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Product, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, Product{ID: r.ID, Name: r.Name, Price: r.Price, Stock: int(r.Stock)})
+	}
+	return out, nil
+}
+```
+
+```go filename="_video/stages/02-main-get.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := NewStore(pool)
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+}
+```
+
+New parts: 8 imports the module path plus `/db`; 26–29 make `Store` hold both `pool` and `q`.
+32–34 call `db.New(pool)` in `NewStore`. 38 calls the generated method from `Get`; 39–44 distinguish errors; 45 converts the `Row` to domain `Product`.
+`int(r.Stock)` converts `int32` to `int`. Mapping `ErrNoRows → ErrNotFound` remains the responsibility of `Store`.
+50–53 call `ListActiveProducts` and check the error; 54 makes an empty non-`nil` slice; 55–57 convert each row to the domain type; 58 returns it.
+The other lines are the previous declarations, comments, and braces.
+
+| Call | SQL executor | Result |
+|---|---|---|
+| `db.New(pool)` | `Queries.db = pool` | no SQL executed yet |
+| `s.q.GetProduct(ctx, 1)` | `pool.QueryRow` | `GetProductRow` and error |
+| `Store.Get(ctx, 1)` | same query | domain `Product` and domain error |
+
+What will `Get(1)` print on the fresh database? **A)** empty product · **B)** olma, stock 40 · **C)** order ID.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `olma` (“apple”) is the first product. This stage creates no order. A is the zero value on error; C belongs to the next stage.
+
+</details>
+
+```console
+$ go run .
+{1 olma 1200000 40} <nil>
+```
+
+Price `1200000` is in tiyin. `<nil>` means no error. Midpoint question: `ProductByName` was added to `query.sql`, but generation was forgotten.
+What happens if `Store` calls the new method? **A)** Go build error · **B)** runtime error only · **C)** automatic generation.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `db.Queries` has no such method. `go build` does not invoke sqlc automatically.
+The following error was rerun with `_video/stages/05-store-undefined.go` as `store.go`: the SQL query exists, but `db/` is stale.
+For exact reproduction, first generate the five queries from the transaction section; then install that stage file as `store.go`.
+Add annotation `ProductByName :one` and `SELECT id, name, price, stock FROM products WHERE name = $1;` to `query.sql`, without generation.
+
+</details>
+
+```console
+$ go build
+# github.com/abdurahmon27/bozor
+./store.go:132:16: s.q.ProductByName undefined (type *db.Queries has no field or method ProductByName)
+```
+
+`#` identifies the package; `store.go:132:16` gives file, line, and column. `undefined` means the name is not defined.
+`has no field or method` says the generated type has neither member. Fix: run `sqlc generate` after valid SQL; keep `query.sql` and `db/` together.
+If only an existing query body changed, the Go compiler may miss the stale method. `sqlc diff` checks for that.
+
+## Parameter names and WithTx
+
+The transaction retains the previous three SQL queries. The initial version (`_video/stages/03-query-dollar.sql`) is:
+
+```sql filename="_video/stages/03-query-dollar.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+
+-- name: CreateOrder :one
+INSERT INTO orders (customer) VALUES ($1)
+RETURNING id;
+
+-- name: DecrementStock :one
+UPDATE products SET stock = stock - $1
+WHERE id = $2
+RETURNING price;
+
+-- name: AddOrderItem :exec
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES ($1, $2, $3, $4);
+```
+
+`CreateOrder` has `RETURNING id`, hence `:one`; `DecrementStock` returns price, so it also uses `:one`.
+`AddOrderItem` writes four parameters without returning a row: `:exec`.
+With this configuration sqlc creates a `Params` struct for multiple parameters. It infers names from columns.
+What field name represents `$1` in `stock = stock - $1`? **A)** `Quantity` · **B)** `Stock` · **C)** `Column1`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Regeneration produced `Stock int32`, `ID int64`. A is our intended meaning but is unwritten; C is not the observed result here.
+
+</details>
+
+```go
+type DecrementStockParams struct {
+	Stock int32
+	ID    int64
+}
+```
+
+Here `Stock` means the quantity to subtract, not current stock. Name it explicitly by replacing `$1` with `@quantity` and `$2` with `@id`.
+`@name` abbreviates `sqlc.arg(name)`. The SQL sent to Postgres uses `$1`, `$2` again.
+The complete final `query.sql`:
+
+```sql filename="query.sql" showLineNumbers
+-- name: GetProduct :one
+SELECT id, name, price, stock FROM products
+WHERE id = $1;
+
+-- name: ListActiveProducts :many
+SELECT id, name, price, stock FROM products
+WHERE active
+ORDER BY id;
+
+-- name: CreateOrder :one
+INSERT INTO orders (customer) VALUES ($1)
+RETURNING id;
+
+-- name: DecrementStock :one
+UPDATE products SET stock = stock - @quantity
+WHERE id = @id
+RETURNING price;
+
+-- name: AddOrderItem :exec
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES ($1, $2, $3, $4);
+```
+
+```console
+$ sqlc generate
+```
+
+It printed nothing. These structs are now generated:
+
+```go
+type DecrementStockParams struct {
+	Quantity int32
+	ID       int64
+}
+```
+
+```go
+type AddOrderItemParams struct {
+	OrderID   int64
+	ProductID int64
+	Quantity  int32
+	UnitPrice int64
+}
+```
+
+`Quantity int32` comes from SQL `integer`; IDs and price `int64` come from SQL `bigint`. `Params` fields make the Go call explicit.
+`AddOrderItem` contains `q.db.Exec(ctx, addOrderItem, arg.OrderID, arg.ProductID, arg.Quantity, arg.UnitPrice)` and `return err`.
+`CreateOrder` returns `int64` through `QueryRow` and `Scan(&id)`. Complete methods are in the course `db/query.sql.go`.
+
+Now restore the saved final files and the test. If you used the broken quiz file, this step also restores it.
+The required domain declarations from `store.go`, followed by the complete `PlaceOrder` method:
+
+```bash
+cp store.go.start store.go
+cp main.go.start main.go
+cp query.sql.start query.sql
+mv store_test.go.off store_test.go
+sqlc generate
+```
+
+```go
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq: baza CHECK (stock >= 0) bilan rad etdi (GB-5.07).
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi va integer ustuniga (int32) sigʻishi kerak.
+var ErrInvalidQuantity = errors.New("miqdor notoʻgʻri: 1 dan 2147483647 gacha boʻlishi kerak")
+
+// OrderItem — buyurtmadagi bitta qator: qaysi mahsulot va nechta.
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+```
+
+```go
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	for _, it := range items {
+		if it.Quantity <= 0 || it.Quantity > math.MaxInt32 {
+			return 0, ErrInvalidQuantity
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.q.WithTx(tx)
+
+	orderID, err := qtx.CreateOrder(ctx, customer)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		price, err = qtx.DecrementStock(ctx, db.DecrementStockParams{
+			Quantity: int32(it.Quantity),
+			ID:       it.ProductID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23514" { // 23514 = check_violation: CHECK (stock >= 0) buzildi
+			return 0, ErrNotEnoughStock
+		}
+		if err != nil {
+			return 0, err
+		}
+		err = qtx.AddOrderItem(ctx, db.AddOrderItemParams{
+			OrderID:   orderID,
+			ProductID: it.ProductID,
+			Quantity:  int32(it.Quantity),
+			UnitPrice: price,
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return orderID, nil
+}
+```
+
+Declarations: two error values; `OrderItem` holds a product ID and quantity. `math.MaxInt32` is `2147483647`.
+The `store.go` imports add `math` and `github.com/jackc/pgx/v5/pgconn`.
+
+| Method lines | Change and purpose |
+|---|---|
+| 1–6 | Quantity must be positive and fit `int32`; otherwise return an error before opening a transaction. `\|\|` means “or”. |
+| 7–11 | `Begin`, error check, `defer Rollback`: the GB-5.07 rule. |
+| 12 | `qtx := s.q.WithTx(tx)` makes a new `Queries` whose executor is `tx`. |
+| 14–17 | `CreateOrder` returns the ID; return on error. |
+| 18–23 | `range items`, declare `price`; pass checked `int32` quantity and product ID in `DecrementStockParams`. |
+| 24–26 | Map `ErrNoRows` to `ErrNotFound`. |
+| 27–30 | `errors.As` extracts `*pgconn.PgError`; `23514` (`check_violation`) means the stock CHECK failed. |
+| 31–33 | Return another error. |
+| 34–42 | Write order ID, product, quantity, and current price through `AddOrderItemParams`; check the error. |
+| 43–48 | Close the loop, check the `Commit` error, return the ID and `nil`. |
+
+`price, err =` assigns to the existing `err`, avoiding an inner shadow variable.
+`WithTx` neither begins nor commits the transaction; those operations remain in `Store`.
+
+| State | `s.q.db` | `qtx.db` | Database |
+|---|---|---|---|
+| before `Begin` | pool | absent | no transaction |
+| after `WithTx(tx)` | pool | tx | open transaction |
+| `qtx.CreateOrder` and the others | pool | tx | uncommitted changes |
+| after `Commit` | pool | finished tx | changes committed |
+
+Calling `s.q` inside the transaction can send a query through the pool on another connection. All three operations must use `qtx`.
+Final `main.go`:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := NewStore(pool)
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := store.Get(qctx, 1)
+	fmt.Println(p, err)
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 1},
+	}
+	id, err := store.PlaceOrder(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+New lines 28–31 put two units of the first product and one of the second into slice `items`. 32 calls `PlaceOrder`; 33 prints the ID and error.
+`"Aziza"` is a fictional fixture customer name. The other lines match the previous main.
+What ID will the first inserted order receive? **A)** `1` · **B)** `4` · **C)** `0`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The seed created three orders. In this fresh database the next ID is `4`. Later runs change IDs and stock; identity numbers are not guaranteed to be gapless.
+
+</details>
+
+```console
+$ go run .
+{1 olma 1200000 40} <nil>
+4 <nil>
+```
+
+The first line comes from `Get`, the second from the order. Reading happened before ordering, so the screen still shows `40`.
+After commit, product 1 has stock `38`; order items are `2 × 1200000` and `1 × 400000`.
+SQL optimization remains your work: sqlc creates code to execute the query you wrote.
+
+## Generation fails, but old code remains
+
+Break the first query in `query.sql`. Keep the rest of the file; replace only `stock` with `qoldiq`:
+
+```sql
+-- name: GetProduct :one
+SELECT id, name, price, qoldiq FROM products
+WHERE id = $1;
+```
+
+What does `go build` do after failed generation? **A)** error, empty `db/` · **B)** passes with old code · **C)** error from partial files.
+
+<details>
+<summary>Answer</summary>
+
+**B.** This column error was caught during checking; previous Go files stayed unchanged. A and C assume existing `db/` files are removed.
+
+</details>
+
+```console
+$ sqlc generate
+# package db
+query.sql:2:25: column "qoldiq" does not exist
+$ go build
+```
+
+`query.sql:2:25` means line two, column 25; `# package db` identifies the intended generated package.
+The message came from sqlc, not the Postgres server: there is no SQLSTATE. Here generate exited with `1`, while build exited with `0`.
+The Go file hashes also stayed unchanged. Build was silent, but that does not validate the new SQL.
+Fix: restore `stock`, then check that generation succeeds.
+
+## Going deeper (optional): keep db/ and SQL together
+
+`db/` is commonly committed to git. Building the program does not require sqlc to be installed; the Go files suffice.
+`sqlc diff` compares what generation would produce with the existing files.
+In a clean starter copy:
+
+```console
+$ sqlc diff
+```
+
+No output, exit `0`. After we added an SQL query without generation, it printed a diff and exited with `1`.
+Diff text depends on the files and is not reproduced here. Adding this rule to automated checks is covered in GB-8.05.
+
+Computed column types are sqlc's inference. We regenerated three variants in a separate copy:
+
+| OrderTotal expression | sqlc v1.31.1 result | Limitation |
+|---|---|---|
+| `COALESCE(SUM(quantity * unit_price), 0)` | `interface{}` | incompatible with a Go method expecting `int64` |
+| `SUM(quantity * unit_price) AS total` | `int64` | Postgres returns `NULL` with no input rows |
+| `COALESCE(SUM(quantity * unit_price), 0)::bigint AS total` | `int64` | empty input gives `0`, SQL type is explicit |
+
+Postgres returns `numeric` for `SUM(bigint)`. `COALESCE` selects the first non-`NULL` value.
+`::bigint` converts the SQL type; `AS total` names the result column. You still need to read sqlc's signature and test with a real database.
+This page's configuration checks without a database; sqlc also supports database-assisted analysis with other settings.
+
+## Common mistakes
+
+**1. “Build passed, so the new SQL is valid.”** The `qoldiq` experiment above kept the old `db/` files.
+Fix: correct the column, check generation's exit status, then run `sqlc diff`. The compiler catches forgotten generation when a new method is used.
+
+**2. Editing `db/*.go` manually.** The next generation overwrites the change. Fix SQL or `sqlc.yaml`, then regenerate.
+
+**3. Using the pool instead of the transaction.** `s.q` is bound to the pool. After `qtx := s.q.WithTx(tx)`, send all three queries through `qtx`.
+
+**4. Not checking the SUM type.** In a solution copy, we removed `::bigint` from `OrderTotal`.
+The new method returned `interface{}`, but `store.go` expected `int64`. Actual result:
+
+```sql
+-- name: OrderTotal :one
+SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+```console
+$ go vet .
+# github.com/abdurahmon27/bozor
+# [github.com/abdurahmon27/bozor]
+vet: ./store.go:158:9: cannot use 1st function result (value of type interface{}) as int64 value in return statement: need type assertion
+```
+
+`store.go:158:9` locates the error in the solution file. `cannot use … as int64` means the result is incompatible with `int64`.
+Here `go vet` did not understand SQL; it found a Go type error after generation.
+Fix: `COALESCE(…)::bigint AS total`, then regenerate.
+
+Removing `COALESCE` entirely is no solution either. This broken variant generated `int64`:
+
+```sql
+-- name: OrderTotal :one
+SELECT SUM(quantity * unit_price) AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+```console
+$ go test -run TestOrderTotal .
+--- FAIL: TestOrderTotal (0.05s)
+    store_test.go:262: OrderTotal(3): can't scan into dest[0] (col: total): cannot scan NULL into *int64
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.055s
+FAIL
+```
+
+`store_test.go:262` is the assertion line. `cannot scan NULL into *int64` means `NULL` cannot be written into an `int64` destination.
+Order `3` has no items. Fix: zero through `COALESCE`, an explicit type through `::bigint`.
+
+**5. Converting quantity to `int32` without checking.** `int32(it.Quantity)` truncates an oversized number. Check `1 … math.MaxInt32` first.
+**6. Always expecting an empty slice from `:many`.** This configuration may return `nil`. Use `make([]Product, 0, len(rows))` in the domain method.
+Alternatively set `emit_empty_slices: true` under `gen.go`; regeneration creates `items := []T{}`.
+
+## Check yourself
+
+**1.** What do `:one`, `:many`, and `:exec` return?
+
+<details>
+<summary>Answer</summary>
+
+A value and error; a slice and error; only an error. `:one` does not map a missing row to a business error.
+
+</details>
+
+**2.** When does sqlc catch a missing column? Does it catch every SQL error at that stage?
+
+<details>
+<summary>Answer</summary>
+
+During generation against the schema. No: CHECK failures, connection errors, and runtime errors such as SUM/NULL remain.
+
+</details>
+
+**3.** From GB-5.06: what is `-- +goose Down` for? Does sqlc execute it?
+
+<details>
+<summary>Answer</summary>
+
+To reverse a migration; `goose down` applies it. sqlc skips `Down` and reads `Up` as the schema definition.
+
+</details>
+
+**4.** Predict: `:many` found no rows. What are `len(rows)` and `rows == nil`? **A)** `0, true` · **B)** `0, false` · **C)** error.
+
+<details>
+<summary>Answer</summary>
+
+**A**: this configuration uses `var items []T`. With `emit_empty_slices: true`, B applies. `Store.ListActive` creates an empty slice itself.
+
+</details>
+
+**5.** Does `WithTx` change `s.q.db`? Who commits?
+
+<details>
+<summary>Answer</summary>
+
+No. The new `qtx.db = tx`; existing `s.q.db = pool`. `Store` calls commit.
+
+</details>
+
+## Homework
+
+[Course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc),
+[complete TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-09-sqlc/TASK.md),
+[answers and tests](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc/solution).
+After the stage experiments, use a clean starter copy. Do not edit the test file.
+
+- 🟢 **Required:** add `ProductByName :one`, `CheapestProducts :many`, and `OrderTotal :one` to `query.sql`; regenerate.
+  Rewrite `ByName`, `Cheapest`, and `OrderTotal` through `s.q`, removing handwritten `Scan` and `pool.Query/QueryRow` calls.
+  An unknown name returns `ErrNotFound`; no active products returns an empty non-`nil` slice; an order without items totals `0`.
+- 🟡 **Optional:** write `AddStock :execrows` for `Restock`. It returns the affected row count and an error.
+  Use `WithTx`; `0` rows means `ErrNotFound`, rolling back all changes.
+
+Tests create a temporary schema and apply migration `Up` sections and the seed themselves, leaving public alone. Tests alone do not require `goose up`.
+`cd` changes folders; `./...` selects all packages in the current module.
+Verification commands:
+
+```bash
+docker compose up -d --wait
+go test .
+```
+
+The starter intentionally fails `TestQueriesMovedToSqlc`. Our rerun produced six messages: three queries are missing and three methods remain handwritten.
+This is the expected exercise failure; an unavailable database is a different error. We describe the exercise condition instead of reproducing the full starter log.
+Complete rerun output from the solution folder:
+
+```console
+$ go test ./...
+ok  	github.com/abdurahmon27/bozor	0.244s
+?   	github.com/abdurahmon27/bozor/db	[no test files]
+```
+
+<details>
+<summary>Answer</summary>
+
+Like `Get`, `ByName` maps `ErrNoRows` and converts `Row → Product`.
+`Cheapest` gets active products with `ORDER BY price, id LIMIT $1`. sqlc makes the `LIMIT` parameter `int32`.
+Return an error first for `n < 0` or `n > math.MaxInt32`; Postgres does not allow a negative `LIMIT`.
+Collect results into `make([]Product, 0, len(rows))`. Remember `Stock: int(r.Stock)`.
+For `OrderTotal`, use this query, then `return s.q.OrderTotal(ctx, orderID)`:
+
+```sql
+-- name: OrderTotal :one
+SELECT COALESCE(SUM(quantity * unit_price), 0)::bigint AS total
+FROM order_items
+WHERE order_id = $1;
+```
+
+🟡 Annotate `UPDATE products SET stock = stock + @quantity WHERE id = @id` with `AddStock :execrows`.
+Check the `qtx.AddStock` error; return `ErrNotFound` when the count is `0`; otherwise commit at the end.
+`go test -run Restock -v` runs both checks. Only the optional migration check is skipped on the starter; `Restock` behavior is tested.
+
+</details>
+
+When finished, run `docker compose down -v` in your copy: it removes this lab's container and volume.
+Our verification container and volume were also removed. Next is GB-5.10, the orders API checkpoint.
+
+## Sources
+
+- [sqlc v1.31.1](https://docs.sqlc.dev/en/v1.31.1/index.html)
+
+- [Installation](https://docs.sqlc.dev/en/v1.31.1/overview/install.html)
+
+- [Query annotations](https://docs.sqlc.dev/en/v1.31.1/reference/query-annotations.html)
+
+- [Configuration](https://docs.sqlc.dev/en/v1.31.1/reference/config.html)
+
+- [Migration schema](https://docs.sqlc.dev/en/v1.31.1/howto/ddl.html)
+
+- [Named parameters](https://docs.sqlc.dev/en/v1.31.1/howto/named_parameters.html)
+
+- [CLI: generate, diff](https://docs.sqlc.dev/en/v1.31.1/reference/cli.html)
+
+- [Datatypes](https://docs.sqlc.dev/en/v1.31.1/reference/datatypes.html)
+
+- [PostgreSQL tutorial](https://docs.sqlc.dev/en/v1.31.1/tutorials/getting-started-postgresql.html)
+
+- [sqlc: parse_wasi.go](https://github.com/sqlc-dev/sqlc/blob/v1.31.1/internal/engine/postgresql/parse_wasi.go)
+
+- [sqlc: postgresql_type.go](https://github.com/sqlc-dev/sqlc/blob/v1.31.1/internal/codegen/golang/postgresql_type.go)
+
+- [go-pgquery / WebAssembly](https://github.com/wasilibs/go-pgquery)
+
+- [pgx: Text](https://pkg.go.dev/github.com/jackc/pgx/v5/pgtype#Text)
+
+- [pgx: Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+
+- [pgx: RowsAffected](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#CommandTag.RowsAffected)
+
+- [PostgreSQL: numeric](https://www.postgresql.org/docs/18/datatype-numeric.html)
+
+- [PostgreSQL: aggregates](https://www.postgresql.org/docs/18/functions-aggregate.html)
+
+- [PostgreSQL: error codes](https://www.postgresql.org/docs/18/errcodes-appendix.html)
+
+- [goose: annotations](https://pressly.github.io/goose/documentation/annotations/)
+
+- [Go: vet](https://pkg.go.dev/cmd/vet)
+
+- [Go: string literals](https://go.dev/ref/spec#String_literals)
+
+- [Go: selectors](https://go.dev/ref/spec#Selectors)
+
+- [Go: generated code](https://go.dev/s/generatedcode)
+
+- [Course README](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-09-sqlc/README.md)
+
+Results rerun with `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, sqlc v1.31.1, goose v3.30.2, pgx v5.13.0, and PostgreSQL 18 on 2026-11-27.
+Video and cold-install timings are explicitly marked as quotations; the other displayed results come from new runs.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-09-sqlc)
+
+---
+
+← Previous lesson: [GB-5.08](/lab/youtube/gb/gb-5-08/en) · Next lesson: [GB-5.10](/lab/youtube/gb/gb-5-10/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

@@ -1,0 +1,858 @@
+---
+title: "Два покупателя, один товар: lost update и блокировка"
+date: "2026/11/27"
+description: "Воспроизведите лишние продажи в Postgres, исправьте их условным UPDATE или SELECT FOR UPDATE и проверьте параллельных покупателей в Go."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-08) · **Русский** · [English](/lab/youtube/gb/gb-5-08/en)  
+Урок GB-5.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-08) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Остался один абрикос. Два покупателя нажали «Купить», и оба получили успех. В базе остаток `0`, ошибки нет. Куда исчезло второе уменьшение?
+
+**Одна идея:** сама транзакция не защищает отдельные чтение, проверку и запись от другого покупателя. Добавьте условие остатка в `UPDATE` или заблокируйте строку перед чтением для принятия решения.
+
+После урока вы:
+
+- воспроизведёте **потерянное обновление** (lost update) в двух соединениях с базой;
+- объедините проверку и уменьшение остатка в одном условном `UPDATE`;
+- примените `SELECT … FOR UPDATE` через `tx` и объясните, кто ждёт;
+- проверите параллельных покупателей и исправите задачу с промокодом.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| потерянное обновление | два покупателя вычисляют из одного старого остатка; одно уменьшение исчезает | lost update |
+| условный UPDATE | проверка и изменение строки одной командой SQL | conditional UPDATE |
+| блокировка строки | конфликтующие записи и чтения с блокировкой ждут завершения транзакции | row-level lock |
+
+**Лишние продажи** (overselling) — принятие большего числа покупок, чем позволяет остаток. `CommandTag` — описание результата, возвращаемое `Exec`; `RowsAffected()` получает из него число строк.
+
+## Что нужно знать заранее
+
+- [GB-5.07 · Транзакции](/lab/youtube/gb/gb-5-07/ru): `Begin`, `Commit`, `Rollback`, `tx.Exec` и `tx.QueryRow`.
+- [GB-4.07 · Параллельные запросы](/lab/youtube/gb/gb-4-07/ru): потерянные обновления в памяти, `sync.Mutex`, `wg.Go` и `wg.Wait`.
+- [GB-5.05 · pgx и пул соединений](/lab/youtube/gb/gb-5-05/ru): `QueryRow`, `Scan`, `$1`, context и `pgx.ErrNoRows`.
+- [GB-5.03 · Таблицы SQL](/lab/youtube/gb/gb-5-03/ru), [GB-5.04 · Связанные таблицы](/lab/youtube/gb/gb-5-04/ru), [GB-5.02 · Postgres в Docker](/lab/youtube/gb/gb-5-02/ru): `products`, ограничения, `psql` и Compose.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru), [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru), [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru), [GB-2.04 · Указатели](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структуры](/lab/youtube/gb/gb-2-03/ru), [GB-2.01 · Слайсы](/lab/youtube/gb/gb-2-01/ru).
+- [GB-1.08 · Тесты](/lab/youtube/gb/gb-1-08/ru), [GB-1.07 · Функции](/lab/youtube/gb/gb-1-07/ru), [GB-1.06 · Циклы](/lab/youtube/gb/gb-1-06/ru), [GB-1.05 · Условия](/lab/youtube/gb/gb-1-05/ru), [GB-1.02 · Переменные](/lab/youtube/gb/gb-1-02/ru), [GB-1.01 · Первая программа](/lab/youtube/gb/gb-1-01/ru).
+
+Из GB-5.07: внутри транзакции выполнили `UPDATE`, затем `ROLLBACK`. Какой остаток сохранится? **A)** до обновления · **B)** после обновления · **C)** `NULL`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `ROLLBACK` отменяет изменения транзакции. `COMMIT` подтверждает их. Сегодня рассматриваем две транзакции, работающие одновременно.
+
+</details>
+
+Работайте в копии `lessons/gb-5-08-ikki-xaridor`. Модулю нужны Go 1.27.4, pgx v5.13.0 и Docker Compose 2.20 или новее. Он подключается к настоящему серверу Postgres, поэтому используйте локальную папку вместо Playground. Следующие настройки действовали для всех запусков Go ниже:
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+```
+
+`CGO_ENABLED=0` отключает интеграцию с C; gcc не нужен. `GOTOOLCHAIN` выбирает версию Go. В нашем запуске порт `5458` был свободен. Если он занят, измените порт в копии `compose.yaml` и согласуйте с ним `DATABASE_URL`. Иначе тесты используют стандартные настройки подключения из папки.
+
+В нашей копии имя проекта Compose — `gb508doc`; в курсе — `gb508`, в видео — `bozor`. От этого меняются имена контейнеров. Полный вывод запуска уже работающего контейнера:
+
+```console
+$ docker compose up -d --wait
+ Container gb508doc-db-1 Running 
+ Container gb508doc-db-1 Waiting 
+ Container gb508doc-db-1 Healthy 
+```
+
+`up` запускает сервисы, `-d` оставляет их в фоне, `--wait` ждёт готовности. `Running` означает, что контейнер работает; `Waiting` — ожидание проверки готовности; `Healthy` — проверка пройдена. При первом запуске появляются и сообщения о создании.
+
+Примените `bozor.sql`. Он удаляет таблицы лаборатории вместе с данными и создаёт их заново. В этом запуске таблицы уже существовали; новая база дополнительно напечатает четыре сообщения `NOTICE … does not exist, skipping`.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+CREATE TABLE
+INSERT 0 1
+```
+
+`exec db` выполняет `psql` в сервисе базы; `-f /lab/bozor.sql` читает подключённый SQL-файл. `DROP TABLE` удаляет старые таблицы, `CREATE TABLE` создаёт таблицу, `INSERT 0 n` сообщает о `n` добавленных строках. Последняя строка добавляет промокод `BAHOR` с тремя использованиями.
+
+Лаборатория выделяет правило остатка: `Buy` не записывает в `orders` или `order_items`. Полная транзакция заказа остаётся в GB-5.07.
+
+## Два соединения, одно старое значение
+
+Для `products.stock` задано `CHECK (stock >= 0)`. Товар `id=4` — `oʻrik` («абрикос»). Установим остаток один и проверим:
+
+```console
+$ docker compose exec db psql -c "UPDATE products SET stock = 1 WHERE id = 4"
+UPDATE 1
+```
+
+```console
+$ docker compose exec db psql -c "SELECT name, stock FROM products WHERE id = 4"
+ name  | stock 
+-------+-------
+ oʻrik |     1
+(1 row)
+```
+
+`UPDATE … SET` присваивает значение столбцу; `WHERE id = 4` выбирает товар. `UPDATE 1` считает одну обновлённую строку, в том числе строку, которой присвоили её прежнее значение. Это не число проданных единиц. В таблице — название товара, остаток и `(1 row)`, одна строка.
+
+В двух терминалах в папке лаборатории откройте `docker compose exec db psql`. Каждый — отдельное соединение с базой, то есть сеанс. В журнале `[A]` и `[B]` обозначают сеанс; не вводите эти префиксы вместе с SQL.
+
+| Шаг | A | B | Подтверждённый остаток |
+|---|---|---|---|
+| 1 | `BEGIN`; прочитал `1` | | `1` |
+| 2 | | `BEGIN`; прочитал `1` | `1` |
+| 3 | записал вычисленный `0`; `COMMIT` | ещё помнит `1` | `0` |
+| 4 | | записал свой вычисленный `0`; `COMMIT` | `0` |
+
+Оба приложения решают, что одна единица доступна. A подтверждает запись раньше B. Что вернёт команда B `UPDATE products SET stock = 0 WHERE id = 4`?
+
+**A)** ошибку, потому что строка изменилась · **B)** `UPDATE 1` · **C)** будет ждать A.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Строка по-прежнему соответствует `id=4`, а записать ноль допустимо. Условия проверки ранее прочитанного остатка нет. A уже завершил транзакцию, поэтому B его не ждёт. Вариант A предполагает автоматическую проверку устаревшего чтения, которую эта команда не запрашивает.
+
+</details>
+
+Вспомогательная программа из папки выполняет этот порядок в двух настоящих сеансах `psql`. `python3` исполняет `_video/sessions.py`; `naive` выбирает сценарий «прочитать–проверить–записать». Начальный `UPDATE 1` восстанавливает остаток. `oxirgi` означает «итоговый». Полный журнал нашей повторной проверки:
+
+```console
+$ python3 _video/sessions.py naive
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[B] BEGIN;
+BEGIN
+
+[B] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[B] COMMIT;
+COMMIT
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     0
+(1 row)
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Две успешные покупки израсходовали в учёте одну единицу: одно уменьшение потерялось. Проверка `CHECK` проходит, потому что ноль допустим. Допустимое конечное значение столбца не доказывает правильность числа продаж.
+
+## Почему BEGIN не исправляет чтение–проверку–запись
+
+По умолчанию Postgres использует **READ COMMITTED** — уровень изоляции, определяющий видимость между транзакциями. Обычный `SELECT` видит данные других транзакций, подтверждённые до начала этого запроса. Он также видит предыдущие записи собственной транзакции.
+
+B прочитал остаток до подтверждения A. Следующий `UPDATE` — новая команда, но `SET stock = 0` всё ещё записывает значение из старой переменной Go у B. Уменьшение не пересчитывается от значения в базе. В READ COMMITTED конфликтующее обновление может подождать и обработать более новую версию строки. В следующем разделе используем это правило.
+
+Это потерянное обновление в базе, связанное с потерянным обновлением в памяти из GB-4.07. Оно не доказывает гонку данных в памяти Go: race detector Go не проверяет это бизнес-правило SQL.
+
+Ниже полный демонстрационный `naive.go`. Он входит в пакет `bozor` вместе со `Store` и значениями ошибок из `store.go`; это не отдельная программа `main`.
+
+```go filename="naive.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// buyNaive — videoning birinchi, XATO versiyasi: transaction bor, lekin oʻqish va yozish orasida qulf yoʻq.
+// Ikki xaridor bir xil eski qoldiqni oʻqib, ikkalasi ham yozadi (lost update). Faqat koʻrsatish uchun (naive_test.go): ishlatmang.
+func (s *Store) buyNaive(ctx context.Context, id int64, qty int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1, 3–8 | `package`, `import` | входит в пакет `bozor`; импортирует context, проверку ошибок и pgx |
+| 10–12 | комментарий и `buyNaive` | демонстрационный метод; `s *Store` — получатель, `id` — товар, `qty` — число единиц |
+| 13–17 | `Begin`, ветка ошибки, отложенный rollback | занимает одно соединение для `tx`; возвращает ошибку начала; назначает rollback при любом выходе |
+| 19–21 | `var stock int`; `QueryRow(...).Scan(&stock)` | читает один остаток по адресу `&stock`; `$1` — это `id` |
+| 22–27 | `errors.Is`; `if err != nil` | преобразует отсутствие строки в `ErrNotFound`; возвращает остальные ошибки чтения |
+| 28–30 | `stock < qty` | возвращает `ErrNotEnoughStock`, если запомненного остатка недостаточно |
+| 31–32 | `_, err = tx.Exec(...)` | отбрасывает описание результата через `_`; записывает `stock-qty` как `$1`, `id` как `$2` |
+| 33–36 | ветка ошибки; `tx.Commit(ctx)` | возвращает ошибку записи или подтверждает транзакцию; ошибка commit доходит до вызывающего кода |
+
+Пустые строки и комментарии `//` не выполняются. `:=` создаёт переменные; `=` присваивает существующим. Точка выбирает метод; круглые скобки вызывают его, фигурные ограничивают блок, `return` завершает метод. Это синтаксис из предыдущих уроков.
+
+`buyNaive` намеренно показывает только положительное количество; проверки `qty <= 0` в нём нет. Оба итоговых метода отклоняют неверное количество. Транзакция подтверждает или откатывает записи этого покупателя вместе; она не резервирует для него ранее прочитанный остаток.
+
+Тест запускает 20 покупателей при остатке 5. Центральный цикл, сокращённый из вспомогательной функции курса:
+
+```go
+errs := make([]error, 20)
+var wg sync.WaitGroup
+for i := range errs {
+	wg.Go(func() {
+		errs[i] = store.Buy(ctx, 4, 1)
+	})
+}
+wg.Wait()
+```
+
+`make([]error, 20)` выделяет 20 ячеек результатов. `i` — индекс ячейки; `wg.Go` запускает функцию в горутине. Каждая пишет только в `errs[i]`. У каждой итерации отдельный `i`. `wg.Wait()` ждёт всех покупателей. Вызывающий код считает `nil` успехом и допускает `ErrNotEnoughStock` для отказов. Полностью `WaitGroup` разбирается в [GB-7.01](/lab/youtube/gb#gb-7-01).
+
+Сколько успехов может сообщить наивный метод? **A)** всегда 5 · **B)** больше 5, вплоть до 20 · **C)** всегда panic.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Несколько покупателей могут прочитать один остаток до первой записи. В видео получилось 20, в этой проверке тоже 20. Порядок выполнения меняет число; последовательность SQL выше объясняет ошибку без опоры на длительности. Транзакция не делает ответ A автоматическим, а корректный SQL не обязан вызывать panic.
+
+</details>
+
+Запустите демонстрационный тест, не меняя файлы:
+
+```console
+$ go test -run Naive -v
+=== RUN   TestNaiveOversells
+    naive_test.go:15: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik
+--- PASS: TestNaiveOversells (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.104s
+```
+
+Здесь `PASS` означает, что тест успешно **наблюдал ошибку**. Узбекская запись: «попытка 1: 20 покупателей, на складе 5, сказали “куплено” двадцати». У итоговых методов другой тест, требующий ровно пять успехов.
+
+Красный тест из видео тоже можно повторить. В пустую рабочую папку скопируйте `go.mod`, `go.sum`, `bozor.sql` и `store_test.go`. Возьмите `_video/stages/01-store.go` под именем `store.go`. В копии `store_test.go` полностью очистите строку `{"BuyLocked", (*Store).BuyLocked},`, сохранив перевод строки: этот этап определяет только `Buy`. Выполните там `go test`:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.08s)
+    --- FAIL: TestConcurrentBuyers/Buy (0.08s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.128s
+```
+
+`--- FAIL` называет тест и подтест. `store_test.go:172` указывает проверку: получено 20, ожидалось 5. `exit status 1` означает неуспешное завершение; последняя строка называет модуль и длительность. В видео было `0.126s`, здесь `0.128s`; эти числа не доказывают производительность.
+
+## Исправление 1: проверка и уменьшение одним UPDATE
+
+Правило помещается в одно условие SQL:
+
+```sql
+UPDATE products
+SET stock = stock - 1
+WHERE id = 4 AND stock >= 1;
+```
+
+`SET` вычисляет из текущего остатка строки. `AND` требует и совпадения id, и наличия хотя бы одной единицы. `UPDATE` удерживает блокировку строки против конфликтующих записей до завершения транзакции. Несоответствующая строка не обновляется.
+
+Восстановите остаток один. A начинает транзакцию и уменьшает остаток, но оставляет её открытой. B отправляет ту же условную команду и ждёт. Что вернёт B после подтверждения A?
+
+**A)** `UPDATE 1`, остаток `-1` · **B)** `UPDATE 0` · **C)** ошибку CHECK.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** После ожидания Postgres повторно проверяет `WHERE` на обновлённой строке. Остаток ноль, поэтому `stock >= 1` ложно. Ничего не уменьшается. A игнорирует условие; C предполагает уменьшение до проверки соответствия строки.
+
+</details>
+
+`shartli` выбирает этот сценарий. Программа проверяет, что B не выдаёт результат две секунды до подтверждения A. `kutyapti = True` означает «ждёт»; эту строку выводит помощник, а не Postgres.
+
+```console
+$ python3 _video/sessions.py shartli
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+UPDATE 1
+
+[B] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+UPDATE 0
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+| Момент | A | B | Остаток по подтверждённым изменениям |
+|---|---|---|---|
+| A обновил | держит блокировку; неподтверждённый `0` | | `1` |
+| B обновляет | ещё открыт | ждёт A | `1` |
+| A подтвердил | освободил блокировку | перепроверил `0 >= 1`; обновил ноль строк | `0` |
+
+Метод Go из `store.go`, показанный фрагментом:
+
+```go
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+```
+
+`qty <= 0` возвращает `ErrInvalidQuantity` до SQL. `Exec` возвращает `tag`, то есть `CommandTag`, и `err`. Сначала верните ошибку SQL, затем проверьте `tag.RowsAffected()`. Ноль означает отсутствие обновлённых строк. Здесь считаем, что товар существует, и возвращаем `ErrNotEnoughStock`; неизвестный id тоже даст ноль.
+
+`$1` встречается дважды, но это один параметр — `qty`. `$2` — `id`. `nil` сообщает об успехе. Одна команда уже выполняется в неявной транзакции, поэтому для изолированного уменьшения остатка явный `Begin` не нужен. Полный заказ с несколькими записями по-прежнему требует транзакции из GB-5.07.
+
+В предыдущей рабочей папке замените `store.go` на `_video/stages/02-store.go`, оставив прежнюю пустую строку в тесте. Предскажите: **A)** лишние продажи останутся · **B)** ровно 5 успехов · **C)** отказ всем.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Успешные уменьшения расходуют пять единиц. Остальные команды не находят строку с подходящим остатком. Тест проверяет пять повторений.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.217s
+```
+
+В видео записано `0.227s`, у нас `0.217s`. `PASS` подтверждает правило остатка; это не сравнение скорости реализаций.
+
+## Исправление 2: SELECT FOR UPDATE внутри tx
+
+Если для решения сначала нужно прочитать строку в Go, заблокируйте её при чтении:
+
+```sql
+SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+```
+
+`FOR UPDATE` блокирует выбранную строку. Записи или конфликтующие чтения с блокировкой из другой транзакции ждут. **Обычный SELECT остаётся разрешённым** и читает видимые подтверждённые данные. Блокировка не заставляет ждать всех читателей.
+
+| Шаг | A | B |
+|---|---|---|
+| 1 | `BEGIN`; чтение с блокировкой вернуло `1` | `BEGIN` |
+| 2 | держит блокировку строки | `SELECT … FOR UPDATE` ждёт |
+| 3 | записал `0`; `COMMIT` | ждёт завершения A |
+| 4 | завершён | блокирует обновлённую строку, читает `0`; отклоняет покупку |
+
+Предскажите чтение B после подтверждения A: **A)** старое `1` · **B)** текущее `0` · **C)** всегда ошибка.
+
+<details>
+<summary>Ответ</summary>
+
+**B** в этом эксперименте с READ COMMITTED. Чтение ждёт, затем возвращает обновлённую строку. Проверка в Go видит недостаточный остаток. При других уровнях изоляции параллельное изменение может потребовать повторить транзакцию.
+
+</details>
+
+`forupdate` запускает настоящие сеансы. Здесь B подтверждает транзакцию после чтения; в Go возврат `ErrNotEnoughStock` приводит к отложенному rollback.
+
+```console
+$ python3 _video/sessions.py forupdate
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[B] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+ stock 
+-------
+     1
+(1 row)
+
+[B] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+ stock 
+-------
+     0
+(1 row)
+
+[B] COMMIT;
+COMMIT
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Полный итоговый `store.go` включает оба подхода. Исходный комментарий на строке 45 говорит, что другой покупатель не может прочитать строку. Понимайте это как «не может выполнить конфликтующее чтение с блокировкой»: обычный SELECT разрешён.
+
+```go filename="store.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08, GB-5.05).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq (GB-5.07).
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi kerak (GB-5.07: manfiy miqdor qoldiqni oshirib yuborar edi).
+var ErrInvalidQuantity = errors.New("miqdor noldan katta boʻlishi kerak")
+
+// Store — Postgres'dagi bozor jadvallariga Go'dan kirish (GB-5.05).
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Buy id mahsulotdan qty dona sotadi. Tekshiruv va kamaytirish bitta UPDATE buyrugʻida:
+// "WHERE stock >= $1" shart bajarilmasa qator oʻzgarmaydi va RowsAffected() nol boʻladi.
+// Bu darsda id mavjud deb faraz qilinadi: nol qator "qoldiq yetmaydi" degani (mavjud boʻlmagan id ham nol qator beradi;
+// ikkisini ajratish uchun alohida SELECT kerak, BuyLocked esa ErrNoRows orqali ErrNotFound beradi).
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+
+// BuyLocked ham sotadi, lekin boshqacha: avval qatorni FOR UPDATE bilan qulflaydi, qoldiqni Go'da tekshiradi,
+// keyin yozadi. Qulf transaction tugaguncha turadi, shuning uchun boshqa xaridorning FOR UPDATE'i yoki UPDATE'i shu qatorni kutadi (oddiy SELECT kutmaydi).
+func (s *Store) BuyLocked(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+Общие объявления на строках 1–23 импортируют пакеты, создают три значения ошибок (sentinel-ошибки) через `errors.New` и определяют `Store` с `pool *pgxpool.Pool`. `ErrNotFound` — товар не найден, `ErrNotEnoughStock` — недостаточный остаток, `ErrInvalidQuantity` требует положительное количество. Каждая — отдельное значение ошибки, которое вызывающий код распознаёт через `errors.Is`. Строки 29–42 — уже разобранный условный метод.
+
+Только новые части `BuyLocked`:
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 46–49 | метод и проверка количества | те же входы и правило неверного количества, что у `Buy` |
+| 50–54 | `Begin`; отложенный rollback | сохраняет чтение и запись на одном соединении транзакции |
+| 56–58 | `tx.QueryRow(... FOR UPDATE).Scan(&stock)` | получает блокировку и читает остаток |
+| 59–64 | ветки отсутствия строки и других ошибок | заменяет `pgx.ErrNoRows` на `ErrNotFound`; сохраняет остальные ошибки |
+| 65–67 | проверка остатка | отклоняет покупку, ещё удерживая блокировку строки |
+| 68–72 | `tx.Exec`; проверка ошибки | записывает остаток, вычисленный под блокировкой |
+| 73 | `tx.Commit(ctx)` | подтверждает запись и завершает транзакцию |
+
+При любом раннем выходе после `Begin` выполняется отложенный rollback. Успешный commit тоже завершает транзакцию; последующий отложенный rollback возвращает `ErrTxClosed`, который этот шаблон игнорирует.
+
+В новой копии модуля с исходными `store.go`, `store_test.go`, `go.mod`, `go.sum` и `bozor.sql` команда `go test` проверяет оба метода остатка. Предскажите: **A)** оба проходят · **B)** проходит только условный UPDATE · **C)** оба продают лишнее.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Каждый метод разрешает ровно пять успешных покупок в каждом из пяти повторений. Теперь чтение–проверка–запись удерживает блокировку базы на протяжении этих шагов.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.378s
+```
+
+Соответствующий запуск в видео — `0.381s`, у нас — `0.378s`. Это длительности теста, а не измерение пропускной способности. Полезный счёт: **5/20 приняты, 15/20 отклонены**, итоговый остаток ноль. Наивный запуск принял **20/20** — в четыре раза больше доступных пяти единиц.
+
+## Выбор метода и общая граница
+
+| Требование | Выбор | Цена или ограничение |
+|---|---|---|
+| правило помещается в `stock >= qty` | условный UPDATE | ноль строк не различает отсутствие товара и недостаточный остаток |
+| прочитать, решить в Go, записать | `FOR UPDATE` в одной транзакции | блокировка удерживается во время решения в Go; транзакция должна быть короткой |
+| изменить остаток и оформить заказ | включить выбранное правило в транзакцию заказа | все связанные записи должны идти через один `tx` |
+
+У двух серверов приложения свой `sync.Mutex` у каждого. Предотвратит ли это ошибку в базе? **A)** да · **B)** только внутри каждого процесса · **C)** только с race detector.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Мьютекс Go координирует горутины одного процесса, использующие именно этот мьютекс. У другого сервера другой мьютекс. Правило базы должно координировать оба сервера. Race detector не обеспечивает условие остатка в SQL.
+
+</details>
+
+## Частые ошибки
+
+**1. Отправить FOR UPDATE через пул.** Это классическая тихая ошибка. После `tx := … Begin` замените только чтение в `BuyLocked` на:
+
+```go
+var stock int
+err = s.pool.QueryRow(ctx,
+	"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+```
+
+Это фрагмент из `_video/stages/04-store-pool-mistake.go`. `pool.QueryRow` использует отдельное соединение вместо соединения, занятого `tx`. Его неявная транзакция завершается вместе с командой; блокировка строки снимается до последующего `tx.Exec`. Поэтому наличие слов `FOR UPDATE` не защищает всю операцию.
+
+Предскажите тест: **A)** PASS, ведь FOR UPDATE написан · **B)** FAIL, слишком много успехов · **C)** всегда panic.
+
+<details>
+<summary>Ответ</summary>
+
+**B** в нашем запуске. Команда корректна, поэтому синтаксическая ошибка SQL или panic не обязательны. Блокировка чтения не охватывает запись в другой транзакции.
+
+</details>
+
+В предыдущей новой копии для тестов остатка замените `store.go` на `_video/stages/04-store-pool-mistake.go` и выполните:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.31s)
+    --- FAIL: TestConcurrentBuyers/BuyLocked (0.12s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.397s
+```
+
+Проверка в `store_test.go:172` ожидала пять, но получила 20. В видео — `0.381s`, здесь — `0.397s`. **Исправление:** и чтение, и запись должны использовать `tx`, как в полном итоговом файле. У тестов пул на 40 соединений; при 20 покупателях и меньшем пуле ошибка может исчерпать соединения, потому что каждый удерживает одно и просит второе.
+
+**2. Считать BEGIN резервированием остатка.** Наивный пример уже показал эту тихую ошибку. Блокируйте перед чтением или объединяйте условие и уменьшение.
+
+**3. Полагаться только на CHECK при записи устаревшего абсолютного значения.** Оба покупателя записывают ноль и проходят `CHECK (stock >= 0)`. Незащищённое *относительное* уменьшение ниже нуля вызывает ошибку. Сценарий `check` сначала устанавливает остаток ноль; его полный вывод:
+
+```console
+$ python3 _video/sessions.py check
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4;
+ERROR:  new row for relation "products" violates check constraint "products_stock_check"
+DETAIL:  Failing row contains (4, oʻrik, 3500000, -1, t).
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+`violates check constraint` — новая строка нарушает именованное ограничение. `DETAIL` показывает отклонённую строку: товар 4, абрикос, цена `3500000` тийинов, остаток `-1`, активность `t` — true. После неуспешной команды остаток остаётся нулевым. Сохраните ограничение как последнюю защиту; для ожидаемого результата «недостаточный остаток» используйте условное правило.
+
+**4. Удерживать блокировки во время посторонней работы.** Завершайте транзакцию быстро; избегайте сетевых вызовов, пока строка остатка заблокирована. Несколько товаров блокируйте в одинаковом порядке, чтобы снизить риск deadlock — взаимного ожидания транзакций. Postgres прерывает одну из них, поэтому вызывающий код должен обработать ошибку.
+
+## Проверьте себя
+
+**1.** Что сообщает `RowsAffected() == 0`?
+
+<details>
+<summary>Ответ</summary>
+
+Команда обновила ноль строк. Для этого SQL либо отсутствует id, либо не выполнено условие остатка. `Buy` предполагает существующий id и возвращает `ErrNotEnoughStock`; задача с промокодом требует различить причины.
+
+</details>
+
+**2.** Когда заканчивается блокировка FOR UPDATE в `BuyLocked`? Может ли обычный SELECT читать в это время?
+
+<details>
+<summary>Ответ</summary>
+
+На этих путях кода блокировка действует до commit или rollback транзакции. Обычный SELECT может читать видимые подтверждённые данные при удерживаемой блокировке строки. Конфликтующие писатели и читатели с блокировкой ждут.
+
+</details>
+
+**3.** Из GB-5.05: `QueryRow` не нашёл строку. Где и какую ошибку вы получите?
+
+<details>
+<summary>Ответ</summary>
+
+`Scan` возвращает `pgx.ErrNoRows`. `BuyLocked` преобразует её в `ErrNotFound`.
+
+</details>
+
+**4.** Предскажите: остаток ноль. Что вернёт `UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1`? **A)** ошибку CHECK · **B)** `UPDATE 0` · **C)** `UPDATE 1`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Строка не проходит WHERE, поэтому команда не уменьшает остаток. То же правило сработало после возобновления ожидающего обновления.
+
+</details>
+
+## Домашнее задание
+
+Работайте с исходной копией стартового кода: [папка курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-08-ikki-xaridor/TASK.md), [ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor/solution).
+
+- 🟢 **Обязательно:** в `coupon.go` перепишите `UseCoupon(ctx, code)` одним условным UPDATE: `uses_left = uses_left - 1`, `WHERE code = $1 AND uses_left > 0`. У `BAHOR` изначально три использования; десять параллельных вызовов должны дать ровно три успеха. Верните `nil` при одной обновлённой строке.
+- 🟢 **Обязательное различение ошибок:** после нуля обновлённых строк отдельно прочитайте промокод. Преобразуйте `pgx.ErrNoRows` в `ErrCouponNotFound`; существующий исчерпанный код даёт `ErrCouponUsedUp`. Сохраните остальные ошибки базы.
+- 🟡 **Необязательно:** реализуйте `UseCouponLocked` через `Begin`, `tx.QueryRow(... FOR UPDATE)`, проверку в Go, `tx.Exec` и `Commit`. Тест пропускается только пока остаётся необязательная заглушка.
+
+Зелёные уровни назначены обязательным шагам на этой письменной странице; TASK.md их не задаёт. Не меняйте `store_test.go`, `coupon_test.go` и `naive_test.go`. Тесты создают отдельную временную схему и удаляют её после выполнения; им нужен работающий сервер Postgres.
+
+Запустите Postgres командой из начала урока, затем выполните `go test .` в стартовом коде. Точка выбирает текущий пакет. Наша повторная проверка упала на ожидаемой задаче с промокодом:
+
+```console
+$ go test .
+--- FAIL: TestUseCouponConcurrent (0.06s)
+    coupon_test.go:61: 1-urinish: promo-kod 3 marta, 10 kishi bir vaqtda: 9 tasiga oʻtdi; kutilgan: 3 (TASK.md)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.696s
+FAIL
+```
+
+`coupon_test.go:61` сообщает: «попытка 1: промокод на 3 использования, 10 человек одновременно: прошло 9, ожидалось 3». В выводе задачи времён видео записано 10; порядок выполнения меняет это число. Итоговые методы остатка уже правильные в стартовом коде.
+
+<details>
+<summary>Ответ</summary>
+
+Для `UseCoupon` метод `Exec` возвращает описание результата; `RowsAffected() == 1` означает успех. SELECT после нуля строк только определяет причину отказа; он не разрешает ещё одно уменьшение. Лаборатория не удаляет и не пополняет промокоды параллельно. Более широкая система должна определить влияние таких изменений на классификацию ошибки.
+
+Для необязательного метода возьмите `BuyLocked` за образец и измените таблицу, ключ и преобразование ошибок. Обе команды должны идти через одну транзакцию. Полный ответ — `solution/coupon.go`:
+
+```go filename="solution/coupon.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ErrCouponUsedUp — promo-kodning ishlatish soni tugagan.
+var ErrCouponUsedUp = errors.New("promo-kod tugagan")
+
+// ErrCouponNotFound — bunday promo-kod yoʻq.
+var ErrCouponNotFound = errors.New("promo-kod topilmadi")
+
+// UseCoupon promo-kodni bir marta ishlatadi: coupons.uses_left bittaga kamayadi.
+// Tekshiruv va kamaytirish bitta UPDATE buyrugʻida (WHERE uses_left > 0): parallel chaqiruvlarda ham roppa-rosa uses_left marta oʻtadi.
+func (s *Store) UseCoupon(ctx context.Context, code string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE coupons SET uses_left = uses_left - 1 WHERE code = $1 AND uses_left > 0", code)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Nol qator: promo-kod yoʻq yoki tugagan. Qaysi biri ekanini alohida oʻqib bilamiz.
+	var left int
+	err = s.pool.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return ErrCouponUsedUp
+}
+
+var errUseCouponLockedTODO = errors.New("UseCouponLocked hali yozilmagan")
+
+// UseCouponLocked ham promo-kodni ishlatadi, lekin boshqacha: qatorni FOR UPDATE bilan qulflaydi, Go'da tekshiradi, keyin yozadi.
+func (s *Store) UseCouponLocked(ctx context.Context, code string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var left int
+	err = tx.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1 FOR UPDATE", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if left == 0 {
+		return ErrCouponUsedUp
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE coupons SET uses_left = $1 WHERE code = $2", left-1, code)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+Новые имена: `code` определяет промокод, `left` хранит оставшиеся использования, `ErrCouponUsedUp` означает «промокод исчерпан», `ErrCouponNotFound` — «промокод не найден». Строки 19–26 выполняют защищённое уменьшение и возвращают успех. Строки 28–37 классифицируют результат с нулём строк. Строки 44–67 повторяют шаблон транзакции с проверкой `left == 0` под блокировкой строки. Строка 40 сохраняет исходную ошибку необязательной заглушки для проверяющего кода; реализованный метод больше её не возвращает.
+
+</details>
+
+У ответа собственный модуль. `cd` меняет рабочую папку, а `&&` запускает следующую команду только при успешной смене папки:
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	0.708s
+```
+
+`ok` означает, что все тесты решения прошли. В предыдущем запуске курса записано `0.700s`, у нас `0.708s`; условие правильности — три успеха из десяти вызовов. Вернитесь в папку лаборатории и удалите её контейнеры, сеть и том данных. `-v` удаляет том лаборатории:
+
+```bash
+cd ..
+docker compose down -v
+```
+
+## Источники
+
+- [PostgreSQL 18: READ COMMITTED](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED)
+- [PostgreSQL 18: блокировки строк](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS)
+- [PostgreSQL 18: взаимные блокировки](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-DEADLOCKS)
+- [PostgreSQL 18: блокировка в SELECT](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [PostgreSQL 18: UPDATE](https://www.postgresql.org/docs/18/sql-update.html)
+- [PostgreSQL 18: ROLLBACK](https://www.postgresql.org/docs/18/sql-rollback.html)
+- [pgx: Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+- [pgconn: CommandTag.RowsAffected](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#CommandTag.RowsAffected)
+- [pgxpool: Pool.QueryRow](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.QueryRow)
+- [Go: WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go)
+- [Go: Mutex](https://pkg.go.dev/sync#Mutex)
+- [Go: отдельная переменная цикла в каждой итерации](https://go.dev/blog/loopvar-preview)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. Консольные блоки получены повторным запуском; измерения из видео и прежних запусков курса явно отмечены в тексте. Это не бенчмарк.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+---
+
+← Предыдущий урок: [GB-5.07](/lab/youtube/gb/gb-5-07/ru) · Следующий урок: [GB-5.09](/lab/youtube/gb/gb-5-09/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

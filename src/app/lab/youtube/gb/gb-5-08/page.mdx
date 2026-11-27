@@ -1,0 +1,858 @@
+---
+title: "Ikki xaridor, bitta mahsulot: lost update va lock"
+date: "2026/11/27"
+description: "Postgres'da ortiqcha sotuvni qayta yarating, shartli UPDATE yoki SELECT FOR UPDATE bilan toʻsing va Go'da parallel xaridorlarni tekshiring."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 40
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-08"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-5-08/ru) · [English](/lab/youtube/gb/gb-5-08/en)  
+Dars GB-5.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-08) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Oʻrikdan bitta qoldi. Ikki xaridor sotib olishni bosdi, ikkalasiga ham «olindi» dedik. Bazada qoldiq `0`, xato yoʻq. Ikkinchi kamaytirish qayerga ketdi?
+
+**Bitta gʻoya:** transaction oʻzi alohida oʻqish, tekshirish va yozishni boshqa xaridordan himoyalamaydi. Qoldiq shartini `UPDATE`ga qoʻshing yoki qaror uchun oʻqishdan oldin qatorni qulflang.
+
+Darsdan keyin siz:
+
+- ikkita baza ulanishida **yoʻqolgan yangilanish**ni (lost update) qayta yaratasiz;
+- qoldiq tekshiruvi va kamaytirishni bitta shartli `UPDATE`ga birlashtirasiz;
+- `SELECT … FOR UPDATE`ni `tx` orqali ishlatib, kim kutishini tushuntirasiz;
+- parallel xaridorlarni tekshirib, promo-kod vazifasini tuzatasiz.
+
+| Soʻz | Sodda maʼnosi | Inglizcha atama |
+|---|---|---|
+| yoʻqolgan yangilanish | ikki xaridor bir xil eski qoldiqdan hisoblaydi; bitta kamaytirish yoʻqoladi | lost update |
+| shartli UPDATE | qatorni tekshirish va oʻzgartirish bitta SQL buyrugʻida | conditional UPDATE |
+| qator qulfi | zid yozuvlar va qulfli oʻqishlar transaction tugashini kutadi | row-level lock |
+
+**Ortiqcha sotuv** (overselling) — bor qoldiqdan koʻproq xaridni qabul qilish. `CommandTag` — `Exec` qaytaradigan natija yozuvi; `RowsAffected()` undan qator sonini oladi.
+
+## Oldin bilish kerak
+
+- [GB-5.07 · Transaction](/lab/youtube/gb/gb-5-07): `Begin`, `Commit`, `Rollback`, `tx.Exec` va `tx.QueryRow`.
+- [GB-4.07 · Parallel soʻrovlar](/lab/youtube/gb/gb-4-07): xotirada yoʻqolgan yangilanish, `sync.Mutex`, `wg.Go` va `wg.Wait`.
+- [GB-5.05 · pgx va ulanishlar pool'i](/lab/youtube/gb/gb-5-05): `QueryRow`, `Scan`, `$1`, context va `pgx.ErrNoRows`.
+- [GB-5.03 · SQL jadvallari](/lab/youtube/gb/gb-5-03), [GB-5.04 · Bogʻlangan jadvallar](/lab/youtube/gb/gb-5-04), [GB-5.02 · Docker'da Postgres](/lab/youtube/gb/gb-5-02): `products`, constraint, `psql` va Compose.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09), [GB-2.08 · Error](/lab/youtube/gb/gb-2-08), [GB-2.05 · Metodlar](/lab/youtube/gb/gb-2-05), [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01).
+- [GB-1.08 · Testlar](/lab/youtube/gb/gb-1-08), [GB-1.07 · Funksiyalar](/lab/youtube/gb/gb-1-07), [GB-1.06 · Sikllar](/lab/youtube/gb/gb-1-06), [GB-1.05 · Shartlar](/lab/youtube/gb/gb-1-05), [GB-1.02 · Oʻzgaruvchilar](/lab/youtube/gb/gb-1-02), [GB-1.01 · Birinchi dastur](/lab/youtube/gb/gb-1-01).
+
+GB-5.07 dan: transaction ichida `UPDATE`, keyin `ROLLBACK` bajarildi. Qaysi qoldiq qoladi? **A)** yangilashdan oldingi · **B)** yangilashdan keyingi · **C)** `NULL`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** `ROLLBACK` transaction oʻzgarishlarini bekor qiladi. `COMMIT` ularni tasdiqlaydi. Bugun ikkita transaction birga ishlashini koʻramiz.
+
+</details>
+
+`lessons/gb-5-08-ikki-xaridor` nusxasida ishlang. Modul uchun Go 1.27.4, pgx v5.13.0 va Docker Compose 2.20 yoki yangirogʻi kerak. Haqiqiy Postgres serverga ulanadi, shuning uchun Playground oʻrniga mahalliy papkadan foydalaning. Quyidagi sozlamalar barcha Go tekshiruvlariga qoʻllandi:
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+```
+
+`CGO_ENABLED=0` C integratsiyasini oʻchiradi; gcc kerak emas. `GOTOOLCHAIN` Go versiyasini tanlaydi. Tekshiruvimizda `5458` port boʻsh edi. Band boʻlsa, nusxadagi `compose.yaml` portini almashtiring va `DATABASE_URL`ni moslang. Aks holda testlar papkaning standart ulanish sozlamalarini ishlatadi.
+
+Nusxamizdagi Compose loyiha nomi `gb508doc`; kursda `gb508`, videoda `bozor`. Shu sabab konteyner nomi farq qiladi. Ishlab turgan konteynerni qayta boshlashning toʻliq chiqishi:
+
+```console
+$ docker compose up -d --wait
+ Container gb508doc-db-1 Running 
+ Container gb508doc-db-1 Waiting 
+ Container gb508doc-db-1 Healthy 
+```
+
+`up` xizmatlarni boshlaydi, `-d` fonda qoldiradi, `--wait` tayyorlikni kutadi. `Running` — ishlayapti; `Waiting` — tayyorlik tekshiruvi kutilmoqda; `Healthy` — tekshiruv oʻtdi. Birinchi boshlashda yaratish xabarlari ham chiqadi.
+
+`bozor.sql`ni qoʻllang. U laboratoriya jadvallarini maʼlumotlari bilan oʻchirib, qayta yaratadi. Bu tekshiruvda jadvallar avvaldan bor edi. Yangi bazada yana toʻrtta `NOTICE … does not exist, skipping` xabari chiqadi.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+CREATE TABLE
+INSERT 0 1
+```
+
+`exec db` baza xizmati ichida `psql`ni bajaradi; `-f /lab/bozor.sql` ulangan SQL faylni oʻqiydi. `DROP TABLE` eski jadvallarni oʻchiradi, `CREATE TABLE` jadval yaratadi, `INSERT 0 n` esa qoʻshilgan `n` qatorni bildiradi. Oxirgi qator uch marta ishlatiladigan `BAHOR` promo-kodini qoʻshadi.
+
+Bu laboratoriya qoldiq qoidasini ajratadi: `Buy` `orders` yoki `order_items`ga yozmaydi. Toʻliq buyurtma transaction'i GB-5.07 da qoladi.
+
+## Ikki ulanish, bitta eski qiymat
+
+`products.stock`da `CHECK (stock >= 0)` bor. `id=4` mahsulot — `oʻrik`. Qoldigʻini bitta qilib, tekshiramiz:
+
+```console
+$ docker compose exec db psql -c "UPDATE products SET stock = 1 WHERE id = 4"
+UPDATE 1
+```
+
+```console
+$ docker compose exec db psql -c "SELECT name, stock FROM products WHERE id = 4"
+ name  | stock 
+-------+-------
+ oʻrik |     1
+(1 row)
+```
+
+`UPDATE … SET` ustunga qiymat beradi; `WHERE id = 4` mahsulotni tanlaydi. `UPDATE 1` bitta yangilangan qatorni sanaydi. Mos qatorga oʻzining eski qiymati yozilsa ham sanaladi. Bu sotilgan dona soni emas. Jadvalda mahsulot nomi, qoldiq va `(1 row)` — bitta qator bor.
+
+Laboratoriya papkasida ikkita terminalda `docker compose exec db psql`ni oching. Har biri alohida baza ulanishi, yaʼni seans. Jurnaldagi `[A]` va `[B]` seansni bildiradi; bu old qoʻshimchalarni SQL bilan yozmang.
+
+| Qadam | A | B | Tasdiqlangan qoldiq |
+|---|---|---|---|
+| 1 | `BEGIN`; `1` oʻqidi | | `1` |
+| 2 | | `BEGIN`; `1` oʻqidi | `1` |
+| 3 | hisoblangan `0`ni yozdi; `COMMIT` | hali `1`ni eslab turibdi | `0` |
+| 4 | | oʻzi hisoblagan `0`ni yozdi; `COMMIT` | `0` |
+
+Ikkala ilova ham bir dona bor deb qaror qiladi. B yozishidan oldin A tasdiqlaydi. B'ning `UPDATE products SET stock = 0 WHERE id = 4` buyrugʻi nima qaytaradi?
+
+**A)** qator oʻzgargani uchun xato · **B)** `UPDATE 1` · **C)** A'ni kutadi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Qator hali `id=4`ga mos, nol yozish esa mumkin. Oldin oʻqilgan qoldiqni tekshiradigan shart yoʻq. A tasdiqlab boʻlgan, shuning uchun B uni kutmaydi. A javobi bu buyruq soʻramagan avtomatik eski qiymat tekshiruvini faraz qiladi.
+
+</details>
+
+Papkadagi yordamchi dastur shu tartibni ikkita haqiqiy `psql` seansida bajaradi. `python3` `_video/sessions.py`ni bajaradi; `naive` oʻqi–tekshir–yoz holatini tanlaydi. Boshlangʻich `UPDATE 1` qoldiqni tiklaydi. `oxirgi` yakuniy qoldiqni bildiradi. Bu qayta tekshiruvimizning toʻliq jurnali:
+
+```console
+$ python3 _video/sessions.py naive
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[B] BEGIN;
+BEGIN
+
+[B] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[B] COMMIT;
+COMMIT
+
+[A] SELECT stock FROM products WHERE id = 4;
+ stock 
+-------
+     0
+(1 row)
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Ikkita muvaffaqiyatli xarid hisobda bitta donani sarfladi: bitta kamaytirish yoʻqoldi. Nol mumkin boʻlgani uchun `CHECK` oʻtadi. Yakuniy ustun qiymati toʻgʻri boʻlishi sotuv soni toʻgʻriligini isbotlamaydi.
+
+## Nega BEGIN oʻqi–tekshir–yozni tuzatmaydi?
+
+Postgres standarti — **READ COMMITTED**. Bu izolyatsiya darajasi transaction'lar orasida nimalar koʻrinishini belgilaydi. Oddiy `SELECT` boshqa transaction'larning soʻrov boshlanishidan oldin tasdiqlangan maʼlumotini koʻradi. Oʻz transaction'ining oldingi yozuvlarini ham koʻradi.
+
+B A tasdiqlashidan oldin oʻqidi. Keyingi `UPDATE` yangi buyruq, lekin `SET stock = 0` B'ning eski Go oʻzgaruvchisidan hisoblangan qiymatni yozadi. Kamaytirish bazadagi qiymatdan qayta hisoblanmaydi. READ COMMITTED'da zid yangilash kutib, keyin qatorning yangiroq nusxasiga ishlashi mumkin. Keyingi boʻlim shu qoidaga tayanadi.
+
+Bu bazadagi yoʻqolgan yangilanish; GB-4.07 dagi xotira xatosiga bogʻliq. Bu Go xotirasida data race borligini isbotlamaydi. Go race detector'i bu SQL biznes qoidasini tekshirmaydi.
+
+Koʻrsatish uchun berilgan toʻliq `naive.go` quyida. U `Store` va xato qiymatlari joylashgan `store.go` bilan birga `bozor` paketiga kiradi. Bu alohida `main` dasturi emas.
+
+```go filename="naive.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// buyNaive — videoning birinchi, XATO versiyasi: transaction bor, lekin oʻqish va yozish orasida qulf yoʻq.
+// Ikki xaridor bir xil eski qoldiqni oʻqib, ikkalasi ham yozadi (lost update). Faqat koʻrsatish uchun (naive_test.go): ishlatmang.
+func (s *Store) buyNaive(ctx context.Context, id int64, qty int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1, 3–8 | `package`, `import` | `bozor` paketiga kiradi; context, xato tekshiruvi va pgx'ni import qiladi |
+| 10–12 | izoh va `buyNaive` | koʻrsatish metodi; `s *Store` receiver, `id` mahsulot, `qty` dona soni |
+| 13–17 | `Begin`, xato shoxi, kechiktirilgan rollback | `tx`ga bitta ulanish oladi; boshlash xatosini qaytaradi; har chiqish uchun rollback rejalaydi |
+| 19–21 | `var stock int`; `QueryRow(...).Scan(&stock)` | bitta qoldiqni `&stock` manziliga oʻqiydi; `$1` — `id` |
+| 22–27 | `errors.Is`; `if err != nil` | qator yoʻqligini `ErrNotFound`ga aylantiradi; boshqa oʻqish xatosini qaytaradi |
+| 28–30 | `stock < qty` | eslab qolingan qoldiq yetmasa `ErrNotEnoughStock` qaytaradi |
+| 31–32 | `_, err = tx.Exec(...)` | `_` bilan natija yozuvini tashlaydi; `stock-qty`ni `$1`, `id`ni `$2` qilib yozadi |
+| 33–36 | xato shoxi; `tx.Commit(ctx)` | yozish xatosini qaytaradi yoki tasdiqlaydi; commit xatosi chaqiruvchiga yetadi |
+
+Boʻsh qator va `//` izohlar bajarilishga taʼsir qilmaydi. `:=` oʻzgaruvchi yaratadi; `=` boriga qiymat beradi. Nuqta metodni tanlaydi; qavs chaqiradi, jingalak qavslar blok chegarasini belgilaydi, `return` metoddan chiqadi. Bu yozilishlar oldingi darslarda bor.
+
+`buyNaive` ataylab faqat musbat xaridni koʻrsatadi; unda `qty <= 0` himoyasi yoʻq. Ikkala yakuniy metod notoʻgʻri miqdorni rad etadi. Transaction shu xaridor yozuvlarini birga tasdiqlaydi yoki bekor qiladi. U oldin oʻqilgan qoldiqni shu xaridorga band qilmaydi.
+
+Test qoldiq 5 boʻlganda 20 xaridorni boshlaydi. Berilgan yordamchi funksiyadan qisqartirilgan markaziy sikl:
+
+```go
+errs := make([]error, 20)
+var wg sync.WaitGroup
+for i := range errs {
+	wg.Go(func() {
+		errs[i] = store.Buy(ctx, 4, 1)
+	})
+}
+wg.Wait()
+```
+
+`make([]error, 20)` 20 natija joyini ajratadi. `i` — joy indeksi; `wg.Go` funksiyani goroutine'da boshlaydi. Har biri faqat `errs[i]`ga yozadi. Har aylanishning alohida `i`si bor. `wg.Wait()` hammani kutadi. Chaqiruvchi `nil`ni muvaffaqiyat deb sanaydi, rad etilgan xaridor uchun `ErrNotEnoughStock`ni qabul qiladi. `WaitGroup` toʻliq [GB-7.01](/lab/youtube/gb#gb-7-01)da oʻtiladi.
+
+Naive metod nechta muvaffaqiyat bildirishi mumkin? **A)** doim 5 · **B)** 5 tadan koʻp, hatto 20 · **C)** doim panic.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bir nechta xaridor hech kim yozmasidan oldin bir xil qoldiqni oʻqishi mumkin. Videoda 20 qayd etilgan, bu tekshiruvda ham 20. Bajarilish tartibi sonni oʻzgartiradi. Yuqoridagi SQL ketma-ketligi vaqtga tayanmasdan xatoni tushuntiradi. Transaction A javobini avtomatik bermaydi; toʻgʻri SQL panic berishi shart emas.
+
+</details>
+
+Hech qanday faylni oʻzgartirmasdan namoyish testini bajaring:
+
+```console
+$ go test -run Naive -v
+=== RUN   TestNaiveOversells
+    naive_test.go:15: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik
+--- PASS: TestNaiveOversells (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.104s
+```
+
+Bu yerda `PASS` test **xatoni kuzatganini** bildiradi. Xabar: birinchi urinish, 20 xaridor, omborda 5 ta, 20 tasiga «olindi» dedik. Yakuniy metodlarning boshqa testi roppa-rosa beshta muvaffaqiyatni talab qiladi.
+
+Videodagi qizil testni ham qaytarish mumkin. Boʻsh ishchi papkaga `go.mod`, `go.sum`, `bozor.sql` va `store_test.go`ni nusxalang. `_video/stages/01-store.go`ni `store.go` nomida oling. Shu nusxadagi `store_test.go`ning `{"BuyLocked", (*Store).BuyLocked},` qatorini butunlay boʻshating, yangi qator belgisini saqlang. Bu bosqichda faqat `Buy` bor. Oʻsha papkada `go test` bajaring:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.08s)
+    --- FAIL: TestConcurrentBuyers/Buy (0.08s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.128s
+```
+
+`--- FAIL` test va ichki testni nomlaydi. `store_test.go:172` tekshiruv manzili: olingan 20, kutilgan 5. `exit status 1` muvaffaqiyatsiz tugashni bildiradi. Oxirgi qator modul va vaqtni beradi. Videoda `0.126s`, bu safar `0.128s`; bu vaqtlar unumdorlikni isbotlamaydi.
+
+## 1-tuzatish: tekshiruv va kamaytirish bitta UPDATE'da
+
+Qoida bitta SQL shartiga sigʻadi:
+
+```sql
+UPDATE products
+SET stock = stock - 1
+WHERE id = 4 AND stock >= 1;
+```
+
+`SET` qatorning hozirgi qoldigʻidan hisoblaydi. `AND` id mosligini ham, kamida bir dona borligini ham talab qiladi. `UPDATE` transaction tugaguncha zid yozuvchilarga qarshi qator qulfini ushlaydi. Mos kelmagan qator yangilanmaydi.
+
+Qoldiqni bittaga tiklang. A boshlaydi va kamaytiradi, lekin transaction'ni ochiq qoldiradi. B shu shartli buyruqni yuborib kutadi. A tasdiqlagach B nima qaytaradi?
+
+**A)** `UPDATE 1`, qoldiq `-1` · **B)** `UPDATE 0` · **C)** CHECK xatosi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Kutishdan keyin Postgres `WHERE`ni yangilangan qatorga qayta tekshiradi. Qoldiq nol, `stock >= 1` yolgʻon. Hech narsa kamaymaydi. A shartni eʼtiborsiz qoldiradi; C kamaytirish qator tanlanishidan oldin boʻladi deb hisoblaydi.
+
+</details>
+
+`shartli` shu holatni tanlaydi. Yordamchi dastur A tasdiqlaguncha B ikki soniya javob bermasligini tekshiradi. `kutyapti = True` — kutmoqda; bu qatorni Postgres emas, yordamchi dastur chiqaradi.
+
+```console
+$ python3 _video/sessions.py shartli
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+UPDATE 1
+
+[B] UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+UPDATE 0
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+| Payt | A | B | Tasdiqlangan ishlar boʻyicha qoldiq |
+|---|---|---|---|
+| A yangiladi | qator qulfi bor; tasdiqlanmagan `0` | | `1` |
+| B yangilamoqda | hali ochiq | A'ni kutadi | `1` |
+| A tasdiqladi | qulf ochildi | `0 >= 1`ni qayta tekshirdi; nol qator yangiladi | `0` |
+
+`store.go`dagi Go metodi, parcha sifatida:
+
+```go
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+```
+
+`qty <= 0` SQL'dan oldin `ErrInvalidQuantity` qaytaradi. `Exec` `tag`, yaʼni `CommandTag`, hamda `err`ni qaytaradi. Avval SQL xatosini qaytaring, keyin `tag.RowsAffected()`ni tekshiring. Nol — hech qaysi qator yangilanmagan. Bu yerda mahsulot bor deb faraz qilib, `ErrNotEnoughStock` qaytaramiz; yoʻq id ham nol beradi.
+
+`$1` ikki marta yozilgan, lekin bitta `qty` parametri. `$2` — `id`. `nil` muvaffaqiyatni bildiradi. Bu bitta buyruq oʻzining avtomatik transaction'ida bajariladi. Ajratilgan qoldiq kamaytirish uchun alohida `Begin` kerak emas. Bir nechta yozuvli toʻliq buyurtmaga GB-5.07 dagi transaction hali kerak.
+
+Oldingi ishchi papkada `store.go`ni `_video/stages/02-store.go` bilan almashtiring. Testdagi oʻsha boʻsh qator qolsin. Bashorat: **A)** ortiqcha sotuv qoladi · **B)** roppa-rosa 5 muvaffaqiyat · **C)** hamma rad etiladi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Muvaffaqiyatli kamaytirishlar besh donani sarflaydi. Qolgan buyruqlar shartga mos qoldiqli qator topmaydi. Test besh marta tekshiradi.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.217s
+```
+
+Videoda `0.227s`, bizda `0.217s`. `PASS` qoldiq qoidasini tasdiqlaydi; bu usullarning tezlik taqqoslanishi emas.
+
+## 2-tuzatish: tx ichida SELECT FOR UPDATE
+
+Qaror uchun qatorni avval Go'ga oʻqish kerak boʻlsa, oʻqishda qulflang:
+
+```sql
+SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+```
+
+`FOR UPDATE` tanlangan qatorni qulflaydi. Boshqa transaction yozuvlari yoki zid qulfli oʻqishlari kutadi. **Oddiy SELECT mumkin**: u koʻrinadigan tasdiqlangan maʼlumotni oʻqiydi. Qulf hamma oʻquvchini kutdirmaydi.
+
+| Qadam | A | B |
+|---|---|---|
+| 1 | `BEGIN`; qulfli oʻqish `1` berdi | `BEGIN` |
+| 2 | qator qulfini ushlab turibdi | `SELECT … FOR UPDATE` kutadi |
+| 3 | `0` yozdi; `COMMIT` | A tugashini kutadi |
+| 4 | tugadi | yangilangan qatorni qulflab, `0` oʻqidi; xaridni rad etdi |
+
+A tasdiqlagach B'ning qulfli oʻqishini bashorat qiling: **A)** eski `1` · **B)** hozirgi `0` · **C)** doim xato.
+
+<details>
+<summary>Javob</summary>
+
+Bu READ COMMITTED tajribasida **B**. Oʻqish kutib, keyin yangilangan qatorni qaytaradi. Go tekshiruvi qoldiq yetmasligini koʻradi. Boshqa izolyatsiya darajalarida parallel oʻzgarish transaction'ni qayta urinishni talab qilishi mumkin.
+
+</details>
+
+`forupdate` haqiqiy seanslarni bajaradi. Bu yerda B oʻqishdan keyin tasdiqlaydi. Go'da `ErrNotEnoughStock` qaytarish kechiktirilgan rollback yoʻlidan ketadi.
+
+```console
+$ python3 _video/sessions.py forupdate
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] BEGIN;
+BEGIN
+
+[B] BEGIN;
+BEGIN
+
+[A] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+ stock 
+-------
+     1
+(1 row)
+
+[B] SELECT stock FROM products WHERE id = 4 FOR UPDATE;
+(2 soniya javob yoʻq: kutyapti = True)
+
+[A] UPDATE products SET stock = 0 WHERE id = 4;
+UPDATE 1
+
+[A] COMMIT;
+COMMIT
+
+[B] (kutgan buyruqning javobi)
+ stock 
+-------
+     0
+(1 row)
+
+[B] COMMIT;
+COMMIT
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+Ikkala usulni ham oʻz ichiga olgan toʻliq yakuniy `store.go` quyida. Uning 45-qatoridagi asl izoh boshqa xaridor qatorni oʻqiy olmaydi deydi. Buni «zid qulfli oʻqishni bajara olmaydi» deb oʻqing: oddiy SELECT mumkin.
+
+```go filename="store.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08, GB-5.05).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq (GB-5.07).
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi kerak (GB-5.07: manfiy miqdor qoldiqni oshirib yuborar edi).
+var ErrInvalidQuantity = errors.New("miqdor noldan katta boʻlishi kerak")
+
+// Store — Postgres'dagi bozor jadvallariga Go'dan kirish (GB-5.05).
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Buy id mahsulotdan qty dona sotadi. Tekshiruv va kamaytirish bitta UPDATE buyrugʻida:
+// "WHERE stock >= $1" shart bajarilmasa qator oʻzgarmaydi va RowsAffected() nol boʻladi.
+// Bu darsda id mavjud deb faraz qilinadi: nol qator "qoldiq yetmaydi" degani (mavjud boʻlmagan id ham nol qator beradi;
+// ikkisini ajratish uchun alohida SELECT kerak, BuyLocked esa ErrNoRows orqali ErrNotFound beradi).
+func (s *Store) Buy(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1", qty, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotEnoughStock
+	}
+	return nil
+}
+
+// BuyLocked ham sotadi, lekin boshqacha: avval qatorni FOR UPDATE bilan qulflaydi, qoldiqni Go'da tekshiradi,
+// keyin yozadi. Qulf transaction tugaguncha turadi, shuning uchun boshqa xaridorning FOR UPDATE'i yoki UPDATE'i shu qatorni kutadi (oddiy SELECT kutmaydi).
+func (s *Store) BuyLocked(ctx context.Context, id int64, qty int) error {
+	if qty <= 0 {
+		return ErrInvalidQuantity
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var stock int
+	err = tx.QueryRow(ctx,
+		"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if stock < qty {
+		return ErrNotEnoughStock
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE products SET stock = $1 WHERE id = $2", stock-qty, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+1–23-qatorlardagi umumiy eʼlonlar paketlarni import qiladi, `errors.New` bilan uchta sentinel xato yaratadi va `pool *pgxpool.Pool`li `Store`ni belgilaydi. `ErrNotFound` — mahsulot yoʻq; `ErrNotEnoughStock` — qoldiq yetmaydi; `ErrInvalidQuantity` — musbat miqdor kerak. Har biri chaqiruvchi `errors.Is` bilan taniydigan bitta xato qiymati. 29–42-qatorlar yuqorida tushuntirilgan shartli metod.
+
+Faqat `BuyLocked`ning yangi qismlari:
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 46–49 | metod va miqdor himoyasi | `Buy` bilan bir xil kirish va notoʻgʻri miqdor qoidasi |
+| 50–54 | `Begin`; kechiktirilgan rollback | oʻqish va yozishni bitta transaction ulanishida saqlaydi |
+| 56–58 | `tx.QueryRow(... FOR UPDATE).Scan(&stock)` | qulf oladi va qoldiqni oʻqiydi |
+| 59–64 | qator yoʻqligi va boshqa xato shoxlari | `pgx.ErrNoRows`ni `ErrNotFound`ga aylantiradi; boshqasini saqlaydi |
+| 65–67 | qoldiq tekshiruvi | qator qulfi hali ushlab turilganida xaridni rad etadi |
+| 68–72 | `tx.Exec`; xato tekshiruvi | qulf ostida hisoblangan qoldiqni yozadi |
+| 73 | `tx.Commit(ctx)` | yozuvni tasdiqlab, transaction'ni tugatadi |
+
+`Begin`dan keyingi har erta chiqishda kechiktirilgan rollback bajariladi. Muvaffaqiyatli commit ham transaction'ni tugatadi. Keyingi kechiktirilgan rollback `ErrTxClosed` beradi; bu andoza uni eʼtiborsiz qoldiradi.
+
+Asl `store.go`, `store_test.go`, `go.mod`, `go.sum` va `bozor.sql`li yangi modul nusxasida `go test` ikkala qoldiq metodini tekshiradi. Bashorat: **A)** ikkalasi oʻtadi · **B)** faqat shartli UPDATE oʻtadi · **C)** ikkalasi ortiqcha sotadi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Har usul beshta takrorning har birida roppa-rosa beshta muvaffaqiyatli xaridga ruxsat beradi. Oʻqi–tekshir–yoz endi shu qadamlar davomida baza qulfini ushlaydi.
+
+</details>
+
+```console
+$ go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.378s
+```
+
+Videodagi mos tekshiruv `0.381s`; bizda `0.378s`. Bular test vaqtlari, oʻtkazuvchanlik oʻlchovi emas. Foydali hisob: **5/20 qabul qilindi, 15/20 rad etildi**, oxirgi qoldiq nol. Naive tekshiruvda **20/20** qabul qilindi — bor besh donadan toʻrt marta koʻp.
+
+## Usul tanlash va umumiy chegara
+
+| Talab | Tanlov | Narxi yoki chegarasi |
+|---|---|---|
+| qoida `stock >= qty`ga sigʻadi | shartli UPDATE | nol qator mahsulot yoʻqligi va qoldiq yetmasligini ajratmaydi |
+| oʻqing, Go'da qaror qiling, yozing | bitta transaction ichida `FOR UPDATE` | Go qaror qilayotganda qulf turadi; transaction qisqa boʻlsin |
+| qoldiqni yozish va toʻliq buyurtma | tanlangan qoidani buyurtma transaction'iga qoʻshish | barcha bogʻliq yozuvlar bitta `tx` orqali ketishi kerak |
+
+Ikkita ilova serverining har birida oʻz `sync.Mutex`i bor. Bazadagi xatoni toʻsadimi? **A)** ha · **B)** faqat har jarayon ichida · **C)** faqat race detector bilan.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Go mutex'i bitta jarayonda shu mutex'ni boʻlishadigan goroutine'larni muvofiqlashtiradi. Boshqa serverda boshqa mutex bor. Baza qoidasi ikkala serverni muvofiqlashtirishi kerak. Race detector SQL qoldiq shartini bajartira olmaydi.
+
+</details>
+
+## Koʻp uchraydigan xatolar
+
+**1. FOR UPDATE'ni pool orqali yuborish.** Bu klassik jim xato. `tx := … Begin`dan keyin `BuyLocked`dagi faqat oʻqishni shunga almashtiring:
+
+```go
+var stock int
+err = s.pool.QueryRow(ctx,
+	"SELECT stock FROM products WHERE id = $1 FOR UPDATE", id).Scan(&stock)
+```
+
+Bu `_video/stages/04-store-pool-mistake.go`dagi parcha. `pool.QueryRow` `tx` band qilgan ulanish oʻrniga alohida ulanish oladi. Uning avtomatik transaction'i shu buyruq bilan tugaydi. Keyingi `tx.Exec`dan oldin qator qulfi ochiladi. Demak, `FOR UPDATE` soʻzlari butun operatsiyani himoyalamaydi.
+
+Testni bashorat qiling: **A)** FOR UPDATE borligi uchun PASS · **B)** FAIL, ortiqcha muvaffaqiyat · **C)** doim panic.
+
+<details>
+<summary>Javob</summary>
+
+Tekshiruvimizda **B**. Buyruq toʻgʻri, shuning uchun SQL sintaksis xatosi yoki panic shart emas. Oʻqish qulfi boshqa transaction'dagi yozuvni qamramaydi.
+
+</details>
+
+Oldingi yangi qoldiq-test nusxasida `store.go`ni `_video/stages/04-store-pool-mistake.go` bilan almashtirib, bajaring:
+
+```console
+$ go test
+--- FAIL: TestConcurrentBuyers (0.31s)
+    --- FAIL: TestConcurrentBuyers/BuyLocked (0.12s)
+        store_test.go:172: 1-urinish: 20 xaridor, omborda 5 ta: 20 tasiga "olindi" dedik; kutilgan: 5
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.397s
+```
+
+`store_test.go:172` tekshiruvi beshta kutib, 20 oldi. Videoda `0.381s`; bu safar `0.397s`. **Tuzatish:** toʻliq yakuniy fayldagidek oʻqish ham, yozish ham `tx` orqali boʻlsin. Test pool'i 40 ulanishli. 20 xaridor va kichikroq pool'da bu xato ulanishlarni ham tugatishi mumkin: har xaridor bittasini ushlab, yana bittasini soʻraydi.
+
+**2. BEGIN'ni qoldiqni band qilish deb olish.** Naive misol bu jim xatoni koʻrsatdi. Oʻqishdan oldin qulflang yoki shart va kamaytirishni birlashtiring.
+
+**3. Faqat CHECK eski qiymat yozilishini ushlaydi deb oʻylash.** Ikkala xaridor nol yozsa, `CHECK (stock >= 0)` oʻtadi. Himoyasiz *nisbiy* kamaytirish nol ostiga tushsa, xato beradi. Yordamchining `check` holati avval qoldiqni nol qiladi; toʻliq chiqishi:
+
+```console
+$ python3 _video/sessions.py check
+UPDATE 1
+stock 
+-------
+     1
+(1 row)
+
+[A] UPDATE products SET stock = stock - 1 WHERE id = 4;
+ERROR:  new row for relation "products" violates check constraint "products_stock_check"
+DETAIL:  Failing row contains (4, oʻrik, 3500000, -1, t).
+
+oxirgi: stock 
+-------
+     0
+(1 row)
+```
+
+`violates check constraint` — yangi qator nomlangan qoidani buzdi. `DETAIL` rad etilgan qatorni koʻrsatadi: 4-mahsulot, oʻrik, narx `3500000` tiyin, qoldiq `-1`, faol `t` — true. Xato buyruqdan keyin qoldiq nol qoladi. Constraint oxirgi himoya boʻlib qolsin. Kutiladigan «qoldiq yetmaydi» natijasi uchun shartli qoidani ishlating.
+
+**4. Aloqasiz ish paytida qulf ushlash.** Transaction'ni tez tugating; qoldiq qatori qulflanganda tarmoq chaqiruvlarini qilmang. Bir nechta mahsulot qulflansa, doim bir xil tartibda oling. Bu transaction'lar bir-birini kutadigan deadlock xavfini kamaytiradi. Postgres ulardan bittasini toʻxtatadi; chaqiruvchi bu xatoni qayta ishlashi kerak.
+
+## Oʻzingizni tekshiring
+
+**1.** `RowsAffected() == 0` nimani bildiradi?
+
+<details>
+<summary>Javob</summary>
+
+Buyruq nol qatorni yangiladi. Bu SQL uchun id yoʻq yoki qoldiq sharti bajarilmadi. `Buy` mavjud id'ni faraz qilib, `ErrNotEnoughStock` beradi. Promo-kod vazifasi sabablarni ajratishni talab qiladi.
+
+</details>
+
+**2.** `BuyLocked`da FOR UPDATE qulfi qachon ochiladi? Shu paytda oddiy SELECT oʻqiy oladimi?
+
+<details>
+<summary>Javob</summary>
+
+Shu kod yoʻllarida transaction commit yoki rollback qilguncha qulf turadi. Oddiy SELECT qulf paytida koʻrinadigan tasdiqlangan maʼlumotni oʻqiy oladi. Zid yozuvchilar va qulfli oʻquvchilar kutadi.
+
+</details>
+
+**3.** GB-5.05 dan: `QueryRow` qator topmadi. Qayerda qaysi xatoni olasiz?
+
+<details>
+<summary>Javob</summary>
+
+`Scan` `pgx.ErrNoRows` beradi. `BuyLocked` uni `ErrNotFound`ga aylantiradi.
+
+</details>
+
+**4.** Bashorat: qoldiq nol. `UPDATE products SET stock = stock - 1 WHERE id = 4 AND stock >= 1` nima qaytaradi? **A)** CHECK xatosi · **B)** `UPDATE 0` · **C)** `UPDATE 1`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Qator WHERE shartiga mos emas, shuning uchun kamaytirilmaydi. Kutayotgan yangilash davom etganda ham shu qoida ishladi.
+
+</details>
+
+## Uy vazifasi
+
+Asl starter nusxasida ishlang: [kurs papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-08-ikki-xaridor/TASK.md), [javoblar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor/solution).
+
+- 🟢 **Majburiy:** `coupon.go`dagi `UseCoupon(ctx, code)`ni bitta shartli UPDATE bilan yozing: `uses_left = uses_left - 1`, `WHERE code = $1 AND uses_left > 0`. `BAHOR` boshida uch marta ishlatiladi. Oʻnta parallel chaqiruvdan roppa-rosa uchtasi oʻtsin. Bitta qator yangilansa `nil` qaytaring.
+- 🟢 **Majburiy xato ajratish:** nol qator yangilangach, promo-kodni alohida oʻqing. `pgx.ErrNoRows`ni `ErrCouponNotFound`ga aylantiring; mavjud tugagan kod uchun `ErrCouponUsedUp` qaytaring. Boshqa baza xatolari saqlansin.
+- 🟡 **Ixtiyoriy:** `UseCouponLocked`ni `Begin`, `tx.QueryRow(... FOR UPDATE)`, Go tekshiruvi, `tx.Exec` va `Commit` bilan yozing. Uning testi faqat ixtiyoriy boʻsh metod qolganida tashlab ketiladi.
+
+Yashil darajalar shu yozma sahifada majburiy qadamlarga berildi; TASK.md ularga daraja qoʻymaydi. `store_test.go`, `coupon_test.go` va `naive_test.go`ni oʻzgartirmang. Testlar har safar vaqtinchalik schema yaratib, oxirida oʻchiradi. Ishlayotgan Postgres server kerak.
+
+Postgres'ni boshidagi buyruq bilan boshlang, keyin starterda `go test .` bajaring. Nuqta joriy paketni tanlaydi. Qayta tekshiruvimiz kutilgan promo-kod vazifasida yiqildi:
+
+```console
+$ go test .
+--- FAIL: TestUseCouponConcurrent (0.06s)
+    coupon_test.go:61: 1-urinish: promo-kod 3 marta, 10 kishi bir vaqtda: 9 tasiga oʻtdi; kutilgan: 3 (TASK.md)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.696s
+FAIL
+```
+
+`coupon_test.go:61` xabari: birinchi urinish, kod uch marta, oʻnta parallel odamdan toʻqqiztasiga oʻtdi, kutilgan uch. Video davridagi vazifa chiqishida 10 qayd etilgan; bajarilish tartibi bu sonni oʻzgartiradi. Starterdagi yakuniy qoldiq metodlari allaqachon toʻgʻri.
+
+<details>
+<summary>Javob</summary>
+
+`UseCoupon`da `Exec` natija yozuvini beradi; `RowsAffected() == 1` muvaffaqiyatni bildiradi. Nol qatordan keyingi SELECT faqat rad etish sababini aniqlaydi. U yana kamaytirishga ruxsat bermaydi. Laboratoriyada promo-kodlar parallel oʻchirilmaydi va toʻldirilmaydi. Kengroq tizim bu oʻzgarishlar xato sababini aniqlashga qanday taʼsir qilishini belgilashi kerak.
+
+Ixtiyoriy metodga `BuyLocked`ni andoza qiling, jadval, kalit va xato tarjimasini almashtiring. Ikkala buyruq bitta transaction orqali ketsin. Toʻliq javob — `solution/coupon.go`:
+
+```go filename="solution/coupon.go" showLineNumbers
+package bozor
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ErrCouponUsedUp — promo-kodning ishlatish soni tugagan.
+var ErrCouponUsedUp = errors.New("promo-kod tugagan")
+
+// ErrCouponNotFound — bunday promo-kod yoʻq.
+var ErrCouponNotFound = errors.New("promo-kod topilmadi")
+
+// UseCoupon promo-kodni bir marta ishlatadi: coupons.uses_left bittaga kamayadi.
+// Tekshiruv va kamaytirish bitta UPDATE buyrugʻida (WHERE uses_left > 0): parallel chaqiruvlarda ham roppa-rosa uses_left marta oʻtadi.
+func (s *Store) UseCoupon(ctx context.Context, code string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE coupons SET uses_left = uses_left - 1 WHERE code = $1 AND uses_left > 0", code)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Nol qator: promo-kod yoʻq yoki tugagan. Qaysi biri ekanini alohida oʻqib bilamiz.
+	var left int
+	err = s.pool.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return ErrCouponUsedUp
+}
+
+var errUseCouponLockedTODO = errors.New("UseCouponLocked hali yozilmagan")
+
+// UseCouponLocked ham promo-kodni ishlatadi, lekin boshqacha: qatorni FOR UPDATE bilan qulflaydi, Go'da tekshiradi, keyin yozadi.
+func (s *Store) UseCouponLocked(ctx context.Context, code string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var left int
+	err = tx.QueryRow(ctx,
+		"SELECT uses_left FROM coupons WHERE code = $1 FOR UPDATE", code).Scan(&left)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCouponNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if left == 0 {
+		return ErrCouponUsedUp
+	}
+	_, err = tx.Exec(ctx,
+		"UPDATE coupons SET uses_left = $1 WHERE code = $2", left-1, code)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+```
+
+Yangi nomlar: `code` promo-kodni aniqlaydi, `left` qolgan ishlatishlarni saqlaydi. `ErrCouponUsedUp` — promo-kod tugagan; `ErrCouponNotFound` — promo-kod topilmadi. 19–26-qatorlar himoyalangan kamaytirish va muvaffaqiyatni bajaradi. 28–37-qatorlar nol qator sababini aniqlaydi. 44–67-qatorlar transaction andozasini takrorlab, `left == 0`ni qator qulfi ostida tekshiradi. 40-qator test uchun asl ixtiyoriy boʻsh metod xatosini saqlaydi. Yozilgan metod endi uni qaytarmaydi.
+
+</details>
+
+Javobning oʻz moduli bor. `cd` ishchi papkani almashtiradi; `&&` keyingi buyruqni faqat papka almashishi oʻtsa bajaradi:
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	0.708s
+```
+
+`ok` — barcha javob testlari oʻtdi. Oldingi kurs tekshiruvida `0.700s`, bizda `0.708s`; toʻgʻrilik sharti — oʻnta chaqiruvdan uchta muvaffaqiyat. Laboratoriya papkasiga qaytib, konteynerlar, tarmoq va maʼlumot volume'ini oʻchiring. `-v` laboratoriya volume'ini oʻchiradi:
+
+```bash
+cd ..
+docker compose down -v
+```
+
+## Manbalar
+
+- [PostgreSQL 18: READ COMMITTED](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED)
+- [PostgreSQL 18: qator qulflari](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS)
+- [PostgreSQL 18: deadlock](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-DEADLOCKS)
+- [PostgreSQL 18: SELECT qulf sharti](https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [PostgreSQL 18: UPDATE](https://www.postgresql.org/docs/18/sql-update.html)
+- [PostgreSQL 18: ROLLBACK](https://www.postgresql.org/docs/18/sql-rollback.html)
+- [pgx: Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+- [pgconn: CommandTag.RowsAffected](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#CommandTag.RowsAffected)
+- [pgxpool: Pool.QueryRow](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.QueryRow)
+- [Go: WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go)
+- [Go: Mutex](https://pkg.go.dev/sync#Mutex)
+- [Go: har aylanishda alohida sikl oʻzgaruvchisi](https://go.dev/blog/loopvar-preview)
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. Konsol bloklari qayta bajarilgan. Video va oldingi kurs oʻlchovlari matnda alohida belgilandi. Tezlik benchmark'i daʼvo qilinmaydi.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-08-ikki-xaridor)
+
+---
+
+← Oldingi dars: [GB-5.07](/lab/youtube/gb/gb-5-07) · Keyingi dars: [GB-5.09](/lab/youtube/gb/gb-5-09) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
