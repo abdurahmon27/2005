@@ -1,0 +1,889 @@
+---
+title: "Go → Postgres: pgx, пул, Scan и тайм-аут"
+date: "2026/11/27"
+description: "Подключение Go к Postgres через pgxpool: параметры SQL, Scan, NULL, ErrNotFound, rows.Close и срок выполнения context."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-05/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-05"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-05) · **Русский** · [English](/lab/youtube/gb/gb-5-05/en)  
+Урок GB-5.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-05) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+`products` уже создана. Как прочитать из неё товар в Go? Как ограничить ожидание, если база не отвечает?
+
+**Одна идея:** Go выступает клиентом Postgres. Запрос получает соединение из пула, отправляет SQL и параметры отдельно, читает ответ через `Scan`. Context задаёт срок ожидания.
+
+После урока вы сможете:
+
+- выполнять `Get` и `ListActive` через `pgxpool`;
+- отличать отсутствие строки от суммы `NULL`;
+- ограничивать ожидание и находить незакрытые результаты, удерживающие соединение;
+- реализовать `ByName` и `Cheapest` до прохождения тестов.
+
+| Термин | Значение | English term |
+|---|---|---|
+| пул соединений | открытые соединения для повторного использования | connection pool |
+| чтение строк результата | перенос ответа `QueryRow` или `Query` в значения Go через `Scan` | row scanning |
+| срок context | ограничение времени ожидания запроса | context deadline |
+
+## Что нужно знать заранее
+
+- [GB-5.04 · JOIN, GROUP BY и NULL](/lab/youtube/gb/gb-5-04/ru): `orders`, `order_items`, `SUM`, `COALESCE`.
+- [GB-5.03 · Таблица SQL](/lab/youtube/gb/gb-5-03/ru): `products`, столбцы, фильтрация через `WHERE`.
+- [GB-5.02 · Лаборатория Postgres](/lab/youtube/gb/gb-5-02/ru): Docker Compose, порты и `psql`.
+- [GB-2.07 · Интерфейс](/lab/youtube/gb/gb-2-07/ru) и [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru): контракт вызывающего кода, `errors.Is`.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru), [GB-2.06 · Пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru).
+- [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структура](/lab/youtube/gb/gb-2-03/ru), [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru).
+- [GB-1.07 · Функция и error](/lab/youtube/gb/gb-1-07/ru), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/ru), [GB-1.05 · Условия](/lab/youtube/gb/gb-1-05/ru), [GB-1.03 · Деньги](/lab/youtube/gb/gb-1-03/ru).
+
+Запускайте примеры во временной копии `lessons/gb-5-05-pgx-pool`: по ходу урока меняются `main.go` и `store.go`. Сохраните исходную папку. Go Playground не заменяет сетевой Postgres. Нужны Go 1.27.4, Docker и Compose; pgx написан на Go, gcc не нужен.
+
+Вспомните: оставит ли `WHERE ustun > 5` строку, где `ustun` равен `NULL`? **A)** да · **B)** нет · **C)** ошибка SQL.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `NULL > 5` даёт неизвестное значение. `WHERE` оставляет только истину. Все столбцы `products` имеют `NOT NULL`, но агрегат всё равно может вернуть `NULL`.
+
+</details>
+
+## Подключение: адрес и пул
+
+Клиент Postgres отправляет SQL: раньше это был `psql`, теперь Go. `pgx` работает с протоколом, `pgxpool` повторно использует соединения. Каждое соединение обслуживает процесс Postgres. Не создавайте отдельный пул для каждого HTTP-запроса.
+
+| Шаг | Пул | Postgres |
+|---|---|---|
+| до запроса | есть свободное соединение | ждёт SQL |
+| `QueryRow` / `Query` | соединение занято | выполняет SQL |
+| результат закрыт | соединение возвращено | ждёт следующую команду |
+
+Выполняйте команды внутри копии. `export` задаёт **переменную окружения**, доступную дочерним программам. `CGO_ENABLED=0` отключает интеграцию с C, `GOTOOLCHAIN` выбирает версию Go. `up -d --wait` запускает базу в фоне и ждёт готовности. Если `5475` занят, укажите одинаковый свободный порт в `ports` копии и в URL.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+docker compose up -d --wait
+```
+
+`exec db psql` запускает SQL-клиент в сервисе `db`. Каждый `-f` читает один файл из `/lab/` внутри контейнера. Примените четыре файла к новой базе:
+
+```console
+$ docker compose exec db psql -f /lab/products.sql -f /lab/seed.sql -f /lab/orders.sql -f /lab/orders_seed.sql
+psql:/lab/products.sql:1: NOTICE:  table "products" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+`NOTICE` сообщает, что удаление несуществующей таблицы пропущено; это не ошибка. `CREATE TABLE` — таблица создана. `INSERT 0 n` — добавлено `n` строк: 4 товара, 3 заказа, 4 позиции заказа.
+
+```bash
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5475/bozor
+```
+
+Это учебный URL подключения с вымышленными данными. `postgres` — протокол; `bozor:bozor-lab` — пользователь и лабораторный пароль. `localhost:5475` — адрес и порт компьютера, последнее `bozor` — база. `os.Getenv("DATABASE_URL")` читает эту строку.
+
+```go filename="_video/stages/01-main-pool.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+}
+```
+
+| Строки | Действие |
+|---|---|
+| 1–9 | пакет `main`; импорты context, вывода, окружения и pgxpool |
+| 11–13 | начало `main`; `ctx` — `context.Background()` без срока; `New` создаёт пул из URL |
+| 14–17 | при ошибке выводит `pool:` в `os.Stderr`, завершает процесс с кодом 1 |
+| 18–19 | `defer pool.Close()` закрывает соединения при обычном возврате |
+
+`ctx` — первый аргумент вызовов pgx. Context переносит срок и сигнал отмены; подробно — в [GB-7.03](/lab/youtube/gb#gb-7-03). Успех `New` не подтверждает связь с базой: для этого есть `pool.Ping(ctx)`. `os.Exit` не выполняет отложенные через `defer` вызовы.
+
+```console
+$ go mod tidy
+```
+
+Повторный запуск ничего не вывел: готовые `go.mod` и `go.sum` уже содержат pgx v5.13.0. `tidy` согласует зависимости с импортами. Строки `finding`/`found` в видео взяты из первого добавления зависимости; здесь они не воспроизводились. `/v5` — старшая версия и часть пути импорта.
+
+## Одна строка: QueryRow и Scan
+
+`Product` — одна запись товара. `ID`, `Price`: `bigint` → `int64`; `Name`: `text` → `string`; `Stock`: `integer` → `int`. Цена в тийинах. `active` не выбирается. `Store` хранит адрес пула; `*pgxpool.Pool` — тип указателя.
+
+```go filename="_video/stages/02-store.go" showLineNumbers
+package main
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	return p, err
+}
+```
+
+| Строки | Действие |
+|---|---|
+| 1–7 | пакет и необходимые импорты |
+| 9–14 | структура `Product` с четырьмя полями |
+| 16–18 | поле `pool` в `Store` |
+| 20 | получатель `s *Store`; вход: `ctx`, `id`; выход: `Product`, `error` |
+| 21 | переменная `p` с нулевым значением для результата |
+| 22–24 | `QueryRow` ожидает одну строку; `Scan` записывает столбцы по адресам |
+| 25–26 | возвращает товар и ошибку вызывающему коду |
+
+`$1` — место первого параметра; следующий аргумент `id` передаёт его значение отдельно от SQL. Это предотвращает SQL injection: входная строка не меняет структуру запроса. Не подставляйте пользовательские значения через `fmt.Sprintf`. `&p.ID` — адрес поля; порядок аргументов `Scan` соответствует `SELECT`. Точка в конце строки продолжает вызов метода на следующей строке.
+
+| Состояние | `p.ID` | `p.Name` | `p.Price` | `p.Stock` |
+|---|---|---|---|---|
+| `var p Product` | 0 | `""` | 0 | 0 |
+| после `Scan` | 1 | `"olma"` | 1200000 | 40 |
+
+```go filename="_video/stages/03-main-get1.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	p, err := store.Get(ctx, 1)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+}
+```
+
+Новые строки относительно прежнего `main`: 20 получает адрес структуры `&Store{pool: pool}`; 21 вызывает `Get(ctx, 1)`. Строки 22–25 проверяют ошибку, 26 выводит поля. `olma` означает «яблоко». `go run .` собирает и запускает текущий пакет; `cp` копирует этап видео в рабочий файл.
+
+Что выведет `Get(ctx, 1)`? **A)** товар из таблицы · **B)** нулевую структуру · **C)** ошибку соединения.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** В таблице есть id 1; `Scan` заполнит четыре показанных поля.
+
+</details>
+
+```console
+$ cp _video/stages/02-store.go store.go
+$ cp _video/stages/03-main-get1.go main.go
+$ go run .
+1 olma 1200000 40
+```
+
+Теперь `Get(ctx, 99)`. Правило: если строки нет, `Scan` у результата `QueryRow` возвращает `pgx.ErrNoRows`. Что произойдёт? **A)** нулевой товар без ошибки · **B)** ошибка · **C)** panic.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `no rows in result set` означает «в результате нет строк». Ошибка `QueryRow` получается при `Scan`. Нулевая структура не означает успех; panic не возникает.
+
+</details>
+
+```console
+$ cp _video/stages/04-main-get99.go main.go
+$ go run .
+xato: no rows in result set
+exit status 1
+```
+
+Чтобы вызывающий код не зависел от ошибки драйвера, преобразуем её в sentinel из GB-2.08 — заранее объявленное значение ошибки:
+
+```go
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// QueryRow(...).Scan(...) dan keyin:
+if errors.Is(err, pgx.ErrNoRows) {
+	return Product{}, ErrNotFound
+}
+return p, err
+```
+
+`errors.Is` проверяет совпадение; при нём возвращаем нулевой `Product{}` и `ErrNotFound`. Остальные ошибки сохраняются. Вызывающий код может выбрать HTTP 404 через `errors.Is(err, ErrNotFound)`.
+
+```console
+$ cp _video/stages/05-store.go store.go
+$ go run .
+xato: mahsulot topilmadi
+exit status 1
+```
+
+`mahsulot topilmadi` означает «товар не найден». `exit status 1`: `main` вывел ошибку и завершился с кодом 1. Это не panic.
+
+## Несколько строк: Query, Next, Close и Err
+
+`ListActive` возвращает активные товары по `id`. Результат `Query` — `Rows`, строки для последовательного чтения. Основная часть метода:
+
+```go
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+```
+
+Строки 1–5: запрос и его ошибка; `WHERE active` выбирает истинные значения. 6: `defer rows.Close()` закрывает результат и при раннем выходе. 7: `out := []Product{}` — пустой слайс, отличный от `nil`. 8: `Next()` переходит к следующей строке. 9–12: чтение в отдельный `p`, возврат при ошибке. 13: `append` добавляет товар. 15: возврат слайса и `rows.Err()`.
+
+| Действие | Текущая строка | `out` | Соединение |
+|---|---|---|---|
+| `Query` | ещё нет | `[]` | занято |
+| `Next` → `Scan` | olma | `[olma]` | занято |
+| следующие три строки | non, choy, oʻrik | `[olma non choy oʻrik]` | занято |
+| `Next` → false | конец | без изменений | возвращено |
+
+`non` — «хлеб», `choy` — «чай», `oʻrik` — «абрикос». `Next() == false` означает конец либо ошибку чтения. Их различает `rows.Err()`. При полном чтении `Next` закрывает результат автоматически; `defer Close` покрывает и ранний выход. Закрытие возвращает соединение в пул.
+
+## Сумма заказа: SUM, NULL и COALESCE
+
+Теперь вызываем SQL из GB-5.04 через Go. `quantity * unit_price` — количество, умноженное на цену единицы. `SUM(bigint)` возвращает `numeric`, точное десятичное число. pgx читает целое значение, помещающееся в `int64`; дробь и выход за диапазон дают ошибку.
+
+```go
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT SUM(quantity*unit_price) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+```
+
+`orderID` — номер заказа, `total` — сумма. Строка 2 создаёт нулевую переменную; 3–5 читают ответ по её адресу; 6 возвращает число и ошибку. Агрегат без `GROUP BY` выдаёт одну строку результата. Если входных строк нет, её значение — `NULL`.
+
+Заказа 99 нет. Что вернёт `SUM`? **A)** 0 · **B)** `NULL` · **C)** `pgx.ErrNoRows`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Строка результата есть, но значение — `NULL`. `int64` не хранит отсутствие значения. Заказ 1: `2*1200000 + 3*400000 = 3600000`. Ответы «ноль» и «нет строки» смешивают разные понятия.
+
+</details>
+
+Этот `main` выводит `Get`, затем список, затем два результата `OrderTotal`. Полный `main.go` приведён ниже. Сейчас установите версию с ошибкой `SUM`:
+
+```console
+$ cp _video/stages/07a-store-sum.go store.go
+$ cp _video/stages/08-main-final.go main.go
+$ go run .
+1 olma 1200000 40
+1 olma 1200000 40
+2 non 400000 3
+3 choy 2500000 8
+4 oʻrik 3500000 2
+3600000 <nil>
+0 can't scan into dest[0] (col: sum): cannot scan NULL into *int64
+```
+
+`<nil>` означает отсутствие ошибки. `dest[0]` — первый получатель, `col: sum` — столбец SQL. `cannot scan NULL into *int64` означает невозможность записать `NULL` по адресу `int64`. Выведенный `0` — начальное значение; при ошибке его нельзя считать вычисленной суммой.
+
+```sql
+SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1
+```
+
+`COALESCE` выбирает первое значение, отличное от `NULL`: при отсутствии суммы это 0. Таково правило лаборатории: для 99 сумма тоже 0. Если отдельно требуется проверить существование заказа, сделайте отдельную проверку.
+
+| Вход | Результат SQL | Результат Go |
+|---|---|---|
+| заказ 1, две позиции | `SUM = 3600000` | `3600000, nil` |
+| 99, строк нет | `SUM = NULL` | `0, ошибка Scan` |
+| 99, с `COALESCE` | 0 | `0, nil` |
+
+## Срок выполнения: context.WithTimeout
+
+`context.Background()` не имеет срока. `WithTimeout` создаёт из него `qctx` и функцию `cancel` для освобождения ресурсов. Этот полный этап видео намеренно создаёт медленный запрос:
+
+```go filename="_video/stages/06-main-slow.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = pool.Exec(qctx, "SELECT pg_sleep(5)")
+	fmt.Println("xato:", err, time.Since(start).Round(time.Second))
+}
+```
+
+Новые строки 21–25: `2*time.Second` — две секунды; `defer cancel()` освобождает ресурсы. `time.Now()` сохраняет начало. `Exec` не читает строки ответа; `_` отбрасывает результат команды, `err` сохраняется. `pg_sleep(5)` ждёт в базе пять секунд. `time.Since(start)` измеряет прошедшее время, `Round(time.Second)` округляет до секунды.
+
+Что получится? **A)** 5 секунд без ошибки · **B)** около 2 секунд и ошибка срока · **C)** сразу 0.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Срок `qctx` истекает раньше пятсекундного запроса. Не убирайте `cancel()`, полагаясь только на истечение срока.
+
+</details>
+
+```console
+$ cp _video/stages/06-main-slow.go main.go
+$ go run .
+xato: timeout: context deadline exceeded 2s
+```
+
+`timeout: context deadline exceeded` означает истечение срока context. И в видео, и здесь округлённое время — 2s: около 40% от 5s ожидания. Нагрузка и планировщик меняют точное время. Главное — ожидание ограничил context, а не сон базы; сборка в это измерение не входит.
+
+| Время | `qctx` | Ожидание Go |
+|---|---|---|
+| 0s | активен | внутри запроса |
+| около 2s | срок истёк | возвращается ошибка |
+| далее | завершён | следующий запрос с тем же context тоже ошибочен |
+
+## Итоговые файлы и запуск
+
+Это полный `store.go` курса: разобранные методы, исправление `COALESCE` и два незавершённых метода задания. Новые части в конце: `ByName` и `Cheapest` пока намеренно возвращают ошибку.
+
+```go filename="store.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — products jadvaliga Go'dan kirish. pool bir vaqtda koʻp goroutine'dan ishlatilishi mumkin.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OrderTotal bitta buyurtmaning jami summasini (tiyinda) hisoblaydi. Buyurtma yoʻq boʻlsa SUM NULL beradi: COALESCE uni nolga aylantiradi.
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+
+// ByName nom boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound. VAZIFA (TASK.md, 1-qadam).
+func (s *Store) ByName(ctx context.Context, name string) (Product, error) {
+	return Product{}, errors.New("ByName hali yozilmagan")
+}
+
+// Cheapest eng arzon n ta faol mahsulotni narx boʻyicha oʻsish tartibida oʻqiydi. VAZIFA (TASK.md, 2-qadam).
+func (s *Store) Cheapest(ctx context.Context, n int) ([]Product, error) {
+	return nil, errors.New("Cheapest hali yozilmagan")
+}
+```
+
+Итоговый `main.go` передаёт один `qctx` всем трём видам запросов. Две секунды не начинаются заново для каждого метода: срок общий. Если нужен отдельный срок, создавайте context для каждой операции.
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	p, err := store.Get(qctx, 1)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+
+	products, err := store.ListActive(qctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	for _, p := range products {
+		fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+	}
+
+	fmt.Println(store.OrderTotal(qctx, 1))
+	fmt.Println(store.OrderTotal(qctx, 99))
+}
+```
+
+Новые строки: импорт `time`; 23–24 — общий context; 32–39 — получение списка и вывод через `for _, p := range products`. `_` отбрасывает индекс. 41–42 передают оба возвращаемых значения, сумму и ошибку, в `Println`.
+
+Какими будут последние две строки? **A)** `3600000 <nil>` и `0 <nil>` · **B)** две `ErrNotFound` · **C)** снова ошибка NULL.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Сумма заказа 1 прежняя; для 99 `COALESCE` заменяет NULL на 0.
+
+</details>
+
+```console
+$ cp _video/stages/07-store.go store.go
+$ cp _video/stages/08-main-final.go main.go
+$ go run .
+1 olma 1200000 40
+1 olma 1200000 40
+2 non 400000 3
+3 choy 2500000 8
+4 oʻrik 3500000 2
+3600000 <nil>
+0 <nil>
+```
+
+Первая строка — `Get(1)`, следующие четыре — `ListActive`. Последние две — суммы заказов 1 и 99. Обе без ошибки; ноль для 99 теперь получен по правилу SQL.
+
+## Глубже (необязательно): отменился ли запрос в базе?
+
+В этом пути ошибки pgx v5.13.0 закрывает соединение и асинхронно отправляет `CancelRequest`. В отдельной проверке с 30s сна возврат занял 2.001s. Сразу, через 0.5s и 1s наблюдающее соединение видело 0 активных запросов сна. Это наш повторный замер. Отмена не гарантирована: слово «обычно» необходимо; возврат ошибки не доказывает мгновенную остановку SQL.
+
+Код проверки не входит в папку курса; полный дополнительный пример приведён ниже. `observer` наблюдает, `victim` выполняет медленный запрос. `application_name` выделяет его. `count(*)` считает строки `active` в `pg_stat_activity`; `time.Sleep` задаёт интервалы наблюдения.
+
+Этой дополнительной программы нет в папке курса. Сохраните её в рабочей копии как `probe/main.go`. `mkdir -p probe` создаёт папку:
+
+```bash
+mkdir -p probe
+```
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	observer, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		panic(err)
+	}
+	defer observer.Close()
+	var kind string
+	err = observer.QueryRow(ctx, "SELECT pg_typeof(SUM(quantity*unit_price))::text FROM order_items WHERE order_id=1").Scan(&kind)
+	fmt.Println("SUM type:", kind, err)
+	for _, sql := range []string{"SELECT 1.5::numeric", "SELECT 9223372036854775808::numeric"} {
+		var n int64
+		err := observer.QueryRow(ctx, sql).Scan(&n)
+		fmt.Println(sql, n, err)
+	}
+	victim, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL")+"?application_name=gb505_timeout_probe")
+	if err != nil {
+		panic(err)
+	}
+	defer victim.Close()
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = victim.Exec(qctx, "SELECT pg_sleep(30)")
+	fmt.Printf("timeout elapsed=%.3fs err=%v\n", time.Since(start).Seconds(), err)
+	for _, wait := range []time.Duration{0, 500 * time.Millisecond, 500 * time.Millisecond} {
+		time.Sleep(wait)
+		var n int
+		err := observer.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE application_name='gb505_timeout_probe' AND state='active' AND query LIKE '%pg_sleep%'").Scan(&n)
+		fmt.Println("active sleepers:", n, err)
+	}
+	fmt.Println("default MaxConns:", observer.Config().MaxConns)
+}
+```
+
+`pg_typeof(... )::text` читает имя типа SQL как строку. Два дополнительных SQL проверяют дробное значение `numeric` и выход за диапазон. `%v` выводит ошибку, `%.3f` — секунды с тремя знаками. `pool.Config().MaxConns` на этой машине равен 12. По умолчанию берётся максимум из 4 и `runtime.NumCPU()`; это не рекомендация по настройке.
+
+```console
+$ go run ./probe
+SUM type: numeric <nil>
+SELECT 1.5::numeric 0 can't scan into dest[0] (col: numeric): cannot convert &{15 -1 false finite true} to integer
+SELECT 9223372036854775808::numeric 0 can't scan into dest[0] (col: numeric): 9223372036854775808 is out of range for int64
+timeout elapsed=2.001s err=timeout: context deadline exceeded
+active sleepers: 0 <nil>
+active sleepers: 0 <nil>
+active sleepers: 0 <nil>
+default MaxConns: 12
+```
+
+`numeric <nil>` — тип SQL и отсутствие ошибки. `cannot convert … to integer` — дробь нельзя прочитать как целое. `out of range for int64` — целое число вышло за диапазон. `active sleepers: 0` — в момент наблюдения нет активного сна этой программы. Наблюдения не гарантируют успех каждой будущей отмены.
+
+## Частые ошибки
+
+**1. Забыть `rows.Close` и прекратить чтение раньше конца.** Главная ошибка урока. Эта полная программа возвращается после первого имени. `firstName` читает имя первого товара:
+
+```go filename="_video/leak/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// firstName: birinchi mahsulotning nomi
+func firstName(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	rows, err := pool.Query(ctx, "SELECT name FROM products ORDER BY id")
+	if err != nil {
+		return "", err
+	}
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var name string
+	err = rows.Scan(&name)
+	return name, err
+}
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for i := 1; i <= 2; i++ {
+		start := time.Now()
+		name, err := firstName(qctx, pool)
+		fmt.Println(i, name, err, time.Since(start).Round(time.Second))
+	}
+}
+```
+
+Новые строки: `!rows.Next()` в `firstName` означает отсутствие следующей строки; тогда возвращается `rows.Err()`. `err = rows.Scan(&name)` меняет существующую переменную. Цикл `for` в `main` делает два вызова и измеряет каждый. В этом сломанном примере нет `pool.Close()`: он ждал бы невозвращённое соединение. После исправления закрывайте и пул.
+
+Ограничим пул одним соединением. Что сделает второй вызов? **A)** быстро завершится · **B)** ждёт свободное соединение и получает ошибку срока · **C)** откроет новое соединение.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Первый `Rows` ещё открыт и удерживает единственное соединение. `pool_max_conns=1` запрещает второе. Здесь запрос ждёт получения соединения, а не выполнения SQL.
+
+</details>
+
+`?pool_max_conns=1` в URL задаёт предел пула. Одинарные кавычки защищают `?` от интерпретации оболочкой. `mkdir -p` готовит рабочую папку `leak`:
+
+```console
+$ mkdir -p leak
+$ cp _video/leak/main.go leak/main.go
+$ export DATABASE_URL='postgres://bozor:bozor-lab@localhost:5475/bozor?pool_max_conns=1'
+$ go run ./leak
+1 olma <nil> 0s
+2  context deadline exceeded 2s
+```
+
+Во второй строке два пробела из-за пустого имени. `context deadline exceeded` — срок истёк. В видео и при повторе получены 0s/2s; 0s округлено до секунды и не означает абсолютный ноль. Без срока вызов продолжил бы ждать.
+
+Исправление — одна строка после проверки ошибки `Query`:
+
+```go
+defer rows.Close()
+```
+
+Что даст второй вызов после исправления? **A)** `olma` без ошибки · **B)** ошибку срока через 2s · **C)** panic.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** При возврате из первой функции `defer` закрыл результат и вернул единственное соединение.
+
+</details>
+
+```console
+$ cp _video/leak-fixed/main.go leak/main.go
+$ go run ./leak
+1 olma <nil> 0s
+2 olma <nil> 0s
+```
+
+| Вариант | После первого вызова | Второй вызов |
+|---|---|---|
+| без `Close` | соединение занято | ожидание, ошибка через 2s |
+| с `defer Close` | соединение свободно | olma, 0s |
+
+**2. Считать `Next == false` безусловным успехом.** Верните `rows.Err()`, как в `ListActive`, чтобы не потерять сетевую ошибку или истечение срока.
+
+**3. Принимать 0 после `NULL` за сумму.** Проверьте реальную ошибку `Scan` в разделе о сумме заказа. Правило нуля задайте через SQL `COALESCE`.
+
+**4. Склеивать SQL вместо `$1`.** Передавайте `name` и `n` отдельными аргументами после SQL. Параметр заменяет значение, а не имя таблицы или столбца.
+
+**5. Повторно использовать завершённый `qctx`.** Все вызовы делят один момент окончания срока. Для следующей независимой операции создайте новый context.
+
+## Проверьте себя
+
+**1.** Что получит вызывающий код, если `Get` не найдёт id?
+
+<details>
+<summary>Ответ</summary>
+
+`ErrNotFound`: `pgx.ErrNoRows` преобразован внутри хранилища. Остальные ошибки проходят без изменения.
+
+</details>
+
+**2.** Как влияет на пул забытый `rows.Close` при неполном чтении?
+
+<details>
+<summary>Ответ</summary>
+
+Соединение остаётся занятым. Когда свободных соединений не останется, запросы ждут; со сроком context они возвращают ошибку.
+
+</details>
+
+**3.** GB-5.02: что означает левое число в `5475:5432`?
+
+<details>
+<summary>Ответ</summary>
+
+Порт компьютера. Справа `5432` — порт контейнера; Go на компьютере подключается к `5475`.
+
+</details>
+
+**4.** Предскажите: что даст чтение `SUM` для 99 прямо в `int64`? **A)** `ErrNotFound` · **B)** `0, nil` · **C)** ошибка `Scan`.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Строка есть, значение — `NULL`, `int64` его не принимает. После `COALESCE` верным станет B.
+
+</details>
+
+## Домашнее задание
+
+Условия: [папка курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool) и [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-05-pgx-pool/TASK.md). Ответ: [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool/solution). Меняйте `store.go` в исходном starter; не меняйте `store_test.go`.
+
+- 🟢 **ByName:** один `Product` по имени; при отсутствии — `ErrNotFound`. Используйте `$1`. `x' OR 'a'='a` и `olma'; DROP TABLE products; --` проверяются как обычные имена.
+- 🟡 **Cheapest:** `n` самых дешёвых активных товаров; `ORDER BY price, id LIMIT $1`. При одинаковой цене сортируйте по `id`. Если товаров нет, верните `[]Product{}` без ошибки. Нужны `rows.Close`, `rows.Err` и `ctx` в обоих методах.
+
+Уровни добавлены для письменного урока; TASK.md требует оба метода. Тесты также проверяют отменённый context. Пустой слайс кодируется в JSON как `[]`, nil-слайс — как `null`.
+
+Верните обычный URL после опыта с одним соединением. `go test .` запускает тесты текущего пакета. Каждый тест создаёт отдельную временную схему и удаляет её в конце. Если база недоступна, тест падает с указанием запустить её, а не пропускается.
+
+```bash
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5475/bozor
+docker compose up -d --wait
+go test .
+```
+
+Реальный повторный запуск starter: два незавершённых метода дают сбой. Вывод содержит имя теста, время, файл и строку, ожидаемый и полученный ответы:
+
+```console
+$ go test .
+--- FAIL: TestByName (0.04s)
+    store_test.go:130: ByName("choy") = {ID:0 Name: Price:0 Stock:0}, ByName hali yozilmagan; kutilgan: {3 choy 2500000 8}, nil (TASK.md, 1-qadam)
+--- FAIL: TestCheapest (0.04s)
+    store_test.go:154: Cheapest(2) = [], Cheapest hali yozilmagan; kutilgan: [non olma], nil (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.248s
+FAIL
+```
+
+<details>
+<summary>Ответ</summary>
+
+Для `ByName` начните с `Get`: условие `WHERE name = $1`, аргумент `name`. `Scan` и преобразование `ErrNoRows` те же. Для `Cheapest` возьмите `ListActive`: SQL `ORDER BY price, id LIMIT $1`, аргумент `n`. Сохраните `out := []Product{}`. Полный ответ — в `solution/store.go`. Ниже проверен отдельный модуль решения; `cd` меняет рабочую папку.
+
+</details>
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	0.220s
+```
+
+`&&` запускает следующую команду только после успешного `cd`. `ok` означает прохождение тестов, далее идут путь модуля и время. Здесь 0.220s, в записи было `(cached)`; время тестов не измеряет изучаемое свойство. Вернитесь в родительскую папку. `down -v` удаляет контейнер, сеть и том данных этой лаборатории:
+
+```bash
+cd ..
+docker compose down -v
+```
+
+## Источники
+
+- [pgx: Getting started](https://github.com/jackc/pgx/wiki/Getting-started-with-pgx)
+- [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)
+- [pgx: Query](https://pkg.go.dev/github.com/jackc/pgx/v5#Conn.Query)
+- [pgx: Rows](https://pkg.go.dev/github.com/jackc/pgx/v5#Rows)
+- [pgx: ErrNoRows](https://pkg.go.dev/github.com/jackc/pgx/v5#pkg-variables)
+- [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool)
+- [pgxpool: ParseConfig](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig)
+- [pgxpool: Acquire](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Acquire)
+- [pgconn: cancellation](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn)
+- [pgconn v5.13.0 source: asyncClose](https://github.com/jackc/pgx/blob/v5.13.0/pgconn/pgconn.go)
+- [pgtype v5.13.0: numeric](https://github.com/jackc/pgx/blob/v5.13.0/pgtype/numeric.go)
+- [PostgreSQL 18: psql](https://www.postgresql.org/docs/18/app-psql.html)
+- [PostgreSQL 18: connections](https://www.postgresql.org/docs/18/connect-estab.html)
+- [PostgreSQL 18: connection URI](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNSTRING-URIS)
+- [PostgreSQL 18: protocol](https://www.postgresql.org/docs/18/protocol.html)
+- [PostgreSQL 18: extended query](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY)
+- [PostgreSQL 18: SUM](https://www.postgresql.org/docs/18/functions-aggregate.html)
+- [PostgreSQL 18: NULL](https://www.postgresql.org/docs/18/functions-comparison.html)
+- [PostgreSQL 18: COALESCE](https://www.postgresql.org/docs/18/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL)
+- [PostgreSQL 18: pg_sleep](https://www.postgresql.org/docs/18/functions-datetime.html#FUNCTIONS-DATETIME-DELAY)
+- [PostgreSQL 18: pg_stat_activity](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW)
+- [Go: context.WithTimeout](https://pkg.go.dev/context#WithTimeout)
+- [Go: errors.Is](https://pkg.go.dev/errors#Is)
+- [Go: os.Getenv](https://pkg.go.dev/os#Getenv)
+- [Go: go mod tidy](https://go.dev/ref/mod#go-mod-tidy)
+- [OWASP: SQL Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. Консольные блоки получены при этой проверке; числа из видео отдельно отмечены в тексте.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool)
+
+---
+
+← Предыдущий урок: [GB-5.04](/lab/youtube/gb/gb-5-04/ru) · Следующий урок: [GB-5.06](/lab/youtube/gb#gb-5-06) → · [Все уроки](/lab/youtube/gb)
+
+</div>

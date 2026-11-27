@@ -1,0 +1,667 @@
+---
+title: "JOIN, GROUP BY и NULL: заказы и их итоговые суммы"
+date: "2026/11/27"
+description: "Свяжите таблицы, вычислите суммы через GROUP BY и SUM, сохраните пустые заказы через LEFT JOIN и обработайте NULL с IS NULL и COALESCE."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-04"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-04) · **Русский** · [English](/lab/youtube/gb/gb-5-04/en)  
+Урок GB-5.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-04) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+bozor нужен отчёт с итоговой суммой каждого заказа. Сумма не хранится в столбце: позиции заказа находятся в другой таблице. Как вычислить её, сохранив заказ без позиций?
+
+**Одна идея:** соедините строки связанных таблиц, сгруппируйте пары по заказу и вычислите сумму каждой группы. Сохраните заказы без пар и явно обработайте отсутствующие значения.
+
+К концу урока вы сможете:
+
+- связать `orders` и `order_items` через `REFERENCES`;
+- построить отчёт с `JOIN`, `LEFT JOIN`, `GROUP BY` и `SUM`;
+- объяснить, почему `note = NULL` ничего не находит, и правильно использовать `IS NULL` и `COALESCE`;
+- написать два SQL-запроса и проверить их командой `go test`.
+
+| Слово | Простое значение | Английский термин |
+|---|---|---|
+| `JOIN` / `LEFT JOIN` | соединение строк таблиц в пары; левое соединение сохраняет и строки слева без пары | join / left join |
+| `GROUP BY` + `SUM` | создание групп и вычисление одной суммы для каждой | grouping / aggregate |
+| `NULL` | отсутствующее или неизвестное значение; обычное сравнение может дать неизвестный результат | NULL / three-valued logic |
+
+Два вспомогательных понятия: **внешний ключ** (`REFERENCES`, foreign key) требует существования строки, на которую указывает ссылка. **COALESCE** возвращает первое значение среди аргументов, отличное от NULL.
+
+## Что нужно знать заранее
+
+- [GB-5.03 · Необходимый SQL](/lab/youtube/gb/gb-5-03/ru): таблицы, типы, первичный ключ, ограничения, `INSERT`, `SELECT`, `WHERE` и `ORDER BY`.
+- [GB-5.02 · Postgres в Docker Compose](/lab/youtube/gb/gb-5-02/ru): контейнеры, тома, `exec` и `psql`.
+- [GB-5.01 · Зачем нужна база](/lab/youtube/gb#gb-5-01): два процесса обновляют один JSON-файл; вспомним в конце.
+- [GB-1.03 · Числа и деньги](/lab/youtube/gb/gb-1-03/ru): цены хранятся в целых тийинах, без плавающей точки.
+- [GB-1.08 · Первый тест](/lab/youtube/gb/gb-1-08/ru): `go test`, `ok` и `FAIL`.
+
+Возьмите [папку урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null). Выполняйте команды в ней. Лабораторной нужны локальный Docker и файлы; в Go Playground она не работает. `cd` меняет рабочую папку.
+
+`compose.yaml` запускает `postgres:18-alpine` на `127.0.0.1:5464`; порт должен быть свободен. `PGUSER` и `PGDATABASE` выбирают `bozor`, папка доступна внутри контейнера по пути `/lab` только для чтения. `psql` работает в контейнере, локальная установка не нужна. Начните с нового тома лабораторной: существующие таблицы вызовут ошибки создания.
+
+Для этой страницы папку скопировали во временное рабочее место. Изменилось только имя проекта Compose: `gb504docs`; в курсе оно `gb504`, в видео — `bozor`. Поэтому имена контейнеров в выводе запуска и очистки отличаются. Весь вывод ниже получен повторным запуском, а не процитирован. Проверки Go выполнены с `CGO_ENABLED=0` и `GOTOOLCHAIN=go1.27.4`.
+
+**Вспомните:** примет ли текстовый столбец с `NOT NULL` значение `''`?
+**A)** нет · **B)** да, это значение · **C)** синтаксическая ошибка
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Длина пустой строки равна нулю, но это значение. `NOT NULL` запрещает отсутствие значения. A смешивает пустую строку с NULL; C неверно, потому что `''` — допустимая запись текста в SQL.
+
+</details>
+
+## Таблицы: заказ и его позиции
+
+Запустим базу в фоне (`-d`) и дождёмся проверки готовности (`--wait`). Когда она готова, ожидайте `Healthy`:
+
+```console
+$ docker compose up -d --wait
+ Network gb504docs_default Creating 
+ Network gb504docs_default Creating 
+ Volume gb504docs_pgdata Creating 
+ Volume gb504docs_pgdata Creating 
+ Volume gb504docs_pgdata Created 
+ Volume gb504docs_pgdata Created 
+ Network gb504docs_default Created 
+ Network gb504docs_default Created 
+ Container gb504docs-db-1 Creating 
+ Container gb504docs-db-1 Created 
+ Container gb504docs-db-1 Starting 
+ Container gb504docs-db-1 Started 
+ Container gb504docs-db-1 Waiting 
+ Container gb504docs-db-1 Healthy 
+```
+
+Строки сообщают о создании сети, тома и контейнера, затем о запуске и готовности. Повторяющиеся строки состояния сохранены из реального вывода.
+
+Подготовим таблицу `products` из предыдущего урока: `id`, `name`, `price`, `stock`, `active` и четыре товара. `exec db` выполняет команду в сервисе базы; `psql -f` читает SQL-файл по пути внутри контейнера.
+
+```console
+$ docker compose exec db psql -f /lab/products.sql
+CREATE TABLE
+INSERT 0 4
+```
+
+`CREATE TABLE` подтверждает создание таблицы; `INSERT 0 4` означает вставку четырёх строк. Товары: `olma` («яблоко»), `non` («хлеб»), `choy` («чай»), `oʻrik` («абрикос»).
+
+Заказу нужен необязательный комментарий. Каждая позиция должна ссылаться на существующие заказ и товар. Полный `orders.sql`:
+
+```sql filename="orders.sql" showLineNumbers
+CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer text   NOT NULL,
+    note     text
+);
+CREATE TABLE order_items (
+    id         bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id   bigint  NOT NULL REFERENCES orders (id),
+    product_id bigint  NOT NULL REFERENCES products (id),
+    quantity   integer NOT NULL CHECK (quantity > 0),
+    unit_price bigint  NOT NULL CHECK (unit_price > 0)
+);
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `CREATE TABLE orders (` | начинает таблицу заказов и список её столбцов |
+| 2 | `id ... PRIMARY KEY` | идентификатор `bigint`, выдаваемый базой; первичный ключ определяет одну строку |
+| 3 | `customer text NOT NULL,` | обязательное имя клиента; запятая разделяет столбцы |
+| 4 | `note text` | необязательный комментарий: требования `NOT NULL` нет |
+| 5 | `);` | закрывает список столбцов и завершает команду |
+| 6 | `CREATE TABLE order_items (` | начинает таблицу позиций заказа |
+| 7 | `id ... PRIMARY KEY,` | выдаваемый базой идентификатор каждой позиции |
+| 8 | `order_id ... REFERENCES orders (id),` | обязательный идентификатор заказа; указанный заказ должен существовать |
+| 9 | `product_id ... REFERENCES products (id),` | обязательный идентификатор товара; указанный товар должен существовать |
+| 10 | `quantity ... CHECK (quantity > 0),` | обязательное положительное целое количество |
+| 11 | `unit_price ... CHECK (unit_price > 0)` | обязательная положительная цена единицы в тийинах на момент покупки |
+| 12 | `);` | завершает определение второй таблицы |
+
+`unit_price` — снимок цены. Последующее изменение `products.price` не должно менять сумму старого заказа. Внешний ключ проверяет существование строки, но не копирует цену.
+
+```console
+$ docker compose exec db psql -f /lab/orders.sql
+CREATE TABLE
+CREATE TABLE
+```
+
+Обе таблицы созданы. Полный `seed.sql` добавляет трёх вымышленных клиентов и четыре позиции:
+
+```sql filename="seed.sql" showLineNumbers
+INSERT INTO orders (customer, note)
+VALUES ('Dilnoza', NULL),
+       ('Jasur', 'ertalab yetkazing'),
+       ('Malika', NULL);
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 1, 2, 1200000),
+       (1, 2, 3, 400000),
+       (2, 4, 1, 3500000),
+       (2, 1, 1, 1200000);
+```
+
+Строки 1–4 выбирают столбцы заказов и вставляют три строки; два комментария равны NULL. Комментарий Jasur означает «доставьте утром». Строки 5–9 выбирают четыре столбца позиций и вставляют четыре набора значений в том же порядке. Скобки окружают каждый набор, запятые разделяют значения и строки, `;` завершает команду.
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 3
+INSERT 0 4
+```
+
+Ожидайте три заказа и четыре позиции; `INSERT 0 3` и `INSERT 0 4` подтверждают эти количества.
+
+**Предскажите:** заказа 99 нет. Что произойдёт при вставке позиции с `order_id = 99`?
+**A)** позиция добавится · **B)** `order_id` станет NULL · **C)** вставка будет отклонена
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `REFERENCES orders (id)` требует существования заказа. A нарушает внешний ключ. B означало бы молчаливую замену указанного значения, чего это ограничение не делает.
+
+</details>
+
+```console
+$ docker compose exec db psql -c "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (99, 1, 1, 1200000)"
+ERROR:  insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey"
+DETAIL:  Key (order_id)=(99) is not present in table "orders".
+```
+
+`violates foreign key constraint` означает нарушение ограничения внешнего ключа. `order_items_order_id_fkey` — имя ограничения; `DETAIL` указывает отсутствующий ключ `(order_id)=(99)`. Исправьте идентификатор на существующий заказ или сначала создайте нужный заказ.
+
+Посмотрим данные. Ожидайте три заказа с пустыми комментариями у Dilnoza и Malika и четыре позиции:
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders'
+ id | customer |       note        
+----+----------+-------------------
+  1 | Dilnoza  | 
+  2 | Jasur    | ertalab yetkazing
+  3 | Malika   | 
+(3 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM order_items'
+ id | order_id | product_id | quantity | unit_price 
+----+----------+------------+----------+------------
+  1 |        1 |          1 |        2 |    1200000
+  2 |        1 |          2 |        3 |     400000
+  3 |        2 |          4 |        1 |    3500000
+  4 |        2 |          1 |        1 |    1200000
+(4 rows)
+```
+
+`SELECT *` выбирает все столбцы; `(3 rows)` и `(4 rows)` — количество строк результата. Здесь пустые комментарии означают NULL: именно это вставил seed. По умолчанию `psql` показывает пустую строку тоже пустым местом, поэтому одного отображения недостаточно, чтобы их различить.
+
+## JOIN: одна строка результата на пару
+
+Для каждой позиции нужен клиент. Создайте `sorov.sql` и запишите в него этот полный запрос. Для каждого следующего запроса заменяйте содержимое файла, а не добавляйте запрос в конец.
+
+```sql
+SELECT orders.customer, order_items.quantity
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id;
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `SELECT orders.customer, order_items.quantity` | выбирает два столбца; `таблица.столбец` указывает источник каждого |
+| 2 | `FROM orders` | начинает с таблицы заказов |
+| 3 | `JOIN order_items ON ...` | образует пары при `order_items.order_id = orders.id`; `ON` задаёт условие соответствия |
+
+Одному заказу могут соответствовать несколько позиций. Состояние соединения до выбора выводимых столбцов:
+
+| Заказ | Количества в подходящих позициях | Строк результата JOIN |
+|---|---|---|
+| 1, Dilnoza | 2, 3 | 2 |
+| 2, Jasur | 1, 1 | 2 |
+| 3, Malika | подходящих позиций нет | 0 |
+
+**Предскажите:** сколько строк вернёт JOIN?
+**A)** 3 заказа · **B)** 4 пары · **C)** 5 строк, включая Malika
+
+<details>
+<summary>Ответ</summary>
+
+**B: 4.** `JOIN` означает `INNER JOIN`: остаются только совпавшие пары. A считает заказы вместо пар. Для C нужно сохранить и заказ без пары.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ customer | quantity 
+----------+----------
+ Dilnoza  |        2
+ Dilnoza  |        3
+ Jasur    |        1
+ Jasur    |        1
+(4 rows)
+```
+
+Malika отсутствует. В начальном запросе нет `ORDER BY`: показанный порядок наблюдался, но не гарантирован. Далее запросы отчёта задают порядок явно.
+
+## GROUP BY и SUM: одна сумма на заказ
+
+Для каждой позиции умножим количество на сохранённую цену единицы. Здесь `*` — умножение; в `SELECT *` он выбирал все столбцы. **SUM** — агрегат: объединяет входные значения в одно. `AS jami` называет столбец результата `jami` («итого»).
+
+Сначала замените `sorov.sql` этой незавершённой попыткой:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id;
+```
+
+**Предскажите:** можно ли вывести агрегат вместе с отдельными столбцами заказа без группировки?
+**A)** да, сумма по заказу · **B)** да, общая сумма · **C)** ошибка GROUP BY
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Запрос не указывает, какие строки относятся к каждой сумме. A предполагает автоматическую группировку. B не определяет, какой `orders.id` показать рядом с общей суммой.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+psql:/lab/sorov.sql:4: ERROR:  column "orders.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT orders.id, orders.customer,
+               ^
+```
+
+`psql:/lab/sorov.sql:4` указывает файл и строку завершения команды. `LINE 1` и `^` указывают проблемное выражение. “Must appear in the GROUP BY clause or be used in an aggregate function” означает требование к `orders.id`: столбец должен быть в GROUP BY или внутри агрегата.
+
+Добавьте `GROUP BY orders.id`, чтобы образовать группу для каждого идентификатора заказа. `ORDER BY orders.id` задаст определённый порядок по возрастанию:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+Строки 1–4 по-прежнему выбирают поля заказа, вычисляют сумму и соединяют таблицы. Строка 5 создаёт группы; строка 6 сортирует результат и завершает команду. `SUM(...)` вычисляет выражение в скобках для каждой входной строки и складывает значения внутри группы.
+
+| Группа | Суммы позиций в тийинах | SUM |
+|---|---|---|
+| заказ 1 | `2 × 1200000 + 3 × 400000` | 3600000 |
+| заказ 2 | `1 × 3500000 + 1 × 1200000` | 4700000 |
+
+Почему в GROUP BY нет `orders.customer`? `orders.id` — первичный ключ таблицы, поэтому каждому идентификатору соответствует ровно один клиент. PostgreSQL распознаёт эту зависимость здесь. Это не разрешение выбирать любые несгруппированные столбцы.
+
+**Предскажите:** сколько строк останется в результате?
+**A)** 3 · **B)** 2 · **C)** 4
+
+<details>
+<summary>Ответ</summary>
+
+**B: 2.** Четыре соединённые строки образуют две группы. A считает Malika, хотя JOIN её исключил. C считает строки до группировки.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+(2 rows)
+```
+
+Суммы равны 3 600 000 и 4 700 000 тийинов. `SUM(bigint)` возвращает `numeric`, точный числовой тип PostgreSQL, даже для этих целых сумм. Чтение в Go разбирается в [GB-5.05 · Go → Postgres: pgx](/lab/youtube/gb/gb-5-05/ru).
+
+## LEFT JOIN и NULL: сохранить пропавший заказ
+
+Отчёту нужен каждый заказ. **LEFT JOIN** сохраняет все строки левой таблицы, здесь `orders`. Для строки без пары он выдаёт NULL в столбцах правой таблицы. Новую строку в `order_items` он не вставляет.
+
+Замените `sorov.sql`:
+
+```sql
+SELECT orders.customer, order_items.quantity
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id;
+```
+
+Изменилась только строка 3: `LEFT` сохраняет заказ без пары. Ожидайте четыре совпавшие пары и строку Malika с количеством NULL:
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ customer | quantity 
+----------+----------
+ Dilnoza  |        2
+ Dilnoza  |        3
+ Jasur    |        1
+ Jasur    |        1
+ Malika   |         
+(5 rows)
+```
+
+**NULL** означает отсутствующее или неизвестное значение. Это не ноль и не `''`. Обычные сравнения `=` и `<>` с NULL дают NULL, то есть неизвестный результат. Это **трёхзначная логика**: истина, ложь, неизвестно. `WHERE` оставляет только истину.
+
+| `note` | `note = NULL` | WHERE оставит? | `note IS NULL` |
+|---|---|---|---|
+| `NULL` | неизвестно (`NULL`) | нет | истина |
+| `'ertalab yetkazing'` | неизвестно (`NULL`) | нет | ложь |
+| `''` | неизвестно (`NULL`) | нет | ложь |
+
+Пустая строка в таблице иллюстрирует правило; это не дополнительная запись в seed.
+
+**Предскажите:** у двух заказов комментарий NULL. Сколько строк вернёт `WHERE note = NULL`?
+**A)** 2 · **B)** 0 · **C)** синтаксическая ошибка
+
+<details>
+<summary>Ответ</summary>
+
+**B: 0.** Условие для каждой строки неизвестно, а не истинно. A считает NULL обычным сравнимым значением. C неверно: запрос допустим и молча возвращает пустой результат.
+
+</details>
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE note = NULL'
+ id | customer 
+----+----------
+(0 rows)
+```
+
+Проверяйте отсутствие значения через **IS NULL**. Он всегда возвращает истину или ложь; `IS NOT NULL` проверяет обратное. Ожидайте Dilnoza и Malika:
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE note IS NULL'
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+В этих двух демонстрационных фильтрах нет `ORDER BY`; показанный порядок строк не гарантирован. Запрос домашнего задания добавляет сортировку.
+
+## COALESCE: ноль вместо отсутствующей суммы
+
+Теперь сохраним все заказы в сгруппированном отчёте. В предыдущем запросе с группировкой замените только `JOIN` на `LEFT JOIN`:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+`SUM` пропускает входные NULL. В группе Malika одна строка результата, её количество и цена равны NULL. Умножение тоже даёт NULL; складывать нечего, значений кроме NULL нет.
+
+**Промежуточный вопрос:** чему равен SUM для Malika?
+**A)** 0 · **B)** NULL · **C)** ошибка
+
+<details>
+<summary>Ответ</summary>
+
+**B: NULL.** Если нет входных значений, отличных от NULL, SUM возвращает NULL. A предполагает автоматический ноль; C считает отсутствие значения ошибкой SQL.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+  3 | Malika   |        
+(3 rows)
+```
+
+Пустая сумма означает NULL. Чтобы отчёт показывал ноль, замените строку 2 на `COALESCE(SUM(...), 0) AS jami`. Полный запрос:
+
+```sql
+SELECT orders.id, orders.customer,
+       COALESCE(SUM(order_items.quantity * order_items.unit_price), 0) AS jami
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+**COALESCE** рассматривает разделённые запятыми аргументы по порядку и возвращает первый, отличный от NULL. Внутренние скобки содержат выражение SUM; внешние — результат SUM и запасной ноль. Остальные строки прежние.
+
+| Заказ | Подходящих позиций | SUM | COALESCE(SUM, 0) |
+|---|---|---|---|
+| 1 | 2 | 3600000 | 3600000 |
+| 2 | 2 | 4700000 | 4700000 |
+| 3 | 0 | `NULL` | 0 |
+
+Ожидайте три заказа с суммами 3600000, 4700000 и 0:
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+  3 | Malika   |       0
+(3 rows)
+```
+
+`LEFT JOIN` сохраняет заказ; `COALESCE` заменяет отсутствующую сумму. Нужны оба: COALESCE не возвращает строку, уже исключённую INNER JOIN.
+
+## Глубже (необязательно): неравенство с NULL
+
+`<>` означает «не равно», но сравнение комментария NULL с текстом снова даёт неизвестно. Предскажите результат для комментариев, отличных от `'ertalab yetkazing'`: строк не останется. У Jasur сравнение ложно, у остальных двух неизвестно.
+
+```console
+$ docker compose exec db psql -c "SELECT id, customer FROM orders WHERE note <> 'ertalab yetkazing'"
+ id | customer 
+----+----------
+(0 rows)
+```
+
+**IS DISTINCT FROM** сравнивает значения, считая NULL сравнимым отсутствующим значением. NULL и этот текст различны, поэтому Dilnoza и Malika теперь остаются. Два NULL считались бы неразличными.
+
+```console
+$ docker compose exec db psql -c "SELECT id, customer FROM orders WHERE note IS DISTINCT FROM 'ertalab yetkazing'"
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+Здесь тоже нет `ORDER BY`. Используйте это условие, когда правило требует «отличается, включая отсутствие значения», а не обычного SQL-неравенства.
+
+## Частые ошибки
+
+1. **`WHERE note = NULL`.** Допустимый SQL, пустой результат. В разделе «LEFT JOIN и NULL» есть полный ошибочный запрос и реальный вывод. Используйте `WHERE note IS NULL`; `''` — отдельное значение.
+2. **Ожидание автоматической группировки от SUM.** Запрос из четырёх строк в разделе «GROUP BY и SUM» даёт реальную ошибку `must appear in the GROUP BY clause`. Добавьте `GROUP BY orders.id`, сохраните `ORDER BY` для определённого порядка.
+3. **INNER JOIN в отчёте обо всех заказах.** Запрос работает, но исключает Malika. Используйте LEFT JOIN и COALESCE для суммы; одна замена NULL не восстановит строку.
+4. **Фильтр правой таблицы после LEFT JOIN.** `WHERE order_items.quantity > 0` снова отбрасывает строку с добавленными NULL. Если нужно сохранить каждую левую строку, поместите ограничение позиций в `ON` или уберите его.
+5. **Сортировка NULL-суммы через DESC.** По умолчанию PostgreSQL ставит NULL первым при убывании. Заданию нужен числовой ноль: примените COALESCE до сортировки.
+
+Внешний ключ также не создаёт автоматически индекс на ссылающемся столбце. Выбор индекса и проверка связи — отдельные задачи.
+
+## Проверьте себя
+
+1. Чем JOIN и LEFT JOIN отличаются для заказа без позиций?
+
+<details>
+<summary>Ответ</summary>
+
+JOIN исключает заказ. LEFT JOIN сохраняет одну строку результата с NULL в правых столбцах. Совпавшие пары ведут себя одинаково в обоих вариантах.
+
+</details>
+
+2. Почему `WHERE note = NULL` не возвращает строки?
+
+<details>
+<summary>Ответ</summary>
+
+Обычное равенство с NULL даёт неизвестно; WHERE требует истину. `IS NULL` проверяет отсутствие и возвращает логическое значение.
+
+</details>
+
+3. Предскажите сумму Malika после `LEFT JOIN`, `GROUP BY` и `COALESCE(SUM(...), 0)`: **A)** NULL · **B)** 0 · **C)** строки нет.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** LEFT JOIN сохраняет заказ; SUM не получает суммы, отличной от NULL, и возвращает NULL; COALESCE заменяет его на 0. A забывает COALESCE, C описывает INNER JOIN.
+
+</details>
+
+4. Из GB-5.01: что возможно, если два процесса одновременно обновляют один JSON-файл?
+
+<details>
+<summary>Ответ</summary>
+
+Обновление может потеряться, а файл — повредиться. База координирует доступ; нескольким изменениям, которые должны выполниться вместе, нужна транзакция. Она рассматривается в GB-5.07.
+
+</details>
+
+## Домашнее задание
+
+Используйте [папку курса и TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null). Уровни ниже назначены на этой странице; TASK.md уровней не задаёт.
+
+- 🟢 `izohsiz.sql`: один SELECT со столбцами `id`, `customer` заказов, где `note IS NULL`, по возрастанию `id`. Пустая строка не подходит.
+- 🟡 `sotilgan.sql`: один SELECT со столбцами `name` и `sotilgan` («продано единиц») для каждого товара. `sotilgan` — сумма количеств во всех позициях этого товара. Непроданные товары включите с 0. Сортировка: `sotilgan DESC`, при равенстве — `name` по возрастанию.
+
+Удалите начальные комментарии и завершите каждую команду `;`. Не меняйте `products.sql`, `orders.sql`, `seed.sql` и `tekshiruv_test.go`. Уже запущенной базы достаточно. Начальная версия должна упасть: оба SELECT ещё отсутствуют.
+
+```console
+$ go test .
+--- FAIL: TestSotilgan (0.00s)
+    tekshiruv_test.go:132: sotilgan.sql'da SELECT yoʻq: har mahsulot uchun name va sotilgan (order_items.quantity yigʻindisi) ni tanlang; hech sotilmaganda 0 chiqsin (TASK.md)
+--- FAIL: TestIzohsiz (0.00s)
+    tekshiruv_test.go:143: izohsiz.sql'da SELECT yoʻq: izohi yoʻq (NULL) buyurtmalarning id va customer ustunlarini tanlang (TASK.md)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+`SELECT yoʻq` означает «SELECT отсутствует»; сообщение указывает файл и нужный результат. Проверка создаёт временные схемы, загружает два набора данных и использует два плана запроса. Затем удаляет схемы, не затрагивая `public`. Её вывод `psql -At` не содержит заголовков, столбцы разделены `|`, например `non|3`.
+
+<details>
+<summary>Ответ</summary>
+
+Полные [эталонные ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null/solution):
+
+```sql filename="solution/sotilgan.sql" showLineNumbers
+SELECT products.name,
+       COALESCE(SUM(order_items.quantity), 0) AS sotilgan
+FROM products
+LEFT JOIN order_items ON order_items.product_id = products.id
+GROUP BY products.id
+ORDER BY sotilgan DESC, products.name;
+```
+
+Строка 1 выбирает имя товара. Строка 2 суммирует количества, заменяет NULL нулём и называет результат. Строки 3–4 начинают со всех товаров и присоединяют их позиции по `product_id`. Строка 5 группирует по первичному ключу товара. Строка 6 сортирует по вычисленному имени столбца, затем разрешает равенство по названию товара.
+
+После переноса ответа в `sotilgan.sql` ожидайте хлеб и яблоки с 3, абрикосы с 1, непроданный чай с 0:
+
+```console
+$ docker compose exec db psql -f /lab/sotilgan.sql
+ name  | sotilgan 
+-------+----------
+ non   |        3
+ olma  |        3
+ oʻrik |        1
+ choy  |        0
+(4 rows)
+```
+
+```sql filename="solution/izohsiz.sql" showLineNumbers
+SELECT id, customer
+FROM orders
+WHERE note IS NULL
+ORDER BY id;
+```
+
+Строка 1 выбирает два столбца результата; строка 2 выбирает заказы; строка 3 проверяет отсутствие комментария; строка 4 сортирует по id. Ожидайте два заказа без комментариев:
+
+```console
+$ docker compose exec db psql -f /lab/izohsiz.sql
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+Скопировав оба ответа в начальные файлы, повторите проверку:
+
+```console
+$ go test .
+ok  	github.com/abdurahmon27/bozor	2.774s
+```
+
+Этот запуск занял 2.774 с; число после имени пакета — время теста, а не замер скорости запроса. Время зависит от нагрузки; важны `ok`, проверенные строки и их порядок.
+
+Можно отдельно запустить неизменённую папку ответов: `cd solution`, затем `docker compose up -d --wait` и `go test .`. Она использует проект `gb504-solution` и порт 5466. Здесь имя проекта было `gb504docs-solution`, тест прошёл за 2.749 с. Из длительности тестов не выводится соотношение производительности.
+
+</details>
+
+После работы удалите контейнер и том лабораторной. **`-v` удаляет данные лабораторной базы.** Выполните команду в папке проекта Compose, который запускали:
+
+```console
+$ docker compose down -v
+ Container gb504docs-db-1 Stopping 
+ Container gb504docs-db-1 Stopped 
+ Container gb504docs-db-1 Removing 
+ Container gb504docs-db-1 Removed 
+ Volume gb504docs_pgdata Removing 
+ Network gb504docs_default Removing 
+ Volume gb504docs_pgdata Removed 
+ Network gb504docs_default Removed 
+```
+
+`Stopping`/`Stopped` сообщают об остановке, `Removing`/`Removed` — об удалении контейнера, сети и тома. Если отдельно запускали `solution/`, выполните там ту же очистку. Оба временных проекта проверки и их тома удалены.
+
+## Источники
+
+- [PostgreSQL 18: Joins Between Tables](https://www.postgresql.org/docs/18/tutorial-join.html).
+- [PostgreSQL 18: Joined tables](https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-JOIN).
+- [PostgreSQL 18: GROUP BY](https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-GROUP).
+- [PostgreSQL 18: SELECT](https://www.postgresql.org/docs/18/sql-select.html).
+- [PostgreSQL 18: SELECT / GROUP BY](https://www.postgresql.org/docs/18/sql-select.html#SQL-GROUPBY).
+- [PostgreSQL 18: Aggregate functions](https://www.postgresql.org/docs/18/functions-aggregate.html).
+- [PostgreSQL 18: Foreign keys](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK).
+- [PostgreSQL 18: Not-null constraints](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-NOT-NULL).
+- [PostgreSQL 18: Check constraints](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS).
+- [PostgreSQL 18: Comparison operators](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [PostgreSQL 18: IS NULL / IS DISTINCT FROM](https://www.postgresql.org/docs/18/functions-comparison.html#FUNCTIONS-COMPARISON-PRED-TABLE).
+- [PostgreSQL 18: COALESCE](https://www.postgresql.org/docs/18/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL).
+- [PostgreSQL 18: Three-valued logic](https://www.postgresql.org/docs/18/functions-logical.html).
+- [PostgreSQL 18: CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html).
+- [PostgreSQL 18: INSERT](https://www.postgresql.org/docs/18/sql-insert.html).
+- [PostgreSQL 18: psql](https://www.postgresql.org/docs/18/app-psql.html).
+- [Docker Compose: up --wait](https://docs.docker.com/reference/cli/docker/compose/up/).
+
+SQL-результаты: `postgres:18-alpine`, PostgreSQL 18.7; Docker Compose 5.4.0. Результаты тестов Go: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27. SQL-результаты совпадают с видео; здесь сохранены строки с количеством записей, сокращённые там. Имена контейнеров и время тестов взяты из запуска для этой страницы.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null)
+
+---
+
+← Предыдущий урок: [GB-5.03](/lab/youtube/gb/gb-5-03/ru) · Следующий урок: [GB-5.05](/lab/youtube/gb/gb-5-05/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

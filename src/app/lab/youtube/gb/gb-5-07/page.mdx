@@ -1,0 +1,961 @@
+---
+title: "Transaction: buyurtma qoldiqni kamaytiradi"
+date: "2026/11/27"
+description: "Buyurtma va qoldiqni bitta transaction'da yozing: BEGIN, COMMIT, ROLLBACK, pgx.Tx va xatodan keyingi holat."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 39
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-07"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-07"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-5-07/ru) · [English](/lab/youtube/gb/gb-5-07/en)  
+Dars GB-5.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-07) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Buyurtma yozildi, olma qoldigʻi kamaydi, lekin non yetmadi. Funksiya xato qaytardi. Bazada yarim buyurtma qoladimi?
+
+**Bitta gʻoya:** bir nechta jadvaldagi oʻzgarishni bitta **transaction** birlashtiradi: hammasi saqlanadi yoki jadval oʻzgarishlari bekor qilinadi. Go'da hamma buyruq bitta `tx` orqali ketadi.
+
+Darsdan keyin siz:
+
+- transaction'siz qoladigan yarim buyurtmani SQL bilan topasiz;
+- `BEGIN`, `COMMIT`, `ROLLBACK` va buzilgan transaction holatini ajratasiz;
+- `pool.Begin`, `defer tx.Rollback(ctx)` va `tx.Commit(ctx)` bilan `PlaceOrder` yozasiz;
+- `tx` oʻrniga pool ishlatilgan xatoni topib, vazifani haqiqiy Postgres'da tekshirasiz.
+
+| Soʻz | Sodda maʼnosi | English term |
+|---|---|---|
+| transaction | bir butun saqlanadigan yoki bekor qilinadigan buyruqlar guruhi | transaction |
+| buzilgan transaction | SQL xatosidan keyin odatdagi buyruqlar rad etiladigan holat | aborted transaction |
+| pgx transaction | pool'dan olingan bitta ulanishdagi transaction'ni boshqaradigan `tx` | pgx transaction |
+
+Yordamchi tushunchalar: `UPDATE … SET` mavjud qator qiymatini yangilaydi. **SQLSTATE** — Postgres xato turining besh belgili kodi.
+
+## Oldin bilish kerak
+
+- [GB-5.06 · goose migratsiyalari](/lab/youtube/gb#gb-5-06): qoʻllangan versiyalar jadvali.
+- [GB-5.05 · pgx va pool](/lab/youtube/gb/gb-5-05): `QueryRow`, `Scan`, `Exec`, `$1`, `pgx.ErrNoRows`, context muddati.
+- [GB-5.04 · JOIN va NULL](/lab/youtube/gb/gb-5-04): `orders`, `order_items`, tashqi kalit va `IS NULL`.
+- [GB-5.03 · SQL jadvali](/lab/youtube/gb/gb-5-03): `products`, `CHECK`, identity, `RETURNING`, `psql -f/-c`.
+- [GB-5.02 · Postgres laboratoriyasi](/lab/youtube/gb/gb-5-02): Docker Compose va portlar.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09), [GB-2.08 · Error](/lab/youtube/gb/gb-2-08): kechiktirilgan chaqiruv, `errors.Is/As`.
+- [GB-2.05 · Metodlar](/lab/youtube/gb/gb-2-05), [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01).
+- [GB-1.07 · Funksiya va error](/lab/youtube/gb/gb-1-07), [GB-1.06 · for](/lab/youtube/gb/gb-1-06), [GB-1.05 · Shartlar](/lab/youtube/gb/gb-1-05), [GB-1.03 · Pul](/lab/youtube/gb/gb-1-03), [GB-1.01 · Birinchi dastur](/lab/youtube/gb/gb-1-01).
+
+`lessons/gb-5-07-transaction` papkasining nusxasida ishlang: bosqichlarda `main.go` va `store.go` almashtiriladi. Asl fayllarni saqlang. Go Playground oʻrniga Go 1.27.4, Docker va Compose kerak. Modul pgx v5.13.0 ishlatadi.
+
+Quyidagi sozlamalar bilan barcha Go buyruqlari qayta bajarildi. `CGO_ENABLED=0` C integratsiyasini oʻchiradi; gcc kerak emas. `GOTOOLCHAIN` Go versiyasini tanlaydi.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+```
+
+`5497` boʻsh ekanini tekshiring; band boʻlsa nusxadagi `compose.yaml` va URL portini bir xil boʻsh raqamga almashtiring. Bizning nusxada Compose loyiha nomi `gb507doc`; kursda `gb507`, videoda `bozor`. Shu sabab konteyner nomi farq qiladi.
+
+```console
+$ docker compose up -d --wait
+ Container gb507doc-db-1 Running 
+ Container gb507doc-db-1 Waiting 
+ Container gb507doc-db-1 Healthy 
+```
+
+Bu qayta ishlayotgan konteynerning toʻliq chiqishi: `Running`, keyin tayyorlikni kutish va `Healthy`. Birinchi ishga tushirishda yaratish qatorlari ham boʻladi.
+
+```console
+$ export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5497/bozor
+
+```
+
+`export` hech narsa chiqarmadi. Bu ochiq laboratoriyaning sunʼiy ulanish URL'i: foydalanuvchi/parol `bozor`/`bozor-lab`, port `5497`, baza `bozor`. Koddagi mijoz ismlari ham sunʼiy sinov maʼlumotlari.
+
+Oldingi darsdan: qoʻllangan migratsiyalarga `goose up` yana berilsa nima boʻladi? **A)** qayta qoʻllaydi · **B)** oʻtkazib yuboradi · **C)** doim xato.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Goose versiyalarni `goose_db_version` jadvalida saqlaydi. `no migrations to run` — qoʻllanadigan yangi migratsiya yoʻq. Bu eslash javobi; bu sahifada goose qayta ishga tushirilmagan.
+
+</details>
+
+## Transaction'siz: xato yarim buyurtmani oʻchirmaydi
+
+`bozor.sql` oldingi darslarning uchta jadvalini qayta yaratadi. `DROP TABLE` mavjud qatorlarni ham oʻchiradi: buni shu laboratoriyada bajaring. Nusxamizdagi jadvallar avvaldan mavjud edi:
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+Yangi bazada oldin uchta `NOTICE … does not exist, skipping` ogohlantirishi ham chiqadi. `CREATE TABLE` jadval yaratadi, `INSERT 0 n` esa `n` qator qoʻshadi. Videoda `DROP TABLE`, ogohlantirishlar va ayrim qator sonlari yashirilgan; bu yerda qayta bajarilgan natijalar berilgan.
+
+| Jadval | Boshlangʻich holat | Buyurtmadagi vazifasi |
+|---|---|---|
+| `products` | olma: `id=1`, qoldiq `40`; non: `id=2`, qoldiq `3`; yana choy va oʻrik | qoldiqni kamaytirish |
+| `orders` | 3 buyurtma | mijoz uchun buyurtma qatori |
+| `order_items` | 4 qator | mahsulot, miqdor va buyurtma paytidagi narx |
+
+`price`/`unit_price` tiyinda: olma `1200000`, non `400000`. `products.stock` uchun `CHECK (stock >= 0)` bor.
+
+`store.go`dagi yangi kirish turi:
+
+```go
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+```
+
+`ProductID` mahsulotni, `Quantity` miqdorni bildiradi. `[]OrderItem` — shu struct qiymatlarining slice'i. `Store` ichida oldingi darsdagi ulanishlar pool'i bor.
+
+Avval xato usulning toʻliq fayli:
+
+```go filename="notx.go" showLineNumbers
+package main
+
+import "context"
+
+// PlaceOrderNoTx — videodagi XATO versiya: shu PlaceOrder, lekin transaction'siz.
+// Har buyruq pool orqali alohida yuboriladi, shuning uchun xatodan keyin yarim yozilgan buyurtma qoladi.
+// Faqat koʻrsatish uchun: ishlatmang.
+func (s *Store) PlaceOrderNoTx(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	var orderID int64
+	err := s.pool.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id", customer).Scan(&orderID)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		err = s.pool.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&price)
+		if err != nil {
+			return 0, err
+		}
+		_, err = s.pool.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return orderID, nil
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1–7 | `package`, `import`, izohlar | `main` paketi, context turi va xato usul haqidagi ogohlantirish |
+| 8 | `PlaceOrderNoTx(…) (int64, error)` | Store metodi: context, mijoz va buyurtma qatorlarini olib, id va xato qaytaradi |
+| 9–11 | `QueryRow(…).Scan(&orderID)` | `orders`ga qator qoʻshadi; `$1` — mijoz; `RETURNING id` qiymatini manzil orqali yozadi |
+| 12–14 | `if err != nil` | xato boʻlsa `0, err`; oldingi SQL natijalarini oʻzi bekor qilmaydi |
+| 15–16 | `for _, it := range items` | har element uchun sikl; indeks `_` bilan tashlanadi, `it` — joriy qator; `price` narx uchun |
+| 17–19 | `UPDATE … RETURNING price` | `SET` yangi qiymat beradi: qoldiqdan `$1` miqdor ayriladi; `$2` mahsulotni tanlaydi; narx `price`ga oʻqiladi |
+| 20–22 | `return 0, err` | qoldiq qoidasi buzilsa chiqadi; `err` mavjud, shuning uchun 17-qatorda `=` |
+| 23–25 | `Exec` | toʻrt parametr bilan `order_items`ga qator yozadi; `_` buyruq natijasini tashlaydi |
+| 26–31 | xato tekshiruvi, `return` | xatoda chiqadi, sikl muvaffaqiyatli tugasa id va `nil` qaytaradi |
+
+Chaqiruvchi faylni nusxalang. `cp` tayyor bosqichni `main.go` oʻrniga qoʻyadi; hech narsa chiqarmaydi.
+
+```console
+$ cp _video/stages/01-main-notx.go main.go
+
+```
+
+```go filename="_video/stages/01-main-notx.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 5},
+	}
+	id, err := store.PlaceOrderNoTx(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1–10 | `package main`, importlar | context, chiqarish, muhit, vaqt va pgxpool |
+| 12–14 | `Background`, `pgxpool.New` | asosiy context va `os.Getenv` oʻqigan URL bilan pool yaratadi |
+| 15–19 | xato, `defer pool.Close()` | boshlangʻich xatoni stderr'ga chiqarib, `os.Exit(1)` bilan toʻxtaydi; muvaffaqiyatda pool yopilishini rejalaydi |
+| 21 | `&Store{pool: pool}` | pool'ni saqlagan Store qiymatining manzilini oladi |
+| 22–23 | `WithTimeout`, `defer cancel()` | `qctx` uchun 5 soniya chegara; funksiya qaytganda context resurslarini boʻshatadi |
+| 25–28 | `[]OrderItem{…}` | 2 olma va 5 non: non qoldigʻi faqat 3 |
+| 29–31 | chaqiruv, `Println` | xato usulni chaqiradi, id va xatoni chiqaradi |
+
+`BEGIN` yoʻq boʻlsa, har alohida SQL buyrugʻi oʻz transaction'ida ishlaydi va muvaffaqiyatda saqlanadi.
+
+Xato qaytgach nima qoladi? **A)** hech qanday yangi qator yoʻq · **B)** buyurtma va olma qatori bor · **C)** faqat buyurtma bor.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Buyurtma INSERT'i, olma UPDATE'i va olma qatori INSERT'i allaqachon saqlangan. Non UPDATE'i `3 - 5` sabab rad etiladi. **A** funksiya xatosini SQL bekor qilishi deb qabul qiladi. **C** birinchi mahsulotning muvaffaqiyatli yozuvlarini oʻtkazib yuboradi.
+
+</details>
+
+```console
+$ go run .
+0 ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514)
+```
+
+`0` — funksiyaning xatoda qaytargan qiymati; bazada buyurtma yoʻq degani emas. `violates check constraint` — tekshirish qoidasi buzildi. `23514` — shu xato kodi.
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE id > 3' -c 'SELECT order_id, product_id, quantity FROM order_items WHERE order_id > 3'
+ id | customer 
+----+----------
+  4 | Aziza
+(1 row)
+
+ order_id | product_id | quantity 
+----------+------------+----------
+        4 |          1 |        2
+(1 row)
+```
+
+Ikki `-c` ikkita soʻrov yuboradi. `id > 3` yangi buyurtmalarni ajratadi. Yangi buyurtma `4`, uning faqat olma qatori bor.
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    38
+  2 | non  |     3
+(2 rows)
+```
+
+`id <= 2` — birinchi ikki mahsulot. Olma `38`, non `3`: funksiya xato qaytarsa ham, birinchi yozuvlar saqlanib qolgan.
+
+## SQL: BEGIN va ROLLBACK
+
+**Transaction** shu yozuvlarni bir guruhga oladi. `BEGIN` boshlaydi; shu ulanish oʻzining yangi qiymatlarini koʻradi. Boshqa ulanishlar saqlanmagan jadval oʻzgarishlarini koʻrmaydi. `COMMIT` saqlaydi, `ROLLBACK` bekor qiladi.
+
+| Bosqich | Shu ulanish | Boshqa ulanish |
+|---|---|---|
+| `BEGIN`dan oldin | olma `38` | olma `38` |
+| `UPDATE … - 2`dan keyin | olma `36` | saqlangan olma `38` |
+| `ROLLBACK`dan keyin | olma `38` | olma `38` |
+| oʻrniga muvaffaqiyatli `COMMIT` boʻlsa | olma `36` | keyingi oʻqish `36`ni koʻra oladi |
+
+Bu jadval oddiy alohida soʻrovlar uchun; boshqa transaction'ning uzoq yashaydigan oʻqish holati bu dars mavzusi emas.
+
+```sql filename="bekor.sql" showLineNumbers
+BEGIN;
+UPDATE products SET stock = stock - 2 WHERE id = 1;
+SELECT stock FROM products WHERE id = 1;
+ROLLBACK;
+SELECT stock FROM products WHERE id = 1;
+```
+
+1-qator boshlaydi, 2-qator kamaytiradi, 3-qator ichki qiymatni oʻqiydi. 4-qator bekor qiladi, 5-qator qayta oʻqiydi. `;` SQL buyrugʻini tugatadi.
+
+Oxirgi `SELECT` nimani chiqaradi? **A)** `38` · **B)** `36` · **C)** `40`.
+
+<details>
+<summary>Javob</summary>
+
+**A: `38`.** `ROLLBACK` faqat shu transaction'dagi kamayishni qaytaradi. **B** bekor qilishni eʼtiborsiz qoldiradi. **C** oldingi transaction'siz buyurtmani ham bekor boʻladi deb hisoblaydi.
+
+</details>
+
+```console
+$ docker compose exec db psql -t -f /lab/bekor.sql
+BEGIN
+UPDATE 1
+    36
+
+ROLLBACK
+    38
+```
+
+`-t` sarlavha va `(N rows)`ni yashiradi, lekin `BEGIN`, `UPDATE 1`, `ROLLBACK` qoladi. `UPDATE 1` — bitta qator yangilandi. Ichkarida `36`, bekor qilingach `38`.
+
+Dastur COMMIT'ga yetmay toʻxtasa-chi? **A)** UPDATE qoladi · **B)** ulanish uzilganda bekor boʻladi · **C)** baza abadiy kutadi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Postgres ulanish yopilganini aniqlaganda tugallanmagan transaction'ni bekor qiladi. **A** UPDATE'ni COMMIT bilan tenglashtiradi. **C** uzilish aniqlanganidan keyingi holatga mos emas. Jarayon toʻxtashi bilan tarmoq uzilishi aniqlanishi orasida vaqt oʻtishi mumkin.
+
+</details>
+
+## SQL xatosi: buzilgan transaction
+
+`xato.sql` non qoldigʻini `3`dan `-2`ga tushirishga urinadi. `SELECT 1` oddiy soʻrov: muvaffaqiyatda `1` qaytaradi.
+
+```sql filename="xato.sql" showLineNumbers
+BEGIN;
+UPDATE products SET stock = stock - 5 WHERE id = 2;
+SELECT 1;
+COMMIT;
+```
+
+Non qoldigʻi oxirida nechta? **A)** `3` · **B)** `-2` · **C)** `0`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** `CHECK` manfiy qoldiqni rad etadi; shu transaction'dagi jadval oʻzgarishlari saqlanmaydi. **B** qoidani, **C** esa buyruqda nolga tushirish yoʻqligini hisobga olmaydi.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/xato.sql
+BEGIN
+psql:/lab/xato.sql:2: ERROR:  new row for relation "products" violates check constraint "products_stock_check"
+DETAIL:  Failing row contains (2, non, 400000, -2, t).
+psql:/lab/xato.sql:3: ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+```
+
+- `/lab/xato.sql:2` — SQL faylining ikkinchi qatori. `DETAIL`dagi `Failing row` saqlangan qator emas, rad etilgan qiymatlar.
+- `current transaction is aborted` — transaction buzilgan; oddiy soʻrovlar blok tugaguncha rad etiladi. Shuning uchun `SELECT 1` ham bajarilmaydi.
+- Oxirgi `COMMIT` bu holatda `ROLLBACK` javobini berdi. Transaction bloki tugadi; oʻzgarishlar saqlanmadi.
+
+Bu laboratoriyada savepoint yoʻq. Savepoint — transaction ichidagi qaytish nuqtasi; unga qaytish alohida mavzu. Oddiy Go xatosi esa Postgres transaction'ni oʻz-oʻzidan buzmaydi. Masalan, `pgx.ErrNoRows` SQL xatosi emas; undan keyin bekor qilishni Go kodi bajarishi kerak.
+
+## Go: bitta tx, hamma buyruqlar
+
+`pool.Begin(ctx)` pool'dan bitta ulanish olib, `BEGIN` yuboradi. Qaytgan `tx` ulanishning oʻzi emas, shu ulanishdagi transaction'ni boshqaruvchi qiymat. Barcha `QueryRow`/`Exec` shu `tx` orqali ketadi.
+
+| Go yoʻli | Postgres | Pool |
+|---|---|---|
+| `pool.Begin` | transaction boshlanadi | bitta ulanish band |
+| `tx.QueryRow` / `tx.Exec` | oʻsha transaction'dagi yozuvlar | ulanish band qoladi |
+| erta `return` → deferred `Rollback` | jadval oʻzgarishlari bekor | sogʻlom ulanish qaytadi |
+| muvaffaqiyatli `Commit` | yozuvlar saqlanadi | ulanish qaytadi |
+| keyingi deferred `Rollback` | yangi ROLLBACK yuborilmaydi | transaction allaqachon yopilgan |
+
+Toʻliq `store.go` quyida; 1–96-qatorlar GB-5.05'dan qolgan kod. Yangi qismlar 98-qatordan boshlanadi.
+
+<details>
+<summary>Toʻliq store.go</summary>
+
+```go filename="store.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — products jadvaliga Go'dan kirish. pool bir vaqtda koʻp goroutine'dan ishlatilishi mumkin.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OrderTotal bitta buyurtmaning jami summasini (tiyinda) hisoblaydi. Buyurtma yoʻq boʻlsa SUM NULL beradi: COALESCE uni nolga aylantiradi.
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+
+// ByName nom boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) ByName(ctx context.Context, name string) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE name = $1", name).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// Cheapest eng arzon n ta faol mahsulotni narx boʻyicha oʻsish tartibida oʻqiydi.
+func (s *Store) Cheapest(ctx context.Context, n int) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY price, id LIMIT $1", n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq. VAZIFA (TASK.md, 1-qadam): PlaceOrder shu xatoni qaytarsin.
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi kerak. VAZIFA (TASK.md, 3-qadam).
+var ErrInvalidQuantity = errors.New("miqdor noldan katta boʻlishi kerak")
+
+// OrderItem — buyurtmadagi bitta qator: qaysi mahsulot va nechta.
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+
+// PlaceOrder buyurtmani bitta transaction'da yozadi: orders qatori, har mahsulot uchun products.stock kamayishi
+// va order_items qatori. Biror qadam xato bersa, hech narsa yozilmaydi.
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var orderID int64
+	err = tx.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id", customer).Scan(&orderID)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		err = tx.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&price)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		if err != nil {
+			return 0, err
+		}
+		_, err = tx.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return orderID, nil
+}
+
+// Restock tovar qabul qilishni yozadi: har mahsulotning qoldigʻi Quantity ga oshadi.
+// Hammasi bitta transaction'da: bitta mahsulot topilmasa, hech birining qoldigʻi oʻzgarmaydi. VAZIFA (TASK.md, 2-qadam).
+func (s *Store) Restock(ctx context.Context, items []OrderItem) error {
+	return errors.New("Restock hali yozilmagan")
+}
+```
+
+</details>
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 98–108 | xatolar va `OrderItem` | vazifa uchun ikki sentinel xato; mahsulot id'si va miqdor struct'i |
+| 110–116 | `PlaceOrder`, `pool.Begin` | oldingi imzo; boshlash xatosida `0, err` |
+| 117 | `defer tx.Rollback(ctx)` | funksiya qaytganda transaction hali ochiq boʻlsa bekor qilishga urinadi |
+| 119–124 | `tx.QueryRow` | buyurtmani shu transaction'da yaratadi; `err` borligi uchun `=` |
+| 125–129 | sikl, `UPDATE` | oldingi SQL, endi `tx` orqali; narx buyurtma qatoriga kerak |
+| 130–135 | `errors.Is(err, pgx.ErrNoRows)` | UPDATE hech qator topmasa `Scan` shu xatoni beradi; `ErrNotFound`ga aylantirib chiqadi; qolgan xatolar oʻzgarmaydi |
+| 136–142 | `tx.Exec`, xato tekshiruvi | buyurtma qatorini oʻsha transaction'ga yozadi |
+| 143–147 | `tx.Commit(ctx)` | xatosini tekshiradi; faqat muvaffaqiyatda `orderID, nil` qaytaradi |
+| 149–153 | `Restock` | vazifa uchun stub: hozir «hali yozilmagan» xatosi |
+
+Commit'dan keyingi Rollback `pgx.ErrTxClosed` (`tx is closed`) qaytaradi va saqlangan yozuvni oʻzgartirmaydi. Deferred chaqiruvning natijasi tashlanadi. Shu sabab bu shakl muvaffaqiyat yoʻlida ham xavfsiz.
+
+`defer` jarayonning majburiy toʻxtashida yoki `os.Exit`da ishlamaydi. Ulanish uzilsa, tugallanmagan transaction'ni Postgres bekor qiladi. `Begin` context'i bekor boʻlishi pgx'da avtomatik rollback bermaydi: `Commit` yoki `Rollback` baribir kerak. Rollback boshqa sababdan bajarilmasa, pgx ulanishni yopadi; sogʻlom ulanishgina pool'ga qaytadi.
+
+## Xuddi shu buyurtma: hammasi bekor, keyin hammasi saqlanadi
+
+Avval bazani qaytaring va 2 olma, 5 non bilan `PlaceOrder`ni tanlang. `cp` hech narsa chiqarmaydi.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/02-main-tx-fail.go main.go
+
+```
+
+Oʻzgargan chaqiruv:
+
+```go
+id, err := store.PlaceOrder(qctx, "Aziza", items)
+```
+
+Funksiya xato qaytarsa nima qoladi? **A)** yangi buyurtma yoʻq, olma `40` · **B)** olma `38` · **C)** buyurtma qatori qoladi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** CHECK transaction'ni buzadi, funksiya xato bilan qaytadi va deferred Rollback blokni tugatadi. **B** va **C** transaction'siz usulning natijalaridir.
+
+</details>
+
+```console
+$ go run .
+0 ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE id > 3' -c 'SELECT order_id, product_id, quantity FROM order_items WHERE order_id > 3'
+ id | customer 
+----+----------
+(0 rows)
+
+ order_id | product_id | quantity 
+----------+------------+----------
+(0 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    40
+  2 | non  |     3
+(2 rows)
+```
+
+Buyurtma va uning qatorlari yoʻq; oldingi olma UPDATE'i ham saqlanmadi. Identity hisoblagichi bundan mustasno: olingan raqam orqaga qaytmaydi.
+
+Endi non miqdorini `1`ga almashtiring. Toʻliq yakuniy `main.go`:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 1},
+	}
+	id, err := store.PlaceOrder(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+Oldingi fayldan farq: 27-qatorda non `5` oʻrniga `1`, 29-qatorda `PlaceOrder`. Qolgan qatorlar oʻsha.
+
+Yangi id nima? **A)** `4` · **B)** `5` · **C)** `0`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bekor qilingan buyurtma INSERT'i `4`ni olgan edi. Identity ketma-ketligi transaction bilan orqaga qaytmaydi. **A** ketma-ketlikni qatorlar bilan birga bekor boʻladi deb hisoblaydi; **C** muvaffaqiyatli yoʻlga mos emas.
+
+</details>
+
+```console
+$ cp _video/stages/03-main-final.go main.go
+
+```
+
+```console
+$ go run .
+5 <nil>
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id > 3'
+ order_id | product_id | quantity | unit_price 
+----------+------------+----------+------------
+        5 |          1 |        2 |    1200000
+        5 |          2 |        1 |     400000
+(2 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    38
+  2 | non  |     2
+(2 rows)
+```
+
+`5 <nil>` — buyurtma id'si va xato yoʻqligi. Ikkita qator, narxlar tiyinda; qoldiq olma `38`, non `2`. Videodagi qiymatlar bilan qayta bajarilgan natija bir xil. Bu dars tezlikni oʻlchamaydi: muhim farq vaqt nisbati emas, saqlangan qatorlar va qoldiqning birgalikdagi holati.
+
+## Chuqurroq (ixtiyoriy): Postgres xatosini kodidan tanish
+
+Vazifada `23514`ni `ErrNotEnoughStock`ga aylantirish kerak. `*pgconn.PgError` — pgx qaytargan Postgres xatosi turi. `errors.As` uni ochadi; `&pgErr` oʻzgaruvchining manzili. `Code` — SQLSTATE, `ConstraintName` — buzilgan qoida nomi.
+
+Quyidagi toʻliq bosqich fayli `errors` va `pgconn` importlarini ham koʻrsatadi:
+
+```go filename="_video/stages/05-main-pgerr.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err = store.PlaceOrder(qctx, "Aziza", []OrderItem{{ProductID: 2, Quantity: 5}})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		fmt.Println(pgErr.Code, pgErr.ConstraintName)
+	}
+}
+```
+
+Oldingi `main`dan yangi qatorlar: 5 va 10 — importlar; 27 — 5 non buyurtmasi; 28–31 — xatoni ochib, ikki maydonni chiqarish. `pgErr` — pointer; `errors.As` muvaffaqiyatli boʻlgandagina uning maydonlarini oʻqiymiz.
+
+Bu ishga tushirish uchun **asl starter `store.go`**ni saqlang; u hali xatoni sentinel'ga aylantirmaydi. Bazani yana qaytaramiz; `cp` jim ishlaydi.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/05-main-pgerr.go main.go
+
+```
+
+```console
+$ go run .
+23514 products_stock_check
+```
+
+Agar SQL xatosidan keyin baribir `tx.Commit` chaqirilsa, pgx `pgx.ErrTxCommitRollback` beradi: `commit unexpectedly resulted in rollback`. Bu misoldagi `PlaceOrder` esa oldinroq xato bilan chiqadi. Shuning uchun u asl `23514` xatosini qaytaradi.
+
+Commit ulanish uzilishi sabab ham xato qaytarishi mumkin. `0, err` — shu funksiyaning qaytarish qoidasi; uzilishda u server saqlamaganini oʻz-oʻzidan isbotlamaydi. Ikki xaridor, `SELECT … FOR UPDATE` va `BeginTx` izolyatsiya sozlamalari [GB-5.08](/lab/youtube/gb#gb-5-08) mavzusi.
+
+## Koʻp uchraydigan xatolar
+
+**Begin'dan keyin pool ishlatish.** Quyidagi notoʻgʻri qator kompilyatsiyadan oʻtadi: pool'da ham `Exec` bor.
+
+```go
+		_, err = s.pool.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+```
+
+`tx` bitta ulanishni band qilib turibdi. Pool boshqa ulanish oladi; unda transaction hali saqlamagan `orders` qatori koʻrinmaydi. Shu misolda tashqi kalit tekshiruvi xato beradi.
+
+**A)** buyurtma yoziladi · **B)** tashqi kalit xatosi · **C)** faqat olma qoladi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Yangi order id boshqa ulanish uchun hali mavjud emas. **A** ikki ulanishni bitta transaction deb oladi. **C** deferred rollback bajarilishini hisobga olmaydi.
+
+</details>
+
+Avval asl `main.go`ni qaytaring: unda 2 olma, 1 non. Keyin xato `store.go` bosqichini qoʻying. `cp` buyruqlari hech narsa chiqarmaydi.
+
+```console
+$ cp _video/stages/03-main-final.go main.go
+
+```
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/04-store-pool-mistake.go store.go
+
+```
+
+```console
+$ go run .
+0 ERROR: insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey" (SQLSTATE 23503)
+```
+
+`order_items_order_id_fkey` — `order_id` uchun tashqi kalit nomi. `23503` — foreign key violation: koʻrinadigan ota qator yoʻq. Go chiqishida fayl/qator raqami yoʻq: bu SQL serveri qaytargan xato.
+
+Tuzatish: `s.pool.Exec` oʻrniga `tx.Exec`. Keyingi ish va vazifa uchun asl starter `store.go`ni qaytaring. Pool eng koʻp bitta ulanishga cheklangan boʻlsa, shu xato shakl ulanish kutib qolishi mumkin; `23503` har qanday pool sozlamasining kafolati emas.
+
+**Xato qaytarsa, hammasi oʻzi bekor boʻladi deb oʻylash.** Transaction'siz natijaga qarang: `0, err` bazani tozalamadi. SQL xatosi bilan oddiy Go xatosini ajrating va har chiqish yoʻliga rollback qoʻying.
+
+**Commit xatosini tekshirmaslik.** Faqat `tx.Commit(ctx)` yozib, keyin muvaffaqiyat qaytarmang. Yuqoridagi 143–146-qatorlar xatoni tekshiradi.
+
+## Oʻzingizni tekshiring
+
+1. Shu darsdagi savepoint'siz transaction ichida CHECK buzilsa, oldingi UPDATE saqlanadimi?
+
+<details>
+<summary>Javob</summary>
+
+Yoʻq. Transaction buziladi; oddiy buyruqlar rad etiladi. ROLLBACK blokni tugatadi; COMMIT ham bu holatda rollback boʻladi. Jadvaldagi oldingi oʻzgarishlar saqlanmaydi.
+
+</details>
+
+2. Commit'dan keyingi deferred Rollback nega saqlangan buyurtmani oʻchirmaydi?
+
+<details>
+<summary>Javob</summary>
+
+`tx` yopilgan. pgx `ErrTxClosed` qaytaradi va bazaga yangi ROLLBACK yubormaydi.
+
+</details>
+
+3. Avvaldan olma `40`. `BEGIN; UPDATE products SET stock = stock - 2 WHERE id = 1; ROLLBACK;`dan keyingi oʻqish: **A)** `38` · **B)** `40` · **C)** xato?
+
+<details>
+<summary>Javob</summary>
+
+**B: `40`.** Faqat shu transaction'dagi oʻzgarish bekor qilingan. `38` boʻlishi uchun muvaffaqiyatli COMMIT kerak edi.
+
+</details>
+
+4. GB-5.04: `WHERE note = NULL` nega hech qator qaytarmaydi?
+
+<details>
+<summary>Javob</summary>
+
+`NULL` bilan oddiy taqqoslash nomaʼlum beradi; WHERE faqat rostni saqlaydi. `WHERE note IS NULL` kerak.
+
+</details>
+
+## Uy vazifasi
+
+[Kurs papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-07-transaction/TASK.md) va [javoblar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction/solution).
+
+TASK.md darajalarni belgilamagan; bu yerda ish hajmiga qarab belgilandi. Uchala topshiriq ham kerak:
+
+1. 🟢 `PlaceOrder`: stock UPDATE'i `23514` bersa `ErrNotEnoughStock` qaytaring; oldingi yozuvlar bekor boʻlsin.
+2. 🟡 `Restock(ctx, items []OrderItem) error`: har qoldiqni miqdorga oshiring. Mahsulot topilmasa `ErrNotFound`; oldingi oshirishlar ham bekor boʻlsin.
+3. 🟢 Ikkala metodda `Quantity <= 0`ni **Begin'dan oldin** `ErrInvalidQuantity` bilan rad eting. Manfiy Restock qoldiqni kamaytirmasin.
+
+Asl starter fayllarini tiklang va konteynerni ishlating. `store_test.go`ni oʻzgartirmang. Testlar vaqtinchalik sxemalarda haqiqiy Postgres'da ishlaydi; bazasiz oʻtkazib yuborilmaydi. Ichki mexanizmi [GB-5.10](/lab/youtube/gb#gb-5-10)da.
+
+Natijani bashorat qiling: **A)** starter darhol oʻtadi · **B)** toʻrtta test yiqiladi · **C)** hammasi oʻtkazib yuboriladi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Transaction tayyor, lekin xatoni aylantirish, Restock va miqdor tekshiruvi yozilmagan. Vaqtlar sizning mashinangizda oʻzgaradi; quyidagilar tezlik oʻlchovi emas.
+
+```console
+$ go test .
+--- FAIL: TestPlaceOrderNotEnoughStock (0.03s)
+    store_test.go:154: PlaceOrder(non x5) = ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514); kutilgan: ErrNotEnoughStock (TASK.md, 1-qadam: errors.As bilan *pgconn.PgError, Code 23514)
+--- FAIL: TestRestock (0.03s)
+    store_test.go:165: Restock = Restock hali yozilmagan; kutilgan: nil (TASK.md, 2-qadam)
+--- FAIL: TestRestockAllOrNothing (0.03s)
+    store_test.go:179: Restock(99-mahsulot) = Restock hali yozilmagan; kutilgan: ErrNotFound (TASK.md, 2-qadam)
+--- FAIL: TestInvalidQuantity (0.03s)
+    store_test.go:190: PlaceOrder(miqdor 0) = ERROR: new row for relation "order_items" violates check constraint "order_items_quantity_check" (SQLSTATE 23514); kutilgan: ErrInvalidQuantity (TASK.md, 3-qadam)
+    store_test.go:193: Restock(miqdor -2) = Restock hali yozilmagan; kutilgan: ErrInvalidQuantity (TASK.md, 3-qadam): manfiy miqdor qoldiqni kamaytirib yuboradi
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.213s
+FAIL
+```
+
+</details>
+
+<details>
+<summary>Javoblar qanday ishlaydi</summary>
+
+Har ikki metod boshida `items` boʻylab yurib, `Quantity <= 0`ni rad eting. `PlaceOrder`dagi UPDATE'ning `Scan`idan keyin, umumiy xato tekshiruvidan oldin:
+
+```go
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+	return 0, ErrNotEnoughStock
+}
+```
+
+`&&` ikkala shartni talab qiladi; ikkinchisi birinchisi rost boʻlsagina tekshiriladi. Importga `github.com/jackc/pgx/v5/pgconn` qoʻshiladi. Bu stock UPDATE'i uchun yozilgan tekshiruv; boshqa joylarda `23514` boshqa CHECK'ni ham anglatishi mumkin. Zarur boʻlsa `ConstraintName == "products_stock_check"` bilan toraytiring.
+
+Restock ham `Begin` → deferred Rollback → `tx` orqali UPDATE'lar → Commit shaklida. SQL'da ayirish oʻrniga qoʻshish:
+
+```sql
+UPDATE products SET stock = stock + $1 WHERE id = $2 RETURNING stock
+```
+
+`Scan` qator topmasa `ErrNotFound`; boshqa xatolar oʻzgarmaydi. Oxirida `return tx.Commit(ctx)`. Shu sabab ikkinchi mahsulot yoʻqligida birinchisiga qoʻshilgan miqdor ham saqlanmaydi.
+
+Tayyor javobni alohida tekshirish: `cd solution` javob papkasiga oʻtadi. Quyidagi chiqish qayta bajarilgan, Go avvalgi muvaffaqiyatli test natijasini keshdan oldi:
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	(cached)
+```
+
+</details>
+
+Oxirida laboratoriya ildizida konteyner va uning volume'ini tozalang. `down -v` shu laboratoriyaning saqlangan maʼlumotlarini ham oʻchiradi.
+
+```console
+$ docker compose down -v
+ Container gb507doc-db-1 Stopping 
+ Container gb507doc-db-1 Stopped 
+ Container gb507doc-db-1 Removing 
+ Container gb507doc-db-1 Removed 
+ Volume gb507doc_pgdata Removing 
+ Network gb507doc_default Removing 
+ Volume gb507doc_pgdata Removed 
+ Network gb507doc_default Removed 
+```
+
+## Manbalar
+
+- [PostgreSQL 18: Transactions](https://www.postgresql.org/docs/18/tutorial-transactions.html): bitta butun ish, avtomatik alohida transaction'lar, bekor qilish va savepoint.
+- [COMMIT](https://www.postgresql.org/docs/18/sql-commit.html), [protokol holatlari](https://www.postgresql.org/docs/18/protocol-message-formats.html), [ulanish tugashi](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-TERMINATION): blokning tugashi va uzilish.
+- [UPDATE](https://www.postgresql.org/docs/18/sql-update.html), [RETURNING](https://www.postgresql.org/docs/18/dml-returning.html), [xato kodlari](https://www.postgresql.org/docs/18/errcodes-appendix.html).
+- [Transaction isolation](https://www.postgresql.org/docs/18/transaction-iso.html), [tashqi kalitlar](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK), [sequence funksiyalari](https://www.postgresql.org/docs/18/functions-sequence.html).
+- [psql](https://www.postgresql.org/docs/18/app-psql.html), [NULL taqqoslashlari](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [pgx v5: Tx va ErrTxCommitRollback](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx), [Pool.Begin](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Begin), [pgconn.PgError](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#PgError).
+- [Go: defer qoidalari](https://go.dev/ref/spec#Defer_statements), [os.Exit](https://pkg.go.dev/os#Exit).
+- [pgx v5.13.0 transaction kodi](https://github.com/jackc/pgx/blob/v5.13.0/tx.go), [pool transaction kodi](https://github.com/jackc/pgx/blob/v5.13.0/pgxpool/tx.go), [ulanishni qaytarish](https://github.com/jackc/pgx/blob/v5.13.0/pgxpool/conn.go).
+- [goose](https://pressly.github.io/goose/): migratsiyalarni eslash savoli.
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. SQL/Go chiqishlari qayta bajarilgan; goose javobi oldingi darsdan eslash sifatida berilgan.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction)
+
+---
+
+← Oldingi dars: [GB-5.06](/lab/youtube/gb#gb-5-06) · Keyingi dars: [GB-5.08](/lab/youtube/gb#gb-5-08) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
