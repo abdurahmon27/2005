@@ -1,0 +1,922 @@
+---
+title: "Slice: len, cap, append and the shared array"
+date: "2026/11/27"
+description: "How a slice is laid out in memory: a header (ptr, len, cap) and an array. When append allocates a new array and why a function can corrupt its caller's data."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-2-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-2-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-2-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-2-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-2-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-2-01) · [Русский](/lab/youtube/gb/gb-2-01/ru) · **English**  
+Lesson GB-2.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-2-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The `afterOrder` function in bozor must only **show** what stock will be left after an order. Let us run it (how to run
+the steps is described in the next section):
+
+```console
+$ ./_video/run.sh 00-bug go run .
+ombor oldin: [40 12 7]
+koʻrish:     [38 11 7]
+ombor keyin: [38 11 7]
+```
+
+The first line (`ombor oldin`, "warehouse before") is the warehouse: apples 40, bread 12, tea 7. The second (`koʻrish`,
+"preview") is the leftover that the function computed: 2 apples and 1 bread were subtracted. The third line
+(`ombor keyin`, "warehouse after") is the real warehouse, and it also became `[38 11 7]`. The stock
+went down although nobody confirmed the order. Nobody told the function to change the warehouse. Why did it change it,
+and how do you fix that?
+
+**One idea:** a slice is a **header** of three fields (`ptr` is the address of the array, `len`, `cap`) and the
+**array** behind it. `before := stock` and passing to a function copy only the header, the array stays one. `append`
+writes into the same array if it has room, and if it has no room, it allocates a new array and returns a new header.
+
+By the end of the lesson you will:
+
+- draw how a slice is laid out in memory: the header and its array;
+- say what `before := stock` and a function parameter copy, and what they do not copy;
+- know when `append` writes into the same array, when it allocates a new one, and why you must always store its result;
+- fix a function that corrupts its caller's data with `make`, and find the same bug yourself (`discounted`, the
+  homework).
+
+Three core new words today:
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| slice | a list of elements of one type. In memory it has two parts: a header (`ptr`, `len`, `cap`) and the array that holds the elements | slice, slice header, array |
+| `append` | adds an element to a slice and **returns a new header**. If the array has room it writes into the same array, if not it allocates a new one | `append` |
+| shared array (aliasing) | two slices (or a parameter and an argument) look at one array: if one writes, the other sees the change | aliasing |
+
+Two helpers: **`make([]int, n)`** allocates a new array and returns a slice that looks at it (in the fix section);
+**`%p`** is a `Printf` verb that prints the address of the array a slice looks at.
+
+## Before you start
+
+This lesson builds on [GB-1.08 · First test](/lab/youtube/gb/gb-1-08/en) and [GB-1.06 · Repetition: the only for in Go](/lab/youtube/gb/gb-1-06/en).
+The page also relies on:
+
+- [GB-1.08](/lab/youtube/gb/gb-1-08/en): the `[]` in `tests := []struct{…}{…}` is a slice, `for _, tc := range tests`, `t.Errorf`,
+  `go test`, `PASS`, `ok …`. Today we open up what a slice is.
+- [GB-1.06](/lab/youtube/gb/gb-1-06/en): `for`, `range`; in `for i := range 3` the variable `i` takes the values 0, 1, 2.
+- [GB-1.07](/lab/youtube/gb/gb-1-07/en): `func` with parameters and a result, `return`, `len(os.Args)`, the index starts at 0, the
+  `index out of range` panic.
+- [GB-1.01](/lab/youtube/gb/gb-1-01/en): `package main`, `import`, `go run .`, `go build`, an error as `file:line:column`.
+- [GB-1.02](/lab/youtube/gb/gb-1-02/en): `:=` (a new variable), `=` (replace the value of an existing one).
+- [GB-1.03](/lab/youtube/gb/gb-1-03/en): `int64`, a price in tiyin, `1_200_000`, the `//` comment.
+- [GB-1.04](/lab/youtube/gb/gb-1-04/en): `fmt.Printf`, `%d`, `\n`.
+- [GB-1.05](/lab/youtube/gb/gb-1-05/en): `<`, `==`.
+
+**How to run the code.** The code is in a folder of the course repository:
+[lessons/gb-2-01-slice](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice). Download the
+repository and open the terminal in that folder (`cd` moves the terminal to another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-2-01-slice
+```
+
+The folder has: `main.go` (bozor at the end of the video), `stock_test.go` (the test of `afterOrder`),
+`tekshiruv_test.go` (checks the homework), `TASK.md`, `solution/` (the homework answer) and `_video/`. `go.mod` says
+`go 1.27`: if your Go is older, the `go` command downloads the right version itself, which needs the internet.
+
+Every step of the video is in the file `_video/<step>/main.go`. `./_video/run.sh <step> <command>` copies that file with
+the folder's `go.mod` into a temporary `bozor/` folder and runs the command there. For example,
+`./_video/run.sh 03-append go run .` runs step 03. Why: in the folder itself `go test` also runs the file that checks
+the homework, and it fails until the homework is done.
+
+First, one question from the last lesson. In the table-driven test loop `for _, tc := range tests {`, what does the
+underscore `_` throw away?
+
+**A)** the index · **B)** the row itself · **C)** the error message
+
+<details>
+<summary>Answer</summary>
+
+**A: the index.** On each iteration `range` gives two values: the index and the element. `_` throws the index away, and
+`tc` gets the row itself. If you chose **B**, you thought `_` throws the element away: but `_` stands in the first
+place, and the first place is the index. **C** — the error message has nothing to do with it. In that lesson we called
+the `[]` before `tests` a slice, a list of values. `os.Args` was also a slice: `len` gave its length, and the number in
+square brackets gave an element. Today we open up that list.
+
+</details>
+
+## What a slice is made of: a header and an array
+
+In the bozor warehouse every product has a stock level: apples, bread, tea. To keep these three numbers in one variable,
+Go has the **slice**. The smallest program:
+
+```go filename="_video/01-slice/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7} // olma, non, choy
+	fmt.Println(stock, len(stock), cap(stock))
+	fmt.Println(stock[0], stock[2])
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | the file is in package `main`: `go run .` runs this package (GB-1.01) |
+| 3 | `import "fmt"` | imports package `fmt`, where `Println` and `Printf` come from (GB-1.01) |
+| 5 | `func main() {` | the program starts in this function (GB-1.01) |
+| 6 | `stock := []int{40, 12, 7}` | a variable `stock`. `[]int` is the type: "a slice of `int`". Inside the braces `40, 12, 7` are the initial elements, separated by commas. This notation is called a **slice literal**. The comment after `//`: apples, bread, tea |
+| 7 | `fmt.Println(stock, len(stock), cap(stock))` | prints `stock`, `len(stock)` (the number of elements) and `cap(stock)` (the **capacity**: how many places the array behind the slice has) |
+| 8 | `fmt.Println(stock[0], stock[2])` | the index starts at 0: `stock[0]` is apples, `stock[2]` is tea |
+
+Output:
+
+```console
+$ ./_video/run.sh 01-slice go run .
+[40 12 7] 3 3
+40 7
+```
+
+`Println` prints a slice in square brackets, elements separated by spaces. Then `len` is 3 and `cap` is 3. In the second
+line `40` and `7` are the zeroth and the second elements.
+
+Why are `len` and `cap` two numbers? The memory picture shows it. The variable `stock` holds not the slice itself but
+its **header** (slice header). The header has three fields:
+
+- `ptr` is the memory address of the zeroth element. `ptr` is short for pointer; we open pointers in
+  [GB-2.04](/lab/youtube/gb#gb-2-04), for now it is enough to read it as "address";
+- `len` is the length: how many elements the slice has now;
+- `cap` is the capacity: how many places there are from the start of the slice to the end of the array.
+
+The elements themselves are not in the header but in the **array** behind it. An array is a row of places next to each
+other in memory, and their number is fixed. Its type is `[3]int`: the length is part of the type and does not change
+([Go spec: Array types](https://go.dev/ref/spec#Array_types)).
+
+```text
+stock ─► ┌─────┬─────┬─────┐
+         │ ptr │ len │ cap │     header (slice header)
+         │  ●  │  3  │  3  │
+         └──┬──┴─────┴─────┘
+            │
+            ▼
+         ┌─────┬─────┬─────┐
+         │ 40  │ 12  │  7  │     array [3]int
+         └─────┴─────┴─────┘
+ index      0     1     2
+```
+
+The literal `[]int{40, 12, 7}` creates the array itself, so both `len` and `cap` are 3: the array has exactly three
+places ([Go spec: Composite literals](https://go.dev/ref/spec#Composite_literals)). `cap` can be bigger than `len` if
+free places are left in the array. We will see this in the `append` section.
+
+## `before := stock`: the copy takes only the header
+
+Suppose the program must remember the state before a change: we give `before` the value of `stock`, then write 38 into
+`stock[0]`.
+
+```go filename="_video/02-nusxa/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7}
+	before := stock
+	stock[0] = 38
+	fmt.Println(before[0])
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `stock := []int{40, 12, 7}` | a header and an array (as in the previous section) |
+| 7 | `before := stock` | a new variable `before`; it is given the value of `stock` |
+| 8 | `stock[0] = 38` | writes 38 into the zeroth element of `stock` (`=` replaces an existing value, GB-1.02) |
+| 9 | `fmt.Println(before[0])` | prints the zeroth element of `before` |
+
+What does `before[0]` print?
+
+**A)** `40` · **B)** `38` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: 38.** `before := stock` copies **only the header**: three fields (`ptr`, `len`, `cap`) go into the new variable,
+and the copy of `ptr` points to the same array. `stock[0] = 38` writes into the array, and `before` sees that same
+array. If you chose **A**, you thought `before` got a full copy of the slice: the array was not copied. **C** — the code
+is correct, the compiler rejects nothing here.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-nusxa go run .
+38
+```
+
+The state line by line (array A is the one array both headers look at):
+
+| Line | header of `stock` | header of `before` | array A | On screen |
+|---|---|---|---|---|
+| 6 | (ptr→A, 3, 3) | — | `40 12 7` | |
+| 7 | (ptr→A, 3, 3) | (ptr→A, 3, 3) copy | `40 12 7` | |
+| 8 | (ptr→A, 3, 3) | (ptr→A, 3, 3) | `38 12 7` | |
+| 9 | (ptr→A, 3, 3) | (ptr→A, 3, 3) | `38 12 7` | `38` |
+
+Result: `before` did not keep the old state. On the other hand, giving a slice to another variable is cheap: however big
+the array is, only three fields are copied.
+
+## `append`: room means the same array, no room means a new array
+
+We add a new product to the warehouse: apricot, stock 25. The function that adds an element to a slice is **`append`**.
+
+```go filename="_video/03-append/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7}
+	fmt.Printf("%d %d %p\n", len(stock), cap(stock), stock)
+	stock = append(stock, 25) // oʻrik
+	fmt.Printf("%d %d %p\n", len(stock), cap(stock), stock)
+	stock = append(stock, 3) // anor
+	fmt.Printf("%d %d %p\n", len(stock), cap(stock), stock)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 7 | `fmt.Printf("%d %d %p\n", len(stock), cap(stock), stock)` | prints `len`, `cap` and the address. `%d` is an integer (GB-1.04); `%p` is the address of the **array** the slice looks at, in hexadecimal with `0x`; `\n` is a new line |
+| 8 | `stock = append(stock, 25) // oʻrik` | `append` takes a slice and a new element and **returns a new header**. We store it into `stock` again |
+| 9 | `fmt.Printf(…)` | prints the state after `append` |
+| 10 | `stock = append(stock, 3) // anor` | one more element: pomegranate, stock 3 |
+| 11 | `fmt.Printf(…)` | prints again |
+
+How `append` works ([Go spec: Appending to and copying slices](https://go.dev/ref/spec#Appending_and_copying_slices)):
+
+1. If the array has room for the new element, that is `len < cap`, the element is written **into the same array**.
+2. If there is no room, `append` allocates a **new array** with spare room, copies the old elements and returns a
+   header that looks at it.
+3. For small slices the runtime usually makes the new array twice as big. This is not a guarantee: the specification
+   only says "large enough".
+
+Three lines will be printed; at the start both `len` and `cap` are 3. In which lines will `%p` be the same?
+
+**A)** 1 and 2 · **B)** 2 and 3 · **C)** all three
+
+<details>
+<summary>Answer</summary>
+
+**B: the second and the third.** At the first `append` there was no room (`len` 3 = `cap` 3): a new array was
+allocated, the address changed, the capacity became 6. At the second `append` there is room: the element was written
+into the same array, only `len` became 5. If you chose **A**, you thought `append` always keeps the previous array: when
+there is no room it does not. **C** would mean that `append` never changes the array.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-append go run .
+3 3 0x6f8787a8000
+4 6 0x6f878800000
+5 6 0x6f878800000
+```
+
+The address is a hexadecimal number that starts with `0x`, and it differs on every run. You do not need to read it: we
+only compare the lines with each other. The same program a second time:
+
+```console
+$ ./_video/run.sh 03-append go run .
+3 3 0xb2fe8d20120
+4 6 0xb2fe8e00000
+5 6 0xb2fe8e00000
+```
+
+The addresses are different, the structure is the same: line 1 ≠ line 2, line 2 = line 3. (The video printed
+`0x103325296000`, `0x10332529e000`, `0x10332529e000`; these three numbers are quoted from the video, I did not re-run
+them.)
+
+| Line | `len` | `cap` | The array the slice looks at |
+|---|---|---|---|
+| 7 | 3 | 3 | array A: `40 12 7` |
+| 9 (`append(…, 25)`) | 4 | 6 | a **new** array B: `40 12 7 25 _ _` (the last two places are free) |
+| 11 (`append(…, 3)`) | 5 | 6 | the same array B: `40 12 7 25 3 _` |
+
+Now we combine both cases: `before` is a copy of `stock` again, but there is an `append` in between.
+
+```go filename="_video/04-append-nusxa/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7}
+	before := stock
+	stock = append(stock, 25)
+	stock[0] = 38
+	fmt.Println(before[0], stock[0])
+}
+```
+
+In the previous example `before` saw 38. What does `fmt.Println(before[0], stock[0])` print this time?
+
+**A)** `40 38` · **B)** `38 38` · **C)** `40 40`
+
+<details>
+<summary>Answer</summary>
+
+**A: `40 38`.** At the moment of `append` the `cap` was 3 and there was no room. A new array for six places was
+allocated, the three old elements were copied, and 25 was written as the fourth. `stock` now looks at the new array, and
+`before` stayed on the old one. `stock[0] = 38` lands in the new array, `before` does not see it. If you chose **B**, you
+thought the array is shared as in the previous example: this time `append` separated it. **C** ignores that `stock[0]`
+became 38.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-append-nusxa go run .
+40 38
+```
+
+| Line | `stock` | `before` | Arrays | On screen |
+|---|---|---|---|---|
+| 6 | (ptr→A, 3, 3) | — | A: `40 12 7` | |
+| 7 | (ptr→A, 3, 3) | (ptr→A, 3, 3) | A: `40 12 7` | |
+| 8 (`append`) | (ptr→**B**, 4, 6) | (ptr→A, 3, 3) | A: `40 12 7`; B: `40 12 7 25 _ _` | |
+| 9 (`stock[0] = 38`) | (ptr→B, 4, 6) | (ptr→A, 3, 3) | A: `40 12 7`; B: `38 12 7 25 _ _` | |
+| 10 | | | | `40 38` |
+
+The code looks the same, but depending on `cap` the array is sometimes shared and sometimes separate. That is why after
+`append` you cannot rely on the old slice.
+
+## Always store the result of `append`
+
+`append` returns a new header and does not change the old one. So the most common mistake is to call `append` and store
+the result nowhere. On line 7 `append` stands alone, without `stock =`:
+
+```go filename="_video/05-xato/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7}
+	append(stock, 25)
+	fmt.Println(stock)
+}
+```
+
+```console
+$ ./_video/run.sh 05-xato go build
+# github.com/abdurahmon27/bozor
+./main.go:7:2: append(stock, 25) (value of type []int) is not used
+```
+
+We read the message:
+
+| Part | Meaning |
+|---|---|
+| `# github.com/abdurahmon27/bozor` | which package is being compiled (the module name, GB-1.01). The video hides this line |
+| `./main.go:7:2` | file `main.go`, line 7, column 2 (GB-1.01): where `append` starts |
+| `append(stock, 25)` | the error is in this very expression |
+| `(value of type []int) is not used` | "a value of type `[]int` was not used": `append` returned a slice, but nobody took it |
+
+The cause is now clear: `append` returns a new header, and the `len` inside `stock` itself does not change. Even if the
+element was written into the array, `stock` will not see it: `len` stays 3. The Go specification forbids writing
+`append` alone on a line, without using its result ([Expression statements](https://go.dev/ref/spec#Expression_statements)).
+
+The fix: `stock = append(stock, 25)`.
+
+## The bozor bug: a function parameter is also a copy of the header
+
+Now we return to the bug at the start of the lesson. When a slice is passed to a function, the header is copied, just as
+in `before := stock`.
+
+```go filename="_video/00-bug/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+// afterOrder buyurtmadan keyingi qoldiqni hisoblaydi.
+func afterOrder(stock []int, sold []int) []int {
+	for i := range stock {
+		stock[i] = stock[i] - sold[i]
+	}
+	return stock
+}
+
+func main() {
+	stock := []int{40, 12, 7} // olma, non, choy
+	sold := []int{2, 1, 0}    // savatda
+	fmt.Println("ombor oldin:", stock)
+	left := afterOrder(stock, sold)
+	fmt.Println("koʻrish:    ", left)
+	fmt.Println("ombor keyin:", stock)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `// afterOrder …` | a comment: the function computes the leftover after an order |
+| 6 | `func afterOrder(stock []int, sold []int) []int {` | two parameters, both slices: `stock` (the warehouse) and `sold` (the quantity in the cart for each product). The result is a slice too |
+| 7 | `for i := range stock {` | `range` over a slice with one variable gives only the index: 0, 1, 2 |
+| 8 | `stock[i] = stock[i] - sold[i]` | on each iteration `sold[i]` is subtracted from `stock[i]` and the result is written back into `stock[i]` |
+| 10 | `return stock` | at the end `stock` is returned |
+| 14–15 | `stock := …`, `sold := []int{2, 1, 0}` | in `main` the warehouse and the cart: 2 apples, 1 bread, 0 tea |
+| 17 | `left := afterOrder(stock, sold)` | the result goes into `left` |
+| 16, 18, 19 | `fmt.Println(…)` | before the function, the result and after the function: the three lines from the start of the lesson |
+
+(The `stock` parameter in the function and the `stock` in `main` are two different variables; the name is the same by
+chance.)
+
+The output is the same as at the start of the lesson: `[40 12 7]`, `[38 11 7]`, `[38 11 7]`. Why:
+
+| Moment | `stock` in `main` | `stock` in `afterOrder` | array A | `left` |
+|---|---|---|---|---|
+| 17: the call | (ptr→A, 3, 3) | (ptr→A, 3, 3) — a copy | `40 12 7` | |
+| 7–9: the loop | (ptr→A, 3, 3) | (ptr→A, 3, 3) | `38 11 7` | |
+| 10: `return stock` | (ptr→A, 3, 3) | | `38 11 7` | (ptr→A, 3, 3) — the returned header |
+| 19 | (ptr→A, 3, 3) | | `38 11 7` | (ptr→A, 3, 3) |
+
+In a call, the parameter is a copy of the header, like `before := stock`. Writing into `stock[i]` inside the function
+lands in the original array. The returned header also looks at that array: `left` and `stock` are the same data. One
+piece of memory with two names is called **aliasing**. `sold` is not in the table: it is only read. The function meant
+"only compute", but it changed the warehouse of the `main` that called it.
+
+## The fix: a separate array for the result with `make`
+
+The result needs its own array. **`make`** gives it:
+
+```go filename="_video/06-tuzat/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+// afterOrder buyurtmadan keyingi qoldiqni hisoblaydi; stock oʻzgarmaydi.
+func afterOrder(stock []int, sold []int) []int {
+	left := make([]int, len(stock))
+	for i := range stock {
+		left[i] = stock[i] - sold[i]
+	}
+	return left
+}
+
+func main() {
+	stock := []int{40, 12, 7} // olma, non, choy
+	sold := []int{2, 1, 0}    // savatda
+	fmt.Println("ombor oldin:", stock)
+	left := afterOrder(stock, sold)
+	fmt.Println("koʻrish:    ", left)
+	fmt.Println("ombor keyin:", stock)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `// afterOrder …; stock oʻzgarmaydi.` | the comment makes the same promise |
+| 7 | `left := make([]int, len(stock))` | `make` allocates a new array, fills it with zeros and returns a slice that looks at it. The length is `len(stock)`, that is 3 |
+| 9 | `left[i] = stock[i] - sold[i]` | the loop now writes only into `left` and only reads `stock` |
+| 11 | `return left` | at the end `left` is returned |
+
+`make([]int, length, capacity)`: the third argument is optional and becomes `cap`. If it is omitted, `cap` equals `len`.
+
+| Line | `stock` | `left` | Arrays |
+|---|---|---|---|
+| 7 | (ptr→A, 3, 3) | (ptr→B, 3, 3) | A: `40 12 7`; B: `0 0 0` (new) |
+| 8–10: the loop | (ptr→A, 3, 3) | (ptr→B, 3, 3) | A: `40 12 7`; B: `38 11 7` |
+
+```console
+$ ./_video/run.sh 06-tuzat go run .
+ombor oldin: [40 12 7]
+koʻrish:     [38 11 7]
+ombor keyin: [40 12 7]
+```
+
+The `koʻrish` line is the same (`[38 11 7]`), and the warehouse stayed `[40 12 7]`. The file `stock_test.go` in the folder
+checks exactly these two conditions:
+
+```go filename="stock_test.go" showLineNumbers
+package main
+
+// Videodagi tuzatishni tekshiradi: afterOrder qoldiqni toʻgʻri hisoblaydi va ombordagi stock'ni oʻzgartirmaydi.
+
+import (
+	"slices"
+	"testing"
+)
+
+func TestAfterOrder(t *testing.T) {
+	stock := []int{40, 12, 7}
+	sold := []int{2, 1, 0}
+	left := afterOrder(stock, sold)
+	// slices.Equal ikki slice'ning uzunligi va elementlari bir xilligini tekshiradi
+	// (slice'larni == bilan solishtirib boʻlmaydi: kompilyator buni rad etadi).
+	if want := []int{38, 11, 7}; !slices.Equal(left, want) {
+		t.Errorf("afterOrder(%v, %v) = %v; kutilgan %v", []int{40, 12, 7}, sold, left, want)
+	}
+	if want := []int{40, 12, 7}; !slices.Equal(stock, want) {
+		t.Errorf("afterOrder stock'ni oʻzgartirdi: endi %v, %v boʻlishi kerak", stock, want)
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5–8 | `import (…)` | two packages: `slices` and `testing` |
+| 10 | `func TestAfterOrder(t *testing.T) {` | the test function (GB-1.08) |
+| 11–13 | `stock`, `sold`, `left` | calls `afterOrder` with the starting data |
+| 14–15 | `// slices.Equal …` | a comment: slices cannot be compared with `==`, so we use `slices.Equal` |
+| 16–18 | `if want := …; !slices.Equal(left, want) {` | is the result not `[38 11 7]`? `slices.Equal` checks that the length and the elements are the same; `!` means "not"; `if want := …;` is a temporary variable for the `if`. If yes, `t.Errorf` fails the test |
+| 19–21 | `if want := []int{40, 12, 7}; …` | checks that `stock` did not change |
+
+```console
+$ ./_video/run.sh 06-tuzat go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+```
+
+`PASS` and `ok`: both conditions hold. Apply this rule at work too: if a function writes into a slice it receives, the
+caller will see it. If that is not stated in the documentation, it is a bug: look for it in code review.
+
+A mid-lesson question. `s := make([]int, 0, 4)`, then one `append(s, 1)`. What are `len(s)` and `cap(s)`?
+
+```go filename="_video/08-make/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	s := make([]int, 0, 4)
+	s = append(s, 1)
+	fmt.Println(len(s), cap(s))
+}
+```
+
+**A)** `1 4` · **B)** `5 8` · **C)** `1 1`
+
+<details>
+<summary>Answer</summary>
+
+**A: `1 4`.** `make([]int, 0, 4)` gives a slice with length 0 and capacity 4. `append` wrote the element into a free
+place, a new array was not needed: `len` became 1, `cap` stayed 4. If you chose **B**, you thought `append` always
+doubles the capacity at once: that happens only when there is no room. **C** ignores the third argument of `make`.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-make go run .
+1 4
+```
+
+If the number of elements is known in advance, this is how it is written at work: `make([]int, 0, n)` and `append`. Each
+`append` does not copy into a new array.
+
+## Going deeper (optional): two `append`s from one header
+
+An `append` with room can also be a trap. Here `stock` has `len` 4 and `cap` 6. We make two `append`s from it: 3 into
+`a`, 9 into `b`.
+
+```go filename="_video/07-ikki-append/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := []int{40, 12, 7}
+	stock = append(stock, 25) // len 4, cap 6
+	a := append(stock, 3)
+	b := append(stock, 9)
+	fmt.Println(a[4], b[4])
+}
+```
+
+`a[4]` and `b[4]` are the fifth elements. What is printed?
+
+**A)** `3 9` · **B)** `9 9` · **C)** `3 3`
+
+<details>
+<summary>Answer</summary>
+
+**B: `9 9`.** Both `append`s have room (`len` 4 &lt; `cap` 6), so neither allocated a new array, and both wrote into index
+4 of the same array. `b` wrote over `a`. If you chose **A**, you thought each `append` keeps its own result. In **C** the
+last write is 9, not 3.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-ikki-append go run .
+9 9
+```
+
+| Line | `stock` | `a` | `b` | Array B |
+|---|---|---|---|---|
+| 7 | (ptr→B, 4, 6) | | | `40 12 7 25 _ _` |
+| 8 (`a := append(stock, 3)`) | (ptr→B, 4, 6) | (ptr→B, 5, 6) | | `40 12 7 25 3 _` |
+| 9 (`b := append(stock, 9)`) | (ptr→B, 4, 6) | (ptr→B, 5, 6) | (ptr→B, 5, 6) | `40 12 7 25 9 _` |
+
+If you make several results from one slice, build each one in its own array with `make`.
+
+## Common mistakes
+
+**1. "`before := stock` saves the old state".** There is no error, but the result is wrong: `before` does not copy the
+array (`38`, see the "`before := stock`" section above). The fix: make a separate array with `make` and copy the
+elements with a loop, as in `afterOrder`.
+
+**2. Not storing the result of `append`.** When `append` stands alone on a line, the compiler catches it (the
+`is not used` error above). But there is also a silent variant: a function appends to its parameter and does not return
+the new header. This code is not in the folder, I ran it separately (the full code is here):
+
+```go showLineNumbers
+package main
+
+import "fmt"
+
+// addPlumLost parametr orqali qoʻshmoqchi: yangi sarlavha faqat s ichida qoladi.
+func addPlumLost(s []int) {
+	s = append(s, 25)
+}
+
+// addPlum yangi sarlavhani qaytaradi.
+func addPlum(s []int) []int {
+	return append(s, 25)
+}
+
+func main() {
+	stock := []int{40, 12, 7}
+	addPlumLost(stock)
+	fmt.Println(stock, len(stock))
+	stock = addPlum(stock)
+	fmt.Println(stock, len(stock))
+}
+```
+
+```console
+$ go run .
+[40 12 7] 3
+[40 12 7 25] 4
+```
+
+`s = append(s, 25)` inside `addPlumLost(stock)` stored the new header only into the parameter `s`. `s` is a copy of the
+header of `stock`, so `stock` in `main` did not change: `[40 12 7]`, `len` 3. No error, no warning. The fix: the function
+returns the new header and the caller stores it: `stock = addPlum(stock)`.
+
+**3. A function writes into a slice it receives.** The main bug of the lesson (bozor's `afterOrder`, see the "The bozor
+bug" section above): no error, the warehouse changes silently. The fix: a separate array for the result with `make`.
+
+**4. An index above `len`, not above `cap`.** `cap` is places in the array, not elements: an index is valid only up to
+`len`. This code is not in the folder either, I ran it separately:
+
+```go showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	s := make([]int, 0, 4)
+	fmt.Println(len(s), cap(s))
+	s[0] = 1
+	fmt.Println(s)
+}
+```
+
+```console
+$ go run .
+0 4
+panic: runtime error: index out of range [0] with length 0
+
+goroutine 1 [running]:
+main.main()
+	…/bozor/main.go:8 +0x8a
+exit status 2
+```
+
+The first line is `0 4`: in `make([]int, 0, 4)` the array has 4 places, but `len` is 0. So `s[0] = 1` on line 8
+panics (the `index out of range` from GB-1.07): `index out of range [0] with length 0` means "index 0 is out of range,
+the length is 0". The `…` in `…/bozor/main.go:8` is the temporary folder, its name differs every time; `exit status 2`
+is the exit code of a program that crashed with a panic, `go run` prints it. The fix: write into the free place with
+`append` (`s = append(s, 1)`) or make the length 4 with `make([]int, 4)`.
+
+## Check yourself
+
+**1.** Which three fields does a slice header have and what does each mean?
+
+<details>
+<summary>Answer</summary>
+
+`ptr` is the address of the array where the zeroth element is, `len` is how many elements the slice has, `cap` is how
+many places there are from the start of the slice to the end of the array. The elements themselves are not in the header
+but in the array behind it.
+
+</details>
+
+**2.** When does `append` allocate a new array?
+
+<details>
+<summary>Answer</summary>
+
+When there is no room: for one element, when `len` equals `cap`. If there is room, the element is written into the same
+array and only `len` grows. In any case you must store the result: `stock = append(stock, 25)`.
+
+</details>
+
+**3.** From GB-1.06: which values does `i` take in the loop `for i := range 3`?
+
+<details>
+<summary>Answer</summary>
+
+0, 1 and 2: `range` over an integer counts from 0 to number−1, the number itself is not included.
+
+</details>
+
+**4.** What does this program print? (This code is not in the folder, I ran it separately.)
+
+```go showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	s := make([]int, 2, 5)
+	t := append(s, 7)
+	u := append(s, 8)
+	fmt.Println(t[2], u[2], len(s))
+}
+```
+
+**A)** `7 8 2` · **B)** `8 8 2` · **C)** `8 8 4`
+
+<details>
+<summary>Answer</summary>
+
+**B: `8 8 2`.** `s` has `len` 2 and `cap` 5: both `append`s have room, both wrote into index 2 of the array, and 8
+overwrote 7. `s` itself did not change: `len(s)` is 2. **A** assumed that both `append`s write into separate arrays.
+**C** assumed that `append` increases the `len` of `s`: it returns a new header, and `s` stays in place.
+
+```console
+$ go run .
+8 8 2
+```
+
+</details>
+
+**5.** `afterOrder(stock, sold)` could change the warehouse `stock`. Why does that not happen with an `int` parameter?
+
+<details>
+<summary>Answer</summary>
+
+A parameter always receives a copy. For an `int` the copy is the value itself: if the function changes it, the caller's
+variable does not change. For a slice the copy is the header; its `ptr` field looks at the caller's array, so a write
+into the array is visible to the caller too.
+
+</details>
+
+## Homework
+
+The task and the answer are in the lesson folder on GitHub:
+[lessons/gb-2-01-slice](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice) (`TASK.md`).
+The answer: [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice/solution). Try it
+yourself first.
+
+- 🟢 **`discounted`: sale prices must not corrupt the catalog.** The function `discounted` in `main.go` computes sale
+  prices: each price is `percent` percent lower (prices in tiyin, `int64`). It has the same bug `afterOrder` had at the
+  start: it writes the result into `prices` itself. The bottom three lines of `go run .` in the folder show it (`narx
+  keyin` went down):
+
+```console
+$ go run .
+ombor oldin: [40 12 7]
+koʻrish:     [38 11 7]
+ombor keyin: [40 12 7]
+narx oldin:  [1200000 500000 2500000]
+aksiya:      [1080000 450000 2250000]
+narx keyin:  [1080000 450000 2250000]
+```
+
+The task: fix `discounted` so that the sale prices are in a **separate array** and `prices` does not change. The function
+name, the parameters and the result type stay the same. In the correct result `narx keyin` is `[1200000 500000 2500000]`.
+
+Hints (from `TASK.md`):
+
+1. Look again at the `afterOrder` fix from the video: a new slice for the result with `make`, with the same length as
+   `prices`. Its type is `[]int64`, not `[]int`.
+2. Let the loop write only into the new slice and only read `prices`. Return the new slice at the end.
+3. `TestVazifaAlohidaMassiv` changes the first element of the result: if `prices[0]` changes, the result still shares an
+   array with the catalog.
+
+The check is `go test` in the folder. It runs `stock_test.go` and `tekshiruv_test.go` together; the last one checks the
+homework, do not change it. Before the task is done the result is:
+
+```console
+$ go test
+--- FAIL: TestVazifaKatalog (0.00s)
+    tekshiruv_test.go:27: discounted katalogni oʻzgartirdi: prices endi [1080000 450000 2250000], [1200000 500000 2500000] boʻlib qolishi kerak (TASK.md)
+--- FAIL: TestVazifaAlohidaMassiv (0.00s)
+    tekshiruv_test.go:40: sale[0] = 1 yozilganda prices[0] ham 1 boʻldi: natija katalog bilan bitta massivda (TASK.md, make)
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.002s
+```
+
+If `ok` appears, the task is done. (`go test ./...` also checks the `solution/` folder; the answer is there, so it is `ok`.)
+
+<details>
+<summary>Answer and explanation</summary>
+
+The answer is `discounted` in `solution/main.go`. The difference from the starting `main.go`:
+
+```console
+$ diff main.go solution/main.go
+15c15
+< // Narxlar tiyinda (int64). VAZIFA (TASK.md): katalogdagi prices oʻzgarmasin.
+---
+> // Narxlar tiyinda (int64); prices oʻzgarmaydi.
+16a17
+> 	sale := make([]int64, len(prices))
+18c19
+< 		prices[i] = prices[i] - prices[i]*percent/100
+---
+> 		sale[i] = prices[i] - prices[i]*percent/100
+20c21
+< 	return prices
+---
+> 	return sale
+```
+
+(`<` is the starting file, `>` is the answer.) The changes are the same as in the `afterOrder` fix: on line 17
+`sale := make([]int64, len(prices))` is a separate array for the result; the loop writes into `sale[i]` and only reads
+`prices[i]`; `return sale`. The rest is a comment. The final function:
+
+```go
+func discounted(prices []int64, percent int64) []int64 {
+	sale := make([]int64, len(prices))
+	for i := range prices {
+		sale[i] = prices[i] - prices[i]*percent/100
+	}
+	return sale
+}
+```
+
+Checking the answer from the folder itself (the answer is in `solution/` as a separate package, so you check it with
+`go test` too):
+
+```console
+$ go test ./solution/...
+ok  	github.com/abdurahmon27/bozor/solution	0.002s
+```
+
+And the answer program: `narx keyin` is now the original prices:
+
+```console
+$ go run ./solution
+ombor oldin: [40 12 7]
+koʻrish:     [38 11 7]
+ombor keyin: [40 12 7]
+narx oldin:  [1200000 500000 2500000]
+aksiya:      [1080000 450000 2250000]
+narx keyin:  [1200000 500000 2500000]
+```
+
+At work you will see: `slices.Clone(prices)` from the standard library also returns a copy in a separate array; for this
+task the `make` way from the video is enough.
+
+</details>
+
+## Sources
+
+- Go specification: [Slice types](https://go.dev/ref/spec#Slice_types) ·
+  [Length and capacity](https://go.dev/ref/spec#Length_and_capacity) ·
+  [Appending to and copying slices](https://go.dev/ref/spec#Appending_and_copying_slices) ·
+  [Composite literals](https://go.dev/ref/spec#Composite_literals) · [Array types](https://go.dev/ref/spec#Array_types) ·
+  [For range](https://go.dev/ref/spec#For_range) · [Expression statements](https://go.dev/ref/spec#Expression_statements)
+- [pkg.go.dev builtin: append, make](https://pkg.go.dev/builtin) · [fmt: `%p`](https://pkg.go.dev/fmt) ·
+  [slices.Equal](https://pkg.go.dev/slices#Equal)
+- go.dev/blog: [Go Slices: usage and internals](https://go.dev/blog/slices-intro) ·
+  [Arrays, slices (and strings): The mechanics of 'append'](https://go.dev/blog/slices)
+- Tour of Go: [Slices](https://go.dev/tour/moretypes/7)
+- Course folder: [lessons/gb-2-01-slice](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice)
+- All results come from `go1.27.4 linux/amd64` (`CGO_ENABLED=0`), 2026-11-27, in the course folder with
+  `./_video/run.sh`, `go run`, `go test` and `diff`. They match the video, except the `%p` addresses, which change on
+  every run, and the hidden name of the temporary folder before `…/bozor/`. Three runs that are not in the folder
+  (`addPlumLost`, `make([]int, 0, 4)` + `s[0]`, the `8 8 2` question) were made in a separate folder with the same
+  `go.mod`.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-01-slice)
+
+---
+
+← Previous lesson: [GB-1.08](/lab/youtube/gb/gb-1-08/en) · Next lesson: [GB-2.02](/lab/youtube/gb/gb-2-02/en) → · [All lessons](/lab/youtube/gb)
+
+</div>
