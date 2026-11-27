@@ -81,9 +81,9 @@ The folder has its own `go.mod` (`module github.com/abdurahmon27/bozor`, `go 1.2
 The script that runs a step as in the video: `./_video/run.sh <step> <command>`. It copies the files of the step folder into a temporary `bozor/` folder together with this `go.mod`, runs the command there
 and prints a line `(chiqish kodi: N)` ("exit code") at the end. That line is the script's output, not the program's; I left it out of the blocks below.
 
-**An important note on `-race`.** The race detector needs a C compiler (on Linux usually `gcc`). My machine has no `gcc`, so I took every `go test -race` result with `_video/race.sh`, in Docker:
-inside the `golang:1.26.8` image (it has gcc), but with the `go1.27.4` toolchain as Go itself. Every other command ran on the normal machine with `CGO_ENABLED=0`.
-That is why the file path in the report is `/home/dev/bozor/main.go` (a folder inside Docker): you will see the path of your own folder. If you have `gcc`, a plain `go test -race` is enough.
+**An important note on `-race`.** On Linux the race detector needs `cgo` enabled and a C compiler installed (usually `gcc`). On macOS, since Go 1.20 the race detector does not depend on Xcode or cgo ([Go 1.20 release notes](https://go.dev/doc/go1.20#cgo)). My machine has no `gcc`, so I took every `go test -race` result with `_video/race.sh`, in Docker:
+inside the `golang:1.26.8` image (it has gcc), but with the `go1.27.4` toolchain as Go itself. The other original video examples ran on the normal machine with `CGO_ENABLED=0`; the timing comparison below runs both modes in Docker.
+That is why the file path in the report is `/home/dev/bozor/main.go` (a folder inside Docker): you will see the path of your own folder. On Linux with `gcc` installed and `cgo` enabled, a plain `go test -race` is enough; on macOS you do not need to install Xcode for this lesson.
 
 One question from the previous lesson. What did we use to read the JSON body of a `POST` request with a size limit?
 
@@ -491,8 +491,16 @@ $ go test -race
 ok  	github.com/abdurahmon27/bozor	1.018s
 ```
 
-A thousand requests, no race, stock 0. A plain `go test` on this code gives `ok` in `0.005s`. Race mode is much slower: according to the documentation usually 2–20 times the time and 5–10 times the memory ([Data Race Detector](https://go.dev/doc/articles/race_detector));
-in this test the ratio is even larger (1.02 s instead of 0.005 s; in three runs 1.016–1.020 s). I did not measure why. What matters: `-race` is for tests and CI, not for a running server.
+A thousand requests, no race, stock 0. Most of the roughly one second here is the race runtime waiting before exit: the `GORACE` setting `atexit_sleep_ms` defaults to `1000` milliseconds ([Data Race Detector](https://go.dev/doc/articles/race_detector#Options)). Dividing this time by the plain `go test` time of `0.005s` does not show that the code slowed down 200 times.
+
+To check, disable the wait; `-count=1` prevents reuse of a cached test result:
+
+```console
+$ GORACE=atexit_sleep_ms=0 go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	0.082s
+```
+
+I repeated the measurement in the Docker environment through `_video/race.sh 03-mutex` (go1.27.4 linux/amd64): over three runs the time in the `ok` line was 1.045–1.062 s with normal `-race` and 0.067–0.082 s without the wait. A separate measurement used a prebuilt test binary for each mode: mean wall times over three runs were 0.102 s for no-sleep race and 0.036 s for plain mode (about 2.8 times; includes process startup). This short test is not a performance benchmark. Race checking itself also costs time and memory: the usual range in the documentation is 2–20 times the time and 5–10 times the memory ([Data Race Detector](https://go.dev/doc/articles/race_detector#Runtime_Overhead)). We use `-race` in parallel tests and CI.
 
 ## Reads go under the lock too
 
@@ -679,7 +687,7 @@ The rule: release the lock before `yield`, or take a copy inside the lock and lo
 **1. "The test passed, so it is safe."** The most common mistake. A test with one request gives `ok`, and code without a mutex works correctly on one goroutine: the `Sell` at the start of this lesson does.
 A data race shows only when the code is called in parallel. The cure: a parallel test (`orderParallel`) and `go test -race`; do not trust a plain `go test`, which sometimes gives `ok` too.
 
-**2. `-race` does not run.** If there is no C compiler:
+**2. `-race` does not run.** If there is no C compiler on Linux:
 
 ```console
 $ go test -race
@@ -695,7 +703,7 @@ cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in $PATH
 FAIL	github.com/abdurahmon27/bozor [build failed]
 ```
 
-The fix: install `gcc` (`apt install gcc`, on macOS `xcode-select --install`). I used Docker (`_video/race.sh`).
+The fix on Linux: install a C compiler (for example, `apt install gcc`) and check that `cgo` is enabled (`go env CGO_ENABLED`: `1`). On macOS, since Go 1.20 the race detector needs no Xcode/cgo ([Go 1.20 release notes](https://go.dev/doc/go1.20#cgo)). I used Docker on Linux (`_video/race.sh`).
 
 **3. Locking only the writer.** `Sell` is under the lock, `Stock` is not: the read is a race too (the report in the section "Reads go under the lock too"). The rule: every access to `products` goes under one lock.
 
@@ -763,7 +771,7 @@ The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-u
 
 - 🟢 **Step 1, `Restock`.** Put `s.mu.Lock()` at the start of the method and `defer s.mu.Unlock()` on the next line. The logic does not change.
 - 🟡 **Step 2, `Total`.** Return the sum of the `Stock` of all products (`for _, p := range s.products` over the map). The lock is taken **once** at the start of `Total`; do not call `s.Stock(…)` inside.
-- 🟡 **Optional.** If you have `gcc`, run `go test -race .` on the starter code and check that the report shows the line of `Restock`.
+- 🟡 **Optional.** On Linux with a C compiler and `cgo` enabled (Xcode is not required on macOS), run `go test -race .` on the starter code and check that the report shows the line of `Restock`.
 
 Do not change `Product`, `Store`, `Sell`, `Stock`, `buy`, `slowHandler`, `main`, `buy_test.go` and `tekshiruv_test.go`. At the start, the format check and `go vet` print nothing:
 
@@ -835,7 +843,7 @@ The solution is clean with `-race` too: in Docker (`./_video/race.sh solution go
 
 - [pkg.go.dev: net/http — Server.Serve](https://pkg.go.dev/net/http#Server.Serve) — a new service goroutine for every new connection; [Server.ListenAndServe](https://pkg.go.dev/net/http#Server.ListenAndServe) — always returns a non-nil error
 - [pkg.go.dev: sync — Mutex](https://pkg.go.dev/sync#Mutex) — the zero value is an unlocked lock; must not be copied after first use; [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go) — starts in a new goroutine ([Go 1.25 release notes](https://go.dev/doc/go1.25))
-- [Go Data Race Detector](https://go.dev/doc/articles/race_detector) — the report format, the cgo requirement, the time and memory overhead
+- [Go Data Race Detector](https://go.dev/doc/articles/race_detector) — the report format, `atexit_sleep_ms`, platform requirements, the time and memory overhead
 - [Go memory model](https://go.dev/ref/mem) — synchronization and the `Unlock` → next `Lock` order
 - [Go FAQ: maps are not atomic](https://go.dev/doc/faq#atomic_maps), [Go 1.6 release notes](https://go.dev/doc/go1.6) — lightweight (best-effort) detection of concurrent map access
 - [pkg.go.dev: cmd/vet](https://pkg.go.dev/cmd/vet) — `copylocks`; [pkg.go.dev: iter](https://pkg.go.dev/iter); [pkg.go.dev: time.Sleep](https://pkg.go.dev/time#Sleep)
