@@ -1,0 +1,1065 @@
+---
+title: "Errors in depth: %w, errors.Is and errors.As"
+date: "2026/11/27"
+description: "The caller tells Sell's errors apart without reading the text: sentinel error, wrapping with %w, errors.Is, your own error type and errors.As."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-2-08/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-2-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-2-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-2-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-2-08"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-2-08) · [Русский](/lab/youtube/gb/gb-2-08/ru) · **English**  
+Lesson GB-2.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-2-08) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-08-xatolar)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The `Sell` method of the `store` package in bozor returns two kinds of error. The first: the product with ID 9 is not in the catalog.
+The second: there is not enough stock of apples. `main` prints both:
+
+```console
+$ ./_video/run.sh 00-matn go run ./cmd/bozor
+mahsulot 9 topilmadi
+olma: qoldiq 40, soʻralgan 41
+```
+
+For `main` these are just two strings. Later bozor becomes a server, and these two errors will need two different answers. You can decide by reading the text,
+but one day the text changes and the code breaks silently. How does the caller know **which** error it got without looking at the text?
+
+**One idea:** `error` is an interface with one method, `Error() string`. A sentinel error made by `errors.New` is one exact value,
+and `==` says it equals only itself. `%w` wraps an error and keeps the original inside a new layer, so `==` becomes false;
+`errors.Is` (by value) and `errors.As` (by type) walk the layers with `Unwrap` to the end.
+
+By the end of the lesson you will:
+
+- declare the sentinel error `ErrNotFound`, add context with `fmt.Errorf("mahsulot %d: %w", …)` and find it with `errors.Is`;
+- explain why `%v` instead of `%w` breaks the chain, and why `==` and `err.(*T)` do not work on a wrapped error;
+- write your own error type with fields (`*StockError`) and get the stock number from it with `errors.As` and `errors.AsType`;
+- combine several errors into one with `errors.Join` (an optional section).
+
+The three core new words today:
+
+| Word | Plain meaning | English |
+|---|---|---|
+| sentinel error | an error value created once at package level; the caller compares against that exact value | sentinel error |
+| wrapping and chain | `%w` adds context to an error and keeps the original error inside; wrapped errors form a chain | wrapping, error chain |
+| typed error | your own type with fields and an `Error()` method; the caller finds it by type and reads its fields | typed error |
+
+Two helpers: `%T` (prints the concrete type of a value) and `errors.Join` (combines several errors into one, in the "Going deeper" section).
+
+## Before you start
+
+This lesson builds on [GB-2.07 · Interface: io.Writer and two real implementations](/lab/youtube/gb/gb-2-07/en): an interface value holds a concrete type and a value
+of that type, and `x.(T)` checks that type. You also need:
+
+- [GB-1.07 · Function and the first error: os.Args and strconv.Atoi](/lab/youtube/gb/gb-1-07/en): the `error` type, `nil`, `if err != nil`, `fmt.Errorf`.
+- [GB-2.06 · Packages: capital letters, internal/ and project layout](/lab/youtube/gb/gb-2-06/en): the `store` package, `cmd/bozor`, capital letter = exported, `Sell`.
+- [GB-2.05 · Methods: value receiver or pointer receiver](/lab/youtube/gb/gb-2-05/en): receiver, pointer receiver, a value receiver works on a copy.
+- [GB-2.04 · Pointers: a copy or a shared value](/lab/youtube/gb/gb-2-04/en): `&x`, a function writes to the caller's variable only through its address, nil pointer.
+- [GB-2.03 · Structs: building the Product and Order types](/lab/youtube/gb/gb-2-03/en): `struct`, struct literal.
+- [GB-1.05 · Decisions: if, else and switch](/lab/youtube/gb/gb-1-05/en): `if … else if`, `==`, the short statement in `if`.
+- [GB-1.04 · Text and formatted output: string and fmt.Printf](/lab/youtube/gb/gb-1-04/en): `%v`, `%d`, `%s`, `Sprintf`.
+
+**How to run the code.** The code of the lesson is in a folder of the course repository:
+[lessons/gb-2-08-xatolar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-08-xatolar). Download the repository and
+open the terminal in this folder (`cd` moves the terminal to another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-2-08-xatolar
+```
+
+The folder holds the final bozor of the lesson (`cmd/bozor`, `internal/store`, `go.mod`), `TASK.md` (the task) and `solution/` (the answer). Each step of the video
+is in `_video/<step>/`: a small complete project. `./_video/run.sh <step> <command>` copies the step folder to a temporary
+`bozor/` folder and runs the command there. In the video the command is plain `go run ./cmd/bozor`; this page says which step each run used.
+At the end the script prints its own line `(chiqish kodi: N)` ("exit code"): I left it out of the page.
+
+The module is written for Go 1.27 (`go 1.27` in `go.mod`); `errors.AsType` exists since Go 1.26. If you have an older Go installed, `go` downloads the needed
+version by itself. Results on this page come from `go1.27.4 linux/amd64`, with `CGO_ENABLED=0`. Small programs that are not in the course folder I ran in a separate
+folder with the same `go.mod` and `internal/store`; their full code is on this page, and the text says which ones they are.
+
+A question from the previous lesson. In `byteCounter` the `Write` method has a **pointer receiver**: `func (c *byteCounter) Write(p []byte) (int, error)`.
+In `main`, `c` is a variable of type `byteCounter` and `writeReport(&c, products)` is called. What does `w` hold inside `writeReport(w io.Writer, …)`?
+
+**A)** a copy of `c`: a `byteCounter` value · **B)** `*byteCounter`: the address of `c` · **C)** only the `Write` method
+
+<details>
+<summary>Answer</summary>
+
+**B: `*byteCounter`, the address of `c`.** An interface value holds a **concrete type** and a **value** of that type (GB-2.07). Here the type is `*byteCounter`
+and the value is the address of `c`. If you chose **A**, you thought the interface copies the value: but `&c` was passed, so an address is taken, not a copy. **C** — the method
+lives in the type, not inside the interface. This is exactly what we need today: `error` is also an interface, and the caller checks the type or value inside the error.
+
+</details>
+
+## The problem: two errors, one kind of text
+
+The first program is the start of the lesson (`_video/00-matn`): `Sell` creates the errors with `fmt.Errorf`, `main` prints them.
+
+```go filename="_video/00-matn/cmd/bozor/main.go" showLineNumbers
+// bozor dasturi: mahsulot sotadi va xatoni turiga qarab tushuntiradi.
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 100)
+
+	err := st.Sell(9, 1)
+	fmt.Println(err)
+	err = st.Sell(1, 41)
+	fmt.Println(err)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `// bozor dasturi: …` | a comment |
+| 2 | `package main` | this is the program package (GB-1.01) |
+| 4–8 | `import ( … )` | `fmt` and our `store` package (GB-2.06) |
+| 10 | `func main() {` | the program starts here |
+| 11 | `var st store.Store` | an empty catalog |
+| 12–13 | `st.Add(…)` | adds apples `olma` (40 pieces) and bread `non` (100 pieces) to the catalog |
+| 15 | `err := st.Sell(9, 1)` | tries to sell 1 piece of the product with ID 9; there is no 9 in the catalog |
+| 16 | `fmt.Println(err)` | prints the text of the error |
+| 17–18 | `err = st.Sell(1, 41)`, `fmt.Println(err)` | asks for 41 apples when 40 are left; the new result is stored in the same `err` variable |
+
+The lines of `Sell` that return the two errors (from the GB-2.06 solution; for now both use `fmt.Errorf`):
+
+```go
+	// … qoldiq yetmasa:
+	return fmt.Errorf("%s: qoldiq %d, soʻralgan %d", p.Name, p.Stock, quantity)
+	// … sikl tugadi, mahsulot topilmasa:
+	return fmt.Errorf("mahsulot %d topilmadi", id)
+```
+
+(Words in the code: `qoldiq` — "stock left", `soʻralgan` — "requested", `mahsulot … topilmadi` — "product … not found".)
+
+Both values have the same type, `error`; only the text differs. If the caller searches the text, the code becomes tied to the text. Below we
+give the caller not a text but a **value** or a **type**.
+
+## error is an interface with one method
+
+First, `error` itself. `go doc builtin.error` is the documentation of the `builtin` package: it describes the names that Go declares in advance
+(`error`, `int`, `string`). They are visible in every package even though they start with a lower-case letter.
+
+```console
+$ go doc builtin.error
+package builtin // import "builtin"
+
+type error interface {
+	Error() string
+}
+    The error built-in interface type is the conventional interface for
+    representing an error condition, with the nil value representing no error.
+```
+
+`error` is an interface with one method: `Error`, no parameters, returns `string`. **Any** type with the method `Error() string`
+implements `error` (GB-2.07: you never write `implements`). When `fmt.Println` prints an error, it calls this method
+([fmt documentation](https://pkg.go.dev/fmt): "If an operand implements the error interface, the Error method will be invoked").
+
+The simplest error is made by `errors.New`. Here is Go's own source (package `errors`, lines 64–75):
+
+```console
+$ sed -n 64,75p $(go env GOROOT)/src/errors/errors.go
+func New(text string) error {
+	return &errorString{text}
+}
+
+// errorString is a trivial implementation of error.
+type errorString struct {
+	s string
+}
+
+func (e *errorString) Error() string {
+	return e.s
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func New(text string) error {` | takes the text `text`, returns the `error` interface |
+| 2 | `return &errorString{text}` | `&` and `{…}` create a new `errorString` struct and return its **address** (GB-2.04). The struct has one field, so the value is written without the field name, by position |
+| 6–8 | `type errorString struct { s string }` | the type name is lower-case: it is not visible outside the `errors` package (GB-2.06). The text is in the field `s` |
+| 10–12 | `func (e *errorString) Error() string { return e.s }` | `*errorString` has an `Error` method that returns the text in `s`: so `*errorString` is an `error` |
+
+So the value that `errors.New("…")` returned holds the **type** `*errors.errorString` and the **value**: the address of a new struct.
+It is the same structure as `w io.Writer` in the question above.
+
+## The sentinel error and ==
+
+The caller needs one exact error value to compare with. In `store.go` we add the `errors` import and declare the variable
+`ErrNotFound` **outside** any function, at package level; when `Sell` does not find the product, it returns exactly this value:
+
+```go
+// ErrNotFound — katalogda bunday ID'li mahsulot yoʻq.
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+func (s *Store) Sell(id int64, quantity int) error {
+	// … mahsulotni qidiradi, topsa sotadi va nil qaytaradi
+	return ErrNotFound
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `var ErrNotFound = errors.New(…)` | a package-level variable: outside a function. It is created when the program starts, before `main`, **once** ([Go spec: Package initialization](https://go.dev/ref/spec#Package_initialization)) |
+| 2 | `ErrNotFound` | capital letter: `main` sees it too (GB-2.06). Starting the name with `Err` is the Go convention |
+| 4 | `func (s *Store) Sell(id int64, quantity int) error {` | as in GB-2.06: `id` is the product number, `quantity` is the number of pieces |
+| 6 | `return ErrNotFound` | if the product is not found, exactly this value is returned |
+
+(Words in the comments: `katalogda bunday ID'li mahsulot yoʻq` — "there is no product with this ID in the catalog"; `mahsulotni qidiradi, topsa sotadi va nil qaytaradi` —
+"looks for the product, sells it if found and returns nil".) Such an error is called a **sentinel error**: `io.EOF` in the standard library is one.
+In `main` we compare `err` with `store.ErrNotFound` using `==`:
+
+```go
+	err := st.Sell(9, 1)
+	if err == store.ErrNotFound {
+		fmt.Println("bunday mahsulot yoʻq")
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+```
+
+(`bunday mahsulot yoʻq` — "there is no such product", `xato` — "error".) Two interface values are equal if both their **types** and their **values** are equal ([Go spec: Comparison operators](https://go.dev/ref/spec#Comparison_operators)).
+If they are equal, the user gets a clear message. Otherwise, if there is an error (`err != nil`), the error itself is printed, so no other error is lost.
+
+```console
+$ ./_video/run.sh 01-sentinel go run ./cmd/bozor
+bunday mahsulot yoʻq
+```
+
+Now we add the `errors` import to `main` and two lines: `other` is a new error made with `errors.New`, and its text is exactly the same as the text of
+`ErrNotFound`. Then we print `other == store.ErrNotFound`:
+
+```go
+	other := errors.New("mahsulot topilmadi")
+	fmt.Println(other == store.ErrNotFound)
+```
+
+What does the second line print?
+
+**A)** `true`: the text is the same · **B)** `false` · **C)** a compile error: interfaces cannot be compared
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** Interfaces can be compared: there is no compile error (**C** is wrong). The comparison looks at type and value, not at text.
+`errors.New` creates a **new** struct on every call and returns its address. Both values have the same type (`*errors.errorString`),
+but the addresses differ. If you chose **A**, you thought the comparison looks at the text. The doc comment of `errors.New` says the same:
+"Each call to New returns a distinct error value even if the text is identical".
+
+</details>
+
+```console
+$ ./_video/run.sh 02-yangi go run ./cmd/bozor
+bunday mahsulot yoʻq
+false
+```
+
+The first line: the error that `Sell` returned equals the sentinel. The second line: `false`. In memory:
+
+| value | type inside | value inside (address) | `== store.ErrNotFound` |
+|---|---|---|---|
+| `store.ErrNotFound` | `*errors.errorString` | A | — |
+| the `err` that `Sell` returned | `*errors.errorString` | A | `true` (the same value) |
+| `other` | `*errors.errorString` | B | `false` (same type, different address) |
+
+That is why a sentinel is declared **once** and everybody uses that one variable.
+
+## Wrapping with %w
+
+The problem: the message says "product not found", but **which** ID? We add the ID. `fmt.Errorf` (GB-1.07) fills a template like `Sprintf` and returns the result as an `error`.
+The new thing is `%w`:
+
+```go
+func (s *Store) Sell(id int64, quantity int) error {
+	// … mahsulotni qidiradi, topsa sotadi va nil qaytaradi
+	return fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 3 | `fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)` | `%d` puts `id` in as a number. In the text `%w` puts the text of the error like `%v`, but the result **keeps the original error inside** |
+ 
+This is called **wrapping**: the original error is inside the new one, and the text has more detail. `main` did not change,
+it still compares with `==`. What is printed when `Sell(9, 1)` is called?
+
+**A)** `bunday mahsulot yoʻq` · **B)** `xato: mahsulot 9: mahsulot topilmadi` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B.** The `else` branch ran: the text now has the ID, but `==` became false. Why — we see in the next step from the type inside the error.
+If you chose **A**, you thought only the text changed and the error stayed the same. **C** — the code is correct, the compiler finds no error.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-wrap go run ./cmd/bozor
+xato: mahsulot 9: mahsulot topilmadi
+```
+
+To see the reason, we add two lines at the end of `main`. `%T` in `fmt.Printf` prints the concrete type of a value; if it is an interface,
+the type inside it. The first line is for `err`, the second for `ErrNotFound`:
+
+```go
+	fmt.Printf("%T\n", err)
+	fmt.Printf("%T\n", store.ErrNotFound)
+```
+
+```console
+$ ./_video/run.sh 04-tur go run ./cmd/bozor
+xato: mahsulot 9: mahsulot topilmadi
+*fmt.wrapError
+*errors.errorString
+```
+
+The type of `err` is `*fmt.wrapError`, the type of `ErrNotFound` is `*errors.errorString`. If the types inside the interfaces differ, `==` is always
+`false`. `wrapError` is a type of the `fmt` package itself; its source:
+
+```console
+$ sed -n 70,81p $(go env GOROOT)/src/fmt/errors.go
+type wrapError struct {
+	msg string
+	err error
+}
+
+func (e *wrapError) Error() string {
+	return e.msg
+}
+
+func (e *wrapError) Unwrap() error {
+	return e.err
+}
+```
+
+`wrapError` keeps two things: the ready text (`msg`) and the original error inside (`err`). The `Unwrap` method returns this inner error.
+Each `%w` adds a new layer, and the layers form a **chain** (error chain):
+
+```text
+err ──► *fmt.wrapError            msg: "mahsulot 9: mahsulot topilmadi"
+            │ Unwrap()            err: ─────────────┐
+            ▼                                       │
+        *errors.errorString  ◄──────────────────────┘
+        (store.ErrNotFound)
+```
+
+`errors.Is(err, target)` compares the error with `target`; if they are not equal, it goes one layer down with `Unwrap` and continues
+until the chain ends. In our chain:
+
+| Step | Layer checked | Type | `== store.ErrNotFound`? |
+|---|---|---|---|
+| 1 | `err` | `*fmt.wrapError` | no (different type) → `Unwrap` |
+| 2 | the error inside | `*errors.errorString` | yes, address A → `true` |
+
+In `main` we write `errors.Is` instead of `==`: the first argument is the error to check, the second is the sentinel we look for. `main` must import `errors`:
+
+```go
+	err := st.Sell(9, 1)
+	if errors.Is(err, store.ErrNotFound) {
+		fmt.Println("bunday mahsulot yoʻq")
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+```
+
+```console
+$ ./_video/run.sh 05-is go run ./cmd/bozor
+bunday mahsulot yoʻq
+```
+
+The error is wrapped, but it was found. A question: we add one more line to `main` — we give `errors.Is` a **new** error with the same text instead of the sentinel:
+
+```go
+	fmt.Println(errors.Is(err, errors.New("mahsulot topilmadi")))
+```
+
+`%w` in `Sell` is correct. What is printed?
+
+**A)** `true`: the text is the same · **B)** `false` · **C)** `true`: the error is wrapped with `%w`
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** `errors.Is` compares each layer of the chain with `==`, not the text. `errors.New` made a new value, its address
+is not equal to the address of `ErrNotFound`. **A** — the text is the same, but `Is` does not look at text. **C** — wrapping builds the chain, but to find an error you still need
+**that very** value. That is why `Is` always gets the declared sentinel itself.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-quiz go run ./cmd/bozor
+bunday mahsulot yoʻq
+false
+```
+
+The first line is the result of the earlier `if`, the second is from the new line.
+
+## Our own error type: StockError
+
+Now the stock. We want to tell the user "only 40 pieces left", but the number 40 lives only in the text, and searching a text for a number is fragile.
+The solution: our own error type where the number sits in a **field**. In `store.go`, a `StockError` struct: the product name `Name`, the stock in the warehouse `Stock`
+and the requested number `Want`. It gets an `Error` method: `Sprintf` builds the text from the first screen.
+
+```go
+// StockError — omborda soʻralgancha mahsulot yoʻq.
+type StockError struct {
+	Name  string
+	Stock int // omborda bor
+	Want  int // soʻralgan
+}
+
+func (e *StockError) Error() string {
+	return fmt.Sprintf("%s: qoldiq %d, soʻralgan %d", e.Name, e.Stock, e.Want)
+}
+```
+
+(Comments: `omborda soʻralgancha mahsulot yoʻq` — "the warehouse does not have as much product as requested"; `omborda bor` — "in the warehouse"; `soʻralgan` — "requested".)
+
+| Line | Code | What it does |
+|---|---|---|
+| 2–6 | `type StockError struct { … }` | three fields: `Name` (product name), `Stock` (how many are in the warehouse), `Want` (how many were requested) |
+| 8 | `func (e *StockError) Error() string {` | the `Error` method, receiver `e`. The receiver is a **pointer**: then only `*StockError` is an `error` (GB-2.07: methods with a pointer receiver belong to `*T`), and the type the caller looks for is just one |
+| 9 | `return fmt.Sprintf(…)` | builds the text from the fields: "olma: qoldiq 40, soʻralgan 41" |
+
+Such an error is a **typed error**: it has its own type and fields. Now `%w` is back in `Sell` (`ErrNotFound` is wrapped with `%w` again). When the stock is not enough, `Sell` used to build
+the error with `fmt.Errorf`; instead we return `&StockError{…}`. Here `p` is a pointer to the found product (the search part is shortened):
+
+```go
+	// … p — topilgan mahsulot (*Product)
+	if p.Stock < quantity {
+		return &StockError{Name: p.Name, Stock: p.Stock, Want: quantity}
+	}
+```
+
+(`topilgan mahsulot` — "the found product".) `&StockError{…}` is a new struct with filled fields and its **address**. The text is the same, and the numbers now sit in the fields.
+
+## errors.As: search by type
+
+In `main` we ask for 41 apples. If there is an error, we wrap it with the layer "buyurtma 7" ("order 7"), as if the call were made inside an order.
+First we print `err`, then the type assertion from GB-2.07 — only `T` is now a concrete type: is there a `*store.StockError` inside `err`?
+The result goes to `ok`, the value is thrown away with `_`:
+
+```go
+	err = st.Sell(1, 41)
+	if err != nil {
+		err = fmt.Errorf("buyurtma 7: %w", err)
+	}
+	fmt.Println(err)
+	_, ok := err.(*store.StockError)
+	fmt.Println(ok)
+```
+
+What will `ok` be?
+
+**A)** `true`: there is a `*StockError` inside · **B)** `false` · **C)** `panic`
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** The text was built layer by layer: "buyurtma 7: " and the text of `Sell`. A type assertion looks only at the **outermost** layer, and there it finds
+`*fmt.wrapError`. Like `==`, it does not work on a wrapped error. **A** — the error is inside, but the assertion does not look inside. **C** — the comma-ok form
+(`_, ok :=`) never panics.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-assert go run ./cmd/bozor
+bunday mahsulot yoʻq
+buyurtma 7: olma: qoldiq 40, soʻralgan 41
+false
+```
+
+The third line is `false`. Instead of the assertion lines we use `errors.As`:
+
+```go
+	var se *store.StockError
+	if errors.As(err, &se) {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+```
+
+(`faqat %d dona qoldi` — "only %d pieces left".)
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `var se *store.StockError` | a variable of type `*store.StockError`; `nil` for now |
+| 2 | `errors.As(err, &se)` | walks the chain like `Is`, but searches for a **type**, not a **value**. Which type — it learns from the type of `se`. When it finds one, it writes the found error into `se` and returns `true` |
+| 2 | `&se` | `se` is itself a pointer, and `&se` is the **address of this variable**: `As` can write into it only through the address (GB-2.04) |
+| 3 | `se.Name`, `se.Stock` | the fields of the found error |
+
+`As` on the chain:
+
+| Step | Layer | Does the type match `*store.StockError`? |
+|---|---|---|
+| 1 | `err` | `*fmt.wrapError`: no → `Unwrap` |
+| 2 | the error inside | `*store.StockError`: yes → `se` = this error, result `true` |
+
+The full program is the `09-as` step of the video (the `main` in the folder is this one plus the `message` function, which belongs to the task):
+
+```go filename="_video/09-as/cmd/bozor/main.go" showLineNumbers
+// bozor dasturi: mahsulot sotadi va xatoni turiga qarab tushuntiradi.
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 100)
+
+	err := st.Sell(9, 1)
+	if errors.Is(err, store.ErrNotFound) {
+		fmt.Println("bunday mahsulot yoʻq")
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+
+	err = st.Sell(1, 41)
+	if err != nil {
+		err = fmt.Errorf("buyurtma 7: %w", err)
+	}
+	var se *store.StockError
+	if errors.As(err, &se) {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+```
+
+New lines: 23–26 wrap the error of `Sell(1, 41)`; 27–32 are `errors.As`. The `errors.Is` in lines 16–21 is the code from the earlier `05-is` step.
+
+```console
+$ ./_video/run.sh 09-as go run ./cmd/bozor
+bunday mahsulot yoʻq
+olma: faqat 40 dona qoldi
+```
+
+At work the server chooses the answer to each error with exactly these two functions
+([GB-4.06 · JSON in and out: limits, validation and the error response](/lab/youtube/gb#gb-4-06) and [GB-6.02 · Uniform API errors: safe for the client, complete in the log](/lab/youtube/gb#gb-6-02)).
+
+Since Go 1.26 there is `errors.AsType` for the same job. Its shape looks like the comma-ok of a type assertion, but along the chain:
+the short statement of `if` returns `se` and `ok`, and `var` and `&` are not needed.
+
+```go
+	if se, ok := errors.AsType[*store.StockError](err); ok {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+```
+
+The type to search for goes in the square brackets: this is a **type parameter**, which we open in [GB-3.04 · Generics: when a type parameter helps](/lab/youtube/gb#gb-3-04).
+The documentation recommends `AsType` for most uses ("For most uses, prefer AsType"). `As` exists since Go 1.13,
+so it is common in code you meet at work. The result is the same (step `10-astype`):
+
+```console
+$ ./_video/run.sh 10-astype go run ./cmd/bozor
+bunday mahsulot yoʻq
+olma: faqat 40 dona qoldi
+```
+
+## Going deeper (optional): errors.Join
+
+An order has three lines and we want to return the errors of all three at once. `errors.Join` combines errors into one `error` and drops the `nil` values. We replace `main`
+with a short example (`_video/11-join`):
+
+```go filename="_video/11-join/cmd/bozor/main.go" showLineNumbers
+// bozor dasturi: mahsulot sotadi va xatoni turiga qarab tushuntiradi.
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 100)
+
+	err := errors.Join(st.Sell(9, 1), st.Sell(1, 41), st.Sell(2, 3))
+	fmt.Println(err)
+	fmt.Println(errors.Is(err, store.ErrNotFound))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 16 | `err := errors.Join(st.Sell(9, 1), st.Sell(1, 41), st.Sell(2, 3))` | runs three sales one after another and combines the results into one error. The third sale succeeds (bread, 100 pieces): it returns `nil`, and `Join` drops it |
+| 17 | `fmt.Println(err)` | the text of the combined error |
+| 18 | `errors.Is(err, store.ErrNotFound)` | checks every error inside `Join` |
+
+How many lines does the first `Println` print?
+
+**A)** 3 · **B)** 2 · **C)** 1
+
+<details>
+<summary>Answer</summary>
+
+**B: 2.** `Join` joins the texts of the errors with a newline, and `nil` is not there: the third sale returned no error. If you chose **A**, you counted `nil` as an error too.
+**C** — `Join` adds the texts together, it does not pick the first one.
+
+</details>
+
+```console
+$ ./_video/run.sh 11-join go run ./cmd/bozor
+mahsulot 9: mahsulot topilmadi
+olma: qoldiq 40, soʻralgan 41
+true
+```
+
+Two errors on separate lines, the third is missing. `errors.Is` checks every error inside `Join` (and so does `errors.As`), so the second `Println` is `true`.
+`Join` exists since Go 1.20.
+
+## Common mistakes
+
+**1. "The text is the same, so the error is the same."** This is the most common wrong idea. A sentinel is not a text, it is **one value**:
+writing `errors.New("mahsulot topilmadi")` a second time creates a new, different error. In the section "The sentinel error and ==" above, `other == store.ErrNotFound`
+gave `false`, and in the question of the section "Wrapping with %w", `errors.Is` did not find the new error. The fix: declare the sentinel at package level **once** and use it everywhere.
+
+**2. `%v` instead of `%w`.** A silent bug: the program runs, the result is wrong. One letter was changed in `Sell` (`_video/06-v`):
+
+```go
+	return fmt.Errorf("mahsulot %d: %v", id, ErrNotFound)
+```
+
+`main` is the same, with `errors.Is`:
+
+```console
+$ ./_video/run.sh 06-v go run ./cmd/bozor
+xato: mahsulot 9: mahsulot topilmadi
+```
+
+Again the `else` branch, and the text is letter for letter as before. `%v` takes only the **text** of the error, the original error is not in the result — the chain breaks, and `errors.Is` finds
+nothing. `go vet` does not see it either:
+
+```console
+$ ./_video/run.sh 06-v go vet ./...
+```
+
+`go vet` printed nothing (the script adds only its own line `(chiqish kodi: 0)`, which, as said above, is left out). The rule: wrap with `%w` the error that the caller has to check.
+If you want to hide an internal detail on purpose, use `%v`: a wrapped error becomes part of your API
+([Go blog: Whether to Wrap](https://go.dev/blog/go1.13-errors#whether-to-wrap)).
+
+**3. `errors.As(err, se)`: no `&`.** This program is not in the course folder: I ran it in a separate folder with the same `go.mod` and `internal/store`.
+`cmd/bozor/main.go`:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+
+	err := st.Sell(1, 41)
+	var se *store.StockError
+	if errors.As(err, se) {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	}
+}
+```
+
+The compiler is silent, and `go vet` catches it:
+
+```console
+$ go vet ./...
+cmd/bozor/main.go:16:5: second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type
+```
+
+`cmd/bozor/main.go:16:5` is the file, line 16, column 5: the call of `errors.As`. The message: "the second argument of `errors.As` must be a **non-nil pointer**". Without vet, running it gives:
+
+```console
+$ go run ./cmd/bozor
+panic: errors: target must be a non-nil pointer
+
+goroutine 1 [running]:
+…
+exit status 2
+```
+
+(The stack trace contains paths of this machine, so it is cut.) `As` has to **write** the found error into `se`, and `se` is a `nil` pointer; writing needs an address.
+The fix: `errors.As(err, &se)`.
+
+**4. `var se store.StockError`: no star.** Again a program that is not in the course folder (the same `go.mod` and `internal/store`):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+
+	err := st.Sell(1, 41)
+	var se store.StockError
+	if errors.As(err, &se) {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	}
+}
+```
+
+```console
+$ go vet ./...
+cmd/bozor/main.go:16:5: second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type
+```
+
+The message is the same as before, the reason is different: `&se` is a pointer not to `*store.StockError` but to `store.StockError`. The `Error` method has a pointer receiver, so
+`store.StockError` (without the star) is **not** an `error`. Running it gives:
+
+```console
+$ go run ./cmd/bozor
+panic: errors: *target must be interface or implement error
+
+goroutine 1 [running]:
+…
+exit status 2
+```
+
+The fix: `var se *store.StockError`. The rule: the variable for `errors.As` must have a type that has the `Error` method (for us `*store.StockError`).
+
+## Check yourself
+
+**1.** In `Errorf`, `%v` and `%w` give the same text. What is the difference?
+
+<details>
+<summary>Answer</summary>
+
+`%w` keeps the original error inside the result (`*fmt.wrapError` + `Unwrap`), so `errors.Is` and `errors.As` find it in the chain. `%v` takes only the text:
+the chain breaks, and `errors.Is` and `errors.As` find nothing.
+
+</details>
+
+**2.** Why do we pass `&se` and not `se` to `errors.As(err, &se)`?
+
+<details>
+<summary>Answer</summary>
+
+`As` **writes** the found error into `se`. A function can write into the caller's variable only through its address (GB-2.04), so `&se`. `se` is itself
+a pointer (`*store.StockError`), and `&se` is the address of this variable. If you pass `se`, `As` panics.
+
+</details>
+
+**3.** From GB-2.05: the `Order` struct has a `Status` field, and the `Pay` method has a **value receiver**:
+
+```go
+func (o Order) Pay() {
+	o.Status = Paid
+}
+```
+
+Does the `Status` of `order` change after `order.Pay()`?
+
+<details>
+<summary>Answer</summary>
+
+No. A value receiver gets a **copy** of `order`, `Status` changes in the copy and disappears with it. To change it, the receiver must be a pointer: `(o *Order) Pay()`.
+
+</details>
+
+**4.** Predict the output. The program is not in the course folder (it was run in a separate folder with the same `go.mod` and `internal/store`):
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	e1 := fmt.Errorf("katalog: %w", store.ErrNotFound)
+	e2 := fmt.Errorf("buyurtma 7: %w", e1)
+	fmt.Println(e2)
+	fmt.Println(errors.Is(e2, store.ErrNotFound))
+	fmt.Println(e2 == e1)
+	fmt.Println(errors.Is(e2, e1))
+}
+```
+
+What is printed?
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ go run ./cmd/bozor
+buyurtma 7: katalog: mahsulot topilmadi
+true
+false
+true
+```
+
+The text is built layer by layer (line 1). The chain has three layers: `e2` → `e1` → `ErrNotFound`; `errors.Is` calls `Unwrap` twice and finds the sentinel (line 2).
+`e2 == e1` — the types are the same (`*fmt.wrapError`), but the addresses differ: `false` (line 3). `errors.Is(e2, e1)` — `e1` is in the chain itself, on the second layer: `true` (line 4).
+
+</details>
+
+## Homework
+
+The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-08-xatolar/TASK.md) in the course folder;
+folder: [lessons/gb-2-08-xatolar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-08-xatolar). Two jobs:
+
+- 🟢 **Step 1, `internal/store/store.go`, `Sell`.** If `quantity` is not positive, `Sell` now returns a plain text error
+  (`dona soni musbat boʻlishi kerak, hozir 0`), and the caller cannot recognise it with `errors.Is`. `ErrBadQuantity` is already declared in the file:
+  make `Sell` return it wrapped with `%w`, and keep the requested number in the text. The stock must not change.
+- 🟡 **Step 2, `cmd/bozor/main.go`, `message`.** `message(err)` turns an error into text for the user; now it returns
+  `xato: …` for every error. It must return: `store.ErrNotFound` → `bunday mahsulot yoʻq`; `store.ErrBadQuantity` → `dona soni notoʻgʻri`; `*store.StockError` →
+  `olma: faqat 40 dona qoldi` (name and stock from the fields); any other error → `xato: ` + `err.Error()`. The error can be at any layer of the chain.
+
+The level marks (🟢🟡) are not in the course folder: I added them. Do not change `main`, `StockError` and `ErrNotFound`. Hints are in `TASK.md`: the text of `ErrBadQuantity` is
+`dona soni musbat boʻlishi kerak`, in the template `%w` puts the text of the error, and the number goes with `%d`. In `message` the order is: first the two sentinels (`errors.Is`), then the type
+(`errors.As`), and last everything else; `==` does not work because the error is wrapped.
+
+To check, run `go test ./...` in the root of the folder. With the starting code the test fails, and the message says which step it is:
+
+```console
+$ go test ./...
+--- FAIL: TestVazifaMessage (0.00s)
+    --- FAIL: TestVazifaMessage/topilmadi (0.00s)
+        tekshiruv_test.go:44: message("mahsulot 9: mahsulot topilmadi") = "xato: mahsulot 9: mahsulot topilmadi"; kutilgan "bunday mahsulot yoʻq" — errors.Is(err, store.ErrNotFound) (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaMessage/topilmadi_ikki_qavat (0.00s)
+        tekshiruv_test.go:44: message("buyurtma 7: mahsulot 9: mahsulot topilmadi") = "xato: buyurtma 7: mahsulot 9: mahsulot topilmadi"; kutilgan "bunday mahsulot yoʻq" — errors.Is butun zanjirni tekshiradi (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaMessage/qoldiq (0.00s)
+        tekshiruv_test.go:44: message("olma: qoldiq 40, soʻralgan 41") = "xato: olma: qoldiq 40, soʻralgan 41"; kutilgan "olma: faqat 40 dona qoldi" — errors.As(err, &se), se — *store.StockError; matn se.Name va se.Stock'dan (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaMessage/qoldiq_ikki_qavat (0.00s)
+        tekshiruv_test.go:44: message("buyurtma 7: olma: qoldiq 40, soʻralgan 41") = "xato: buyurtma 7: olma: qoldiq 40, soʻralgan 41"; kutilgan "olma: faqat 40 dona qoldi" — errors.As ham butun zanjirni tekshiradi (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaMessage/dona_soni (0.00s)
+        tekshiruv_test.go:44: message("buyurtma 7: dona soni musbat boʻlishi kerak") = "xato: buyurtma 7: dona soni musbat boʻlishi kerak"; kutilgan "dona soni notoʻgʻri" — errors.Is(err, store.ErrBadQuantity) (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/bozor	0.002s
+--- FAIL: TestVazifaDonaSoni (0.00s)
+    tekshiruv_test.go:60: Sell(1, 0) xatosi "dona soni musbat boʻlishi kerak, hozir 0", lekin errors.Is(err, ErrBadQuantity) = false: ErrBadQuantity'ni fmt.Errorf'da %w bilan oʻrab qaytaring (TASK.md, 1-qadam)
+    tekshiruv_test.go:60: Sell(1, -2) xatosi "dona soni musbat boʻlishi kerak, hozir -2", lekin errors.Is(err, ErrBadQuantity) = false: ErrBadQuantity'ni fmt.Errorf'da %w bilan oʻrab qaytaring (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.002s
+FAIL
+```
+
+Work until you see `ok`. The time (`0.002s`) differs on every run.
+
+<details>
+<summary>Answer and explanation</summary>
+
+The answer is [`solution/internal/store/store.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-08-xatolar/solution/internal/store/store.go):
+
+```go filename="solution/internal/store/store.go" showLineNumbers
+// Package store bozor katalogini xotirada saqlaydi.
+// U internal/ ichida: uni faqat bozor modulining oʻz kodi import qila oladi.
+package store
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+)
+
+// ErrNotFound — katalogda bunday ID'li mahsulot yoʻq.
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// ErrBadQuantity — soʻralgan dona soni musbat emas.
+var ErrBadQuantity = errors.New("dona soni musbat boʻlishi kerak")
+
+// StockError — omborda soʻralgancha mahsulot yoʻq.
+type StockError struct {
+	Name  string
+	Stock int // omborda bor
+	Want  int // soʻralgan
+}
+
+func (e *StockError) Error() string {
+	return fmt.Sprintf("%s: qoldiq %d, soʻralgan %d", e.Name, e.Stock, e.Want)
+}
+
+// Product — katalogdagi bitta mahsulot.
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64 // tiyin
+	Stock int
+}
+
+// Store — xotiradagi katalog. Nol qiymati tayyor: var st store.Store.
+type Store struct {
+	products []Product
+}
+
+// Add katalogga mahsulot qoʻshadi va unga ID beradi (1, 2, 3 …).
+func (s *Store) Add(name string, price int64, stock int) Product {
+	p := Product{ID: int64(len(s.products)) + 1, Name: name, Price: price, Stock: stock}
+	s.products = append(s.products, p)
+	return p
+}
+
+// List katalogdagi mahsulotlarning nusxasini qaytaradi.
+func (s *Store) List() []Product {
+	return slices.Clone(s.products)
+}
+
+// Sell id'li mahsulotdan quantity dona sotadi va qoldiqni kamaytiradi.
+// Xato boʻlsa qoldiq oʻzgarmaydi. Chaqiruvchi xatoni tekshira oladi:
+// errors.Is(err, ErrNotFound) — mahsulot yoʻq,
+// errors.As(err, &se) (se *StockError) — qoldiq yetmaydi,
+// errors.Is(err, ErrBadQuantity) — dona soni musbat emas.
+func (s *Store) Sell(id int64, quantity int) error {
+	if quantity <= 0 {
+		return fmt.Errorf("%w, hozir %d", ErrBadQuantity, quantity)
+	}
+	for i := range s.products {
+		p := &s.products[i]
+		if p.ID == id {
+			if p.Stock < quantity {
+				return &StockError{Name: p.Name, Stock: p.Stock, Want: quantity}
+			}
+			p.Stock -= quantity
+			return nil
+		}
+	}
+	return fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+}
+```
+
+and [`solution/cmd/bozor/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-08-xatolar/solution/cmd/bozor/main.go):
+
+```go filename="solution/cmd/bozor/main.go" showLineNumbers
+// bozor dasturi: mahsulot sotadi va xatoni turiga qarab tushuntiradi.
+package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+func main() {
+	var st store.Store
+	st.Add("olma", 1_200_000, 40)
+	st.Add("non", 400_000, 100)
+
+	err := st.Sell(9, 1)
+	if errors.Is(err, store.ErrNotFound) {
+		fmt.Println("bunday mahsulot yoʻq")
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+
+	err = st.Sell(1, 41)
+	if err != nil {
+		err = fmt.Errorf("buyurtma 7: %w", err)
+	}
+	var se *store.StockError
+	if errors.As(err, &se) {
+		fmt.Printf("%s: faqat %d dona qoldi\n", se.Name, se.Stock)
+	} else if err != nil {
+		fmt.Println("xato:", err)
+	}
+}
+
+// message xatoni (err nil emas) foydalanuvchiga koʻrsatiladigan matnga aylantiradi.
+// Xatoni matnga aylantirish bitta joyda: keyinroq server ham shunday funksiyadan foydalanadi.
+// errors.Is va errors.As butun zanjirni tekshiradi, shuning uchun qoʻshimcha
+// oʻralgan xatolar («buyurtma 7: …») ham taniladi.
+func message(err error) string {
+	if errors.Is(err, store.ErrNotFound) {
+		return "bunday mahsulot yoʻq"
+	}
+	if errors.Is(err, store.ErrBadQuantity) {
+		return "dona soni notoʻgʻri"
+	}
+	var se *store.StockError
+	if errors.As(err, &se) {
+		return fmt.Sprintf("%s: faqat %d dona qoldi", se.Name, se.Stock)
+	}
+	return "xato: " + err.Error()
+}
+```
+
+- `Sell`, step 1: `fmt.Errorf("%w, hozir %d", ErrBadQuantity, quantity)` — `%w` wraps and keeps the sentinel, `%d` puts the requested number in the text.
+  Now `errors.Is(err, ErrBadQuantity)` is `true`, and the text is as before: `dona soni musbat boʻlishi kerak, hozir 0`.
+- `message`, step 2: the order does not matter, but everything is done with `errors.Is`/`errors.As`, not `==`. The test wraps errors with one more layer ("buyurtma 7: …");
+  `Is` and `As` check the whole chain, so those are recognised too. The last `return` is the old `xato: …` behaviour.
+
+To check with the answer: `solution/` is a separate module with its own `go.mod`, so inside it:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	(cached)
+ok  	github.com/abdurahmon27/bozor/internal/store	(cached)
+```
+
+</details>
+
+## Sources
+
+- [Go spec: Errors](https://go.dev/ref/spec#Errors) — `error` is a predeclared interface
+- [Go spec: Comparison operators](https://go.dev/ref/spec#Comparison_operators) — interface values are equal when type and value are equal
+- [Go spec: Package initialization](https://go.dev/ref/spec#Package_initialization) — a package-level variable is initialized once before `main`
+- [Go spec: Type assertions](https://go.dev/ref/spec#Type_assertions) — `x.(T)` checks only the concrete type of `x`
+- [pkg.go.dev: errors](https://pkg.go.dev/errors) — `New` ("Each call to New returns a distinct error value even if the text is identical"), `Is`, `As`, `AsType`, `Join`
+- [pkg.go.dev: fmt.Errorf](https://pkg.go.dev/fmt#Errorf) — `%w`; [fmt: `%T` and the call of `Error()`](https://pkg.go.dev/fmt#hdr-Printing)
+- [Go blog: Working with Errors in Go 1.13](https://go.dev/blog/go1.13-errors) — wrapping, `Is`, `As`, [Whether to Wrap](https://go.dev/blog/go1.13-errors#whether-to-wrap)
+- [Go 1.13 release notes: error wrapping](https://go.dev/doc/go1.13#error_wrapping) — `%w`, `errors.Is`, `errors.As`
+- [Go 1.20 release notes: errors](https://go.dev/doc/go1.20#errors) — `errors.Join`
+- [Go 1.26 release notes: errors.AsType](https://go.dev/doc/go1.26#errorspkgerrors) — `errors.AsType`
+- [Go Code Review Comments: Error Strings](https://go.dev/wiki/CodeReviewComments#error-strings) — error text in lower case, no final period
+- [staticcheck ST1012](https://staticcheck.dev/docs/checks/#ST1012) — a sentinel name in the form `ErrXxx`
+- Go source (go1.27.4): `src/errors/errors.go`, `src/fmt/errors.go`, `src/fmt/doc.go` — [errors/](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/errors/)
+- [Course folder: lessons/gb-2-08-xatolar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-08-xatolar)
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-08-xatolar)
+
+---
+
+← Previous lesson: [GB-2.07](/lab/youtube/gb/gb-2-07/en) · Next lesson: [GB-2.09](/lab/youtube/gb#gb-2-09) → · [All lessons](/lab/youtube/gb)
+
+</div>
