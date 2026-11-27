@@ -1,0 +1,1270 @@
+---
+title: "Контрольная точка: bozor CLI v0 (add, list, order, JSON, тесты)"
+date: "2026/11/27"
+description: "Соберёте модули 2–3 в один bozor CLI: add, list, order, атомарное сохранение, тесты, ловящие баг; команду restock напишете сами."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-3-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-3-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-3-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-3-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-3-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-3-06) · **Русский** · [English](/lab/youtube/gb/gb-3-06/en)  
+Урок GB-3.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-3-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-06-bozor-cli)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+`Store` (GB-2.06) держит каталог только в памяти: программа завершилась, и товары пропали. Работа с `bozor.json` (GB-3.02) осталась в отдельной программе. Как собрать эти части в одну программу командной строки, в **CLI** (command-line interface)? И как сделать её надёжной: чтобы файл не оставался недописанным даже при отключении питания, а молча испорченный остаток ловил тест?
+
+**Одна идея:** bozor CLI выполняет одну команду в одном процессе. `main` только передаёт `os.Args` в `run(path, args, w)` и превращает ошибку в код выхода: 1 — ошибка, 2 — неверный вызов. `run` загружает каталог из `bozor.json`, выбирает команду через `switch`, вызывает правила из `internal/store` и сохраняет изменённый каталог **атомарно**: новый JSON сначала пишется во временный файл, затем `os.Rename` одним шагом ставит его на место `bozor.json`. Путь и `io.Writer` — параметры, поэтому тест вызывает весь CLI в своей папке и проверяет не вывод, а состояние каталога.
+
+К концу урока вы:
+
+- прочитаете CLI со структурой `cmd/bozor` + `internal/store` и объясните, почему `run(path, args, w)` делает весь CLI доступным для теста;
+- различите код выхода 1 (ошибка) и 2 (неверный вызов);
+- увидите, почему `os.WriteFile` может оставить недописанный файл, и прочитаете атомарное сохранение через `os.CreateTemp` + `Sync` + `os.Rename`;
+- увидите, как табличный тест ловит настоящий баг, который `go vet` и `staticcheck` пропустили, а команду `bozor restock ID DONA` напишете сами, вместе с тестом.
+
+Три основных новых слова сегодня:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| структура CLI | `main` только передаёт аргументы и превращает ошибку в код выхода; вся работа в функции `run(path, args, w) error` | CLI structure (thin `main` + `run`) |
+| атомарное сохранение | новый файл сначала пишется отдельно, затем имя меняется одним шагом: читатель видит либо старый, либо новый файл | atomic save |
+| тест, проверяющий состояние | тест проверяет не значение, которое вернула функция, а состояние каталога (или файла) | state-checking test |
+
+Вспомогательные слова объясняются одной фразой там, где встречаются: `t.TempDir()`, ширина в `fmt`, которая считается в рунах, временный файл.
+
+## Что нужно знать заранее
+
+Этот урок объединяет модули 2–3, поэтому опирается на многие уроки:
+
+- [GB-3.05 · Итераторы: range по функции, slices и maps](/lab/youtube/gb/gb-3-05/ru): `All() iter.Seq[Product]`, `if !yield(p) { return }`.
+- [GB-1.08 · Первый тест: go test, t.Errorf и табличные тесты](/lab/youtube/gb/gb-1-08/ru): табличный тест, `t.Run`.
+- [GB-3.02 · JSON и теги структур: сохраняем товары в bozor.json](/lab/youtube/gb/gb-3-02/ru): теги JSON, `MarshalIndent`, `os.WriteFile`, `null` и `[]`.
+- [GB-3.03 · Командные инструменты: go vet, staticcheck и govulncheck](/lab/youtube/gb/gb-3-03/ru): `go vet`, `staticcheck`.
+- [GB-3.01 · Файлы, bufio и io.Reader: читаем каталог из файла](/lab/youtube/gb/gb-3-01/ru): `strconv.ParseInt`, правила строки, `%w`.
+- [GB-2.06 · Пакеты: заглавная буква, internal/ и структура проекта](/lab/youtube/gb/gb-2-06/ru): `cmd/bozor` + `internal/store`, `Store`.
+- [GB-2.08 · Ошибки в Go глубже: %w, errors.Is и errors.As](/lab/youtube/gb/gb-2-08/ru): `ErrNotFound`, `*StockError`, `message(err)`.
+- [GB-2.07 · Интерфейс: io.Writer и две настоящие реализации](/lab/youtube/gb/gb-2-07/ru): `io.Writer`, `fmt.Fprintf`, `strings.Builder`.
+- [GB-2.09 · defer, panic и recover: зачем нужен каждый](/lab/youtube/gb/gb-2-09/ru): именованный результат и `defer`.
+- [GB-2.04 · Указатель: копия или общее значение](/lab/youtube/gb/gb-2-04/ru): `&`, `*p`, запись через указатель.
+- [GB-2.10 · UTF-8: байт, руна и узбекский текст](/lab/youtube/gb/gb-2-10/ru): `oʻrik` — 5 рун, 6 байт.
+- [GB-1.07 · Функция и первая ошибка: os.Args и strconv.Atoi](/lab/youtube/gb/gb-1-07/ru): `os.Args`, stderr, `echo $?`.
+- [GB-1.05 · Решения: if, else и switch](/lab/youtube/gb/gb-1-05/ru), [GB-1.04 · Текст и форматированный вывод: string и fmt.Printf](/lab/youtube/gb/gb-1-04/ru) и [GB-1.03 · Целые числа и деньги: цена в тийинах, а не во float64](/lab/youtube/gb/gb-1-03/ru): `switch`, ширина вроде `%-14s`, тийины.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса: [lessons/gb-3-06-bozor-cli](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-06-bozor-cli). Скачайте репозиторий и откройте терминал в этой папке (`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-3-06-bozor-cli
+```
+
+Папка самостоятельная, со своим `go.mod`: `cmd/bozor` + `internal/store`, ответ к заданию в `solution/`, два варианта из видео в `_video/01-nusxa` и `_video/02-null`. `./_video/run.sh <шаг> <команда>` копирует папку шага во временную папку `bozor/` и выполняет команду там. Если вместо команды передать `bash`, во временной папке откроется оболочка: её `bozor.json` и бинарник не засоряют вашу папку, а после `exit` всё удаляется. `final` — сама папка, только без проверок задания (`tekshiruv_test.go`): в видео задания ещё нет. Все команды `$ ./bozor …` на этой странице выполнены внутри `./_video/run.sh final bash`; исключения указаны на месте. Скрипт в конце печатает собственную строку `(chiqish kodi: N)` («код выхода»): я привёл её только там, где скрипт запускается напрямую.
+
+Модуль написан для Go 1.27 (`go 1.27` в `go.mod`). Если у вас установлен более старый Go, `go` сам скачает нужную версию. Результаты на странице получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0` (на этом компьютере нет компилятора C). Время (вроде `0.054s`) на загруженной машине меняется: числа в видео другие, и это неважно, важно `ok`.
+
+Четыре маленьких примера, которых нет в папке курса (они названы в тексте), запускались в отдельных папках: их полный код есть на этой странице, можете повторить сами. Три программы (`main.go`) лежат в отдельных папках, после `go mod init extra`; пример с тестом добавляется в копию `_video/01-nusxa` как файл `internal/store/qaytgan_test.go`.
+
+Один вопрос по прошлому уроку. Итератор `All()` не проверяет результат `yield(p)`. Что будет с итератором на следующем товаре после `break` в цикле?
+
+**A)** цикл продолжится · **B)** итератор тихо завершится · **C)** panic: программа упадёт
+
+<details>
+<summary>Ответ</summary>
+
+**C.** При `break` `yield` возвращает `false`. Если итератор не проверит это и вызовет `yield` снова, функция, сгенерированная компилятором, вызовет панику. Если вы выбрали **A** или **B**, вы считали `yield` «необязательным»: нет, вызывать его после `false` запрещено. Поэтому `All` написан так: `if !yield(p) { return }`. Сегодняшний `list` тоже обходит каталог этим же итератором `All`.
+
+</details>
+
+## Структура: путь одной команды
+
+Сначала форма готовой папки. `ls` выводит файлы двух папок (в терминале колонками; при выводе в файл каждый идёт отдельной строкой):
+
+```console
+$ ls cmd/bozor internal/store
+cmd/bozor:
+main.go  main_test.go
+
+internal/store:
+file.go  store.go  store_test.go
+```
+
+Структура такая же, как в GB-2.06:
+
+| Файл | Зачем |
+|---|---|
+| `cmd/bozor/main.go` | `main`, `run`, команды (`add`, `list`, `order`) и тексты ошибок: часть, которая общается с пользователем |
+| `cmd/bozor/main_test.go` | тесты CLI: вызывают `run` |
+| `internal/store/store.go` | правила товара: `Product`, `validate`, `Add`, `All`, `find`, `Sell`, ошибки |
+| `internal/store/file.go` | работа с `bozor.json`: `Load` и `Save` |
+| `internal/store/store_test.go` | тесты store: табличные тесты и тесты `Save` |
+
+Пакет из папки `internal/` может импортировать только этот модуль (GB-2.06). Путь одной команды, например `./bozor order 1 3`:
+
+| Шаг | Кто | Что делает |
+|---|---|---|
+| 1 | `main` | передаёт `os.Args[1:]` (`order`, `1`, `3`) в `run` |
+| 2 | `run` | загружает `bozor.json` (`store.Load`), выбирает `order` через `switch` |
+| 3 | `st.Sell(1, 3)` | `internal/store`: проверяет правила и уменьшает остаток |
+| 4 | `st.Save(path)` | записывает изменённый каталог в `bozor.json` |
+| 5 | `main` | если `run` вернул ошибку, пишет её текст в stderr и ставит код выхода |
+
+`main` нарочно тонкий: правил в нём нет. Весь CLI — функция `run`. Пользу этого вы увидите в разделе «Тесты».
+
+## Запускаем: add, list, order
+
+`go build ./cmd/bozor` собирает пакет `cmd/bozor`. Результат — один бинарник (GB-1.01), имя берётся из папки: `bozor`. Первая команда — `list`. Файла `bozor.json` ещё нет, `Load` считает это не ошибкой, а пустым каталогом.
+
+```console
+$ go build ./cmd/bozor
+$ ./bozor list
+katalog boʻsh: bozor add NOM NARX QOLDIQ
+```
+
+`go build` ничего не вывел: успех. `add` принимает название, цену в сумах и остаток. Программа сама выдаёт новый ID (наибольший ID + 1) и записывает каталог в `bozor.json`:
+
+```console
+$ ./bozor add olma 12000 40
+qoʻshildi: 1. olma, 12000 soʻm, 40 dona
+$ ./bozor add non 4000 3
+qoʻshildi: 2. non, 4000 soʻm, 3 dona
+$ ./bozor add choy 25000 8
+qoʻshildi: 3. choy, 25000 soʻm, 8 dona
+$ ./bozor add oʻrik 35000 2
+qoʻshildi: 4. oʻrik, 35000 soʻm, 2 dona
+```
+
+ID у `oʻrik` — четыре: это четвёртый `add`. Теперь код `list`. Он обходит каталог итератором `All` из GB-3.05 и пишет каждый товар в `w`:
+
+```go showLineNumbers
+func list(st *store.Store, w io.Writer) error {
+	n := 0
+	for p := range st.All() {
+		n++
+		_, err := fmt.Fprintf(w, "%2d. %-20s %8d soʻm %4d dona\n",
+			p.ID, p.Name, p.Price/tiyinPerSom, p.Stock)
+		if err != nil {
+			return err
+		}
+	}
+	if n == 0 {
+		_, err := fmt.Fprintln(w, "katalog boʻsh: bozor add NOM NARX QOLDIQ")
+		return err
+	}
+	return nil
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func list(st *store.Store, w io.Writer) error` | каталог и место вывода (`w`, GB-2.07) — параметры; возвращает только `error` |
+| 2, 4 | `n := 0`, `n++` | число выведенных строк; `++` — GB-1.06 |
+| 3 | `for p := range st.All()` | обходит каталог по одному товару (GB-3.05) |
+| 5–6 | `fmt.Fprintf(w, "…", p.ID, p.Name, …)` | пишет одну строку в `w`; `_` — число записанных байт не нужно |
+| 6 | `p.Price/tiyinPerSom` | цена хранится в тийинах, при выводе переводится в сумы (GB-1.03) |
+| 7–9 | `if err != nil { return err }` | если записать не удалось, возвращает ошибку |
+| 11–14 | `if n == 0 { … }` | если ни одной строки не выведено: «каталог пуст» |
+
+Шаблон `"%2d. %-20s %8d soʻm %4d dona\n"` задаёт для четырёх значений четыре ширины (GB-1.04):
+
+| Шаблон | Значение | Ширина |
+|---|---|---|
+| `%2d` | `p.ID` | 2 символа, справа |
+| `%-20s` | `p.Name` | колонка в 20 символов, слева (минус — выравнивание влево) |
+| `%8d` | цена в сумах | 8 символов, справа |
+| `%4d` | `p.Stock` | 4 символа, справа |
+
+В `oʻrik` 5 символов, но 6 байт (GB-2.10). Где в строке `oʻrik` окажется колонка цены относительно строки `olma`?
+
+**A)** на одной линии · **B)** на один символ левее · **C)** на один символ правее
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `fmt` считает ширину не в байтах, а в рунах: в pkg.go.dev/fmt сказано «Width and precision are measured in units of Unicode code points, that is, runes». В `oʻrik` 5 рун, поэтому добавляется 15 пробелов, и колонка не сдвигается. Если вы выбрали **B**, вы решили, что считаются байты: тогда `oʻrik` занял бы 6 мест, а остаток строки сдвинулся бы на один символ вправо. В варианте **C** строка, наоборот, сдвинулась бы влево. А то, что название не длиннее 20 символов, проверяет store (`validate`, ниже).
+
+</details>
+
+```console
+$ ./bozor list
+ 1. olma                    12000 soʻm   40 dona
+ 2. non                      4000 soʻm    3 dona
+ 3. choy                    25000 soʻm    8 dona
+ 4. oʻrik                   35000 soʻm    2 dona
+```
+
+Начало `bozor.json`. Ключи берутся из тегов в `Product` (GB-3.02), цена в тийинах: `1200000` тийинов — 12 000 сумов. `head -6` выводит первые шесть строк файла:
+
+```console
+$ head -6 bozor.json
+[
+  {
+    "id": 1,
+    "name": "olma",
+    "price": 1200000,
+    "stock": 40
+```
+
+Теперь `order`: `ID` и количество. Три `olma` — итого `12000 × 3 = 36000` сумов, остаток `40 − 3 = 37`. Следующий `list` тоже показывает 37: это новый процесс, и остаток он прочитал не из памяти, а из `bozor.json`.
+
+```console
+$ ./bozor order 1 3
+buyurtma: olma × 3 = 36000 soʻm, qoldiq 37
+$ ./bozor list
+ 1. olma                    12000 soʻm   37 dona
+ 2. non                      4000 soʻm    3 dona
+ 3. choy                    25000 soʻm    8 dona
+ 4. oʻrik                   35000 soʻm    2 dona
+```
+
+## Ошибка и код выхода: 1 или 2
+
+Теперь ошибки. Просим пять штук `oʻrik`, на складе две. Сообщение уходит в stderr (GB-1.07). `echo $?` показывает код выхода последней команды:
+
+```console
+$ ./bozor order 4 5
+xato: oʻrik: faqat 2 dona qoldi
+$ echo $?
+1
+```
+
+Код выхода 1: ошибка. Теперь неизвестная команда, например `sell`. Это не ошибка внутри программы, а неверный вызов. Что покажет `echo $?` после `./bozor sell 1 1`?
+
+**A)** 0 · **B)** 1 · **C)** 2
+
+<details>
+<summary>Ответ</summary>
+
+**C.** В GB-1.07 любая ошибка давала 1. Теперь CLI отделяет неверный вызов (неизвестная команда, неверное число аргументов) отдельным кодом: 2. Если вы выбрали **A**, вы решили, что раз сообщение вывелось, то это успех: 0 получает только программа, завершившаяся без ошибки. Если выбрали **B**, вы вспомнили правило из GB-1.07: теперь оно относится только к ошибкам внутри программы.
+
+</details>
+
+```console
+$ ./bozor sell 1 1
+foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA
+$ echo $?
+2
+```
+
+Это не прихоть, а правило: команда `go` тоже возвращает 2 при неверном вызове. Для этого вопроса мы запустили её сами (в папке курса такого нет):
+
+```console
+$ go foo
+go foo: unknown command
+Run 'go help' for usage.
+$ echo $?
+2
+```
+
+Пакет `flag` (флаги командной строки) делает то же самое: документация его `ExitOnError` (pkg.go.dev/flag) говорит «Call os.Exit(2) or for -h/-help Exit(0)». Это мы не запускали: цитата из документации. Польза такого разделения: скрипт или другая программа по коду выхода отличит «вызов нужно исправить» (2) от «операция не выполнена» (1).
+
+Остальные сообщения тоже выходят из функции `message` (GB-2.08). Если передать `order` несуществующий ID, неверное количество или ID не числом:
+
+```console
+$ ./bozor order 9 1
+xato: bunday mahsulot yoʻq
+$ ./bozor order 1 0
+xato: dona soni notoʻgʻri
+$ ./bozor order bir 1
+xato: ID: strconv.ParseInt: parsing "bir": invalid syntax
+```
+
+## Код: main, run, order и Sell
+
+Теперь код, который даёт такое поведение. Сначала `main`:
+
+```go showLineNumbers
+func main() {
+	err := run(dataFile, os.Args[1:], os.Stdout)
+	if err == nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, message(err))
+	if errors.Is(err, errUsage) {
+		os.Exit(2)
+	}
+	os.Exit(1)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `err := run(dataFile, os.Args[1:], os.Stdout)` | `dataFile` — константа `"bozor.json"`; `os.Args[1:]` — аргументы без имени программы (GB-2.02); `os.Stdout` — `io.Writer` (GB-2.07) |
+| 3–5 | `if err == nil { return }` | ошибки нет: `main` завершается обычно, код выхода 0 |
+| 6 | `fmt.Fprintln(os.Stderr, message(err))` | `message` превращает ошибку в текст, который пишется в stderr (GB-2.08) |
+| 7–9 | `if errors.Is(err, errUsage) { os.Exit(2) }` | `errUsage` — `errors.New("foydalanish: …")` («использование: …»): если это ошибка использования, код выхода 2 |
+| 10 | `os.Exit(1)` | любая другая ошибка — 1 |
+
+`run` — весь CLI:
+
+```go showLineNumbers
+func run(path string, args []string, w io.Writer) error {
+	if len(args) == 0 {
+		return errUsage
+	}
+	st, err := store.Load(path)
+	if err != nil {
+		return err
+	}
+	var msg string // oʻzgartiruvchi buyruqning natija qatori
+	switch args[0] {
+	case "list":
+		return list(st, w)
+	case "add":
+		msg, err = add(st, args[1:])
+	case "order":
+		msg, err = order(st, args[1:])
+	default:
+		return errUsage
+	}
+	if err != nil {
+		return err
+	}
+	if err := st.Save(path); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, msg)
+	return err
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func run(path string, args []string, w io.Writer) error` | путь к файлу, аргументы и `w`, куда пишется результат, — параметры; в `main` `w` — `os.Stdout`, в тесте — `strings.Builder` |
+| 2–4 | `if len(args) == 0 { return errUsage }` | команда не задана: ошибка использования (поэтому дальше `args[0]` безопасен) |
+| 5–8 | `st, err := store.Load(path)` | загружает каталог, при порче файла выходит с ошибкой |
+| 9 | `var msg string` | строка-результат изменяющей команды |
+| 10–12 | `switch args[0] { case "list": return list(st, w) }` | `list` только читает: возвращается сразу, без сохранения (GB-1.05) |
+| 13–16 | `case "add"`, `case "order"` | команда возвращает строку-результат (`msg`) и ошибку; `args[1:]` — аргументы после имени команды |
+| 17–18 | `default: return errUsage` | сюда попадает неизвестная команда (`sell`): код выхода 2 |
+| 20–22 | `if err != nil { return err }` | если команда вернула ошибку, не сохраняем и не печатаем |
+| 23–25 | `st.Save(path)` | **сначала** сохраняем |
+| 26–27 | `fmt.Fprintln(w, msg)` | строку-результат печатаем **после** успешного сохранения |
+
+В строке 23 `if err := st.Save(path); err != nil` затеняет внешний `err` новым `err` (shadowing): он живёт только внутри этого `if`. Порядок важен: несохранённый заказ не должен выводить «buyurtma: …» («заказ: …»). Это проверяет `TestNoOutputWithoutSave`. А поскольку путь и `w` — параметры, тест может вызвать `run` в своей папке.
+
+`order` — образец структуры и для `add`, и для будущего `restock`:
+
+```go showLineNumbers
+func order(st *store.Store, args []string) (string, error) {
+	if len(args) != 2 {
+		return "", errUsage
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("ID: %w", err)
+	}
+	quantity, err := strconv.Atoi(args[1])
+	if err != nil {
+		return "", fmt.Errorf("dona: %w", err)
+	}
+	p, err := st.Sell(id, quantity)
+	if err != nil {
+		return "", err
+	}
+	total := p.Price * int64(quantity)
+	return fmt.Sprintf("buyurtma: %s × %d = %d soʻm, qoldiq %d", p.Name, quantity, total/tiyinPerSom, p.Stock), nil
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2–4 | `if len(args) != 2 { return "", errUsage }` | если аргументов не два: ошибка использования; второе значение — `""`, потому что при ошибке строка не нужна |
+| 5–8 | `strconv.ParseInt(args[0], 10, 64)` | ID из текста в число: 10 — десятичная система, 64 — `int64` (GB-3.01); ошибка оборачивается как `"ID: %w"` |
+| 9–12 | `strconv.Atoi(args[1])` | количество в `int`; ошибка с `"dona: %w"` |
+| 13–16 | `st.Sell(id, quantity)` | правила store; ошибку возвращает без изменений |
+| 17 | `total := p.Price * int64(quantity)` | итог в тийинах: `Price` — `int64`, поэтому `quantity` преобразуется (GB-1.03) |
+| 18 | `return fmt.Sprintf(…), nil` | строка-результат; `run` печатает её после `Save` |
+
+`message` превращает ошибку в текст, который читает пользователь:
+
+```go showLineNumbers
+func message(err error) string {
+	var se *store.StockError
+	switch {
+	case errors.Is(err, errUsage):
+		return err.Error()
+	case errors.Is(err, store.ErrNotFound):
+		return "xato: bunday mahsulot yoʻq"
+	case errors.Is(err, store.ErrBadQuantity):
+		return "xato: dona soni notoʻgʻri"
+	case errors.As(err, &se):
+		return fmt.Sprintf("xato: %s: faqat %d dona qoldi", se.Name, se.Stock)
+	}
+	return "xato: " + err.Error()
+}
+```
+
+Каждое сообщение начинается с `xato:` («ошибка:»), а ошибка использования выводится своим текстом. `errors.Is` и `errors.As` — GB-2.08. Теперь сторона store: `Sell` и `find`, которым он пользуется.
+
+```go showLineNumbers
+func (s *Store) find(id int64) *Product {
+	for i := range s.products {
+		if s.products[i].ID == id {
+			return &s.products[i]
+		}
+	}
+	return nil
+}
+```
+
+```go showLineNumbers
+func (s *Store) Sell(id int64, quantity int) (Product, error) {
+	if quantity <= 0 {
+		return Product{}, fmt.Errorf("%w, hozir %d", ErrBadQuantity, quantity)
+	}
+	p := s.find(id)
+	if p == nil {
+		return Product{}, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	if p.Stock < quantity {
+		return Product{}, &StockError{Name: p.Name, Stock: p.Stock, Want: quantity}
+	}
+	p.Stock -= quantity
+	return *p, nil
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| `find` 1 | `func (s *Store) find(id int64) *Product` | отдаёт **адрес** товара в каталоге, а если не найден — `nil` (GB-2.04) |
+| `find` 2–4 | `for i := range s.products`, `return &s.products[i]` | перебирает по индексу и возвращает адрес самого элемента внутри слайса |
+| `Sell` 1 | `(Product, error)` | теперь возвращает и товар после продажи: `order` печатает цену и остаток |
+| `Sell` 2–4 | `quantity <= 0` | `ErrBadQuantity` через `%w` (GB-2.08) |
+| `Sell` 5–8 | `p := s.find(id)`, `if p == nil` | нет такого ID: `ErrNotFound` |
+| `Sell` 9–11 | `p.Stock < quantity` | остатка не хватает: `&StockError{…}` |
+| `Sell` 12 | `p.Stock -= quantity` | запись через указатель меняет **сам** каталог |
+| `Sell` 13 | `return *p, nil` | `*p` — копия: вызывающий код не может задеть внутреннее состояние каталога |
+
+`find` даёт адрес, `*p` — копию: эта разница решит дело в разделе «Баг».
+
+## Сохранение: чем опасен os.WriteFile
+
+Теперь сохранение. `saveProducts` из GB-3.02 (в этой папке её нет, она взята из урока GB-3.02):
+
+```go showLineNumbers
+func saveProducts(path string, products []Product) error {
+	data, err := json.MarshalIndent(products, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+```
+
+По документации `os.WriteFile` перед записью очищает файл: «otherwise WriteFile truncates it before writing». Документация ещё предупреждает: «Since WriteFile requires multiple system calls to complete, a failure mid-operation can leave the file in a partially written state». То есть шагов два:
+
+| Момент | `bozor.json` |
+|---|---|
+| в начале | весь каталог (320 байт) |
+| 1) очищен | 0 байт |
+| 2) идёт запись | часть каталога |
+| 2 завершён | новый целый каталог |
+
+Если процесс убьют или отключат питание между 1 и 2, файл останется недописанным. Воспроизведём это вручную: `truncate -s 60` обрезает файл до 60 байт, как будто запись прервалась посередине:
+
+```console
+$ truncate -s 60 bozor.json
+```
+
+Что теперь сделает `list`?
+
+**A)** выведет, что каталог пуст · **B)** ошибка, код выхода 1 · **C)** panic
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Файл есть, но JSON не дочитан до конца: `Unmarshal` возвращает ошибку `unexpected end of JSON input` («неожиданный конец JSON-ввода»), `Load` оборачивает её именем файла (`"%s: %w"`), `run` возвращает ошибку, `main` ставит код выхода 1. Чтобы получить **A**, файла не должно быть совсем (`os.ErrNotExist`). **C** неверно: ошибка обычная, `error`, а не panic.
+
+</details>
+
+```console
+$ ./bozor list
+xato: bozor.json: unexpected end of JSON input
+$ echo $?
+1
+$ ./bozor add anor 3000 1
+xato: bozor.json: unexpected end of JSON input
+```
+
+`add` тоже не работает: он тоже сначала делает `Load`. С недописанным файлом программа останавливается, и каталог нужно восстанавливать вручную. Это как раз то поведение, которое нам нужно: поверх испорченного каталога новая запись не пишется. Лучше, чтобы такой файл вообще не появлялся. Но сначала вторая задача `Load`.
+
+### Load проверяет и прочитанный товар
+
+```go showLineNumbers
+func Load(path string) (*Store, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &Store{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var products []Product
+	if err := json.Unmarshal(data, &products); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	seen := make(map[int64]bool)
+	for i, p := range products {
+		if err := validate(p); err != nil {
+			return nil, fmt.Errorf("%s: %d-mahsulot: %w", path, i+1, err)
+		}
+		if seen[p.ID] {
+			return nil, fmt.Errorf("%s: %d-mahsulot: %w: ID %d takrorlangan", path, i+1, ErrBadProduct, p.ID)
+		}
+		seen[p.ID] = true
+	}
+	return &Store{products: products}, nil
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2–5 | `os.ReadFile`, `os.ErrNotExist` | файла нет: первый запуск, пустой каталог; другая ошибка чтения — ошибка |
+| 9–12 | `json.Unmarshal(data, &products)` | ошибка JSON оборачивается именем файла (GB-3.02) |
+| 13 | `seen := make(map[int64]bool)` | map уже встреченных ID (GB-2.02) |
+| 14–17 | `validate(p)` | каждый товар проходит правила; ошибка `"%s: %d-mahsulot: %w"`: имя файла и номер товара |
+| 18–21 | `seen[p.ID]` | повторяющийся ID — тоже ошибка |
+
+`validate` собирает в одном месте правила `parseLine` из GB-3.01 и правила названия из GB-2.10:
+
+```go showLineNumbers
+func validate(p Product) error {
+	switch {
+	case p.ID <= 0:
+		return fmt.Errorf("%w: ID musbat boʻlishi kerak, keldi %d", ErrBadProduct, p.ID)
+	case p.Name == "":
+		return fmt.Errorf("%w: nom boʻsh", ErrBadProduct)
+	case !utf8.ValidString(p.Name):
+		return fmt.Errorf("%w: nom UTF-8 emas", ErrBadProduct)
+	case utf8.RuneCountInString(p.Name) > maxNameRunes:
+		return fmt.Errorf("%w: nom %d belgi, eng koʻpi %d", ErrBadProduct, utf8.RuneCountInString(p.Name), maxNameRunes)
+	case p.Price <= 0:
+		return fmt.Errorf("%w: narx musbat boʻlishi kerak, keldi %d", ErrBadProduct, p.Price)
+	case p.Stock < 0:
+		return fmt.Errorf("%w: qoldiq manfiy boʻlmasin, keldi %d", ErrBadProduct, p.Stock)
+	}
+	return nil
+}
+```
+
+Через эту функцию проходят и `Add`, и `Load`. Каждая ошибка оборачивает `ErrBadProduct` через `%w`. Если файл испортить вручную, например поставить остаток `oʻrik` равным `-5`, bozor не будет торговать по испорченному каталогу, а остановится с ошибкой:
+
+```console
+$ sed -i 's/"stock": 2$/"stock": -5/' bozor.json
+$ ./bozor list
+xato: bozor.json: 4-mahsulot: mahsulot notoʻgʻri: qoldiq manfiy boʻlmasin, keldi -5
+```
+
+## Атомарное сохранение: временный файл и os.Rename
+
+Решение: сначала пишем в **другой** файл, а когда он готов, меняем имя. Вот полный код `Save`:
+
+```go showLineNumbers
+func (s *Store) Save(path string) (err error) {
+	products := s.products
+	if products == nil {
+		products = []Product{} // nil slice JSON'da null boʻladi, boʻsh slice esa []
+	}
+	data, err := json.MarshalIndent(products, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	f, err := os.CreateTemp(filepath.Dir(path), ".bozor-*.json")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name()) // xato boʻlsa vaqtinchalik fayl qolmasin
+		}
+	}()
+	if err = f.Chmod(0o644); err != nil { // CreateTemp 0600 bilan ochadi; bozor.json GB-3.02'dagidek 0644
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `func (s *Store) Save(path string) (err error)` | `(err error)` — именованный результат (GB-2.09): `defer` его видит |
+| 2–5 | `if products == nil { products = []Product{} }` | пустой каталог записывается как `[]`, а не `null` (ниже) |
+| 6–10 | `json.MarshalIndent(…)`, `append(data, '\n')` | текст JSON и перевод строки в конце. В `data, err :=` `data` новая, а `err` — именованный результат этой функции: он в той же области видимости, поэтому новая переменная не создаётся |
+| 12–15 | `os.CreateTemp(filepath.Dir(path), ".bozor-*.json")` | открывает новый файл в папке `path`; `*` в имени заменяет случайным числом (`.bozor-2476821519.json`). `filepath.Dir("bozor.json")` — `"."`, текущая папка |
+| 16–21 | `defer func() { if err != nil { … } }()` | при ошибке закрывает файл и удаляет его через `os.Remove`: временный файл не остаётся. `f.Name()` — путь этого файла |
+| 22–24 | `f.Chmod(0o644)` | `CreateTemp` открывает файл с правами `0600`; `bozor.json` должен остаться `0644`, как в GB-3.02 |
+| 25–27 | `f.Write(data)` | отдаёт байты операционной системе |
+| 28–30 | `f.Sync()` | ждёт, пока байты попадут на диск (pkg.go.dev/os: «Sync commits the current contents of the file to stable storage») |
+| 31–33 | `f.Close()` | закрывает файл и проверяет ошибку |
+| 34 | `os.Rename(f.Name(), path)` | переносит временный файл на имя `bozor.json` |
+
+Файл, имя которого начинается с точки, скрытый: обычный `ls` его не показывает. После успешного `Save` временного файла не остаётся: `Rename` переименовал его в `bozor.json`. `ls -A1` показывает и скрытые файлы, каждый в отдельной строке:
+
+```console
+$ ./bozor add olma 12000 40
+qoʻshildi: 1. olma, 12000 soʻm, 40 dona
+$ ls -A1
+bozor
+bozor.json
+cmd
+go.mod
+internal
+```
+
+Во время записи до `bozor.json` никто не дотрагивается:
+
+| Шаг | `bozor.json` | `.bozor-*.json` |
+|---|---|---|
+| в начале | старый каталог | нет |
+| `CreateTemp`, `Write`, `Sync`, `Close` | старый каталог, не тронут | новый каталог пишется и попадает на диск |
+| `os.Rename` | новый каталог (имя перешло одним шагом) | нет (теперь это `bozor.json`) |
+
+`os.Rename` — одна операция ядра Linux (системный вызов `rename(2)`): имя переходит на новый файл **атомарно**, то есть одним шагом. Атомарно значит: читатель видит либо старый, либо новый каталог, но никогда половину. Страница man: «newpath will be atomically replaced». Порядок важен: `Sync` идёт до rename. Если после rename без `Sync` отключится питание, новое имя может указывать на файл, не записанный на диск (`fsync(2)` и документация `os.File.Sync`).
+
+Промежуточный вопрос. `Save` выполнил `Sync`, но до `Rename` отключилось питание. Что лежит в `bozor.json` после включения компьютера?
+
+**A)** недописанный каталог · **B)** старый каталог, целый · **C)** новый каталог
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Rename` не выполнялся, поэтому `bozor.json` не тронут: старый каталог цел. Может остаться только временный файл с точкой (`.bozor-*.json`): его можно удалить вручную. Если вы выбрали **A**, вы решили, что запись идёт в сам `bozor.json`: нет, она идёт в другой файл. Если выбрали **C**, вы решили, что `Sync` ставит новый каталог на место: `Sync` лишь сбрасывает временный файл на диск, а имя меняет `Rename`. В production состояние и конфигурационные файлы пишут так же: `github.com/google/renameio` упаковал именно этот приём в пакет.
+
+</details>
+
+### Где гарантия заканчивается
+
+- **Одна файловая система.** Rename выполняется одним шагом только внутри одной файловой системы; в другую он возвращает ошибку `EXDEV` («invalid cross-device link»). Поэтому временный файл открывается **рядом** с `bozor.json` (`filepath.Dir(path)`). Саму ошибку вы увидите в разделе «Частые ошибки».
+- **Linux и macOS.** `go doc os.Rename`: «Even within the same directory, on non-Unix platforms Rename is not an atomic operation». Гарантия — для Unix-систем.
+- **Запись папки.** Для полной гарантии «даже при отключении питания» после rename нужно сделать `Sync` ещё и самой папки. CLI v0 этого не делает: в худшем случае остаётся старый каталог, но не недописанный файл (README курса).
+- **Один процесс.** Если два `bozor` работают одновременно, побеждает последний `rename`: файловой блокировки нет. По README это сознательно оставлено до мьютекса в модуле 4 и транзакции Postgres в модуле 5.
+
+## Тесты: проверяем состояние
+
+`go test ./...` проверяет оба пакета (GB-1.08, GB-2.06):
+
+```console
+$ go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.054s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.017s
+```
+
+Время здесь моё: в видео получилось `0.025s` и `0.009s`. На загруженном компьютере числа каждый раз разные; важно `ok`. В `store_test.go` лежат табличные тесты и тесты `Save`. `main_test.go` вызывает `run`:
+
+```go showLineNumbers
+// bozor run'ni buyruq qatoridagidek chaqiradi: bozor(t, path, "order 1 3").
+func bozor(t *testing.T, path, line string) (string, error) {
+	t.Helper()
+	var out strings.Builder
+	err := run(path, strings.Fields(line), &out)
+	return out.String(), err
+}
+
+// yangi videodagi toʻrt mahsulotli bozor.json'ni yangi vaqtinchalik papkada yasaydi.
+func yangi(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "bozor.json")
+	for _, line := range []string{"add olma 12000 40", "add non 4000 3", "add choy 25000 8", "add oʻrik 35000 2"} {
+		if _, err := bozor(t, path, line); err != nil {
+			t.Fatalf("%s: %v", line, err)
+		}
+	}
+	return path
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2–7 | `func bozor(t *testing.T, path, line string)` | вызывает `run` так, как из командной строки: `strings.Fields(line)` делит строку на аргументы по пробелам; вывод идёт в `strings.Builder` (GB-2.07), возвращается `out.String()`. `t.Helper()` указывает в сообщении об ошибке на вызвавший тест |
+| 10–19 | `func yangi(t *testing.T) string` | создаёт для каждого теста новый `bozor.json`: `t.TempDir()` — пустая временная папка, выданная тесту и удаляемая после его завершения (pkg.go.dev/testing); внутри четыре товара из видео |
+
+Тест вызывает `run` со своим путём (`path`) и своим `w`: настоящего `bozor.json` не касается и с экрана не читает. Один из тестов проверяет, что `order` уменьшает остаток и **сохраняет** это:
+
+```go showLineNumbers
+// order qoldiqni kamaytiradi va bu bozor.json'ga yoziladi: keyingi list uni koʻradi.
+func TestOrderSaved(t *testing.T) {
+	path := yangi(t)
+	out, err := bozor(t, path, "order 1 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "buyurtma: olma × 3 = 36000 soʻm, qoldiq 37\n"; out != want {
+		t.Fatalf("order chiqishi %q, kutilgan %q", out, want)
+	}
+	out, _ = bozor(t, path, "list")
+	if !strings.Contains(out, "olma                    12000 soʻm   37 dona") {
+		t.Fatalf("order'dan keyin list'da olma qoldigʻi 37 emas:\n%s", out)
+	}
+}
+```
+
+После `order` вызывается `list`, и он должен показать 37: тест смотрит не на сообщение `order`, а на состояние, попавшее в файл.
+
+### Один тест: пустой каталог
+
+Если файла нет, `s.products` — nil-слайс (GB-2.01): за ним нет массива. В JSON отсутствие значения обозначает `null`, а пустой список — `[]`. Как `json.MarshalIndent` запишет nil-слайс?
+
+**A)** `[]` · **B)** `null` · **C)** пустой файл
+
+<details>
+<summary>Ответ</summary>
+
+**B: `null`.** Документация `encoding/json`: «a nil slice encodes as the null JSON value». Если вы выбрали **A**, вы перепутали пустой слайс с nil-слайсом: `[]Product{}` даст `[]`, а nil-слайс — `null`. **C** неверно: JSON никогда не пишет пустой текст.
+
+</details>
+
+Это мы запустили сами (в папке курса такого нет; заодно видна разница `encoding/json/v2`). Полный код:
+
+```go showLineNumbers
+package main
+
+import (
+	"encoding/json"
+	jsonv2 "encoding/json/v2"
+	"fmt"
+)
+
+type Product struct {
+	ID int64 `json:"id"`
+}
+
+func main() {
+	var nilSlice []Product
+	emptySlice := []Product{}
+
+	a, _ := json.Marshal(nilSlice)
+	b, _ := json.Marshal(emptySlice)
+	c, _ := jsonv2.Marshal(nilSlice)
+	fmt.Println("v1, nil slice: ", string(a), nilSlice == nil)
+	fmt.Println("v1, boʻsh slice:", string(b), emptySlice == nil)
+	fmt.Println("v2, nil slice: ", string(c))
+}
+```
+
+```console
+$ go run .
+v1, nil slice:  null true
+v1, boʻsh slice: [] false
+v2, nil slice:  []
+```
+
+Стандартный `encoding/json` (v1) записывает nil-слайс как `null`, новый `encoding/json/v2` — как `[]`. Курс работает с v1; различия разобраны в разделе «Глубже» урока GB-3.02. В папке есть `_video/02-null`: там из `Save` убрана проверка nil, то есть осталось только `json.MarshalIndent(s.products, "", "  ")`. Это ловит `TestSaveEmpty`:
+
+```go showLineNumbers
+// Boʻsh katalog [] boʻlib yoziladi, null emas.
+func TestSaveEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bozor.json")
+	var st Store
+	if err := st.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if got := strings.TrimSpace(string(data)); got != "[]" {
+		t.Fatalf("boʻsh katalog %q boʻlib yozildi, kutilgan []", got)
+	}
+}
+```
+
+```console
+$ ./_video/run.sh 02-null go test ./internal/store
+--- FAIL: TestSaveEmpty (0.00s)
+    store_test.go:157: boʻsh katalog "null" boʻlib yozildi, kutilgan []
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.014s
+FAIL
+(chiqish kodi: 1)
+```
+
+Файл с `null` другая программа, читающая каталог, воспримет не как список, которого ждёт: поэтому `Save` в начале заменяет nil на `[]Product{}` (строки 2–5 `Save` выше).
+
+### TestSell: табличный тест
+
+`TestSell` в табличной форме из GB-1.08:
+
+```go showLineNumbers
+func TestSell(t *testing.T) {
+	tests := []struct {
+		name      string
+		id        int64
+		quantity  int
+		wantStock int   // shu ID'li mahsulotning katalogdagi qoldigʻi Sell'dan keyin
+		wantErr   error // errors.Is bilan tekshiriladi; nil — xato kutilmaydi
+	}{
+		{"oddiy", 1, 3, 37, nil},
+		{"hammasi", 4, 2, 0, nil},
+		{"yoq_mahsulot", 9, 1, 0, ErrNotFound},
+		{"nol_dona", 1, 0, 40, ErrBadQuantity},
+		{"manfiy_dona", 1, -2, 40, ErrBadQuantity},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := katalog()
+			_, err := st.Sell(tc.id, tc.quantity)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Sell(%d, %d) xatosi %v, kutilgan %v", tc.id, tc.quantity, err, tc.wantErr)
+			}
+			if p := st.find(tc.id); p != nil && p.Stock != tc.wantStock {
+				t.Fatalf("Sell(%d, %d) dan keyin katalogda qoldiq %d, kutilgan %d", tc.id, tc.quantity, p.Stock, tc.wantStock)
+			}
+		})
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2–8 | `tests := []struct{ … }` | в каждой строке: название, ID, количество, **ожидаемый остаток в каталоге**, ожидаемая ошибка |
+| 9–13 | `{"oddiy", 1, 3, 37, nil}` и другие строки | если продать 3 штуки товара 1, в каталоге должно остаться 37; несуществующий ID — `ErrNotFound`; 0 и отрицательное количество — `ErrBadQuantity` |
+| 15–17 | `for _, tc := range tests`, `t.Run(tc.name, …)`, `st := katalog()` | каждая строка в своём подтесте, каждый раз новый каталог (четыре товара из видео) |
+| 18–21 | `st.Sell(…)`, `errors.Is(err, tc.wantErr)` | проверяет ошибку (GB-2.08) |
+| 22–24 | `st.find(tc.id)` | **главное место**: тест проверяет не возвращаемое значение, а остаток в каталоге через `find` |
+
+Тест находится внутри пакета `store` (`package store`), поэтому видит `find` и `products` с маленькой буквы. Это и есть **тест, проверяющий состояние**.
+
+## Баг: vet молчит, тест ловит
+
+Теперь настоящий баг. Ваш коллега «упростил» `Sell`: вместо `find` один цикл `range` (`_video/01-nusxa`). Код собирается:
+
+```go showLineNumbers
+func (s *Store) Sell(id int64, quantity int) (Product, error) {
+	if quantity <= 0 {
+		return Product{}, fmt.Errorf("%w, hozir %d", ErrBadQuantity, quantity)
+	}
+	for _, p := range s.products {
+		if p.ID == id {
+			if p.Stock < quantity {
+				return Product{}, &StockError{Name: p.Name, Stock: p.Stock, Want: quantity}
+			}
+			p.Stock -= quantity
+			return p, nil
+		}
+	}
+	return Product{}, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+}
+```
+
+`go vet ./...` и `staticcheck ./...` (GB-3.03) оба молчат. Они запущены в папке `_video/01-nusxa`, внутри `./_video/run.sh 01-nusxa bash`:
+
+```console
+$ go vet ./...
+$ staticcheck ./...
+```
+
+Оба ничего не нашли. Сначала соберите бинарник через `go build ./cmd/bozor`, повторите четыре `add` выше, затем выполните `./bozor order 1 3` и после него `./bozor list`. Что выведет `order` и сколько будет `olma` в `list`?
+
+**A)** «qoldiq 37» · list: 37 · **B)** «qoldiq 37» · list: 40 · **C)** «qoldiq 40» · list: 40
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Сообщение о заказе выглядит верно: в копии, которую вернул `Sell`, остаток 37. Но в каталоге всё ещё 40. Если вы выбрали **A**, вы решили, что `Sell` изменил и каталог: как раз тут и есть загвоздка. **C** означало бы, что `Sell` ничего не посчитал; но 37 в сообщении посчитано в той копии.
+
+</details>
+
+```console
+$ ./bozor order 1 3
+buyurtma: olma × 3 = 36000 soʻm, qoldiq 37
+$ ./bozor list
+ 1. olma                    12000 soʻm   40 dona
+ 2. non                      4000 soʻm    3 dona
+ 3. choy                    25000 soʻm    8 dona
+ 4. oʻrik                   35000 soʻm    2 dona
+```
+
+Покупатель заплатил за три `olma`, а склад не уменьшился. Причина: `range` на каждом шаге записывает в `p` **копию** элемента (спецификация Go, For statements with range clause), как `p := olma`. `p.Stock -= quantity` меняет копию, `olma` в каталоге по-прежнему 40. А `find` отдаёт адрес: запись через него меняет сам каталог. Посмотрим это на маленькой программе (в папке курса её нет, полный код):
+
+```go showLineNumbers
+package main
+
+import "fmt"
+
+type Product struct {
+	Name  string
+	Stock int
+}
+
+func main() {
+	olma := Product{Name: "olma", Stock: 40} // katalogdagi element
+
+	p := olma // range'dagi p
+	p.Stock -= 3
+	fmt.Println("p:", p.Stock, "olma:", olma.Stock)
+
+	q := &olma // find qaytargan manzil
+	q.Stock -= 3
+	fmt.Println("q:", q.Stock, "olma:", olma.Stock)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11 | `olma := Product{…}` | элемент в каталоге: `Stock` 40 |
+| 13–15 | `p := olma`, `p.Stock -= 3` | `p` — отдельная копия; уменьшилась только она |
+| 17–19 | `q := &olma`, `q.Stock -= 3` | `q` — адрес `olma`; запись через него попадает в сам `olma` |
+
+```console
+$ go run .
+p: 37 olma: 40
+q: 37 olma: 37
+```
+
+| Шаг | `olma.Stock` | `p.Stock` | `q.Stock` |
+|---|---|---|---|
+| `olma := …` | 40 | — | — |
+| `p := olma`, `p.Stock -= 3` | 40 | 37 | — |
+| `q := &olma`, `q.Stock -= 3` | 37 | 37 | сам `olma` |
+
+`go test` показывает это сразу. `TestOrderSaved` показывает вывод `list` после `order` (там `olma` всё ещё 40); падают две строки таблицы `TestSell`:
+
+```console
+$ go test ./...
+--- FAIL: TestOrderSaved (0.01s)
+    main_test.go:63: order'dan keyin list'da olma qoldigʻi 37 emas:
+         1. olma                    12000 soʻm   40 dona
+         2. non                      4000 soʻm    3 dona
+         3. choy                    25000 soʻm    8 dona
+         4. oʻrik                   35000 soʻm    2 dona
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/bozor	0.049s
+--- FAIL: TestSell (0.00s)
+    --- FAIL: TestSell/oddiy (0.00s)
+        store_test.go:47: Sell(1, 3) dan keyin katalogda qoldiq 40, kutilgan 37
+    --- FAIL: TestSell/hammasi (0.00s)
+        store_test.go:47: Sell(4, 2) dan keyin katalogda qoldiq 2, kutilgan 0
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.017s
+FAIL
+```
+
+`TestSell/oddiy`: остаток в каталоге 40, ожидалось 37. `TestOrderSaved` тоже упал. Тесты проверяют состояние каталога, поэтому поймали баг. `go vet` и `staticcheck` промолчали: код с любой стороны корректный Go, ошибка в логике. Исправление — исходные `Sell` и `find`: обойти по индексу и взять адрес элемента (`&s.products[i]` — сам элемент внутри слайса). После этого `go test ./...` снова даёт `ok` (вывод `ok` выше).
+
+## Частые ошибки
+
+**Ошибка 1: в тесте проверять только возвращаемое значение.** Самое распространённое заблуждение: «функция вернула верное значение, значит, она работает». Добавим такой тест в папку с багом `_video/01-nusxa` (в папке курса его нет, полный код):
+
+```go showLineNumbers
+package store
+
+import "testing"
+
+func TestSellQaytgan(t *testing.T) {
+	st := katalog()
+	p, err := st.Sell(1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stock != 37 {
+		t.Fatalf("Sell(1, 3) qoldiq %d, kutilgan 37", p.Stock)
+	}
+}
+```
+
+```console
+$ go test -run TestSellQaytgan ./internal/store
+ok  	github.com/abdurahmon27/bozor/internal/store	0.003s
+```
+
+Тест прошёл, потому что `Sell` с багом верно возвращает 37 из копии. А 40 в каталоге этот тест не видит. Исправление: как в `TestSell`, кроме возвращённого значения проверяйте и сам каталог через `find`.
+
+**Ошибка 2: писать каталог через `os.WriteFile`.** Текст ошибки: `xato: bozor.json: unexpected end of JSON input` (раздел «Сохранение» выше). Как читать: имя файла, затем ошибка JSON: JSON неполный, файл оборван на середине. Исправление: временный файл + `Rename`, то есть `Save`.
+
+**Ошибка 3: открывать временный файл в другой папке.** `CreateTemp("", …)` создаёт файл в общей временной папке системы; она может оказаться на другой файловой системе, чем `bozor.json`. Другую файловую систему мы явно взяли в `/dev/shm` (в папке курса этого нет, полный код):
+
+```go showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	// vaqtinchalik fayl bozor.json'dan boshqa fayl tizimida: /dev/shm (Linux'da odatda tmpfs)
+	f, err := os.CreateTemp("/dev/shm", ".bozor-*.json")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer os.Remove(f.Name())
+	f.WriteString("[]\n")
+	f.Close()
+
+	err = os.Rename(f.Name(), "bozor.json")
+	fmt.Println(err)
+}
+```
+
+```console
+$ go run .
+rename /dev/shm/.bozor-2476821519.json bozor.json: invalid cross-device link
+```
+
+Как читать: операция `rename`, старый путь (каждый раз другое число), новый путь, причина: `invalid cross-device link` — это `EXDEV`. Исправление: `CreateTemp(filepath.Dir(path), …)`, то есть рядом с целью.
+
+**Ошибка 4: тихие ошибки.** Две из них эта страница уже показала, и ни в одной нет текста ошибки. Первая — копия из `range`: смотрите раздел «Баг», исправление — взять адрес через `find`. Вторая — если убрать из `Save` проверку nil, пустой каталог запишется как `null` (`TestSaveEmpty` в разделе «Тесты»); исправление — при `products == nil` взять `[]Product{}`.
+
+**Ошибка 5: писать узбекский апостроф обычным `'`.** В строке результата `bozor restock` слово `toʻldirildi` пишется с `ʻ` (U+02BB). Если поставить обычный `'`, проверка задания скажет об этом (мы проверили это сознательно: в копии ответа поставили `'`):
+
+```console
+$ go test ./cmd/bozor
+--- FAIL: TestVazifaRestockBuyrugi (0.01s)
+    tekshiruv_test.go:20: bozor restock 2 10 chiqishi "to'ldirildi: non, qoldiq 13\n", kutilgan "toʻldirildi: non, qoldiq 13\n" (TASK.md, 3-qadam; ʻ — U+02BB, oddiy ' emas: TASK.md'dan nusxalang)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/bozor	0.063s
+```
+
+Как читать: `tekshiruv_test.go:20`, выведенная строка (`"to'ldirildi…"`) и ожидаемая (`"toʻldirildi…"`) отличаются одним символом, причина дописана в конце сообщения. Исправление — скопировать `ʻ` из `TASK.md`.
+
+## Проверьте себя
+
+**1.** Почему `Save` открывает временный файл именно рядом с `bozor.json`?
+
+<details>
+<summary>Ответ</summary>
+
+`os.Rename` выполняется одним шагом только внутри одной файловой системы. Если временный файл на другой файловой системе, `rename` вернёт ошибку `invalid cross-device link` (`EXDEV`), и атомарность пропадёт. `filepath.Dir(path)` берёт папку у самого `bozor.json`.
+
+</details>
+
+**2.** Почему `run` принимает путь к файлу и `io.Writer` параметрами?
+
+<details>
+<summary>Ответ</summary>
+
+Тест может вызвать `run` с файлом в своей временной папке (`t.TempDir()`) и читать вывод из памяти (`strings.Builder`). А `main` передаёт `dataFile` и `os.Stdout`. Весь CLI проверяется, не касаясь настоящего `bozor.json` и не печатая на экран.
+
+</details>
+
+**3.** (GB-3.03) Запускает ли `go test` все проверки `go vet`?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. `go test` запускает лишь небольшую часть проверок vet: 11 из 35 (GB-3.03). Для полной проверки `go vet ./...` запускают отдельно. А сегодняшний баг с копией из `range` не нашли ни `go vet`, ни `staticcheck`: его поймал тест.
+
+</details>
+
+**4.** После `./bozor order 1 3` запущено `./bozor order 1 38` (остаток `olma` — 37). Что выведется и какой будет код выхода?
+
+<details>
+<summary>Ответ</summary>
+
+Запрошено 38 штук, на складе 37: `Sell` возвращает `*StockError`, `message` превращает его в «xato: olma: faqat 37 dona qoldi» («ошибка: olma: осталось только 37 штук»), `main` ставит код выхода 1 (это не ошибка использования). Каталог не меняется: при ошибке `run` не вызывает `Save`.
+
+```console
+$ ./bozor order 1 3
+buyurtma: olma × 3 = 36000 soʻm, qoldiq 37
+$ ./bozor order 1 38; echo $?
+xato: olma: faqat 37 dona qoldi
+1
+```
+
+</details>
+
+**5.** (GB-2.09) Зачем в `Save` нужен именованный результат `(err error)`?
+
+<details>
+<summary>Ответ</summary>
+
+Анонимная функция внутри `defer` видит `err` в момент завершения функции: что бы ни вернул `return os.Rename(…)` или другой `return err`, `err` получит это значение. Если `err != nil`, `defer` закрывает временный файл и удаляет его через `os.Remove`. Без именованного результата `defer` не увидел бы возвращаемую ошибку.
+
+</details>
+
+## Домашнее задание
+
+Задание лежит в папке этого урока в репозитории курса: [lessons/gb-3-06-bozor-cli](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-06-bozor-cli), файл `TASK.md`. Ответ — в `solution/`: [solution/internal/store/store.go](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-3-06-bozor-cli/solution/internal/store/store.go). На этот раз задание крупнее и без подсказок-туториала: метод в store, его тест, команда в CLI и сохранение. Проверка: `go test ./...` в этой папке; работайте, пока не появится `ok`. Не трогайте `Sell`, `Load`, `Save`, `message` и файлы `tekshiruv_test.go`. Цель:
+
+```console
+$ ./bozor restock 2 10
+toʻldirildi: non, qoldiq 13
+```
+
+- 🟡 **Шаг 1: `func (s *Store) Restock(id int64, quantity int) (Product, error)` в `internal/store/store.go`.** Прибавляет `quantity` штук к `Stock` товара с этим `id` и возвращает обновлённый товар. `quantity` от 1 до 10 000; иначе верните `ErrBadQuantity`, обёрнутую через `%w`, не меняя каталог. Несуществующий ID — `ErrNotFound`, обёрнутая через `%w`. Товар ищите через `s.find(id)`, как в `Sell`: если запишете в копию (баг из видео), тест проверит остаток в каталоге и упадёт.
+- 🟡 **Шаг 2: `internal/store/restock_test.go`.** Ваш собственный `TestRestock`: в табличной форме из GB-1.08, не меньше 3 строк (например: обычный, несуществующий ID, неверное количество), каждая строка через `t.Run`. Образец — `TestSell` и `katalog()`.
+- 🟢 **Шаг 3: команда `bozor restock ID DONA` в `cmd/bozor/main.go`.** Добавьте в `switch` внутри `run` ветку `case "restock":` и вызовите `msg, err = restock(st, args[1:])`. `func restock(st *store.Store, args []string) (string, error)` — та же структура, что у `order`: ровно 2 аргумента (иначе `errUsage`), `strconv.ParseInt` и `strconv.Atoi`, ошибки `"ID: %w"` и `"dona: %w"`. Строка-результат: `toʻldirildi: <название>, qoldiq <новый остаток>` (`ʻ` — U+02BB, скопируйте из `TASK.md`). Допишите в текст `errUsage` `| restock ID DONA`.
+
+В исходном состоянии тест падает так (только пакет `cmd/bozor`, длинные строки полностью):
+
+```console
+$ go test ./cmd/bozor
+--- FAIL: TestVazifaRestockBuyrugi (0.01s)
+    tekshiruv_test.go:17: bozor restock 2 10: xato «foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA», kutilgan chiqish «toʻldirildi: non, qoldiq 13» (TASK.md, 3-qadam)
+--- FAIL: TestVazifaRestockXatolar (0.01s)
+    --- FAIL: TestVazifaRestockXatolar/restock_9_5 (0.00s)
+        tekshiruv_test.go:60: bozor restock 9 5: xabar «foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA», kutilgan «xato: bunday mahsulot yoʻq» (TASK.md, 3-qadam)
+    --- FAIL: TestVazifaRestockXatolar/restock_2_0 (0.00s)
+        tekshiruv_test.go:60: bozor restock 2 0: xabar «foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA», kutilgan «xato: dona soni notoʻgʻri» (TASK.md, 3-qadam)
+    --- FAIL: TestVazifaRestockXatolar/restock_non_10 (0.00s)
+        tekshiruv_test.go:55: bozor restock non 10: xabar «foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA», kutilgan «xato: …» (ID son emas; TASK.md, 3-qadam)
+    tekshiruv_test.go:65: foydalanish matnida restock yoʻq: "foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA"; errUsage'ga «| restock ID DONA» qoʻshing (TASK.md, 3-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/bozor	0.060s
+```
+
+<details>
+<summary>Ответ и объяснение</summary>
+
+`Restock` — обратный `Sell`: сначала проверяем `quantity`, затем `find`, затем `p.Stock += quantity` и `return *p, nil`. Для границы удобна константа:
+
+```go showLineNumbers
+// maxRestock — bitta Restock'da qoʻshiladigan eng koʻp dona (xato yozilgan sondan himoya).
+const maxRestock = 10_000
+
+// Restock id'li mahsulotning qoldigʻiga quantity dona qoʻshadi va yangilangan mahsulotni qaytaradi.
+// Xato boʻlsa katalog oʻzgarmaydi: ErrBadQuantity (quantity 1..maxRestock emas), ErrNotFound.
+func (s *Store) Restock(id int64, quantity int) (Product, error) {
+	if quantity <= 0 {
+		return Product{}, fmt.Errorf("%w, hozir %d", ErrBadQuantity, quantity)
+	}
+	if quantity > maxRestock {
+		return Product{}, fmt.Errorf("%w: bir martada koʻpi bilan %d, hozir %d", ErrBadQuantity, maxRestock, quantity)
+	}
+	p := s.find(id)
+	if p == nil {
+		return Product{}, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	p.Stock += quantity
+	return *p, nil
+}
+```
+
+Табличный тест (полный файл, `solution/internal/store/restock_test.go`):
+
+```go filename="solution/internal/store/restock_test.go" showLineNumbers
+package store
+
+// 2-qadam javobi (TASK.md): Restock uchun oʻz jadvalli testimiz (GB-1.08 shakli).
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestRestock(t *testing.T) {
+	tests := []struct {
+		name      string
+		id        int64
+		quantity  int
+		wantStock int
+		wantErr   error
+	}{
+		{"oddiy", 2, 10, 13, nil},
+		{"yoq_id", 9, 1, 0, ErrNotFound},
+		{"nol_dona", 2, 0, 3, ErrBadQuantity},
+		{"juda_kop", 2, 10_001, 3, ErrBadQuantity},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := katalog()
+			_, err := st.Restock(tc.id, tc.quantity)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Restock(%d, %d) xatosi %v, kutilgan %v", tc.id, tc.quantity, err, tc.wantErr)
+			}
+			if p := st.find(tc.id); p != nil && p.Stock != tc.wantStock {
+				t.Fatalf("qoldiq %d, kutilgan %d", p.Stock, tc.wantStock)
+			}
+		})
+	}
+}
+```
+
+Команда `restock` — копия `order`, различаются только `st.Restock` и строка-результат:
+
+```go showLineNumbers
+// restock: bozor restock ID DONA.
+func restock(st *store.Store, args []string) (string, error) {
+	if len(args) != 2 {
+		return "", errUsage
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("ID: %w", err)
+	}
+	quantity, err := strconv.Atoi(args[1])
+	if err != nil {
+		return "", fmt.Errorf("dona: %w", err)
+	}
+	p, err := st.Restock(id, quantity)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("toʻldirildi: %s, qoldiq %d", p.Name, p.Stock), nil
+}
+```
+
+Ещё два изменения: в `switch` внутри `run` добавляется `case "restock": msg, err = restock(st, args[1:])`, а текст `errUsage` становится `… | order ID DONA | restock ID DONA`. Проверка через `solution/`:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.098s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.021s
+```
+
+Ручная проверка (бинарник, собранный из `solution/`, в `bozor.json` с четырьмя товарами, добавленными через `add`):
+
+```console
+$ ./bozor restock 2 10
+toʻldirildi: non, qoldiq 13
+$ ./bozor restock 2 0; echo $?
+xato: dona soni notoʻgʻri
+1
+$ ./bozor restock 2; echo $?
+foydalanish: bozor add NOM NARX QOLDIQ | list | order ID DONA | restock ID DONA
+2
+```
+
+</details>
+
+## Источники
+
+- Спецификация Go: For statements with range clause (`range` записывает в переменную копию элемента) — [go.dev/ref/spec#For_range](https://go.dev/ref/spec#For_range)
+- pkg.go.dev `fmt` (Width: «measured in units of Unicode code points, that is, runes») — [pkg.go.dev/fmt](https://pkg.go.dev/fmt)
+- pkg.go.dev `os.WriteFile` («truncates it before writing … a failure mid-operation can leave the file in a partially written state») — [pkg.go.dev/os#WriteFile](https://pkg.go.dev/os#WriteFile)
+- pkg.go.dev `os.CreateTemp`, `(*os.File).Sync`, `os.Rename` — [pkg.go.dev/os](https://pkg.go.dev/os)
+- rename(2) (`newpath` заменяется атомарно; в другой файловой системе `EXDEV`) — [man7.org/linux/man-pages/man2/rename.2.html](https://man7.org/linux/man-pages/man2/rename.2.html)
+- fsync(2) — [man7.org/linux/man-pages/man2/fsync.2.html](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- pkg.go.dev `encoding/json` Marshal (nil-слайс → `null`) — [pkg.go.dev/encoding/json#Marshal](https://pkg.go.dev/encoding/json#Marshal)
+- pkg.go.dev `testing` `T.TempDir` — [pkg.go.dev/testing#T.TempDir](https://pkg.go.dev/testing#T.TempDir)
+- pkg.go.dev `flag` (`ExitOnError`: «Call os.Exit(2) …») — [pkg.go.dev/flag#ErrorHandling](https://pkg.go.dev/flag#ErrorHandling)
+- coreutils `truncate(1)` — [man7.org/linux/man-pages/man1/truncate.1.html](https://man7.org/linux/man-pages/man1/truncate.1.html)
+- github.com/google/renameio (библиотека для этого приёма в production) — [pkg.go.dev/github.com/google/renameio/v2](https://pkg.go.dev/github.com/google/renameio/v2)
+- `os.Exit` — [pkg.go.dev/os#Exit](https://pkg.go.dev/os#Exit)
+- Папка курса и каждый шаг из видео — [lessons/gb-3-06-bozor-cli](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-06-bozor-cli)
+
+Результаты получены на `go1.27.4 linux/amd64`, 2026-11-27, `CGO_ENABLED=0`; `staticcheck 2026.2.2` (собран `go1.27.4`).
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-3-06-bozor-cli)
+
+---
+
+← Предыдущий урок: [GB-3.05](/lab/youtube/gb/gb-3-05/ru) · Следующий урок: [GB-4.01](/lab/youtube/gb/gb-4-01/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>
