@@ -1,0 +1,961 @@
+---
+title: "Транзакция: заказ уменьшает остаток"
+date: "2026/11/27"
+description: "Запишите заказ и остатки в одной транзакции: BEGIN, COMMIT, ROLLBACK, pgx.Tx и состояние после ошибки."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-07/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-07"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-07) · **Русский** · [English](/lab/youtube/gb/gb-5-07/en)  
+Урок GB-5.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-07) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Заказ записан, остаток яблок уменьшился, но хлеба не хватило. Функция вернула ошибку. Останется ли в базе половина заказа?
+
+**Одна идея:** **транзакция** объединяет изменения в нескольких таблицах: сохраняются либо все изменения, либо изменения таблиц отменяются. В Go все команды идут через один `tx`.
+
+После урока вы:
+
+- найдёте через SQL частичный заказ, оставшийся без транзакции;
+- различите `BEGIN`, `COMMIT`, `ROLLBACK` и прерванную транзакцию;
+- напишете `PlaceOrder` с `pool.Begin`, `defer tx.Rollback(ctx)` и `tx.Commit(ctx)`;
+- найдёте команду, отправленную через пул вместо `tx`, и проверите задание на настоящем Postgres.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| транзакция | группа команд, сохраняемых или отменяемых вместе | transaction |
+| прерванная транзакция | состояние, в котором после SQL-ошибки отклоняются обычные команды | aborted transaction |
+| транзакция pgx | `tx`, управляющий транзакцией на одном соединении из пула | pgx transaction |
+
+Два вспомогательных понятия: `UPDATE … SET` меняет значение в существующей строке. **SQLSTATE** — код категории ошибки Postgres из пяти символов.
+
+## Что нужно знать заранее
+
+- [GB-5.06 · Миграции goose](/lab/youtube/gb#gb-5-06): таблица применённых версий.
+- [GB-5.05 · pgx и пул](/lab/youtube/gb/gb-5-05/ru): `QueryRow`, `Scan`, `Exec`, `$1`, `pgx.ErrNoRows`, срок context.
+- [GB-5.04 · JOIN и NULL](/lab/youtube/gb/gb-5-04/ru): `orders`, `order_items`, внешний ключ и `IS NULL`.
+- [GB-5.03 · SQL-таблица](/lab/youtube/gb/gb-5-03/ru): `products`, `CHECK`, identity, `RETURNING`, `psql -f/-c`.
+- [GB-5.02 · Лаборатория Postgres](/lab/youtube/gb/gb-5-02/ru): Docker Compose и порты.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru), [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru): отложенный вызов, `errors.Is/As`.
+- [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru), [GB-2.04 · Указатели](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структуры](/lab/youtube/gb/gb-2-03/ru), [GB-2.01 · Слайсы](/lab/youtube/gb/gb-2-01/ru).
+- [GB-1.07 · Функции и error](/lab/youtube/gb/gb-1-07/ru), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/ru), [GB-1.05 · Условия](/lab/youtube/gb/gb-1-05/ru), [GB-1.03 · Деньги](/lab/youtube/gb/gb-1-03/ru), [GB-1.01 · Первая программа](/lab/youtube/gb/gb-1-01/ru).
+
+Работайте в копии папки `lessons/gb-5-07-transaction`: на этапах заменяются `main.go` и `store.go`. Сохраните исходные файлы. Нужны Go 1.27.4, Docker и Compose вместо Go Playground. Модуль использует pgx v5.13.0.
+
+Все команды Go повторно выполнены с этими настройками. `CGO_ENABLED=0` отключает интеграцию с C; gcc не нужен. `GOTOOLCHAIN` выбирает версию Go.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+```
+
+Проверьте, что `5497` свободен. Если занят, замените порт в копии `compose.yaml` и в URL на один свободный номер. В нашей копии имя проекта Compose — `gb507doc`, в курсе — `gb507`, в видео — `bozor`. Поэтому имя контейнера отличается.
+
+```console
+$ docker compose up -d --wait
+ Container gb507doc-db-1 Running 
+ Container gb507doc-db-1 Waiting 
+ Container gb507doc-db-1 Healthy 
+```
+
+Это полный вывод для уже работающего контейнера: `Running`, ожидание готовности и `Healthy`. При первом запуске будут также строки создания.
+
+```console
+$ export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5497/bozor
+
+```
+
+`export` ничего не вывел. Это учебный URL подключения открытой лаборатории: пользователь/пароль `bozor`/`bozor-lab`, порт `5497`, база `bozor`. Имена клиентов в коде тоже вымышленные тестовые данные.
+
+Вопрос из прошлого урока: что произойдёт при повторном `goose up` после применения миграций? **A)** применит заново · **B)** пропустит · **C)** всегда ошибка.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Goose хранит версии в `goose_db_version`. `no migrations to run` означает, что новых миграций для применения нет. Это ответ на вопрос для повторения; для этой страницы goose заново не запускался.
+
+</details>
+
+## Без транзакции: ошибка не удаляет половину заказа
+
+`bozor.sql` заново создаёт три таблицы из прошлых уроков. `DROP TABLE` удаляет и существующие строки: выполняйте его в этой лаборатории. В нашей копии таблицы уже существовали:
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+В новой базе сначала появятся ещё три предупреждения `NOTICE … does not exist, skipping`. `CREATE TABLE` создаёт таблицу, `INSERT 0 n` добавляет `n` строк. В видео скрыты `DROP TABLE`, предупреждения и некоторые количества строк; здесь приведены повторно полученные результаты.
+
+| Таблица | Начальное состояние | Роль в заказе |
+|---|---|---|
+| `products` | яблоко (`olma`): `id=1`, остаток `40`; хлеб (`non`): `id=2`, остаток `3`; ещё чай и абрикосы | уменьшить остаток |
+| `orders` | 3 заказа | строка заказа клиента |
+| `order_items` | 4 строки | товар, количество и цена на момент заказа |
+
+`price`/`unit_price` указаны в тийинах: яблоко `1200000`, хлеб `400000`. Для `products.stock` есть `CHECK (stock >= 0)`.
+
+Новый входной тип из `store.go`:
+
+```go
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+```
+
+`ProductID` определяет товар, `Quantity` — количество. `[]OrderItem` — слайс значений этой структуры. `Store` содержит пул соединений из прошлого урока.
+
+Сначала полный файл с неправильным подходом:
+
+```go filename="notx.go" showLineNumbers
+package main
+
+import "context"
+
+// PlaceOrderNoTx — videodagi XATO versiya: shu PlaceOrder, lekin transaction'siz.
+// Har buyruq pool orqali alohida yuboriladi, shuning uchun xatodan keyin yarim yozilgan buyurtma qoladi.
+// Faqat koʻrsatish uchun: ishlatmang.
+func (s *Store) PlaceOrderNoTx(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	var orderID int64
+	err := s.pool.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id", customer).Scan(&orderID)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		err = s.pool.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&price)
+		if err != nil {
+			return 0, err
+		}
+		_, err = s.pool.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return orderID, nil
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–7 | `package`, `import`, комментарии | пакет `main`, тип context и предупреждение о неправильной версии |
+| 8 | `PlaceOrderNoTx(…) (int64, error)` | метод Store: получает context, клиента и позиции заказа, возвращает id и ошибку |
+| 9–11 | `QueryRow(…).Scan(&orderID)` | добавляет строку в `orders`; `$1` — клиент; записывает `RETURNING id` по адресу |
+| 12–14 | `if err != nil` | при ошибке возвращает `0, err`; сам по себе не отменяет предыдущие результаты SQL |
+| 15–16 | `for _, it := range items` | цикл по элементам; `_` отбрасывает индекс, `it` — текущая позиция; `price` хранит цену |
+| 17–19 | `UPDATE … RETURNING price` | `SET` присваивает новое значение: из остатка вычитается количество `$1`; `$2` выбирает товар; цена читается в `price` |
+| 20–22 | `return 0, err` | выходит при нарушении ограничения остатка; `err` уже существует, поэтому в строке 17 стоит `=` |
+| 23–25 | `Exec` | добавляет строку в `order_items` с четырьмя параметрами; `_` отбрасывает результат команды |
+| 26–31 | проверка ошибки, `return` | выходит при ошибке, а после успешного цикла возвращает id и `nil` |
+
+Скопируйте вызывающий файл. `cp` заменяет `main.go` готовым этапом и ничего не выводит.
+
+```console
+$ cp _video/stages/01-main-notx.go main.go
+
+```
+
+```go filename="_video/stages/01-main-notx.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 5},
+	}
+	id, err := store.PlaceOrderNoTx(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–10 | `package main`, импорты | context, вывод, окружение, время и pgxpool |
+| 12–14 | `Background`, `pgxpool.New` | создаёт основной context и пул с URL, прочитанным через `os.Getenv` |
+| 15–19 | ошибка, `defer pool.Close()` | выводит ошибку инициализации в stderr и завершает процесс через `os.Exit(1)`; при успехе планирует закрытие пула |
+| 21 | `&Store{pool: pool}` | получает адрес Store, хранящего пул |
+| 22–23 | `WithTimeout`, `defer cancel()` | ограничивает `qctx` пятью секундами; при возврате из функции освобождает ресурсы context |
+| 25–28 | `[]OrderItem{…}` | 2 яблока и 5 единиц хлеба: хлеба на складе только 3 |
+| 29–31 | вызов, `Println` | вызывает неправильную версию, выводит id и ошибку |
+
+Без `BEGIN` каждая отдельная SQL-команда работает в собственной транзакции и сохраняется при успехе.
+
+Что останется после ошибки? **A)** новых строк нет · **B)** заказ и позиция яблок · **C)** только заказ.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** INSERT заказа, UPDATE яблок и INSERT позиции яблок уже сохранены. UPDATE хлеба отклонён из-за `3 - 5`. **A** приравнивает ошибку функции к откату SQL. **C** не учитывает успешные записи для первого товара.
+
+</details>
+
+```console
+$ go run .
+0 ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514)
+```
+
+`0` — значение, возвращённое функцией при ошибке; оно не означает отсутствие заказа в базе. `violates check constraint` означает нарушение проверочного ограничения. `23514` — код этой ошибки.
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE id > 3' -c 'SELECT order_id, product_id, quantity FROM order_items WHERE order_id > 3'
+ id | customer 
+----+----------
+  4 | Aziza
+(1 row)
+
+ order_id | product_id | quantity 
+----------+------------+----------
+        4 |          1 |        2
+(1 row)
+```
+
+Два `-c` отправляют два запроса. `id > 3` выделяет новые заказы. Новый заказ — `4`, в нём есть только позиция яблок.
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    38
+  2 | non  |     3
+(2 rows)
+```
+
+`id <= 2` выбирает первые два товара. Яблок `38`, хлеба `3`: первые записи сохранились, хотя функция вернула ошибку.
+
+## SQL: BEGIN и ROLLBACK
+
+**Транзакция** объединяет эти записи. `BEGIN` начинает её; то же соединение видит собственные новые значения. Другие соединения не видят несохранённых изменений таблиц. `COMMIT` сохраняет, `ROLLBACK` отменяет.
+
+| Этап | Это соединение | Другое соединение |
+|---|---|---|
+| до `BEGIN` | яблок `38` | яблок `38` |
+| после `UPDATE … - 2` | яблок `36` | сохранённый остаток `38` |
+| после `ROLLBACK` | яблок `38` | яблок `38` |
+| если вместо этого успешный `COMMIT` | яблок `36` | последующее чтение может увидеть `36` |
+
+Таблица предполагает обычные отдельные запросы. Долгоживущий снимок чтения в другой транзакции выходит за рамки урока.
+
+```sql filename="bekor.sql" showLineNumbers
+BEGIN;
+UPDATE products SET stock = stock - 2 WHERE id = 1;
+SELECT stock FROM products WHERE id = 1;
+ROLLBACK;
+SELECT stock FROM products WHERE id = 1;
+```
+
+Строка 1 начинает транзакцию, 2 уменьшает остаток, 3 читает значение внутри неё. Строка 4 отменяет изменения, 5 читает снова. `;` завершает SQL-команду.
+
+Что выведет последний `SELECT`? **A)** `38` · **B)** `36` · **C)** `40`.
+
+<details>
+<summary>Ответ</summary>
+
+**A: `38`.** `ROLLBACK` отменяет только уменьшение в этой транзакции. **B** игнорирует откат. **C** предполагает, что отменится и предыдущий заказ без транзакции.
+
+</details>
+
+```console
+$ docker compose exec db psql -t -f /lab/bekor.sql
+BEGIN
+UPDATE 1
+    36
+
+ROLLBACK
+    38
+```
+
+`-t` скрывает заголовки и `(N rows)`, но оставляет `BEGIN`, `UPDATE 1`, `ROLLBACK`. `UPDATE 1` — обновлена одна строка. Внутри остаток `36`, после отката — `38`.
+
+А если программа остановится до COMMIT? **A)** UPDATE останется · **B)** откатится при разрыве соединения · **C)** база будет ждать вечно.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Postgres откатывает незавершённую транзакцию, обнаружив закрытие соединения. **A** приравнивает UPDATE к COMMIT. **C** не описывает состояние после обнаружения разрыва. Между остановкой процесса и обнаружением сетевого разрыва может пройти время.
+
+</details>
+
+## SQL-ошибка: прерванная транзакция
+
+`xato.sql` пытается уменьшить остаток хлеба с `3` до `-2`. `SELECT 1` — простой запрос, который при успехе возвращает `1`.
+
+```sql filename="xato.sql" showLineNumbers
+BEGIN;
+UPDATE products SET stock = stock - 5 WHERE id = 2;
+SELECT 1;
+COMMIT;
+```
+
+Сколько хлеба останется в конце? **A)** `3` · **B)** `-2` · **C)** `0`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `CHECK` запрещает отрицательный остаток; изменения таблиц в этой транзакции не сохраняются. **B** игнорирует ограничение; **C** предполагает обнуление, которого команда не запрашивает.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/xato.sql
+BEGIN
+psql:/lab/xato.sql:2: ERROR:  new row for relation "products" violates check constraint "products_stock_check"
+DETAIL:  Failing row contains (2, non, 400000, -2, t).
+psql:/lab/xato.sql:3: ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+```
+
+- `/lab/xato.sql:2` — вторая строка SQL-файла. `Failing row` в `DETAIL` содержит отклонённые значения, а не сохранённую строку.
+- `current transaction is aborted` — транзакция прервана; обычные запросы отклоняются до завершения блока. Поэтому даже `SELECT 1` не выполняется.
+- Последний `COMMIT` в этом состоянии ответил `ROLLBACK`. Блок транзакции завершился без сохранения изменений.
+
+В этой лаборатории нет точек сохранения. Точка сохранения, savepoint, — место внутри транзакции, к которому можно откатиться; это отдельная тема. Обычная ошибка Go сама по себе не переводит транзакцию Postgres в прерванное состояние. Например, `pgx.ErrNoRows` — не SQL-ошибка; после неё откат всё равно должен выполнить код Go.
+
+## Go: один tx для всех команд
+
+`pool.Begin(ctx)` получает из пула одно соединение и отправляет `BEGIN`. Возвращённый `tx` — не само соединение, а значение, управляющее транзакцией на нём. Все `QueryRow`/`Exec` идут через этот `tx`.
+
+| Путь Go | Postgres | Пул |
+|---|---|---|
+| `pool.Begin` | начинается транзакция | одно соединение занято |
+| `tx.QueryRow` / `tx.Exec` | записи в той же транзакции | соединение остаётся занятым |
+| ранний `return` → отложенный `Rollback` | изменения таблиц отменены | исправное соединение возвращается |
+| успешный `Commit` | записи сохранены | соединение возвращается |
+| последующий отложенный `Rollback` | новый ROLLBACK не отправляется | транзакция уже закрыта |
+
+Ниже полный `store.go`; строки 1–96 остались из GB-5.05. Новые части начинаются со строки 98.
+
+<details>
+<summary>Полный store.go</summary>
+
+```go filename="store.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — products jadvaliga Go'dan kirish. pool bir vaqtda koʻp goroutine'dan ishlatilishi mumkin.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OrderTotal bitta buyurtmaning jami summasini (tiyinda) hisoblaydi. Buyurtma yoʻq boʻlsa SUM NULL beradi: COALESCE uni nolga aylantiradi.
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+
+// ByName nom boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) ByName(ctx context.Context, name string) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE name = $1", name).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// Cheapest eng arzon n ta faol mahsulotni narx boʻyicha oʻsish tartibida oʻqiydi.
+func (s *Store) Cheapest(ctx context.Context, n int) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY price, id LIMIT $1", n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ErrNotEnoughStock — omborda yetarli qoldiq yoʻq. VAZIFA (TASK.md, 1-qadam): PlaceOrder shu xatoni qaytarsin.
+var ErrNotEnoughStock = errors.New("qoldiq yetarli emas")
+
+// ErrInvalidQuantity — miqdor noldan katta boʻlishi kerak. VAZIFA (TASK.md, 3-qadam).
+var ErrInvalidQuantity = errors.New("miqdor noldan katta boʻlishi kerak")
+
+// OrderItem — buyurtmadagi bitta qator: qaysi mahsulot va nechta.
+type OrderItem struct {
+	ProductID int64
+	Quantity  int
+}
+
+// PlaceOrder buyurtmani bitta transaction'da yozadi: orders qatori, har mahsulot uchun products.stock kamayishi
+// va order_items qatori. Biror qadam xato bersa, hech narsa yozilmaydi.
+func (s *Store) PlaceOrder(ctx context.Context, customer string, items []OrderItem) (int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var orderID int64
+	err = tx.QueryRow(ctx,
+		"INSERT INTO orders (customer) VALUES ($1) RETURNING id", customer).Scan(&orderID)
+	if err != nil {
+		return 0, err
+	}
+	for _, it := range items {
+		var price int64
+		err = tx.QueryRow(ctx,
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 RETURNING price",
+			it.Quantity, it.ProductID).Scan(&price)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		if err != nil {
+			return 0, err
+		}
+		_, err = tx.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return orderID, nil
+}
+
+// Restock tovar qabul qilishni yozadi: har mahsulotning qoldigʻi Quantity ga oshadi.
+// Hammasi bitta transaction'da: bitta mahsulot topilmasa, hech birining qoldigʻi oʻzgarmaydi. VAZIFA (TASK.md, 2-qadam).
+func (s *Store) Restock(ctx context.Context, items []OrderItem) error {
+	return errors.New("Restock hali yozilmagan")
+}
+```
+
+</details>
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 98–108 | ошибки и `OrderItem` | две sentinel-ошибки для задания; структура с id товара и количеством |
+| 110–116 | `PlaceOrder`, `pool.Begin` | прежняя сигнатура; при ошибке начала возвращает `0, err` |
+| 117 | `defer tx.Rollback(ctx)` | при возврате из функции пытается откатить транзакцию, если та ещё открыта |
+| 119–124 | `tx.QueryRow` | создаёт заказ в этой транзакции; `=` потому, что `err` уже есть |
+| 125–129 | цикл, `UPDATE` | прежний SQL, теперь через `tx`; цена нужна для позиции заказа |
+| 130–135 | `errors.Is(err, pgx.ErrNoRows)` | если UPDATE не нашёл строку, `Scan` возвращает эту ошибку; преобразует в `ErrNotFound` и выходит; прочие ошибки не меняет |
+| 136–142 | `tx.Exec`, проверка ошибки | записывает позицию заказа в той же транзакции |
+| 143–147 | `tx.Commit(ctx)` | проверяет ошибку; возвращает `orderID, nil` только при успехе |
+| 149–153 | `Restock` | заглушка задания: пока возвращает «hali yozilmagan» («ещё не реализовано») |
+
+Rollback после Commit возвращает `pgx.ErrTxClosed` (`tx is closed`) и не меняет сохранённую запись. Возвращаемое значение отложенного вызова отбрасывается. Поэтому этот шаблон безопасен и на успешном пути.
+
+`defer` не выполняется при принудительном завершении процесса или `os.Exit`. При разрыве соединения незавершённую транзакцию откатывает Postgres. Отмена context, переданного в `Begin`, не вызывает автоматический rollback в pgx: всё равно нужен `Commit` или `Rollback`. Если rollback не удаётся по другой причине, pgx закрывает соединение; в пул возвращается только исправное.
+
+## Тот же заказ: всё отменено, затем всё сохранено
+
+Сначала сбросьте базу и выберите `PlaceOrder` с 2 яблоками и 5 единицами хлеба. `cp` ничего не выводит.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/02-main-tx-fail.go main.go
+
+```
+
+Изменившийся вызов:
+
+```go
+id, err := store.PlaceOrder(qctx, "Aziza", items)
+```
+
+Что останется при ошибке функции? **A)** нового заказа нет, яблок `40` · **B)** яблок `38` · **C)** строка заказа останется.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** CHECK прерывает транзакцию, функция возвращает ошибку, а отложенный Rollback завершает блок. **B** и **C** описывают результаты версии без транзакции.
+
+</details>
+
+```console
+$ go run .
+0 ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE id > 3' -c 'SELECT order_id, product_id, quantity FROM order_items WHERE order_id > 3'
+ id | customer 
+----+----------
+(0 rows)
+
+ order_id | product_id | quantity 
+----------+------------+----------
+(0 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    40
+  2 | non  |     3
+(2 rows)
+```
+
+Нет ни заказа, ни его позиций; предыдущий UPDATE яблок тоже не сохранился. Исключение — счётчик identity: выданное число не возвращается.
+
+Теперь замените количество хлеба на `1`. Полный итоговый `main.go`:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	items := []OrderItem{
+		{ProductID: 1, Quantity: 2},
+		{ProductID: 2, Quantity: 1},
+	}
+	id, err := store.PlaceOrder(qctx, "Aziza", items)
+	fmt.Println(id, err)
+}
+```
+
+Отличия от предыдущего файла: в строке 27 хлеба `1` вместо `5`, в строке 29 — `PlaceOrder`. Остальные строки прежние.
+
+Какой новый id? **A)** `4` · **B)** `5` · **C)** `0`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** INSERT отменённого заказа уже получил `4`. Последовательность identity не откатывается вместе с транзакцией. **A** предполагает откат последовательности вместе со строками; **C** не соответствует успешному пути.
+
+</details>
+
+```console
+$ cp _video/stages/03-main-final.go main.go
+
+```
+
+```console
+$ go run .
+5 <nil>
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id > 3'
+ order_id | product_id | quantity | unit_price 
+----------+------------+----------+------------
+        5 |          1 |        2 |    1200000
+        5 |          2 |        1 |     400000
+(2 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, name, stock FROM products WHERE id <= 2 ORDER BY id'
+ id | name | stock 
+----+------+-------
+  1 | olma |    38
+  2 | non  |     2
+(2 rows)
+```
+
+`5 <nil>` — id заказа и отсутствие ошибки. Две позиции, цены в тийинах; остаток яблок `38`, хлеба `2`. Повторный запуск дал те же значения, что и видео. Урок не измеряет скорость: важна совместная сохранность строк и остатков, а не отношение времени выполнения.
+
+## Глубже (необязательно): узнать ошибку Postgres по коду
+
+В задании нужно преобразовать `23514` в `ErrNotEnoughStock`. `*pgconn.PgError` — тип ошибки Postgres в pgx. `errors.As` извлекает её; `&pgErr` — адрес переменной. `Code` — SQLSTATE, `ConstraintName` — имя нарушенного ограничения.
+
+Полный файл этого этапа показывает и импорты `errors` и `pgconn`:
+
+```go filename="_video/stages/05-main-pgerr.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err = store.PlaceOrder(qctx, "Aziza", []OrderItem{{ProductID: 2, Quantity: 5}})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		fmt.Println(pgErr.Code, pgErr.ConstraintName)
+	}
+}
+```
+
+Новые строки относительно прежнего `main`: 5 и 10 — импорты; 27 — заказ 5 единиц хлеба; 28–31 — извлечение ошибки и вывод двух полей. `pgErr` — указатель; читаем его поля только при успешном `errors.As`.
+
+Для этого запуска сохраните **исходный starter `store.go`**: он ещё не преобразует ошибку в sentinel. Снова сбросим базу; `cp` работает без вывода.
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/05-main-pgerr.go main.go
+
+```
+
+```console
+$ go run .
+23514 products_stock_check
+```
+
+Если после SQL-ошибки всё же вызвать `tx.Commit`, pgx вернёт `pgx.ErrTxCommitRollback`: `commit unexpectedly resulted in rollback`. Но `PlaceOrder` из примера выходит по ошибке раньше. Поэтому он возвращает исходную ошибку `23514`.
+
+Commit может вернуть ошибку и из-за разрыва соединения. `0, err` — соглашение о результате этой функции; при разрыве оно само по себе не доказывает, что сервер не сохранил данные. Два покупателя, `SELECT … FOR UPDATE` и настройки изоляции `BeginTx` — тема [GB-5.08](/lab/youtube/gb#gb-5-08).
+
+## Частые ошибки
+
+**Пул после Begin.** Неправильная строка компилируется: у пула тоже есть `Exec`.
+
+```go
+		_, err = s.pool.Exec(ctx,
+			"INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)",
+			orderID, it.ProductID, it.Quantity, price)
+```
+
+`tx` удерживает одно соединение. Пул получает другое; оно не видит строку `orders`, которую транзакция ещё не сохранила. В этом примере проверка внешнего ключа завершается ошибкой.
+
+**A)** заказ сохранится · **B)** ошибка внешнего ключа · **C)** останется только изменение яблок.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Для другого соединения нового order id ещё нет. **A** считает два соединения одной транзакцией. **C** не учитывает отложенный rollback.
+
+</details>
+
+Сначала восстановите исходный `main.go`: в нём 2 яблока и 1 единица хлеба. Затем установите этап с неправильным `store.go`. Команды `cp` ничего не выводят.
+
+```console
+$ cp _video/stages/03-main-final.go main.go
+
+```
+
+```console
+$ docker compose exec db psql -f /lab/bozor.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+```console
+$ cp _video/stages/04-store-pool-mistake.go store.go
+
+```
+
+```console
+$ go run .
+0 ERROR: insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey" (SQLSTATE 23503)
+```
+
+`order_items_order_id_fkey` — имя внешнего ключа для `order_id`. `23503` — foreign key violation: видимой родительской строки нет. В выводе Go нет номера файла/строки: ошибку вернул SQL-сервер.
+
+Исправление: `tx.Exec` вместо `s.pool.Exec`. Для дальнейшей работы и задания восстановите исходный starter `store.go`. Если пул ограничен одним соединением, этот неправильный вариант может ждать свободного соединения; `23503` не гарантирован при любой настройке пула.
+
+**Ожидать, что возврат ошибки всё отменит.** Посмотрите на результат без транзакции: `0, err` не очистил базу. Различайте SQL-ошибку и обычную ошибку Go, предусматривайте rollback на каждом пути выхода.
+
+**Не проверять ошибку Commit.** Не вызывайте `tx.Commit(ctx)` с безусловным возвратом успеха после него. Строки 143–146 выше проверяют ошибку.
+
+## Проверьте себя
+
+1. Если CHECK нарушен внутри транзакции этого урока без savepoint, сохранится ли предыдущий UPDATE?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Транзакция прерывается; обычные команды отклоняются. ROLLBACK завершает блок; COMMIT в этом состоянии тоже приводит к откату. Предыдущие изменения таблиц не сохраняются.
+
+</details>
+
+2. Почему отложенный Rollback после Commit не удаляет сохранённый заказ?
+
+<details>
+<summary>Ответ</summary>
+
+`tx` закрыт. pgx возвращает `ErrTxClosed`, не отправляя базе новый ROLLBACK.
+
+</details>
+
+3. Вначале яблок `40`. Чтение после `BEGIN; UPDATE products SET stock = stock - 2 WHERE id = 1; ROLLBACK;` вернёт: **A)** `38` · **B)** `40` · **C)** ошибку?
+
+<details>
+<summary>Ответ</summary>
+
+**B: `40`.** Отменено только изменение этой транзакции. Для `38` нужен был успешный COMMIT.
+
+</details>
+
+4. GB-5.04: почему `WHERE note = NULL` не возвращает строк?
+
+<details>
+<summary>Ответ</summary>
+
+Обычное сравнение с `NULL` даёт неизвестное значение; WHERE сохраняет только истину. Нужно `WHERE note IS NULL`.
+
+</details>
+
+## Домашнее задание
+
+[Папка курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-07-transaction/TASK.md) и [ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction/solution).
+
+TASK.md не задаёт уровни; здесь они назначены по объёму работы. Нужны все три задания:
+
+1. 🟢 `PlaceOrder`: если UPDATE остатка вернул `23514`, верните `ErrNotEnoughStock`; предыдущие записи должны откатиться.
+2. 🟡 `Restock(ctx, items []OrderItem) error`: увеличьте каждый остаток на указанное количество. Если товара нет — `ErrNotFound`; предыдущие увеличения тоже отменяются.
+3. 🟢 В обоих методах отклоняйте `Quantity <= 0` через `ErrInvalidQuantity` **до Begin**. Отрицательное количество в Restock не должно уменьшать остаток.
+
+Восстановите исходные starter-файлы и оставьте контейнер работающим. Не меняйте `store_test.go`. Тесты используют временные схемы настоящего Postgres; без базы они не пропускаются. Их устройство разбирается в [GB-5.10](/lab/youtube/gb#gb-5-10).
+
+Предскажите результат: **A)** starter сразу проходит · **B)** четыре теста падают · **C)** все тесты пропускаются.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Транзакция реализована, но преобразование ошибки, Restock и проверка количества ещё не реализованы. Время на вашей машине изменится; это не измерение скорости.
+
+```console
+$ go test .
+--- FAIL: TestPlaceOrderNotEnoughStock (0.03s)
+    store_test.go:154: PlaceOrder(non x5) = ERROR: new row for relation "products" violates check constraint "products_stock_check" (SQLSTATE 23514); kutilgan: ErrNotEnoughStock (TASK.md, 1-qadam: errors.As bilan *pgconn.PgError, Code 23514)
+--- FAIL: TestRestock (0.03s)
+    store_test.go:165: Restock = Restock hali yozilmagan; kutilgan: nil (TASK.md, 2-qadam)
+--- FAIL: TestRestockAllOrNothing (0.03s)
+    store_test.go:179: Restock(99-mahsulot) = Restock hali yozilmagan; kutilgan: ErrNotFound (TASK.md, 2-qadam)
+--- FAIL: TestInvalidQuantity (0.03s)
+    store_test.go:190: PlaceOrder(miqdor 0) = ERROR: new row for relation "order_items" violates check constraint "order_items_quantity_check" (SQLSTATE 23514); kutilgan: ErrInvalidQuantity (TASK.md, 3-qadam)
+    store_test.go:193: Restock(miqdor -2) = Restock hali yozilmagan; kutilgan: ErrInvalidQuantity (TASK.md, 3-qadam): manfiy miqdor qoldiqni kamaytirib yuboradi
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.213s
+FAIL
+```
+
+</details>
+
+<details>
+<summary>Как работают ответы</summary>
+
+В начале обоих методов пройдите циклом по `items` и отклоните `Quantity <= 0`. После `Scan` UPDATE остатка в `PlaceOrder`, перед общей проверкой ошибки:
+
+```go
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+	return 0, ErrNotEnoughStock
+}
+```
+
+`&&` требует выполнения обоих условий; второе проверяется только при истинном первом. Добавляется импорт `github.com/jackc/pgx/v5/pgconn`. Эта проверка относится к UPDATE остатка; в другом месте `23514` может означать иной CHECK. При необходимости уточните `ConstraintName == "products_stock_check"`.
+
+Restock следует тому же шаблону: Begin → отложенный Rollback → UPDATE через `tx` → Commit. В SQL вместо вычитания — сложение:
+
+```sql
+UPDATE products SET stock = stock + $1 WHERE id = $2 RETURNING stock
+```
+
+Если `Scan` не нашёл строку, верните `ErrNotFound`; прочие ошибки не меняются. В конце — `return tx.Commit(ctx)`. Поэтому при отсутствии второго товара увеличение остатка первого тоже не сохранится.
+
+Проверка готового ответа отдельно: `cd solution` переходит в папку ответа. Вывод получен повторным запуском; Go взял предыдущий успешный результат тестов из кэша:
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	(cached)
+```
+
+</details>
+
+В конце из корня лаборатории удалите контейнер и его volume. `down -v` удаляет и сохранённые данные этой лаборатории.
+
+```console
+$ docker compose down -v
+ Container gb507doc-db-1 Stopping 
+ Container gb507doc-db-1 Stopped 
+ Container gb507doc-db-1 Removing 
+ Container gb507doc-db-1 Removed 
+ Volume gb507doc_pgdata Removing 
+ Network gb507doc_default Removing 
+ Volume gb507doc_pgdata Removed 
+ Network gb507doc_default Removed 
+```
+
+## Источники
+
+- [PostgreSQL 18: Transactions](https://www.postgresql.org/docs/18/tutorial-transactions.html): единая операция, автоматические отдельные транзакции, откат и точки сохранения.
+- [COMMIT](https://www.postgresql.org/docs/18/sql-commit.html), [состояния протокола](https://www.postgresql.org/docs/18/protocol-message-formats.html), [завершение соединения](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-TERMINATION): завершение блока и разрыв.
+- [UPDATE](https://www.postgresql.org/docs/18/sql-update.html), [RETURNING](https://www.postgresql.org/docs/18/dml-returning.html), [коды ошибок](https://www.postgresql.org/docs/18/errcodes-appendix.html).
+- [Transaction isolation](https://www.postgresql.org/docs/18/transaction-iso.html), [внешние ключи](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK), [функции sequence](https://www.postgresql.org/docs/18/functions-sequence.html).
+- [psql](https://www.postgresql.org/docs/18/app-psql.html), [сравнения с NULL](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [pgx v5: Tx и ErrTxCommitRollback](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx), [Pool.Begin](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Begin), [pgconn.PgError](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn#PgError).
+- [Go: правила defer](https://go.dev/ref/spec#Defer_statements), [os.Exit](https://pkg.go.dev/os#Exit).
+- [Код транзакций pgx v5.13.0](https://github.com/jackc/pgx/blob/v5.13.0/tx.go), [код транзакции пула](https://github.com/jackc/pgx/blob/v5.13.0/pgxpool/tx.go), [возврат соединения](https://github.com/jackc/pgx/blob/v5.13.0/pgxpool/conn.go).
+- [goose](https://pressly.github.io/goose/): вопрос о миграциях для повторения.
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. SQL/Go-вывод получен повторными запусками; ответ о goose дан для повторения прошлого урока.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-07-transaction)
+
+---
+
+← Предыдущий урок: [GB-5.06](/lab/youtube/gb#gb-5-06) · Следующий урок: [GB-5.08](/lab/youtube/gb#gb-5-08) → · [Все уроки](/lab/youtube/gb)
+
+</div>

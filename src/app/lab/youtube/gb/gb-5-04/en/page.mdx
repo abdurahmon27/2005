@@ -1,0 +1,667 @@
+---
+title: "JOIN, GROUP BY and NULL: orders and their totals"
+date: "2026/11/27"
+description: "Join order tables, calculate totals with GROUP BY and SUM, preserve empty orders with LEFT JOIN, and handle NULL with IS NULL and COALESCE."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-04"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-04) · [Русский](/lab/youtube/gb/gb-5-04/ru) · **English**  
+Lesson GB-5.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-04) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+bozor needs a report with a total for every order. The total is not stored in a column: its items live in another table. How do you calculate it without losing an order that has no items?
+
+**One idea:** pair rows from related tables, group the pairs by order, and calculate each total. Preserve unmatched orders and handle their missing values explicitly.
+
+By the end, you can:
+
+- connect `orders` and `order_items` with `REFERENCES`;
+- use `JOIN`, `LEFT JOIN`, `GROUP BY`, and `SUM` to build the report;
+- explain why `note = NULL` finds nothing and use `IS NULL` and `COALESCE` correctly;
+- write two SQL queries and check them with `go test`.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| `JOIN` / `LEFT JOIN` | pair table rows; the left variant also preserves unmatched left rows | join / left join |
+| `GROUP BY` + `SUM` | form groups and calculate one sum per group | grouping / aggregate |
+| `NULL` | a missing or unknown value; ordinary comparisons can produce an unknown result | NULL / three-valued logic |
+
+Two helpers: a **foreign key** (`REFERENCES`) requires a referenced row to exist. **COALESCE** returns the first non-NULL value from its arguments.
+
+## Before you start
+
+- [GB-5.03 · Essential SQL](/lab/youtube/gb/gb-5-03/en): tables, types, primary key, constraints, `INSERT`, `SELECT`, `WHERE`, and `ORDER BY`.
+- [GB-5.02 · Postgres in Docker Compose](/lab/youtube/gb/gb-5-02/en): containers, volumes, `exec`, and `psql`.
+- [GB-5.01 · Why a database](/lab/youtube/gb#gb-5-01): two processes updating one JSON file; recalled at the end.
+- [GB-1.03 · Numbers and money](/lab/youtube/gb/gb-1-03/en): prices are integer tiyin, not floating-point amounts.
+- [GB-1.08 · First test](/lab/youtube/gb/gb-1-08/en): `go test`, `ok`, and `FAIL`.
+
+Use the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null). Run commands there. This lab needs local Docker and files; it cannot run in Go Playground. `cd` changes the working folder.
+
+`compose.yaml` starts `postgres:18-alpine` on `127.0.0.1:5464`; keep that port free. `PGUSER` and `PGDATABASE` select `bozor`, and the folder is mounted read-only at `/lab`. `psql` runs inside the container, so no local installation is needed. Start with a fresh lab volume; existing tables make the creation commands fail.
+
+For this page, the folder was copied to a temporary workspace. Only its Compose project name changed to `gb504docs`; the course uses `gb504`, and the video uses `bozor`. Container names in the lifecycle output therefore differ. All outputs below were re-run, not quoted. Go checks used `CGO_ENABLED=0` and `GOTOOLCHAIN=go1.27.4`.
+
+**Recall:** will a `NOT NULL` text column accept `''`?
+**A)** no · **B)** yes, it is a value · **C)** syntax error
+
+<details>
+<summary>Answer</summary>
+
+**B.** An empty string has length zero but is still a value. `NOT NULL` rejects a missing value. A confuses an empty string with `NULL`; C is wrong because `''` is valid SQL text syntax.
+
+</details>
+
+## Tables: an order and its items
+
+Start the database in the background (`-d`) and wait for its health check (`--wait`). Expect `Healthy` when it is ready:
+
+```console
+$ docker compose up -d --wait
+ Network gb504docs_default Creating 
+ Network gb504docs_default Creating 
+ Volume gb504docs_pgdata Creating 
+ Volume gb504docs_pgdata Creating 
+ Volume gb504docs_pgdata Created 
+ Volume gb504docs_pgdata Created 
+ Network gb504docs_default Created 
+ Network gb504docs_default Created 
+ Container gb504docs-db-1 Creating 
+ Container gb504docs-db-1 Created 
+ Container gb504docs-db-1 Starting 
+ Container gb504docs-db-1 Started 
+ Container gb504docs-db-1 Waiting 
+ Container gb504docs-db-1 Healthy 
+```
+
+The lifecycle lines report network, volume, and container creation, then startup and readiness. Repeated progress lines are preserved from the real run.
+
+Prepare the previous lesson's `products` table: `id`, `name`, `price`, `stock`, `active`, and four products. `exec db` runs a command in the database service; `psql -f` reads the SQL file at the container path.
+
+```console
+$ docker compose exec db psql -f /lab/products.sql
+CREATE TABLE
+INSERT 0 4
+```
+
+`CREATE TABLE` confirms creation; `INSERT 0 4` means four rows were inserted. Products are `olma` (apple), `non` (bread), `choy` (tea), and `oʻrik` (apricot).
+
+An order needs an optional note. Each item must refer to an existing order and product. Here is the complete `orders.sql`:
+
+```sql filename="orders.sql" showLineNumbers
+CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer text   NOT NULL,
+    note     text
+);
+CREATE TABLE order_items (
+    id         bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id   bigint  NOT NULL REFERENCES orders (id),
+    product_id bigint  NOT NULL REFERENCES products (id),
+    quantity   integer NOT NULL CHECK (quantity > 0),
+    unit_price bigint  NOT NULL CHECK (unit_price > 0)
+);
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `CREATE TABLE orders (` | begin the order table and its column list |
+| 2 | `id ... PRIMARY KEY` | a `bigint` identifier generated by the database; the primary key identifies one row |
+| 3 | `customer text NOT NULL,` | required customer name; the comma separates columns |
+| 4 | `note text` | optional note: no `NOT NULL` requirement |
+| 5 | `);` | close the column list and end the statement |
+| 6 | `CREATE TABLE order_items (` | begin the item table |
+| 7 | `id ... PRIMARY KEY,` | generated identifier for each item row |
+| 8 | `order_id ... REFERENCES orders (id),` | required order identifier; the referenced order must exist |
+| 9 | `product_id ... REFERENCES products (id),` | required product identifier; the referenced product must exist |
+| 10 | `quantity ... CHECK (quantity > 0),` | required positive integer quantity |
+| 11 | `unit_price ... CHECK (unit_price > 0)` | required positive price per unit, in tiyin, at the time of purchase |
+| 12 | `);` | finish the second table definition |
+
+`unit_price` is a snapshot. A later change to `products.price` must not change an old order's total. The foreign key enforces existence; it does not copy the price.
+
+```console
+$ docker compose exec db psql -f /lab/orders.sql
+CREATE TABLE
+CREATE TABLE
+```
+
+Both tables now exist. The complete `seed.sql` inserts three fictional customers and four item rows:
+
+```sql filename="seed.sql" showLineNumbers
+INSERT INTO orders (customer, note)
+VALUES ('Dilnoza', NULL),
+       ('Jasur', 'ertalab yetkazing'),
+       ('Malika', NULL);
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 1, 2, 1200000),
+       (1, 2, 3, 400000),
+       (2, 4, 1, 3500000),
+       (2, 1, 1, 1200000);
+```
+
+Lines 1–4 select the order columns and insert three rows; two notes are `NULL`. Jasur's note means “deliver in the morning.” Lines 5–9 select four item columns and insert four tuples in that same order. Parentheses group each tuple, commas separate values and rows, and `;` ends each statement.
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 3
+INSERT 0 4
+```
+
+Expect three orders and four items; `INSERT 0 3` and `INSERT 0 4` confirm those counts.
+
+**Predict:** order 99 does not exist. What happens if you insert an item with `order_id = 99`?
+**A)** the item is inserted · **B)** its `order_id` becomes NULL · **C)** the insert is rejected
+
+<details>
+<summary>Answer</summary>
+
+**C.** `REFERENCES orders (id)` requires the order to exist. A would violate the foreign key. B would silently replace the requested value, which this constraint does not do.
+
+</details>
+
+```console
+$ docker compose exec db psql -c "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (99, 1, 1, 1200000)"
+ERROR:  insert or update on table "order_items" violates foreign key constraint "order_items_order_id_fkey"
+DETAIL:  Key (order_id)=(99) is not present in table "orders".
+```
+
+`violates foreign key constraint` means the insert breaks the foreign key rule. `order_items_order_id_fkey` names that rule; `DETAIL` identifies the missing key `(order_id)=(99)`. Fix the identifier to reference an existing order, or create the intended order first.
+
+Inspect the data. Expect three orders, with blank notes for Dilnoza and Malika, and four item rows:
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders'
+ id | customer |       note        
+----+----------+-------------------
+  1 | Dilnoza  | 
+  2 | Jasur    | ertalab yetkazing
+  3 | Malika   | 
+(3 rows)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM order_items'
+ id | order_id | product_id | quantity | unit_price 
+----+----------+------------+----------+------------
+  1 |        1 |          1 |        2 |    1200000
+  2 |        1 |          2 |        3 |     400000
+  3 |        2 |          4 |        1 |    3500000
+  4 |        2 |          1 |        1 |    1200000
+(4 rows)
+```
+
+`SELECT *` selects every column; `(3 rows)` and `(4 rows)` are result counts. Here the blank notes represent `NULL`: that is what the seed inserted. Default `psql` output also displays an empty string as blank, so the display alone cannot distinguish them.
+
+## JOIN: one result row per pair
+
+We need the customer for each item. Replace the contents of a new `sorov.sql` file with this complete query. Replace that file again for each later query on this page; do not append queries.
+
+```sql
+SELECT orders.customer, order_items.quantity
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id;
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `SELECT orders.customer, order_items.quantity` | select two columns; `table.column` identifies which table supplies each one |
+| 2 | `FROM orders` | start from the order table |
+| 3 | `JOIN order_items ON ...` | pair rows where `order_items.order_id = orders.id`; `ON` specifies the matching condition |
+
+The same order can match several items. Here is the pairing state, before projecting the selected columns:
+
+| Order | Matching item quantities | JOIN result rows |
+|---|---|---|
+| 1, Dilnoza | 2, 3 | 2 |
+| 2, Jasur | 1, 1 | 2 |
+| 3, Malika | no matching item | 0 |
+
+**Predict:** how many rows will this JOIN return?
+**A)** 3 orders · **B)** 4 pairs · **C)** 5 rows, including Malika
+
+<details>
+<summary>Answer</summary>
+
+**B: 4.** `JOIN` means `INNER JOIN`: only matching pairs survive. A counts orders rather than pairs. C would require preserving the unmatched order.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ customer | quantity 
+----------+----------
+ Dilnoza  |        2
+ Dilnoza  |        3
+ Jasur    |        1
+ Jasur    |        1
+(4 rows)
+```
+
+Malika is absent. There is no `ORDER BY` in this introductory query: the displayed order is observed, not guaranteed. Later report queries specify their order explicitly.
+
+## GROUP BY and SUM: one total per order
+
+For each item, multiply quantity by its recorded unit price. `*` is multiplication here; it selected every column in `SELECT *`. **SUM** is an aggregate: it combines input values into one value. `AS jami` names the output column `jami` (“total”).
+
+First replace `sorov.sql` with this incomplete attempt:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id;
+```
+
+**Predict:** will mixing an aggregate with individual order columns work without grouping?
+**A)** yes, one total per order · **B)** yes, one total for all orders · **C)** a GROUP BY error
+
+<details>
+<summary>Answer</summary>
+
+**C.** The query does not state which rows belong to each total. A assumes grouping happens automatically. B leaves no single `orders.id` to show beside the overall sum.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+psql:/lab/sorov.sql:4: ERROR:  column "orders.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT orders.id, orders.customer,
+               ^
+```
+
+`psql:/lab/sorov.sql:4` identifies the file and the line where the statement ends. `LINE 1` and `^` point to the offending expression. “Must appear in the GROUP BY clause or be used in an aggregate function” states the missing rule for `orders.id`.
+
+Add `GROUP BY orders.id` to form one group per order identifier. Add `ORDER BY orders.id` for predictable ascending order:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+Lines 1–4 still select the order fields, calculate the sum, and join the tables. Line 5 forms the groups; line 6 sorts the result and ends the statement. `SUM(...)` evaluates its parenthesized expression for each input row, then adds the values within that group.
+
+| Group | Item amounts in tiyin | SUM |
+|---|---|---|
+| order 1 | `2 × 1200000 + 3 × 400000` | 3600000 |
+| order 2 | `1 × 3500000 + 1 × 1200000` | 4700000 |
+
+Why is `orders.customer` absent from `GROUP BY`? `orders.id` is the table's primary key, so each identifier determines exactly one customer. PostgreSQL recognizes that dependency here. It is not permission to select arbitrary ungrouped columns.
+
+**Predict:** how many result rows remain?
+**A)** 3 · **B)** 2 · **C)** 4
+
+<details>
+<summary>Answer</summary>
+
+**B: 2.** The four joined rows form two groups. A counts Malika even though JOIN removed her. C counts inputs before grouping.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+(2 rows)
+```
+
+The amounts are 3 600 000 and 4 700 000 tiyin. `SUM(bigint)` returns `numeric`, PostgreSQL's exact numeric type, even for these integer amounts. Reading it into Go is covered in [GB-5.05 · Go to Postgres: pgx](/lab/youtube/gb/gb-5-05/en).
+
+## LEFT JOIN and NULL: preserve the missing order
+
+The report needs every order. **LEFT JOIN** preserves all rows from the left table, here `orders`. For an unmatched row it supplies NULL values for the right table's columns. It does not insert a row into `order_items`.
+
+Replace `sorov.sql` with:
+
+```sql
+SELECT orders.customer, order_items.quantity
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id;
+```
+
+Only line 3 changed: `LEFT` now preserves the unmatched order. Expect four matching pairs and one row for Malika, whose quantity is NULL:
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ customer | quantity 
+----------+----------
+ Dilnoza  |        2
+ Dilnoza  |        3
+ Jasur    |        1
+ Jasur    |        1
+ Malika   |         
+(5 rows)
+```
+
+**NULL** means a missing or unknown value. It is neither zero nor `''`. Ordinary `=` and `<>` comparisons with NULL produce NULL, an unknown result. This is **three-valued logic**: true, false, unknown. `WHERE` keeps only true.
+
+| `note` | `note = NULL` | Kept by WHERE? | `note IS NULL` |
+|---|---|---|---|
+| `NULL` | unknown (`NULL`) | no | true |
+| `'ertalab yetkazing'` | unknown (`NULL`) | no | false |
+| `''` | unknown (`NULL`) | no | false |
+
+The empty-string row illustrates the rule; it is not an extra row in this seed.
+
+**Predict:** two orders have NULL notes. How many rows does `WHERE note = NULL` return?
+**A)** 2 · **B)** 0 · **C)** syntax error
+
+<details>
+<summary>Answer</summary>
+
+**B: 0.** The predicate is unknown for every row, never true. A treats NULL as an ordinary comparable value. C is wrong: the query is valid and silently returns nothing.
+
+</details>
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE note = NULL'
+ id | customer 
+----+----------
+(0 rows)
+```
+
+Use **IS NULL** to ask whether a value is missing. It always returns true or false; `IS NOT NULL` asks the opposite. Expect Dilnoza and Malika:
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer FROM orders WHERE note IS NULL'
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+These two demonstration filters have no `ORDER BY`; their displayed row order is not guaranteed. The homework query adds it.
+
+## COALESCE: replace a missing total with zero
+
+Now preserve all orders in the grouped report. Replace only `JOIN` with `LEFT JOIN` in the earlier grouped query:
+
+```sql
+SELECT orders.id, orders.customer,
+       SUM(order_items.quantity * order_items.unit_price) AS jami
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+`SUM` ignores NULL inputs. Malika's group contains one result row, whose quantity and unit price are NULL. Multiplication therefore gives NULL; there are no non-NULL amounts to add.
+
+**Mid-lesson check:** what is Malika's SUM?
+**A)** 0 · **B)** NULL · **C)** error
+
+<details>
+<summary>Answer</summary>
+
+**B: NULL.** With no non-NULL input, SUM returns NULL. A assumes the aggregate supplies zero automatically; C assumes missing input is a SQL error.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+  3 | Malika   |        
+(3 rows)
+```
+
+The blank total is NULL. To make the report show zero, replace line 2 with `COALESCE(SUM(...), 0) AS jami`. The full query is:
+
+```sql
+SELECT orders.id, orders.customer,
+       COALESCE(SUM(order_items.quantity * order_items.unit_price), 0) AS jami
+FROM orders
+LEFT JOIN order_items ON order_items.order_id = orders.id
+GROUP BY orders.id
+ORDER BY orders.id;
+```
+
+**COALESCE** considers its comma-separated arguments in order and returns the first non-NULL one. The inner parentheses enclose SUM's expression; the outer parentheses hold SUM's result and the fallback zero. Other lines are unchanged.
+
+| Order | Matching items | SUM | COALESCE(SUM, 0) |
+|---|---|---|---|
+| 1 | 2 | 3600000 | 3600000 |
+| 2 | 2 | 4700000 | 4700000 |
+| 3 | 0 | `NULL` | 0 |
+
+Expect three orders with totals 3600000, 4700000, and 0:
+
+```console
+$ docker compose exec db psql -f /lab/sorov.sql
+ id | customer |  jami   
+----+----------+---------
+  1 | Dilnoza  | 3600000
+  2 | Jasur    | 4700000
+  3 | Malika   |       0
+(3 rows)
+```
+
+`LEFT JOIN` preserves the order; `COALESCE` replaces its missing total. Both are needed: COALESCE cannot restore a row already removed by INNER JOIN.
+
+## Going deeper (optional): inequality with NULL
+
+`<>` means “not equal,” but comparing a NULL note with text still gives unknown. Predict the result for notes different from `'ertalab yetkazing'`: no rows survive. Jasur's comparison is false; the other two are unknown.
+
+```console
+$ docker compose exec db psql -c "SELECT id, customer FROM orders WHERE note <> 'ertalab yetkazing'"
+ id | customer 
+----+----------
+(0 rows)
+```
+
+**IS DISTINCT FROM** compares values while treating NULL as a comparable missing value. NULL and that text are distinct, so Dilnoza and Malika now survive. Two NULL values would be considered not distinct.
+
+```console
+$ docker compose exec db psql -c "SELECT id, customer FROM orders WHERE note IS DISTINCT FROM 'ertalab yetkazing'"
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+These filters also omit `ORDER BY`. Use this predicate when the business rule needs “different, including a missing value,” rather than ordinary SQL inequality.
+
+## Common mistakes
+
+1. **`WHERE note = NULL`.** Valid SQL, empty result. The “LEFT JOIN and NULL” section shows the complete failing query and its real output. Use `WHERE note IS NULL`; `''` is a separate value.
+2. **Expecting SUM to group automatically.** The four-line query in “GROUP BY and SUM” produces the real `must appear in the GROUP BY clause` error. Add `GROUP BY orders.id`; keep `ORDER BY` for deterministic order.
+3. **INNER JOIN in an all-orders report.** The query runs but drops Malika. Use LEFT JOIN, then COALESCE for the total; replacing NULL alone cannot recover her row.
+4. **Filtering the right table after LEFT JOIN.** `WHERE order_items.quantity > 0` rejects the NULL-extended row again. If the intended rule is to keep every left row, put an item restriction in `ON` instead, or omit it.
+5. **Sorting a NULL sum with DESC.** By default PostgreSQL puts NULL first in descending order. The homework needs a numeric zero: apply COALESCE before ordering.
+
+A foreign key also does not automatically create an index on its referencing column. Choosing an index is separate from enforcing the relationship.
+
+## Check yourself
+
+1. How do JOIN and LEFT JOIN differ for an order without items?
+
+<details>
+<summary>Answer</summary>
+
+JOIN drops the order. LEFT JOIN keeps one result row with NULL right-side columns. Existing matching pairs behave the same in both variants.
+
+</details>
+
+2. Why does `WHERE note = NULL` return no rows?
+
+<details>
+<summary>Answer</summary>
+
+Ordinary equality with NULL gives unknown; WHERE requires true. `IS NULL` tests absence and returns a Boolean result.
+
+</details>
+
+3. Predict Malika's total after `LEFT JOIN`, `GROUP BY`, and `COALESCE(SUM(...), 0)`: **A)** NULL · **B)** 0 · **C)** no row.
+
+<details>
+<summary>Answer</summary>
+
+**B.** LEFT JOIN keeps the order; SUM has no non-NULL amount and returns NULL; COALESCE replaces it with 0. A misses COALESCE, C describes INNER JOIN.
+
+</details>
+
+4. From GB-5.01: what can happen when two processes update one JSON file at the same time?
+
+<details>
+<summary>Answer</summary>
+
+An update can be lost or the file can be corrupted. A database coordinates access; several changes that must succeed together need a transaction, covered in GB-5.07.
+
+</details>
+
+## Homework
+
+Use [the course folder and TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null). The following levels are labels for this page; TASK.md does not assign levels.
+
+- 🟢 `izohsiz.sql`: one SELECT returning `id`, `customer` for orders whose `note IS NULL`, ordered by ascending `id`. An empty string must not qualify.
+- 🟡 `sotilgan.sql`: one SELECT returning every product's `name` and `sotilgan` (“units sold”), the sum of its item quantities. Include unsold products with 0. Sort by `sotilgan DESC`, then ascending `name`.
+
+Remove the starter comments and finish each statement with `;`. Leave `products.sql`, `orders.sql`, `seed.sql`, and `tekshiruv_test.go` unchanged. The database started above is sufficient. The starter should fail because both SELECT statements are still missing:
+
+```console
+$ go test .
+--- FAIL: TestSotilgan (0.00s)
+    tekshiruv_test.go:132: sotilgan.sql'da SELECT yoʻq: har mahsulot uchun name va sotilgan (order_items.quantity yigʻindisi) ni tanlang; hech sotilmaganda 0 chiqsin (TASK.md)
+--- FAIL: TestIzohsiz (0.00s)
+    tekshiruv_test.go:143: izohsiz.sql'da SELECT yoʻq: izohi yoʻq (NULL) buyurtmalarning id va customer ustunlarini tanlang (TASK.md)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+`SELECT yoʻq` means “SELECT is missing”; the message identifies the file and required result. The checker creates temporary schemas, loads two datasets, and tries two query plans. It removes those schemas afterwards and leaves `public` alone. Its `psql -At` results omit headers and separate columns with `|`, for example `non|3`.
+
+<details>
+<summary>Answer</summary>
+
+The complete [reference answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null/solution) are:
+
+```sql filename="solution/sotilgan.sql" showLineNumbers
+SELECT products.name,
+       COALESCE(SUM(order_items.quantity), 0) AS sotilgan
+FROM products
+LEFT JOIN order_items ON order_items.product_id = products.id
+GROUP BY products.id
+ORDER BY sotilgan DESC, products.name;
+```
+
+Line 1 selects the product name. Line 2 sums quantities, replaces NULL with zero, and names the result. Lines 3–4 start from every product and match its items by `product_id`. Line 5 groups by the product primary key. Line 6 sorts by the calculated alias and resolves ties by name.
+
+With this answer copied to `sotilgan.sql`, expect bread and apples at 3, apricots at 1, and unsold tea at 0:
+
+```console
+$ docker compose exec db psql -f /lab/sotilgan.sql
+ name  | sotilgan 
+-------+----------
+ non   |        3
+ olma  |        3
+ oʻrik |        1
+ choy  |        0
+(4 rows)
+```
+
+```sql filename="solution/izohsiz.sql" showLineNumbers
+SELECT id, customer
+FROM orders
+WHERE note IS NULL
+ORDER BY id;
+```
+
+Line 1 chooses the two result columns; line 2 selects orders; line 3 tests for a missing note; line 4 sorts by id. Expect the two orders without notes:
+
+```console
+$ docker compose exec db psql -f /lab/izohsiz.sql
+ id | customer 
+----+----------
+  1 | Dilnoza
+  3 | Malika
+(2 rows)
+```
+
+With both answers copied into the starter, rerun the check:
+
+```console
+$ go test .
+ok  	github.com/abdurahmon27/bozor	2.774s
+```
+
+This run took 2.774 s; the value after the package name is elapsed test time, not a query benchmark. Time varies with machine load; the important result is `ok` and the verified rows and order.
+
+You can also run the untouched reference folder independently: `cd solution`, then `docker compose up -d --wait` and `go test .`. It uses project `gb504-solution` and port 5466. In this verification its project name was `gb504docs-solution`; its test passed in 2.749 s. No performance ratio is inferred from test durations.
+
+</details>
+
+After finishing, remove this lab's container and volume. **`-v` deletes the lab database data.** Run the command from the folder whose Compose project you started:
+
+```console
+$ docker compose down -v
+ Container gb504docs-db-1 Stopping 
+ Container gb504docs-db-1 Stopped 
+ Container gb504docs-db-1 Removing 
+ Container gb504docs-db-1 Removed 
+ Volume gb504docs_pgdata Removing 
+ Network gb504docs_default Removing 
+ Volume gb504docs_pgdata Removed 
+ Network gb504docs_default Removed 
+```
+
+`Stopping`/`Stopped` report the stop, `Removing`/`Removed` the deletion of the container, network, and volume. If you started `solution/` independently, run the same cleanup there too. Both temporary verification projects and their volumes were removed.
+
+## Sources
+
+- [PostgreSQL 18: Joins Between Tables](https://www.postgresql.org/docs/18/tutorial-join.html).
+- [PostgreSQL 18: Joined tables](https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-JOIN).
+- [PostgreSQL 18: GROUP BY](https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-GROUP).
+- [PostgreSQL 18: SELECT](https://www.postgresql.org/docs/18/sql-select.html).
+- [PostgreSQL 18: SELECT / GROUP BY](https://www.postgresql.org/docs/18/sql-select.html#SQL-GROUPBY).
+- [PostgreSQL 18: Aggregate functions](https://www.postgresql.org/docs/18/functions-aggregate.html).
+- [PostgreSQL 18: Foreign keys](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK).
+- [PostgreSQL 18: Not-null constraints](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-NOT-NULL).
+- [PostgreSQL 18: Check constraints](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS).
+- [PostgreSQL 18: Comparison operators](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [PostgreSQL 18: IS NULL / IS DISTINCT FROM](https://www.postgresql.org/docs/18/functions-comparison.html#FUNCTIONS-COMPARISON-PRED-TABLE).
+- [PostgreSQL 18: COALESCE](https://www.postgresql.org/docs/18/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL).
+- [PostgreSQL 18: Three-valued logic](https://www.postgresql.org/docs/18/functions-logical.html).
+- [PostgreSQL 18: CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html).
+- [PostgreSQL 18: INSERT](https://www.postgresql.org/docs/18/sql-insert.html).
+- [PostgreSQL 18: psql](https://www.postgresql.org/docs/18/app-psql.html).
+- [Docker Compose: up --wait](https://docs.docker.com/reference/cli/docker/compose/up/).
+
+SQL results: `postgres:18-alpine`, PostgreSQL 18.7; Docker Compose 5.4.0. Go test results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27. SQL results match the video; this page preserves the row-count footers trimmed there. Container names and test durations belong to this page's own run.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-04-join-group-null)
+
+---
+
+← Previous lesson: [GB-5.03](/lab/youtube/gb/gb-5-03/en) · Next lesson: [GB-5.05](/lab/youtube/gb/gb-5-05/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

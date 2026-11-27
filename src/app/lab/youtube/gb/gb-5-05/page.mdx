@@ -1,0 +1,889 @@
+---
+title: "Go → Postgres: pgx, pool, Scan va timeout"
+date: "2026/11/27"
+description: "Go'dan Postgres'ga pgxpool bilan ulaning: parametrli soʻrov, Scan, NULL, ErrNotFound, rows.Close va context muddati."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 37
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-05"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-05"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-5-05/ru) · [English](/lab/youtube/gb/gb-5-05/en)  
+Dars GB-5.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-05) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+`products` jadvali tayyor. Go kodi undan mahsulotni qanday oʻqiydi? Baza javob bermasa, kutishni qayerda toʻxtatamiz?
+
+**Bitta gʻoya:** Go — Postgres mijozi. Soʻrov pool'dan ulanish oladi, SQL va parametrlarni alohida yuboradi, `Scan` bilan javobni oʻqiydi. Context kutish muddatini belgilaydi.
+
+Darsdan keyin siz:
+
+- `pgxpool` orqali `Get` va `ListActive` soʻrovlarini bajarasiz;
+- topilmagan qator bilan `NULL` yigʻindisini ajratasiz;
+- muddat qoʻyasiz va qaytarilmagan ulanish sababini topasiz;
+- `ByName` va `Cheapest` metodlarini testlar oʻtguncha yozasiz.
+
+| Soʻz | Sodda maʼnosi | English term |
+|---|---|---|
+| ulanishlar pool'i | qayta ishlatiladigan ochiq ulanishlar toʻplami | connection pool |
+| natija qatorlarini oʻqish | `QueryRow` yoki `Query` javobini `Scan` bilan Go qiymatlariga koʻchirish | row scanning |
+| context muddati | soʻrov qancha kutishini chegaralash | context deadline |
+
+## Oldin bilish kerak
+
+- [GB-5.04 · JOIN, GROUP BY va NULL](/lab/youtube/gb/gb-5-04): `orders`, `order_items`, `SUM`, `COALESCE`.
+- [GB-5.03 · SQL jadvali](/lab/youtube/gb/gb-5-03): `products`, ustunlar, `WHERE` bilan filtrlash.
+- [GB-5.02 · Postgres laboratoriyasi](/lab/youtube/gb/gb-5-02): Docker Compose, portlar va `psql`.
+- [GB-2.07 · Interface](/lab/youtube/gb/gb-2-07) va [GB-2.08 · Error](/lab/youtube/gb/gb-2-08): chaqiruvchi shartnomasi, `errors.Is`.
+- [GB-2.09 · defer](/lab/youtube/gb/gb-2-09), [GB-2.06 · Paketlar](/lab/youtube/gb/gb-2-06), [GB-2.05 · Metodlar](/lab/youtube/gb/gb-2-05).
+- [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01).
+- [GB-1.07 · Funksiya va error](/lab/youtube/gb/gb-1-07), [GB-1.06 · for](/lab/youtube/gb/gb-1-06), [GB-1.05 · Shartlar](/lab/youtube/gb/gb-1-05), [GB-1.03 · Pul](/lab/youtube/gb/gb-1-03).
+
+Misollar `lessons/gb-5-05-pgx-pool` papkasining vaqtinchalik nusxasida bajariladi. Bosqichlarda `main.go` va `store.go` almashtiriladi. Asl nusxani saqlang. Go Playground tarmoqdagi Postgres oʻrnini bosa olmaydi. Go 1.27.4, Docker va Compose kerak; pgx sof Go, gcc kerak emas.
+
+Avval: ustun `NULL` boʻlsa, `WHERE ustun > 5` shu qatorni qoldiradimi? **A)** ha · **B)** yoʻq · **C)** SQL xatosi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `NULL > 5` — nomaʼlum. `WHERE` faqat rostni qoldiradi. `products` ustunlari `NOT NULL`, lekin agregat baribir `NULL` chiqarishi mumkin.
+
+</details>
+
+## Ulanish: manzil va pool
+
+Postgres mijozi SQL yuboradigan dastur: oldin `psql`, endi Go. `pgx` protokolni bajaradi; `pgxpool` ulanishlarni qayta ishlatadi. Har ulanish Postgres jarayoniga tegishli. Har HTTP soʻrov uchun yangi pool yaratmang.
+
+| Bosqich | Pool | Postgres |
+|---|---|---|
+| soʻrovdan oldin | boʻsh ulanish bor | SQL kutmoqda |
+| `QueryRow` / `Query` | ulanish olindi | SQL bajarilmoqda |
+| natija yopildi | ulanish qaytdi | keyingi buyruqni kutmoqda |
+
+Quyidagi buyruqlar shu nusxa ichida bajariladi. `export` dasturlar koʻradigan **muhit oʻzgaruvchisi**ni beradi. `CGO_ENABLED=0` C integratsiyasini oʻchiradi, `GOTOOLCHAIN` Go versiyasini tanlaydi. `up -d --wait` bazani fonda ishga tushirib, tayyor boʻlishini kutadi. `5475` band boʻlsa, nusxadagi `ports` va URL portini bir xil boʻsh raqamga almashtiring.
+
+```bash
+export CGO_ENABLED=0
+export GOTOOLCHAIN=go1.27.4
+docker compose up -d --wait
+```
+
+`exec db psql` — `db` servisida SQL mijozi. Har `-f` konteynerdagi `/lab/` ostidan bitta faylni oʻqiydi. Yangi bazaga toʻrtta fayl qoʻllanadi:
+
+```console
+$ docker compose exec db psql -f /lab/products.sql -f /lab/seed.sql -f /lab/orders.sql -f /lab/orders_seed.sql
+psql:/lab/products.sql:1: NOTICE:  table "products" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 4
+```
+
+`NOTICE` — mavjud boʻlmagan jadvalni oʻchirish tashlab ketildi; bu xato emas. `CREATE TABLE` — jadval yaratildi. `INSERT 0 n` — `n` qator qoʻshildi: 4 mahsulot, 3 buyurtma, 4 buyurtma qatori.
+
+```bash
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5475/bozor
+```
+
+Bu laboratoriya uchun sunʼiy ulanish URL'i. `postgres` — protokol; `bozor:bozor-lab` — foydalanuvchi va laboratoriya paroli. `localhost:5475` — kompyuterdagi manzil va port, oxirgi `bozor` — baza. `os.Getenv("DATABASE_URL")` shu satrni oʻqiydi.
+
+```go filename="_video/stages/01-main-pool.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+}
+```
+
+| Qatorlar | Nima qiladi |
+|---|---|
+| 1–9 | `main` paketi; `context`, chiqarish, muhit va pgxpool importlari |
+| 11–13 | `main` boshlanadi; `ctx` — muddatsiz `context.Background()`; `New` URL'dan pool yasaydi |
+| 14–17 | xato boʻlsa `pool:` bilan `os.Stderr`ga yozadi va kod 1 bilan chiqadi |
+| 18–19 | `defer pool.Close()` oddiy qaytishda ulanishlarni yopadi |
+
+`ctx` har pgx chaqiruvining birinchi argumenti. Context muddat va bekor qilish belgisini olib yuradi; toʻliq [GB-7.03](/lab/youtube/gb#gb-7-03)da. `New` muvaffaqiyati baza bilan aloqa tekshirildi degani emas; buning uchun `pool.Ping(ctx)` bor. `os.Exit` esa `defer`larni bajarmaydi.
+
+```console
+$ go mod tidy
+```
+
+Bu qayta tekshiruv hech narsa chiqarmadi: tayyor `go.mod` va `go.sum`da pgx v5.13.0 bor. `tidy` importlarga mos bogʻliqliklarni tartiblaydi. Videodagi `finding`/`found` satrlari ilk qoʻshish jurnalidan olingan; bu yerda oʻsha jurnal qayta chiqdi deyilmaydi. `/v5` — katta versiya va import yoʻlining qismi.
+
+## Bitta qator: QueryRow va Scan
+
+`Product` — bitta mahsulot yozuvi. `ID`, `Price`: `bigint` → `int64`; `Name`: `text` → `string`; `Stock`: `integer` → `int`. Narx tiyinda. `active` tanlanmaydi. `Store` pool manzilini saqlaydi; `*pgxpool.Pool` — pointer turi.
+
+```go filename="_video/stages/02-store.go" showLineNumbers
+package main
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	return p, err
+}
+```
+
+| Qatorlar | Nima qiladi |
+|---|---|
+| 1–7 | paket va kerakli importlar |
+| 9–14 | `Product` nomli struct, toʻrtta maydon |
+| 16–18 | `Store` ichidagi `pool` maydoni |
+| 20 | `s *Store` receiver; `ctx`, `id` kiradi; `Product`, `error` chiqadi |
+| 21 | natija uchun nol qiymatli `p` |
+| 22–24 | `QueryRow` bitta qator kutadi; `Scan` ustunlarni manzillarga yozadi |
+| 25–26 | mahsulot va xatoni chaqiruvchiga qaytaradi |
+
+`$1` — birinchi parametr oʻrni; keyingi `id` argumenti uning qiymati. Qiymat SQL matniga qoʻshilmaydi. Shu ajratish SQL injection'ni, yaʼni kiruvchi matn SQL tuzilishini oʻzgartirishini, toʻxtatadi. Foydalanuvchi qiymati uchun `fmt.Sprintf` ishlatmang. `&p.ID` — maydon manzili; `Scan` tartibi `SELECT` tartibi bilan bir xil. Qator oxiridagi nuqta metod chaqiruvini keyingi qatorda davom ettiradi.
+
+| Holat | `p.ID` | `p.Name` | `p.Price` | `p.Stock` |
+|---|---|---|---|---|
+| `var p Product` | 0 | `""` | 0 | 0 |
+| `Scan`dan keyin | 1 | `"olma"` | 1200000 | 40 |
+
+```go filename="_video/stages/03-main-get1.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+	p, err := store.Get(ctx, 1)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+}
+```
+
+Oldingi `main`ga yangi qatorlar: 20-da `&Store{pool: pool}` struct manzilini oladi; 21-da `Get(ctx, 1)` chaqiriladi. 22–25 xatoni tekshiradi. 26 maydonlarni chiqaradi. `olma` — mahsulot nomi. `go run .` joriy paketni yigʻib ishga tushiradi; `cp` esa video bosqichini ishchi faylga koʻchiradi.
+
+`Get(ctx, 1)` nima chiqaradi? **A)** jadvaldagi mahsulot · **B)** nol struct · **C)** ulanish xatosi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Jadvalda id 1 bor; `Scan` yuqoridagi toʻrtta maydonni toʻldiradi.
+
+</details>
+
+```console
+$ cp _video/stages/02-store.go store.go
+$ cp _video/stages/03-main-get1.go main.go
+$ go run .
+1 olma 1200000 40
+```
+
+Endi `Get(ctx, 99)`. Qoida: `QueryRow` natijasida qator boʻlmasa, `Scan` `pgx.ErrNoRows` qaytaradi. Nima chiqadi? **A)** nol mahsulot, xatosiz · **B)** xato · **C)** panic.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `no rows in result set` — natijada qator yoʻq. `QueryRow` xatosi `Scan`dan olinadi. Nol struct muvaffaqiyat degani emas; panic ham yoʻq.
+
+</details>
+
+```console
+$ cp _video/stages/04-main-get99.go main.go
+$ go run .
+xato: no rows in result set
+exit status 1
+```
+
+Chaqiruvchi drayver xatosiga bogʻlanmasin. GB-2.08'dagi sentinel — oldindan eʼlon qilingan xato qiymati — bilan almashtiramiz:
+
+```go
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// QueryRow(...).Scan(...) dan keyin:
+if errors.Is(err, pgx.ErrNoRows) {
+	return Product{}, ErrNotFound
+}
+return p, err
+```
+
+`errors.Is` moslikni tekshiradi; mos kelsa nol `Product{}` va `ErrNotFound`. Boshqa xato oʻzgarmaydi. Chaqiruvchi `errors.Is(err, ErrNotFound)` orqali HTTP 404 tanlashi mumkin.
+
+```console
+$ cp _video/stages/05-store.go store.go
+$ go run .
+xato: mahsulot topilmadi
+exit status 1
+```
+
+`mahsulot topilmadi` — mahsulot yoʻq. `exit status 1` — `main` xato haqida yozib, kod 1 bilan chiqdi. Bu panic emas.
+
+## Koʻp qator: Query, Next, Close va Err
+
+`ListActive` faol mahsulotlarni `id` tartibida qaytaradi. `Query` natijasi — `Rows`, yaʼni ketma-ket oʻqiladigan qatorlar. Quyida metodning asosiy qismi:
+
+```go
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+```
+
+1–5: soʻrov va uning xatosi; `WHERE active` rost qatorlarni tanlaydi. 6: `defer rows.Close()` erta qaytishda ham natijani yopadi. 7: `out := []Product{}` — boʻsh, `nil` boʻlmagan slice. 8: `Next()` navbatdagi qatorga oʻtadi. 9–12: har qatorni alohida `p`ga oʻqiydi, xatoda qaytadi. 13: `append` natijaga mahsulot qoʻshadi. 15: slice va `rows.Err()` qaytadi.
+
+| Amal | Joriy qator | `out` | Ulanish |
+|---|---|---|---|
+| `Query` | hali yoʻq | `[]` | band |
+| `Next` → `Scan` | olma | `[olma]` | band |
+| keyingi uch qator | non, choy, oʻrik | `[olma non choy oʻrik]` | band |
+| `Next` → false | tugadi | oʻzgarmaydi | qaytdi |
+
+`non` — non, `choy` — choy, `oʻrik` — oʻrik nomlari. `Next() == false` oddiy tugash yoki oʻqish xatosi boʻlishi mumkin. `rows.Err()` shu farqni beradi. `Next` oxirigacha oʻqilganda avtomatik yopadi; `defer Close` erta chiqishni ham qoplaydi. Natijani yopish ulanishni pool'ga qaytaradi.
+
+## Buyurtma jami: SUM, NULL va COALESCE
+
+GB-5.04'dagi SQL endi Go'dan chaqiriladi. `quantity * unit_price` — miqdor karra birlik narxi. `SUM(bigint)` natijasi `numeric`: aniq oʻnli son. pgx butun va `int64`ga sigʻadigan qiymatni oʻqiydi; kasr yoki sigʻmaydigan qiymat xato beradi.
+
+```go
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT SUM(quantity*unit_price) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+```
+
+`orderID` — buyurtma raqami, `total` — jami. 2-qator uni nol qiladi; 3–5 soʻrov javobini manziliga yozadi; 6 son va xatoni qaytaradi. Agregat `GROUP BY`siz bitta natija qatori beradi. Kirish qatori yoʻq boʻlsa, uning qiymati `NULL`.
+
+Buyurtma 99 yoʻq. `SUM` nima beradi? **A)** 0 · **B)** `NULL` · **C)** `pgx.ErrNoRows`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Natijada qator bor, lekin qiymat `NULL`. `int64` yoʻqlikni saqlay olmaydi. 1-buyurtma: `2*1200000 + 3*400000 = 3600000`. Nol va “qator yoʻq” javoblari ikki xil tushunchani aralashtiradi.
+
+</details>
+
+Bosqichdagi `main` avval `Get`, keyin roʻyxat, keyin ikkita `OrderTotal` natijasini chiqaradi. Toʻliq `main.go` keyingi boʻlimda. Bu safar xatoli `SUM` versiyasini oʻrnating:
+
+```console
+$ cp _video/stages/07a-store-sum.go store.go
+$ cp _video/stages/08-main-final.go main.go
+$ go run .
+1 olma 1200000 40
+1 olma 1200000 40
+2 non 400000 3
+3 choy 2500000 8
+4 oʻrik 3500000 2
+3600000 <nil>
+0 can't scan into dest[0] (col: sum): cannot scan NULL into *int64
+```
+
+`<nil>` — xato yoʻq. `dest[0]` — birinchi qabul qiluvchi, `col: sum` — SQL ustuni. `cannot scan NULL into *int64` — `NULL`ni `int64` manziliga yozib boʻlmaydi. Bosilgan `0` — boshlangʻich qiymat; xato borligi uchun uni hisoblangan jami deb olmang.
+
+```sql
+SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1
+```
+
+`COALESCE` birinchi `NULL` boʻlmagan qiymatni oladi: yigʻindi yoʻq boʻlsa 0. Bu laboratoriyaning qoidasi: 99 uchun ham jami 0. Buyurtma mavjudligini tekshirish alohida talab boʻlsa, uni alohida soʻrov bilan tekshiring.
+
+| Kirish | SQL natijasi | Go natijasi |
+|---|---|---|
+| 1-buyurtma, ikki qator | `SUM = 3600000` | `3600000, nil` |
+| 99, qator yoʻq | `SUM = NULL` | `0, Scan xatosi` |
+| 99, `COALESCE` bilan | 0 | `0, nil` |
+
+## Muddat: context.WithTimeout
+
+`context.Background()` muddatsiz. `WithTimeout` undan yangi `qctx` va resurslarni boʻshatadigan `cancel` funksiyasini oladi. Quyidagi toʻliq video bosqichi sekin soʻrovni ataylab yaratadi:
+
+```go filename="_video/stages/06-main-slow.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = pool.Exec(qctx, "SELECT pg_sleep(5)")
+	fmt.Println("xato:", err, time.Since(start).Round(time.Second))
+}
+```
+
+Yangi 21–25-qatorlar: `2*time.Second` — ikki soniya; `defer cancel()` resurslarni boʻshatadi. `time.Now()` boshlanish vaqtini saqlaydi. `Exec`da javob qatorlari oʻqilmaydi; `_` buyruq natijasini tashlaydi, `err` saqlanadi. `pg_sleep(5)` bazada besh soniya kutadi. `time.Since(start)` oʻtgan vaqt, `Round(time.Second)` soniyaga yaxlitlaydi.
+
+Nima chiqadi? **A)** 5 soniya, xatosiz · **B)** taxminan 2 soniya, muddat xatosi · **C)** darhol 0.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `qctx`ning muddati besh soniyalik soʻrovdan oldin tugaydi. `cancel()`ni faqat muddat tugashiga ishonib tashlab ketmang.
+
+</details>
+
+```console
+$ cp _video/stages/06-main-slow.go main.go
+$ go run .
+xato: timeout: context deadline exceeded 2s
+```
+
+`timeout: context deadline exceeded` — context muddati tugadi. Videoda ham, bu qayta yugurishda ham yaxlitlangan vaqt 2s: 5s kutishning taxminan 40 foizi. Yuk va rejalashtirish aniq vaqtni oʻzgartiradi. Muhimi, baza uyqusi emas, context kutishni chegaraladi; yigʻish vaqti bu oʻlchovga kirmaydi.
+
+| Vaqt | `qctx` | Go kutishi |
+|---|---|---|
+| 0s | faol | soʻrovda |
+| taxminan 2s | muddati tugadi | xato qaytadi |
+| undan keyin | tugagan | shu context bilan keyingi soʻrov ham xato |
+
+## Yakuniy fayllar va ishga tushirish
+
+Bu — kursdagi toʻliq `store.go`: yuqoridagi metodlar, `COALESCE` tuzatishi va vazifadagi ikkita yozilmagan metod. Yangi qismlar oxirida: `ByName` va `Cheapest` hozir ataylab xato qaytaradi.
+
+```go filename="store.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product — products jadvalidagi bitta qator (narx tiyinda, GB-1.03).
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64
+	Stock int
+}
+
+// ErrNotFound — jadvalda bunday mahsulot yoʻq (GB-2.08: chaqiruvchi errors.Is bilan tekshiradi).
+var ErrNotFound = errors.New("mahsulot topilmadi")
+
+// Store — products jadvaliga Go'dan kirish. pool bir vaqtda koʻp goroutine'dan ishlatilishi mumkin.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// Get id boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound.
+func (s *Store) Get(ctx context.Context, id int64) (Product, error) {
+	var p Product
+	err := s.pool.QueryRow(ctx,
+		"SELECT id, name, price, stock FROM products WHERE id = $1", id).
+		Scan(&p.ID, &p.Name, &p.Price, &p.Stock)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	return p, err
+}
+
+// ListActive faol mahsulotlarni id tartibida oʻqiydi.
+func (s *Store) ListActive(ctx context.Context) ([]Product, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, name, price, stock FROM products WHERE active ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OrderTotal bitta buyurtmaning jami summasini (tiyinda) hisoblaydi. Buyurtma yoʻq boʻlsa SUM NULL beradi: COALESCE uni nolga aylantiradi.
+func (s *Store) OrderTotal(ctx context.Context, orderID int64) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(quantity*unit_price), 0) FROM order_items WHERE order_id = $1", orderID).
+		Scan(&total)
+	return total, err
+}
+
+// ByName nom boʻyicha bitta mahsulotni oʻqiydi; yoʻq boʻlsa ErrNotFound. VAZIFA (TASK.md, 1-qadam).
+func (s *Store) ByName(ctx context.Context, name string) (Product, error) {
+	return Product{}, errors.New("ByName hali yozilmagan")
+}
+
+// Cheapest eng arzon n ta faol mahsulotni narx boʻyicha oʻsish tartibida oʻqiydi. VAZIFA (TASK.md, 2-qadam).
+func (s *Store) Cheapest(ctx context.Context, n int) ([]Product, error) {
+	return nil, errors.New("Cheapest hali yozilmagan")
+}
+```
+
+Yakuniy `main.go` har uch soʻrovga bitta `qctx` beradi. Demak, ikki soniya har metodga yangidan berilmaydi: uchalasi umumiy muddatni boʻlishadi. Alohida muddat kerak boʻlsa, har operatsiya uchun yangi context yarating.
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	store := &Store{pool: pool}
+
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	p, err := store.Get(qctx, 1)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+
+	products, err := store.ListActive(qctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	for _, p := range products {
+		fmt.Println(p.ID, p.Name, p.Price, p.Stock)
+	}
+
+	fmt.Println(store.OrderTotal(qctx, 1))
+	fmt.Println(store.OrderTotal(qctx, 99))
+}
+```
+
+Yangi qatorlar: `time` importi; 23–24 umumiy context; 32–39 roʻyxatni olish va `for _, p := range products` bilan chiqarish. `_` indeksni tashlaydi. 41–42 ikkita qaytgan qiymatni, jami va xatoni, `Println`ga uzatadi.
+
+Yakuniy ikki satr qanday? **A)** `3600000 <nil>` va `0 <nil>` · **B)** ikkita `ErrNotFound` · **C)** yana NULL xatosi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** 1-buyurtma yigʻindisi oʻsha; 99 uchun `COALESCE` NULL oʻrniga 0 beradi.
+
+</details>
+
+```console
+$ cp _video/stages/07-store.go store.go
+$ cp _video/stages/08-main-final.go main.go
+$ go run .
+1 olma 1200000 40
+1 olma 1200000 40
+2 non 400000 3
+3 choy 2500000 8
+4 oʻrik 3500000 2
+3600000 <nil>
+0 <nil>
+```
+
+Birinchi satr — `Get(1)`. Keyingi toʻrtta — `ListActive`. Oxirgi ikkita — 1 va 99 buyurtma jamisi. Ikkalasida ham xato yoʻq; 99 uchun 0 endi SQL'dagi qoida natijasi.
+
+## Chuqurroq (ixtiyoriy): bazadagi soʻrov bekor boʻldimi?
+
+pgx v5.13.0 bu xato yoʻlida ulanishni yopayotib asinxron `CancelRequest` ham yuboradi. Alohida 30s uyqu tajribasida qaytish 2.001s boʻldi. Darhol, 0.5s va 1s keyin kuzatuv ulanishi 0 faol uyqu soʻrovini koʻrdi. Bu — oʻz qayta tekshiruvimiz. Bekor qilish kafolat emas: “odatda” soʻzi zarur; xato qaytgan payt SQL darhol toʻxtadi deb hisoblamang.
+
+Probe kodi kurs papkasiga kirmaydi; bu qoʻshimcha oʻlchovning toʻliq dasturi quyida. `observer` kuzatadi, `victim` sekin soʻrovni bajaradi. `application_name` uni ajratadi. `pg_stat_activity`dagi `active` qatorlarni `count(*)` sanaydi; `time.Sleep` kuzatish oraligʻini beradi.
+
+Quyidagi qoʻshimcha dastur kurs papkasida yoʻq. Uni ishchi nusxada `probe/main.go` sifatida saqlang. `mkdir -p probe` shu papkani tayyorlaydi:
+
+```bash
+mkdir -p probe
+```
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func main() {
+	ctx := context.Background()
+	observer, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		panic(err)
+	}
+	defer observer.Close()
+	var kind string
+	err = observer.QueryRow(ctx, "SELECT pg_typeof(SUM(quantity*unit_price))::text FROM order_items WHERE order_id=1").Scan(&kind)
+	fmt.Println("SUM type:", kind, err)
+	for _, sql := range []string{"SELECT 1.5::numeric", "SELECT 9223372036854775808::numeric"} {
+		var n int64
+		err := observer.QueryRow(ctx, sql).Scan(&n)
+		fmt.Println(sql, n, err)
+	}
+	victim, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL")+"?application_name=gb505_timeout_probe")
+	if err != nil {
+		panic(err)
+	}
+	defer victim.Close()
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = victim.Exec(qctx, "SELECT pg_sleep(30)")
+	fmt.Printf("timeout elapsed=%.3fs err=%v\n", time.Since(start).Seconds(), err)
+	for _, wait := range []time.Duration{0, 500 * time.Millisecond, 500 * time.Millisecond} {
+		time.Sleep(wait)
+		var n int
+		err := observer.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE application_name='gb505_timeout_probe' AND state='active' AND query LIKE '%pg_sleep%'").Scan(&n)
+		fmt.Println("active sleepers:", n, err)
+	}
+	fmt.Println("default MaxConns:", observer.Config().MaxConns)
+}
+```
+
+`pg_typeof(... )::text` SQL turini matn qilib oʻqiydi. Ikkita qoʻshimcha SQL `numeric`ning kasr va diapazon xatolarini tekshiradi. `%v` xatoni, `%.3f` soniyani uch kasr bilan chiqaradi. `pool.Config().MaxConns` shu mashinada 12 boʻldi. Standart chegara — 4 va `runtime.NumCPU()`ning kattasi; bu tavsiya etilgan sozlama degani emas.
+
+```console
+$ go run ./probe
+SUM type: numeric <nil>
+SELECT 1.5::numeric 0 can't scan into dest[0] (col: numeric): cannot convert &{15 -1 false finite true} to integer
+SELECT 9223372036854775808::numeric 0 can't scan into dest[0] (col: numeric): 9223372036854775808 is out of range for int64
+timeout elapsed=2.001s err=timeout: context deadline exceeded
+active sleepers: 0 <nil>
+active sleepers: 0 <nil>
+active sleepers: 0 <nil>
+default MaxConns: 12
+```
+
+`numeric <nil>` — SQL turi va xatosiz javob. `cannot convert … to integer` — kasr butun songa oʻqilmadi. `out of range for int64` — butun son ham diapazonga sigʻmadi. `active sleepers: 0` — kuzatuv paytida shu dasturga tegishli faol uyqu yoʻq. Bu kuzatuvlar kelajakdagi har bir bekor qilish muvaffaqiyatiga kafolat bermaydi.
+
+## Koʻp uchraydigan xatolar
+
+**1. `rows.Close`ni unutib, qatorlarni yarmida tashlash.** Bu darsning asosiy xatosi. Quyidagi toʻliq dastur birinchi nomdan keyin qaytadi. `firstName` — birinchi mahsulot nomini oʻqish:
+
+```go filename="_video/leak/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// firstName: birinchi mahsulotning nomi
+func firstName(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	rows, err := pool.Query(ctx, "SELECT name FROM products ORDER BY id")
+	if err != nil {
+		return "", err
+	}
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var name string
+	err = rows.Scan(&name)
+	return name, err
+}
+
+func main() {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pool:", err)
+		os.Exit(1)
+	}
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for i := 1; i <= 2; i++ {
+		start := time.Now()
+		name, err := firstName(qctx, pool)
+		fmt.Println(i, name, err, time.Since(start).Round(time.Second))
+	}
+}
+```
+
+Yangi qatorlar: `firstName`dagi `!rows.Next()` — keyingi qator yoʻq; shunda `rows.Err()` qaytadi. `err = rows.Scan(&name)` yangi oʻzgaruvchi yaratmaydi, borini oʻzgartiradi. `main`dagi `for` ikki marta chaqiradi va har chaqiruv vaqtini chiqaradi. Bu buzilgan tajribada `pool.Close()` yoʻq: u qaytmagan ulanishni kutardi. Tuzatishdan keyin pool'ni ham yoping.
+
+Pool'da faqat bitta ulanish boʻlsin. Ikkinchi chaqiruv nima qiladi? **A)** tez tugaydi · **B)** boʻsh ulanishni kutadi, muddatda xato · **C)** yangi ulanish ochadi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Birinchi `Rows` hali ochiq va yagona ulanishni ushlab turibdi. `pool_max_conns=1` ikkinchi ulanishni taqiqlaydi. Soʻrov bu safar SQL bajarilishini emas, ulanishni kutdi.
+
+</details>
+
+URL'dagi `?pool_max_conns=1` pool chegarasi. Bir tirnoq shell'ning `?` belgisini talqin qilishini toʻxtatadi. `mkdir -p` ishchi `leak` papkasini tayyorlaydi:
+
+```console
+$ mkdir -p leak
+$ cp _video/leak/main.go leak/main.go
+$ export DATABASE_URL='postgres://bozor:bozor-lab@localhost:5475/bozor?pool_max_conns=1'
+$ go run ./leak
+1 olma <nil> 0s
+2  context deadline exceeded 2s
+```
+
+Ikkinchi satrda boʻsh nom sabab ikki boʻshliq bor. `context deadline exceeded` — muddat tugadi. Videoda ham, qayta tekshiruvda ham 0s/2s; 0s soniyaga yaxlitlangan, mutlaq nol emas. Muddat boʻlmasa, chaqiruv kutishda qoladi.
+
+Tuzatish — `Query` xatosi tekshirilgandan keyin bitta qator:
+
+```go
+defer rows.Close()
+```
+
+Tuzatishdan keyin ikkinchi chaqiruv? **A)** `olma`, xatosiz · **B)** 2s muddat xatosi · **C)** panic.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Birinchi funksiya qaytishida `defer` natijani yopib, yagona ulanishni qaytardi.
+
+</details>
+
+```console
+$ cp _video/leak-fixed/main.go leak/main.go
+$ go run ./leak
+1 olma <nil> 0s
+2 olma <nil> 0s
+```
+
+| Holat | Birinchi chaqiruvdan keyin | Ikkinchi chaqiruv |
+|---|---|---|
+| `Close` yoʻq | ulanish band | kutadi, 2s xato |
+| `defer Close` bor | ulanish boʻsh | olma, 0s |
+
+**2. `Next` false boʻlsa, har doim muvaffaqiyat deb olish.** Yuqoridagi `ListActive`dagi `rows.Err()`ni qaytaring: tarmoq yoki muddat xatosi yoʻqolmasin.
+
+**3. `NULL`dan keyingi 0'ni jami deb olish.** “Buyurtma jami” boʻlimidagi haqiqiy `Scan` xatosini tekshiring. Nol qoidasini SQL'da `COALESCE` bilan belgilang.
+
+**4. `$1` oʻrniga matn qoʻshish.** `name` va `n`ni SQL'dan keyingi argument sifatida bering. Parametr qiymat oʻrnini egallaydi, jadval yoki ustun nomini emas.
+
+**5. Tugagan `qctx`ni qayta ishlatish.** Muddat barcha chaqiruvlar uchun bir xil tugash vaqti. Keyingi mustaqil operatsiya uchun yangi context oling.
+
+## Oʻzingizni tekshiring
+
+**1.** `Get` id topmasa, chaqiruvchi nima oladi?
+
+<details>
+<summary>Javob</summary>
+
+`ErrNotFound`. `pgx.ErrNoRows` ombor ichida almashtirildi. Boshqa xatolar oʻzgarmay chiqadi.
+
+</details>
+
+**2.** `Rows` yarmida tashlansa, `rows.Close` unutilishi pool'ga qanday taʼsir qiladi?
+
+<details>
+<summary>Javob</summary>
+
+Ulanish band qoladi. Boʻsh ulanishlar tugagach boshqa soʻrovlar kutadi; context muddati boʻlsa xato bilan qaytadi.
+
+</details>
+
+**3.** GB-5.02: `5475:5432`ning chap raqami nimani bildiradi?
+
+<details>
+<summary>Javob</summary>
+
+Kompyuterdagi port. Oʻngdagi `5432` — konteyner porti; Go kompyuterdan `5475`ga ulanadi.
+
+</details>
+
+**4.** Bashorat: 99 uchun `SUM`ni `int64`ga toʻgʻridan oʻqisak nima boʻladi? **A)** `ErrNotFound` · **B)** `0, nil` · **C)** `Scan` xatosi.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Qator bor, qiymat `NULL`; `int64` uni qabul qilmaydi. `COALESCE`dan keyin javob B boʻladi.
+
+</details>
+
+## Uy vazifasi
+
+Shartlar: [kurs papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool) va [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-05-pgx-pool/TASK.md). Javob: [solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool/solution). Asl starter nusxasida `store.go`ni oʻzgartiring; `store_test.go`ni oʻzgartirmang.
+
+- 🟢 **ByName:** nomga koʻra bitta `Product`; topilmasa `ErrNotFound`. `$1` ishlating. `x' OR 'a'='a` va `olma'; DROP TABLE products; --` oddiy nom sifatida tekshiriladi.
+- 🟡 **Cheapest:** eng arzon `n` faol mahsulot; `ORDER BY price, id LIMIT $1`. Teng narxda `id` tartibi. Natija boʻlmasa, xatosiz `[]Product{}` qaytsin. `rows.Close`, `rows.Err` va ikkala metodda ham `ctx`ni unutmang.
+
+Bu darajalar yozma sahifa uchun qoʻyildi; TASK.md ikkala metodni ham talab qiladi. Testlar bekor qilingan contextni ham tekshiradi. Boʻsh slice JSON'da `[]`, nil slice esa `null` boʻladi.
+
+Bir ulanishli tajribadan qolgan URL'ni oddiy holatga qaytaring. `go test .` joriy paket testlarini bajaradi. Test har safar alohida vaqtinchalik schema yaratib, oxirida oʻchiradi. Baza ishlamasa, uni ishga tushirishni soʻrab yiqiladi; testni tashlab ketmaydi.
+
+```bash
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5475/bozor
+docker compose up -d --wait
+go test .
+```
+
+Starterdagi haqiqiy qayta tekshiruv: ikki yozilmagan metod sabab yiqiladi. Test nomi, vaqt, fayl va qator, kutilgan hamda olingan javob bosiladi:
+
+```console
+$ go test .
+--- FAIL: TestByName (0.04s)
+    store_test.go:130: ByName("choy") = {ID:0 Name: Price:0 Stock:0}, ByName hali yozilmagan; kutilgan: {3 choy 2500000 8}, nil (TASK.md, 1-qadam)
+--- FAIL: TestCheapest (0.04s)
+    store_test.go:154: Cheapest(2) = [], Cheapest hali yozilmagan; kutilgan: [non olma], nil (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.248s
+FAIL
+```
+
+<details>
+<summary>Javob</summary>
+
+`ByName` uchun `Get`dan boshlang: shart `WHERE name = $1`, qiymat `name`. `Scan` va `ErrNoRows` tarjimasi oʻsha. `Cheapest` uchun `ListActive`ni oling: SQL'ga `ORDER BY price, id LIMIT $1`, argumentga `n`. `out := []Product{}`ni saqlang. `solution/store.go`da toʻliq javob bor. Quyida javob modulini alohida tekshirdik; `cd` ishchi papkani almashtiradi.
+
+</details>
+
+```console
+$ cd solution && go test .
+ok  	github.com/abdurahmon27/bozor	0.220s
+```
+
+`&&` keyingi buyruqni faqat `cd` muvaffaqiyatli boʻlsa bajaradi. `ok` — testlar oʻtdi; modul yoʻli va vaqt undan keyin. Qayta tekshiruvda 0.220s, video yozuvida `(cached)` edi; test vaqti mavzuning oʻlchovi emas. Buyruqdan keyin yuqori papkaga qayting. `down -v` konteyner, tarmoq va shu laboratoriya maʼlumot volume'ini oʻchiradi:
+
+```bash
+cd ..
+docker compose down -v
+```
+
+## Manbalar
+
+- [pgx: Getting started](https://github.com/jackc/pgx/wiki/Getting-started-with-pgx)
+- [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)
+- [pgx: Query](https://pkg.go.dev/github.com/jackc/pgx/v5#Conn.Query)
+- [pgx: Rows](https://pkg.go.dev/github.com/jackc/pgx/v5#Rows)
+- [pgx: ErrNoRows](https://pkg.go.dev/github.com/jackc/pgx/v5#pkg-variables)
+- [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool)
+- [pgxpool: ParseConfig](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig)
+- [pgxpool: Acquire](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#Pool.Acquire)
+- [pgconn: cancellation](https://pkg.go.dev/github.com/jackc/pgx/v5/pgconn)
+- [pgconn v5.13.0 source: asyncClose](https://github.com/jackc/pgx/blob/v5.13.0/pgconn/pgconn.go)
+- [pgtype v5.13.0: numeric](https://github.com/jackc/pgx/blob/v5.13.0/pgtype/numeric.go)
+- [PostgreSQL 18: psql](https://www.postgresql.org/docs/18/app-psql.html)
+- [PostgreSQL 18: connections](https://www.postgresql.org/docs/18/connect-estab.html)
+- [PostgreSQL 18: connection URI](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNSTRING-URIS)
+- [PostgreSQL 18: protocol](https://www.postgresql.org/docs/18/protocol.html)
+- [PostgreSQL 18: extended query](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY)
+- [PostgreSQL 18: SUM](https://www.postgresql.org/docs/18/functions-aggregate.html)
+- [PostgreSQL 18: NULL](https://www.postgresql.org/docs/18/functions-comparison.html)
+- [PostgreSQL 18: COALESCE](https://www.postgresql.org/docs/18/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL)
+- [PostgreSQL 18: pg_sleep](https://www.postgresql.org/docs/18/functions-datetime.html#FUNCTIONS-DATETIME-DELAY)
+- [PostgreSQL 18: pg_stat_activity](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW)
+- [Go: context.WithTimeout](https://pkg.go.dev/context#WithTimeout)
+- [Go: errors.Is](https://pkg.go.dev/errors#Is)
+- [Go: os.Getenv](https://pkg.go.dev/os#Getenv)
+- [Go: go mod tidy](https://go.dev/ref/mod#go-mod-tidy)
+- [OWASP: SQL Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, pgx v5.13.0, PostgreSQL 18.7 (`postgres:18-alpine`), 2026-11-27. Konsol bloklari shu tekshiruvdan; video sonlari matnda alohida belgilandi.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-05-pgx-pool)
+
+---
+
+← Oldingi dars: [GB-5.04](/lab/youtube/gb/gb-5-04) · Keyingi dars: [GB-5.06](/lab/youtube/gb#gb-5-06) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
