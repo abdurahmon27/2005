@@ -1,0 +1,750 @@
+---
+title: "Essential SQL: CREATE TABLE, INSERT, SELECT and constraints"
+date: "2026/11/27"
+description: "Create products, select rows with SQL, and verify that NOT NULL, UNIQUE and CHECK reject invalid product data."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-03"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-03) · [Русский](/lab/youtube/gb/gb-5-03/ru) · **English**  
+Lesson GB-5.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-03) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The `bozor.json` file cannot prevent an empty name or a negative price from being written. Only our Go code checks those rules.
+If another program also writes data, where should the rules live?
+
+**The one idea:** a table's schema—its columns, types and rules—is a contract the database checks on every write.
+When a rule is broken, Postgres returns an error and does not store the invalid row.
+
+By the end of the lesson you will:
+
+- create the bozor `products` table with `CREATE TABLE`;
+- add rows with `INSERT`, then select them with `SELECT`, `WHERE`, `AND`, `ORDER BY` and `LIMIT`;
+- get the new database-generated `id` with `RETURNING`;
+- read `NOT NULL`, `UNIQUE` and `CHECK` errors, then add a rule against empty names.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| table | columns with names and types; each row is one product record | table |
+| `INSERT` / `SELECT` | write a new row / read existing rows | insert / select |
+| constraint | a rule that rejects invalid rows inside the database | constraint |
+
+## Before you start
+
+- [GB-5.02 · Docker Compose and psql](/lab/youtube/gb/gb-5-02/en): containers, named volumes, `psql` and its `-c` flag.
+- [GB-5.01 · Why a database is needed](/lab/youtube/gb#gb-5-01): a catalog written by several processes.
+- [GB-1.03 · Integers and money](/lab/youtube/gb/gb-1-03/en): prices stored in tiyin, using `int64`.
+- [GB-1.08 · The first test](/lab/youtube/gb/gb-1-08/en): `go test .`, `FAIL`, reading a filename and line number.
+- [GB-3.02 · JSON and persistence](/lab/youtube/gb/gb-3-02/en): `bozor.json`.
+- [GB-4.08 · Catalog API](/lab/youtube/gb/gb-4-08/en): the catalog in server memory.
+
+**Where it runs.** You need Docker with Compose and Go; Playground cannot run this lab.
+The course folder `lessons/gb-5-03-sql-jadval` contains SQL files, `compose.yaml`, `go.mod`, `TASK.md` and `solution/`.
+`tekshiruv_test.go` calls `psql` from Go; connecting to the database from Go is covered in [GB-5.05](/lab/youtube/gb#gb-5-05).
+
+Run the following Linux commands from the course repository root.
+`mktemp -d` creates a temporary directory; `cp -R` copies the lab; `cd` switches to that copy.
+`export` sets the environment for subsequent commands.
+`sed -i` changes only the copy's port to `15463`; choose another free port if this one is occupied.
+`COMPOSE_PROJECT_NAME` separates the container and volume names from other lessons.
+`CGO_ENABLED=0` avoids requiring a C compiler; `GOTOOLCHAIN` selects the Go version used for verification.
+
+```bash
+lab=$(mktemp -d)
+cp -R lessons/gb-5-03-sql-jadval "$lab/sql"
+cd "$lab/sql"
+export COMPOSE_PROJECT_NAME=gb503docs
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+sed -i 's/127.0.0.1:5463:5432/127.0.0.1:15463:5432/' compose.yaml
+```
+
+All subsequent commands run in this copy. The course files stay unchanged.
+The video used the project name `bozor`; here the container is `gb503docs-db-1`.
+Every console result was rerun, rather than quoted from the video; Compose progress lines vary between machines.
+
+First, recall GB-5.02: what happens to data in a named volume when you run `docker compose down` without `-v`?
+
+**A)** it is deleted · **B)** it stays in the volume · **C)** the container also stays
+
+<details>
+<summary>Answer</summary>
+
+**B.** The container is removed; the named volume remains. A confuses `down` with `down -v`; C confuses the container with its volume.
+
+</details>
+
+## Table: column names and types
+
+Start the database in the background: `-d` means detached mode, and `--wait` waits for it to become ready.
+`Healthy` means the health check passed.
+
+```console
+$ docker compose up -d --wait
+ Network gb503docs_default Creating 
+ Volume gb503docs_pgdata Creating 
+ Volume gb503docs_pgdata Creating 
+ Network gb503docs_default Creating 
+ Volume gb503docs_pgdata Created 
+ Volume gb503docs_pgdata Created 
+ Network gb503docs_default Created 
+ Network gb503docs_default Created 
+ Container gb503docs-db-1 Creating 
+ Container gb503docs-db-1 Created 
+ Container gb503docs-db-1 Starting 
+ Container gb503docs-db-1 Started 
+ Container gb503docs-db-1 Waiting 
+ Container gb503docs-db-1 Healthy 
+```
+
+This fragment from `compose.yaml` gives `psql` its user and database names; both are `bozor`.
+That lets us omit `-U bozor -d bozor` from each command.
+
+```yaml
+environment:
+  PGUSER: bozor
+  PGDATABASE: bozor
+```
+
+`docker compose exec -T db` runs a command inside the `db` container; `-T` disables terminal allocation.
+`psql -c` executes one command. `\dt` lists tables; it is a `psql` command, rather than SQL.
+The new volume has no tables yet:
+
+```console
+$ docker compose exec -T db psql -c '\dt'
+Did not find any tables.
+```
+
+`Did not find any tables` means the database has no matching tables.
+We begin with the video's file that defines only types. The main `products.sql` contains the final table with its rules.
+
+```sql filename="_video/01-oddiy/products.sql" showLineNumbers
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text,
+    price  bigint,
+    stock  integer,
+    active boolean
+);
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `CREATE TABLE products (` | creates `products`; the parentheses contain comma-separated columns |
+| 2 | `id bigint` | `id` is an 8-byte integer |
+| 3 | `GENERATED ALWAYS AS IDENTITY` | the database supplies the new row's `id` |
+| 4 | `PRIMARY KEY,` | the primary key identifies a row uniquely: no duplicates and no `NULL` |
+| 5 | `name text,` | the product name, as text |
+| 6 | `price bigint,` | price in tiyin; 8 bytes, the same size as Go's `int64` |
+| 7 | `stock integer,` | stock, a 4-byte integer |
+| 8 | `active boolean` | active status: a `true` or `false` value |
+| 9 | `);` | closes the column list and finishes the SQL statement |
+
+`NULL` means a missing value; [GB-5.04](/lab/youtube/gb#gb-5-04) covers it in detail.
+Apart from `id`, the columns have no business rules yet.
+`-f` executes a SQL file. Compose mounts our directory read-only as `/lab` inside the container.
+
+```console
+$ docker compose exec -T db psql -f /lab/_video/01-oddiy/products.sql
+CREATE TABLE
+```
+
+State change: no table → a table with five columns and zero rows.
+
+## INSERT: write four products
+
+Map each product's values to its columns. **`INSERT INTO`** specifies the destination table and columns.
+We omit `id`: the database generates it. Here is the complete course file `seed.sql`:
+
+```sql filename="seed.sql" showLineNumbers
+INSERT INTO products (name, price, stock, active)
+VALUES ('olma', 1200000, 40, true),
+       ('non', 400000, 3, true),
+       ('choy', 2500000, 8, true),
+       ('oʻrik', 3500000, 2, true);
+```
+
+Line 1 sets the column order. Line 2 starts with `VALUES`; each group of parentheses contains one row in that order.
+Lines 3–5 supply the remaining products; commas separate rows, and the final `;` ends the statement.
+`'olma'` is single-quoted text, the numbers are tiyin, and `true` marks an active product.
+The names mean apple (`olma`), bread (`non`), tea (`choy`) and apricot (`oʻrik`).
+
+How many rows will executing this file write?
+
+**A)** `1` · **B)** `4` · **C)** `5`, because there are five columns
+
+<details>
+<summary>Answer</summary>
+
+**B.** There are four parenthesized groups after `VALUES`. One statement can write several rows; the column count is not the row count.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+INSERT 0 4
+```
+
+In `INSERT 0 4`, `4` is the number of inserted rows. The first `0` is a historical field and is always zero now.
+**`SELECT`** reads rows; `*` means all columns, and `FROM products` names the source table.
+Which IDs will appear: **A)** all `0` · **B)** `1, 2, 3, 4` · **C)** no `id`?
+
+<details>
+<summary>Answer</summary>
+
+**B.** The new table's identity counter supplied the next number for each row. Omitting `id` from `INSERT` does not remove the column.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT * FROM products'
+ id | name  |  price  | stock | active 
+----+-------+---------+-------+--------
+  1 | olma  | 1200000 |    40 | t
+  2 | non   |  400000 |     3 | t
+  3 | choy  | 2500000 |     8 | t
+  4 | oʻrik | 3500000 |     2 | t
+(4 rows)
+```
+
+The first line gives column names; the separators draw the table; `(4 rows)` gives the row count.
+`t` in `active` means `true`. State change: zero rows → four products.
+Do not treat the displayed order as a guarantee: the next section makes ordering explicit.
+
+## SELECT: filter, sort and limit
+
+We need names and prices rather than the whole table. `SELECT name, price` returns only those two columns.
+`WHERE stock < 5` keeps only rows with stock below five; `<` means strictly less than.
+
+**A)** olma, choy · **B)** non, oʻrik · **C)** every product?
+
+<details>
+<summary>Answer</summary>
+
+**B.** non has stock `3`, and oʻrik has `2`; olma with `40` and choy with `8` fail the condition.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5'
+ name  |  price  
+-------+---------
+ non   |  400000
+ oʻrik | 3500000
+(2 rows)
+```
+
+`AND` requires both conditions to be true. What remains if we add `price > 1000000`?
+`>` means strictly greater than.
+
+**A)** non · **B)** oʻrik · **C)** non and oʻrik
+
+<details>
+<summary>Answer</summary>
+
+**B.** non costs `400000`, so it fails the new condition. oʻrik costs `3500000`; both conditions are true.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5 AND price > 1000000'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+(1 row)
+```
+
+`ORDER BY price DESC` sorts by decreasing price; omitting `DESC` gives ascending order.
+Without `ORDER BY`, Postgres does not guarantee the order of rows.
+
+```sql
+SELECT name, price
+FROM products
+WHERE stock < 5
+ORDER BY price DESC;
+```
+
+Which rows will appear, and in what order?
+
+**A)** non, oʻrik · **B)** oʻrik, non · **C)** olma, choy
+
+<details>
+<summary>Answer</summary>
+
+**B.** The filter is unchanged: oʻrik and non remain. `DESC` puts `3500000` before `400000`.
+A uses ascending order; C ignores the filter.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products WHERE stock < 5 ORDER BY price DESC'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+ non   |  400000
+(2 rows)
+```
+
+`LIMIT 2` allows at most two result rows.
+This time there is no `WHERE`: which are the two most expensive products in the whole table?
+
+**A)** oʻrik, choy · **B)** olma, non · **C)** oʻrik, non
+
+<details>
+<summary>Answer</summary>
+
+**A.** Decreasing prices are `3500000`, `2500000`, `1200000`, `400000`.
+`LIMIT` takes the first two rows of the sorted result; C incorrectly keeps the earlier filter.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name, price FROM products ORDER BY price DESC LIMIT 2'
+ name  |  price  
+-------+---------
+ oʻrik | 3500000
+ choy  | 2500000
+(2 rows)
+```
+
+| Step | Rows or result |
+|---|---|
+| `FROM products` | four products |
+| `WHERE stock < 5` | non and oʻrik |
+| `ORDER BY price DESC` | oʻrik, non |
+| `SELECT name, price` | only name and price in each row |
+
+This table explains the result; in SQL text, `SELECT` is written first.
+When prices tie, add a second key for a stable order: `ORDER BY price, id`.
+
+## Quotes: text or column name
+
+SQL text uses single quotes: `'olma'`. Double quotes delimit a name: `"olma"` is a column name.
+The outer shell quotes pass the SQL text as one argument; they are separate from SQL quoting.
+
+```sql
+SELECT name FROM products WHERE name = "olma";
+```
+
+What will this broken query do? `=` tests equality in SQL.
+
+**A)** find the apple · **B)** look for an `olma` column and fail · **C)** return every row
+
+<details>
+<summary>Answer</summary>
+
+**B.** The table has a `name` column, but no `olma` column. A confuses a text value with a column name.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c 'SELECT name FROM products WHERE name = "olma"'
+ERROR:  column "olma" does not exist
+LINE 1: SELECT name FROM products WHERE name = "olma"
+                                               ^
+```
+
+`column … does not exist` says the requested column is absent. `LINE 1` identifies the query line, and `^` marks the error position.
+The fix uses `'olma'` inside SQL and double quotes outside for the shell.
+Now one apple row is returned:
+
+```console
+$ docker compose exec -T db psql -c "SELECT name FROM products WHERE name = 'olma'"
+ name 
+------
+ olma
+(1 row)
+```
+
+## RETURNING: a new id and a missing rule
+
+We need to know which `id` the database assigned to a new product immediately.
+**`RETURNING id`** returns `id` from the inserted row. Using it from Go comes in GB-5.05.
+What ID will `sut` (milk) receive: **A)** `4` · **B)** `5` · **C)** no result?
+
+<details>
+<summary>Answer</summary>
+
+**B.** The four previous rows received `1`–`4`. `RETURNING` does not cancel the insert: `INSERT 0 1` below also confirms one inserted row.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('sut', 900000) RETURNING id"
+ id 
+----
+  5
+(1 row)
+
+INSERT 0 1
+```
+
+But a type does not check a business rule. `''` is text of length zero; `-5` is also a valid `bigint` value.
+`RETURNING *` returns all columns of the new row. What happens?
+
+**A)** the database rejects it · **B)** the row is inserted · **C)** the negative price becomes `0`
+
+<details>
+<summary>Answer</summary>
+
+**B.** So far `name` and `price` have only types. Those types forbid neither empty text nor a negative number; there is no automatic correction.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('', -5) RETURNING *"
+ id | name | price | stock | active 
+----+------+-------+-------+--------
+  6 |      |    -5 |       | 
+(1 row)
+
+INSERT 0 1
+```
+
+The blank `stock` and `active` cells are `NULL` here: no values were supplied, and there is no `DEFAULT`.
+But `name` is `''`, not `NULL`. Plain `psql` output can display both as blank cells.
+State change: five valid rows → six rows, one breaking the business rules.
+
+## Constraints: the database rejects invalid rows
+
+The price must be positive regardless of which program writes it.
+A **constraint** keeps that requirement in the table. Now use the main `products.sql`:
+
+```sql filename="products.sql" showLineNumbers
+DROP TABLE IF EXISTS products;
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text    NOT NULL UNIQUE,
+    price  bigint  NOT NULL CHECK (price > 0),
+    stock  integer NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    active boolean NOT NULL DEFAULT true
+);
+```
+
+| Line | New rule | Result |
+|---|---|---|
+| 1 | `DROP TABLE IF EXISTS products` | removes the table and all its rows if it exists |
+| 2–5 | `CREATE TABLE`, identity, `PRIMARY KEY` | a new table and primary key, as before |
+| 6 | `NOT NULL UNIQUE` | the name cannot be `NULL` or duplicated |
+| 7 | `NOT NULL CHECK (price > 0)` | price must be present and above zero |
+| 8 | `NOT NULL DEFAULT 0 CHECK (stock >= 0)` | omitted stock becomes `0`; negative stock is rejected |
+| 9 | `NOT NULL DEFAULT true` | omitted active status becomes `true`; explicit `NULL` is rejected |
+| 10 | `);` | ends the table definition |
+
+`>=` means greater than or equal to. `DEFAULT` supplies an omitted column's value; it does not replace an explicit `NULL`.
+`CHECK (condition)` rejects a row when the condition is false; a `NULL` result passes.
+That is why required values also need `NOT NULL`. `PRIMARY KEY` supplies that requirement for `id`.
+
+| Write path | What is checked | If a rule is broken |
+|---|---|---|
+| value type | compatibility with `bigint`, `text`, `integer`, `boolean` | error |
+| `NOT NULL` | missing value | error |
+| `CHECK` | condition is false | error |
+| `UNIQUE` | duplicate of an existing row's value | error |
+| storage | every requirement passed | new row |
+
+This is the path observed on PostgreSQL 18.7; the order of checks is not a guarantee applications should rely on.
+An error does not leave half an invalid row stored; do not expect the first message to list every problem.
+
+Recreating the table deletes its six old rows. Then reload the four products:
+
+```console
+$ docker compose exec -T db psql -f /lab/products.sql
+DROP TABLE
+CREATE TABLE
+```
+
+```console
+$ docker compose exec -T db psql -f /lab/seed.sql
+INSERT 0 4
+```
+
+Changing tables without dropping them comes in [GB-5.06](/lab/youtube/gb#gb-5-06).
+What happens to the `('', -5)` row now?
+
+**A)** a `NOT NULL` error for the empty name · **B)** a `CHECK` error for the price · **C)** both errors
+
+<details>
+<summary>Answer</summary>
+
+**B.** `''` is a present value, so it passes `NOT NULL`. But price `-5` violates `price > 0`.
+C assumes one error message lists every broken rule.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('', -5)"
+ERROR:  new row for relation "products" violates check constraint "products_price_check"
+DETAIL:  Failing row contains (5, , -5, 0, t).
+```
+
+`new row for relation … violates check constraint` says the table's new row broke its CHECK rule.
+Here `relation` means table; `products_price_check` is the rule's name.
+`DETAIL` shows the rejected row: `id=5`, empty text for the name, price `-5`, stock `0` and active status `t`.
+`DEFAULT` supplied the last two values. The table still contains four rows.
+
+To reject empty text too, add this to line 6; you will do it in the homework:
+
+```sql
+name   text    NOT NULL UNIQUE CHECK (name <> ''),
+```
+
+`<>` means not equal. `''` is two adjacent single quotes: empty text.
+This rule does not check names consisting of spaces; today's task concerns exactly empty text.
+
+Mid-lesson question: the table already has `choy`. What happens when another `choy` is inserted at a different price?
+
+**A)** a second row is added · **B)** the old price is updated · **C)** a `UNIQUE` error
+
+<details>
+<summary>Answer</summary>
+
+**C.** The rule applies to the name, not the price. `INSERT` tries to add a new row; it does not update an existing row's price.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('choy', 2600000)"
+ERROR:  duplicate key value violates unique constraint "products_name_key"
+DETAIL:  Key (name)=(choy) already exists.
+```
+
+`duplicate key value` means a repeated key value; `already exists` identifies the value already present.
+`products_name_key` is the uniqueness rule for the name. No row was added.
+
+How is an explicit `NULL` name checked?
+
+**A)** `NOT NULL` rejects it · **B)** `DEFAULT` creates a name · **C)** it is the same as empty text
+
+<details>
+<summary>Answer</summary>
+
+**A.** `NULL` is an absent value; `''` is present text. There is no `DEFAULT` for `name` either.
+A `CHECK` alone is not enough to reject `NULL`.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES (NULL, 900000)"
+ERROR:  null value in column "name" of relation "products" violates not-null constraint
+DETAIL:  Failing row contains (7, null, 900000, 0, t).
+```
+
+`null value in column "name" … violates not-null constraint` says `NULL` in `name` broke the NOT NULL rule.
+The row in `DETAIL` was not stored either. Four products remain in the table.
+
+## Going deeper (optional): gaps between IDs
+
+An identity number is allocated before the row is checked. Rejecting the row does not reclaim that number.
+Three `INSERT` statements were rejected. What appears when we insert `sut` and request its `id` now?
+
+**A)** `5` · **B)** `8` · **C)** `4`
+
+<details>
+<summary>Answer</summary>
+
+**B.** Those attempts received `5`, `6` and `7` from the identity counter before constraint checking.
+Rejecting a row does not move the counter back. A confuses the row count with the next `id`.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "INSERT INTO products (name, price) VALUES ('sut', 900000) RETURNING id"
+ id 
+----
+  8
+(1 row)
+
+INSERT 0 1
+```
+
+| Action | ID allocated | Rows in the table |
+|---|---|---|
+| initial products | `1`–`4` | `4` |
+| invalid price | `5` | `4` |
+| duplicate name | `6` | `4` |
+| `NULL` name | `7` | `4` |
+| sut | `8` | `5` |
+
+`id` identifies a row; it is neither a product count nor a gapless position number.
+Do not rely on consecutive IDs. This behavior comes from the sequence counter used by identity.
+
+## Common mistakes
+
+1. **“NOT NULL also rejects empty names.”** In the `VALUES ('', -5)` experiment, `CHECK` rejected the price; the name passed `NOT NULL`.
+   Fix: add `CHECK (name <> '')` to `name` and keep `NOT NULL` for `NULL`.
+2. **Double-quoting text.** The Quotes section showed the `WHERE name = "olma"` error.
+   `column "olma" does not exist` means the database looked for a column. Fix: `WHERE name = 'olma'`.
+3. **Expecting INSERT to update an old row.** The duplicate `choy` caused a `UNIQUE` error; its old price stayed unchanged.
+   Use `INSERT` to add new rows.
+4. **Relying on the displayed order.** Without `ORDER BY`, order is unspecified. State the required column and add `id` to break ties.
+5. **Expecting recreation to preserve data.** `DROP TABLE` removes the rows too.
+   This lab reloaded `seed.sql`; changing a system with existing data is the topic of GB-5.06.
+
+## Check yourself
+
+1. In the constrained table, which rule rejects `('', -5)`, and which lets it through?
+
+<details>
+<summary>Answer</summary>
+
+`CHECK (price > 0)` rejects it; `name NOT NULL` accepts empty text.
+This is the table before the homework's additional `CHECK` is added.
+
+</details>
+
+2. What order do rows have without `ORDER BY`?
+
+<details>
+<summary>Answer</summary>
+
+There is no guaranteed order. Seeing insertion order once does not mean the next query will return that order.
+
+</details>
+
+3. Predict: with only the four products from `seed.sql`, what does `SELECT name, price FROM products WHERE stock < 5 ORDER BY price DESC` return?
+
+<details>
+<summary>Answer</summary>
+
+oʻrik (`3500000`), then non (`400000`). `WHERE` filters by stock; `ORDER BY` sorts the remaining rows by price.
+The question specifies the initial four-row state; the later additional `INSERT` statements are excluded.
+
+</details>
+
+4. What happens to the GB-4.08 catalog when its server stops? What about this table?
+
+<details>
+<summary>Answer</summary>
+
+The API catalog was in memory: stopping the server loses it.
+This table is stored in the database's named volume; recreating the container does not delete it. `down -v` removes the volume too.
+
+</details>
+
+## Homework
+
+Use the [course folder and TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval).
+The README does not assign levels; the markers below suggest a level for each of its two steps.
+
+- 🟢 `products.sql`: add `CHECK (name <> '')` to `name`. Keep the other columns unchanged.
+- 🟡 `arzon.sql` (“cheap”): write one `SELECT`. Return `name` and `price` for the two cheapest active products priced strictly below `3000000` tiyin.
+  Sort by increasing price and return at most two rows. `WHERE active` keeps rows whose `active` is true.
+
+`go test .` runs this folder's tests; they use separate temporary schemas and remove them afterward.
+The lesson's rows in `public` do not affect the checks. Docker must be running; the tests do not silently skip an unavailable database.
+Here is the actual result for the unfinished copy:
+
+```console
+$ go test .
+--- FAIL: TestConstraintlar (1.50s)
+    --- FAIL: TestConstraintlar/boʻsh_nom (0.19s)
+        tekshiruv_test.go:95: boʻsh nom: qator qabul qilindi, baza rad etishi kerak edi. products.sql'da name ustuniga CHECK (name <> '') qoʻshing (TASK.md, 1-qadam)
+--- FAIL: TestArzon (0.00s)
+    tekshiruv_test.go:108: arzon.sql'da SELECT yoʻq: faol mahsulotlardan narxi 3 000 000 tiyindan kam boʻlgan eng arzon ikkitasini tanlang (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	1.507s
+FAIL
+```
+
+`TestConstraintlar/boʻsh_nom` (“constraints / empty name”) checks the first task; `tekshiruv_test.go:95` is where the message was written.
+`TestArzon` (“cheap”) checks the second: the file has no query yet. Failure is expected until both issues are fixed.
+
+<details>
+<summary>Answer</summary>
+
+[Solution files](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval/solution).
+Only the `name` line changes in `products.sql`:
+
+```sql
+name   text    NOT NULL UNIQUE CHECK (name <> ''),
+```
+
+The complete `arzon.sql`:
+
+```sql filename="solution/arzon.sql" showLineNumbers
+SELECT name, price
+FROM products
+WHERE active AND price < 3000000
+ORDER BY price, id
+LIMIT 2;
+```
+
+Line 1 selects the columns; line 2 names the source table; line 3 checks active status and price together.
+Line 4 sorts by ascending price, using `id` to break ties; line 5 limits the result.
+The test catalog also contains active `qand` (sugar, `1100000`) and inactive `sut` (milk, `900000`).
+Its expected answer is therefore `non|400000`, then `qand|1100000`.
+The second dataset compares prices `2999999`, `3000000`, `3000001`: the boundary value `3000000` is excluded.
+
+After completing your attempt, you can also check by copying the answer over the lab copy. `cp` replaces two SQL files and prints nothing:
+
+```console
+$ cp solution/products.sql solution/arzon.sql .
+
+```
+
+```console
+$ go test .
+ok  	github.com/abdurahmon27/bozor	3.087s
+```
+
+The lesson preparation log records a solution check of `3.659s`; this rerun took `3.087s`, about `0.84×` the time.
+This is not a speed benchmark: machine load and Docker overhead vary; the useful result is that both tasks passed.
+
+</details>
+
+When finished, this command removes the `gb503docs` container and volume, including the practice data:
+
+```console
+$ docker compose down -v
+ Container gb503docs-db-1 Stopping 
+ Container gb503docs-db-1 Stopped 
+ Container gb503docs-db-1 Removing 
+ Container gb503docs-db-1 Removed 
+ Volume gb503docs_pgdata Removing 
+ Network gb503docs_default Removing 
+ Volume gb503docs_pgdata Removed 
+ Network gb503docs_default Removed 
+```
+
+## Sources
+
+- [CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html), [column types and sizes](https://www.postgresql.org/docs/18/datatype-numeric.html).
+- [Identity columns](https://www.postgresql.org/docs/18/ddl-identity-columns.html), [sequences and non-reclaimed numbers](https://www.postgresql.org/docs/18/functions-sequence.html).
+- [INSERT and its command tag](https://www.postgresql.org/docs/18/sql-insert.html), [RETURNING](https://www.postgresql.org/docs/18/dml-returning.html).
+- [SELECT](https://www.postgresql.org/docs/18/sql-select.html), [table expressions and WHERE](https://www.postgresql.org/docs/18/queries-table-expressions.html), [ORDER BY](https://www.postgresql.org/docs/18/queries-order.html), [AND](https://www.postgresql.org/docs/18/functions-logical.html).
+- [Constraints](https://www.postgresql.org/docs/18/ddl-constraints.html), [NOT NULL](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-NOT-NULL), [CHECK](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS), [UNIQUE](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-UNIQUE-CONSTRAINTS).
+- [Text and quoted names](https://www.postgresql.org/docs/18/sql-syntax-lexical.html), [comparisons and NULL](https://www.postgresql.org/docs/18/functions-comparison.html).
+- [psql](https://www.postgresql.org/docs/18/app-psql.html), [PGUSER and PGDATABASE](https://www.postgresql.org/docs/18/libpq-envars.html).
+- [Compose up and --wait](https://docs.docker.com/reference/cli/docker/compose/up/), [Compose down and -v](https://docs.docker.com/reference/cli/docker/compose/down/).
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL `18.7` (`postgres:18-alpine`), Docker `29.8.1`, Compose `5.4.0`, on 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-03-sql-jadval)
+
+---
+
+← Previous lesson: [GB-5.02](/lab/youtube/gb/gb-5-02/en) · Next lesson: [GB-5.04](/lab/youtube/gb#gb-5-04) → · [All lessons](/lab/youtube/gb)
+
+</div>

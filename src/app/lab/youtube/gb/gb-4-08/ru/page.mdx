@@ -1,0 +1,969 @@
+---
+title: "Контрольная точка: API каталога (CRUD, тесты, чистый -race)"
+date: "2026/11/27"
+description: "Соберите API каталога bozor, сопоставьте ошибки хранилища со статусами HTTP, проверьте маршруты и исправьте утечку указателя из-под блокировки."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-08"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-08) · **Русский** · [English](/lab/youtube/gb/gb-4-08/en)  
+Урок GB-4.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-08) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+К каталогу bozor могут одновременно прийти сотни запросов. Как сервер, маршруты, JSON-функции и хранилище безопасно работают с одним каталогом? Где каждая ошибка должна превращаться в HTTP-ответ?
+
+**Одна идея:** запрос проходит один путь: сервер → mux → обработчик → хранилище под блокировкой → ответ. Блокировка защищает обращения, пока удерживается. Возвращайте из хранилища копии, чтобы JSON-кодирование не читало общие данные после снятия блокировки.
+
+К концу урока вы:
+
+- соберёте `cmd/api` поверх каталога из модуля 3;
+- будете сопоставлять ошибки хранилища со статусами HTTP в одном месте;
+- проверите маршруты через настоящий mux и найдёте гонку, которую пропускают обычные тесты;
+- добавите `DELETE /products/{id}` со своим тестом.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| соединение частей API | серверу, mux и обработчикам передают один каталог | API wiring |
+| сопоставление ошибок хранилища | одна функция выбирает статус HTTP для ошибки хранилища | store error mapping |
+| копия значения | обработчик получает собственный `Product`, а не указатель внутрь каталога | value copy |
+
+**CRUD** — создание, чтение, изменение и удаление. Здесь заказ изменяет остаток; удаление станет вашим заданием. Два вспомогательных статуса: **500 Internal Server Error** — непредвиденная ошибка сервера, **204 No Content** — успех без тела ответа.
+
+## Что нужно знать заранее
+
+Эта контрольная точка объединяет предыдущие уроки:
+
+- [GB-4.07 · Мьютекс и гонки](/lab/youtube/gb/gb-4-07/ru): горутины, `sync.Mutex`, `Lock`, `defer Unlock`, гонка данных, race detector и deadlock в итераторе.
+- [GB-4.03 · Обработчик и httptest](/lab/youtube/gb/gb-4-03/ru): `w`, `r`, recorder, заголовки → статус → тело.
+- [GB-4.04 · Первый сервер](/lab/youtube/gb/gb-4-04/ru), [GB-4.05 · Маршруты и id](/lab/youtube/gb/gb-4-05/ru), [GB-4.06 · JSON на входе и выходе](/lab/youtube/gb/gb-4-06/ru): настройки сервера, паттерны, `PathValue`, строгое чтение и валидация.
+- [GB-4.01 · Текст HTTP-запроса](/lab/youtube/gb/gb-4-01/ru): `curl`, методы HTTP и код статуса.
+- [GB-3.06 · bozor CLI v0](/lab/youtube/gb/gb-3-06/ru), [GB-3.05 · Итераторы](/lab/youtube/gb/gb-3-05/ru), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/ru): `Store`, `Load`, `All`, `yield`, `slices.Clone`, `slices.Collect`, теги структуры, `[]` и `null`.
+- [GB-2.04 · Указатели](/lab/youtube/gb/gb-2-04/ru), [GB-2.05 · Методы](/lab/youtube/gb/gb-2-05/ru), [GB-2.06 · Пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/ru): `*Store`, `&`, `*p`, `internal/`, `errors.Is`, `errors.As`, `%w`.
+- [GB-1.08 · Табличные тесты](/lab/youtube/gb/gb-1-08/ru), [GB-1.05 · if и switch](/lab/youtube/gb/gb-1-05/ru), [GB-1.03 · Целые числа и деньги](/lab/youtube/gb/gb-1-03/ru): `t.Run`, `switch` без выражения, переполнение, цены в тийинах.
+
+**Запускайте код локально в папке курса** [lessons/gb-4-08-katalog-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api). В ней свой `go.mod` (`go 1.27`), используется только стандартная библиотека. Примерам нужны её файлы и HTTP-сервер, поэтому работайте в этой папке, а не в Playground.
+
+Для той же версии Go, что на странице, задайте переменные в каждом терминале перед запуском команд:
+
+```bash
+export GOTOOLCHAIN=go1.27.4
+export CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` выбирает версию инструментов Go; `CGO_ENABLED=0` отключает интеграцию с C. На этой машине нет `gcc`. Все приведённые ниже запуски с `-race` я повторил через скрипт урока `./_video/race.sh` в Docker: в образе есть `gcc`, а подключённый набор инструментов — Go 1.27.4. Сам Docker разбирается в [GB-5.02](/lab/youtube/gb/gb-5-02/ru).
+
+`./_video/run.sh final <команда>` копирует урок во временную папку без проверок домашнего задания. `01-pointer` дополнительно подставляет прежний `Get`, возвращающий указатель; `solution` выбирает решение. Скрипты дописывают `(chiqish kodi: N)` («код выхода»): `0` — успех, `1` — ошибка. В стартовой папке есть `tekshiruv_test.go`; до выполнения задания её тесты намеренно падают.
+
+Вспомните [GB-4.07](/lab/youtube/gb/gb-4-07/ru): `All` вызывает `yield` под блокировкой, а тело цикла вызывает `Sell`. Что произойдёт?
+
+**A)** гонка данных · **B)** deadlock · **C)** `Sell` подождёт, затем всё завершится
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Sell` ждёт блокировку, которую удерживает `All`. `All` не может снять её до возврата из тела цикла. **A** смешивает несинхронизированные обращения с ожиданием; **C** упускает, что ни один вызов не может завершиться. Это вопрос из GB-4.07, здесь пример повторно не запускался. Ниже исправим `All`.
+
+</details>
+
+## Один каталог, один путь запроса
+
+Код — CLI из модуля 3 и новая точка входа по HTTP:
+
+| Файл | Задача |
+|---|---|
+| `cmd/bozor/` | существующий CLI |
+| `cmd/api/main.go` | загрузить каталог и запустить сервер |
+| `cmd/api/handlers.go` | `api`, маршруты, обработчики, чтение ID и сопоставление ошибок |
+| `cmd/api/json.go` | JSON-функции из GB-4.06 |
+| `cmd/api/api_test.go` | тесты маршрутов, остатка, сервера и параллельных обращений |
+| `internal/store/store.go` | товары и правила остатков, теперь под мьютексом |
+| `internal/store/file.go` | `Load` и атомарный `Save` из GB-3.06 |
+| `internal/store/restock_test.go` | тесты прежнего задания на пополнение остатка |
+| `cmd/api/tekshiruv_test.go`, `internal/store/tekshiruv_test.go` | проверки нового задания |
+
+| Этап | Вход → действие → результат |
+|---|---|
+| `http.Server` | соединение → прочитать заголовки запроса за 5 секунд → mux |
+| `ServeMux` | метод и путь → выбрать паттерн → обработчик |
+| обработчик | путь или тело → прочитать и проверить → вызов хранилища |
+| хранилище | захватить `mu` → прочитать или изменить каталог → скопировать результат → освободить `mu` |
+| ответ | успех → `writeJSON`; ошибка хранилища → `writeStoreError` |
+
+Сначала фрагмент соединения частей из `handlers.go`:
+
+```go
+type api struct {
+	st *store.Store
+}
+
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{st: st}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.HandleFunc("GET /products", a.listProducts)
+	mux.HandleFunc("GET /products/{id}", a.getProduct)
+	mux.HandleFunc("POST /products", a.createProduct)
+	mux.HandleFunc("POST /orders", a.createOrder)
+	// VAZIFA (TASK.md, 2-qadam): DELETE /products/{id} → a.deleteProduct
+	return mux
+}
+```
+
+| Код | Что делает |
+|---|---|
+| `type api struct`, `st *store.Store` | зависимости обработчиков; `st` указывает на единственный каталог |
+| `newMux(st *store.Store) *http.ServeMux` | принимает этот каталог и возвращает mux |
+| `a := &api{st: st}` | создаёт `api`; полю `st` присваивается аргумент `st` |
+| `http.NewServeMux()` | создаёт отдельную таблицу маршрутов |
+| пять вызовов `HandleFunc` | регистрируют проверку состояния, список, один товар, создание товара и заказ |
+| `a.listProducts` | **значение метода** (method value): функция, связанная с `a`; скобок нет, регистрация её не вызывает |
+| комментарий задания, `return mux` | отмечает отсутствующий маршрут удаления, затем возвращает настроенный mux |
+
+Глобального каталога нет. Каждый тест передаёт в `newMux` своё хранилище, поэтому заказ в одном тесте не меняет начальный остаток другого. `healthHandler` каталог не нужен: он возвращает обычный текст `ok`.
+
+Полный `main.go`:
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor katalog API'si (GB-4.08, 4-modul nazorat nuqtasi): GB-3.06'dagi internal/store
+// katalogi HTTP orqali. Katalog ishga tushishda bozor.json'dan oʻqiladi (CLI yozgan fayl) va keyin
+// xotirada turadi: API'dagi oʻzgarishlar faylga yozilmaydi, server toʻxtasa yoʻqoladi.
+// Saqlash Postgres'ga 5-modulda koʻchadi (GB-5.01: nega baza kerak).
+//
+//	go run ./cmd/api        → bozor API: http://localhost:8765
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+const dataFile = "bozor.json"
+
+// newServer — bozor API serveri (GB-4.04): route'lar newMux'da (GB-4.05), sarlavhalar uchun vaqt chegarasi.
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newMux(st),
+		ReadHeaderTimeout: 5 * time.Second, // soʻrov sarlavhalari 5 s'da kelmasa, ulanish yopiladi
+	}
+}
+
+func main() {
+	st, err := store.Load(dataFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	srv := newServer(":8765", st)
+	fmt.Println("bozor API: http://localhost:8765")
+	err = srv.ListenAndServe()
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Строки | Что делают |
+|---|---|
+| 1–6 | комментарии описывают API в памяти и команду запуска |
+| 7–16 | `package main`; импорты пакетов вывода, HTTP, процесса, времени и `internal/store` |
+| 18 | `dataFile` задаёт относительное имя файла `bozor.json` |
+| 20–27 | `newServer`: адрес из аргумента, `Handler: newMux(st)`, предел чтения заголовков `5 * time.Second` |
+| 29–34 | `main` вызывает `store.Load`; ошибка загрузки выводится в `os.Stderr`, код выхода 1 |
+| 35–36 | создать сервер на `:8765` и вывести его адрес |
+| 37–40 | `ListenAndServe` ждёт запросы; при возврате вывести его ненулевую ошибку; программа завершается |
+
+`bozor.json` читается только при старте. Изменения API остаются в памяти и исчезают при остановке процесса. `Save` на каждый запрос не вызывается. Постоянное хранение появится в модуле 5.
+
+## Запустите маршруты и прочитайте ответы
+
+Я проверил, что локальный порт `8765` свободен, запустил API и остановил его после запросов. Запускайте в первом терминале из корня папки урока:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+`go run ./cmd/api` собирает и запускает пакет. Оставьте его работающим; для `curl` используйте второй терминал. `-s` скрывает индикатор прогресса, `-i` добавляет заголовки ответа, `-d` передаёт тело и выбирает POST, `-X DELETE` явно выбирает DELETE. В выводе заголовков `…` заменяет `Date`, `Content-Length` и, где он есть, `X-Content-Type-Options`.
+
+ID каталога взяты из GB-3.06: `olma` («яблоко») 1, `non` («хлеб») 2, `choy` («чай») 3, `oʻrik` («абрикос») 4. В небольших лабораторных примерах ID были другими. Прочитайте абрикос:
+
+```console
+$ curl -s localhost:8765/products/4
+{"id":4,"name":"oʻrik","price":3500000,"stock":2}
+```
+
+`price` указан в тийинах: `3500000` означает 35 000 сумов; `stock` — 2 штуки.
+
+Предскажите: заказ запрашивает 5 штук товара 4. Валидация количества разрешает 1–100, но остаток равен 2. Какой статус?
+
+**A)** 422 · **B)** 409 · **C)** 201
+
+<details>
+<summary>Ответ</summary>
+
+**B: 409 Conflict.** Пять — допустимое количество, но запрос противоречит текущему остатку. **A** относится к недопустимому количеству, например нулю; **C** означал бы успех без достаточного остатка. Это выбранный контракт статусов нашего API.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/orders -d '{"product_id":4,"quantity":5}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+…
+
+{"error":{"code":"insufficient_stock","message":"oʻrik: qoldiq 2, soʻralgan 5"}}
+```
+
+`insufficient_stock` — стабильный код ошибки; узбекское сообщение означает «абрикос: остаток 2, запрошено 5». Опции `-H Content-Type` нет: этот сервер не проверяет тип содержимого запроса и читает тело как JSON. Демонстрационный сервер из GB-4.01 проверял его; там был другой контракт.
+
+Теперь закажите оставшиеся 2 штуки. Предскажите общую сумму и следующий остаток:
+
+**A)** `7000000`, остаток 0 · **B)** `70000`, остаток 0 · **C)** ошибка, остаток 2
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `3500000 × 2 = 7000000` тийинов, то есть 70 000 сумов. Заказ забирает обе штуки. **B** смешивает тийины и сумы; **C** забывает, что купить ровно весь остаток разрешено.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/orders -d '{"product_id":4,"quantity":2}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+…
+
+{"product_id":4,"quantity":2,"total":7000000}
+$ curl -s localhost:8765/products/4
+{"id":4,"name":"oʻrik","price":3500000,"stock":0}
+```
+
+Неизвестный путь не попадёт в наши обработчики. Предскажите статус и формат: **A)** 404 текст · **B)** 404 JSON · **C)** 200.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `ServeMux` сам пишет обычный текст 404. **B** предполагает вызов `writeError`; **C** потребовал бы подходящего обработчика успешного ответа.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/narsalar
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+…
+
+404 page not found
+```
+
+До выполнения задания для `/products/{id}` есть только GET. Что вернёт DELETE?
+
+**A)** 404 · **B)** 405 текст · **C)** 405 в нашем JSON-формате ошибки
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Путь подходит, метод — нет. Mux пишет `405 Method Not Allowed` и `Allow: GET, HEAD`; GET разрешает также HEAD. **A** смешивает путь и метод; **C** снова предполагает, что сработал наш обработчик.
+
+</details>
+
+```console
+$ curl -s -i -X DELETE localhost:8765/products/1
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+…
+
+Method Not Allowed
+```
+
+У собственных ответов mux 404 и 405 правильные статус и заголовок `Allow`. Для превращения их в JSON нужен слой вокруг mux — **middleware**, он разбирается в [GB-6.01](/lab/youtube/gb#gb-6-01). Универсальный паттерн (catch-all) `"/"` без метода перехватит и неверные методы, нарушив поведение 405.
+
+Ещё три запроса из README тоже запущены повторно. Предсказание: **422 ошибка значения**, **400 неверный ID**, затем **201 с `Location: /products/5`**.
+
+```console
+$ curl -s localhost:8765/products -d '{"name":"","price":-5}'
+{"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+$ curl -s localhost:8765/products/abc
+{"error":{"code":"bad_id","message":"id butun son boʻlishi kerak"}}
+$ curl -s -i localhost:8765/products -d '{"name":"anor","price":1800000,"stock":7}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /products/5
+…
+
+{"id":5,"name":"anor","price":1800000,"stock":7}
+```
+
+Сообщения означают «неверные значения», «не должно быть пустым», «должно быть больше 0» и «id должен быть целым числом». `anor` — «гранат». `Location` указывает на созданный товар. Я также запустил `GET /health` (текст `ok`) и `GET /products` (JSON-массив из четырёх товаров до изменений).
+
+Остановите первый терминал через `Ctrl+C`. После этого я проверил, что порт `8765` больше не слушается.
+
+## Один путь обработчика, одно место для ошибок хранилища
+
+`getProduct` и его функция чтения ID, фрагменты без изменений из `handlers.go`:
+
+```go
+func (a *api) getProduct(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	p, err := a.st.Get(id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_id", Message: "id butun son boʻlishi kerak"})
+		return 0, false
+	}
+	return id, true
+}
+```
+
+| Строки внутри каждой функции | Значение |
+|---|---|
+| `getProduct` 1–5 | `a *api` — receiver; `w` пишет ответ, `r` — запрос; при ошибке `pathID` сам пишет ответ и возвращает `false` |
+| `getProduct` 6–10 | вызвать `a.st.Get(id)` этого API; при ошибке сопоставить её со статусом и выйти через `return` |
+| `getProduct` 11–12 | закодировать товар со статусом 200 |
+| `pathID` 1–2 | прочитать wildcard через `r.PathValue("id")`; `ParseInt` разбирает десятичное число в 64 бита |
+| `pathID` 3–8 | при ошибке разбора написать `400 bad_id`, вернуть `0, false`; иначе вернуть ID и `true` |
+
+Оба POST-обработчика идут тем же путём. Здесь их полные тела функций; типы входных данных и функции валидации уже есть в этом файле:
+
+```go
+func (a *api) createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	p, err := a.st.Add(in.Name, in.Price, in.Stock)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("Location", fmt.Sprintf("/products/%d", p.ID)) // yangi resursning manzili (RFC 9110 §15.3.2)
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (a *api) createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	p, err := a.st.Sell(in.ProductID, in.Quantity)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	// Narx ≤ maxPrice (store), dona ≤ 100 (validateOrder): koʻpaytma int64'ga sigʻadi.
+	writeJSON(w, http.StatusCreated, orderResponse{ProductID: p.ID, Quantity: in.Quantity, Total: p.Price * int64(in.Quantity)})
+}
+```
+
+У `productInput` поля `Name string`, `Price int64`, `Stock int`; у `orderInput` — `ProductID int64`, `Quantity int`. Их JSON-теги соответствуют ключам запроса. `orderResponse` содержит `ProductID`, `Quantity`, `Total`: имя `Order` оставлено для будущего доменного типа.
+
+| Код | Что делает |
+|---|---|
+| `var in …`, `decodeJSON(w, r, &in)` | создать входное значение и прочитать данные по его адресу; при ошибке функция сама пишет ответ, поэтому выйти |
+| `validate` / `validateOrder`, `len(f) > 0` | собрать ошибки полей; непустая map → 422 с `fields` |
+| `a.st.Add` / `a.st.Sell` | изменить общий каталог под его блокировкой; ошибка хранилища → `writeStoreError`, затем `return` |
+| `w.Header().Set("Location", fmt.Sprintf(…))` | задать адрес нового товара до отправки статуса |
+| `writeJSON(…, http.StatusCreated, …)` | 201 и созданный товар либо результат заказа |
+| `p.Price * int64(in.Quantity)` | привести количество к `int64` и умножить тийины, а не сумы |
+
+Функции в [`json.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-08-katalog-api/cmd/api/json.go) — код из GB-4.06: тело не более 1024 байт, неизвестные поля запрещены, JSON-значение должно быть одно. Ошибки чтения дают 400, превышение размера 413, неверные значения 422. `writeJSON` задаёт `Content-Type`, пишет статус, затем кодирует тело. `writeError` помещает `apiError{Code, Message, Fields}` внутрь `error`; отсутствующее `fields` опускается.
+
+Новое **сопоставление ошибок хранилища** со статусами находится в одной функции:
+
+```go
+func writeStoreError(w http.ResponseWriter, err error) {
+	var se *store.StockError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: err.Error()})
+	case errors.As(err, &se):
+		writeError(w, http.StatusConflict, apiError{Code: "insufficient_stock", Message: err.Error()})
+	case errors.Is(err, store.ErrBadQuantity), errors.Is(err, store.ErrBadProduct):
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: err.Error()})
+	default:
+		log.Printf("ichki xato: %v", err) // tafsilot server logiga (slog: GB-8.02), mijozga emas
+		writeError(w, http.StatusInternalServerError, apiError{Code: "internal", Message: "ichki xato"})
+	}
+}
+```
+
+| Ветка | Статус и код | Причина |
+|---|---|---|
+| `errors.Is(err, store.ErrNotFound)` | 404 `not_found` | товара с этим ID нет; работает и для обёрнутой ошибки |
+| `errors.As(err, &se)` | 409 `insufficient_stock` | найти `*StockError` через обёртки; `se` — целевой указатель |
+| любая из двух ошибок в `case` через запятую | 422 `validation_failed` | количество или товар нарушает правило хранилища |
+| `default` | 500 `internal` | непредвиденный сбой; клиенту только `ichki xato` («внутренняя ошибка») |
+
+У `switch` нет выражения: каждый `case` содержит условие. Два условия через запятую означают, что достаточно любого из них. `log.Printf("ichki xato: %v", err)` пишет настоящую ошибку в журнал сервера; `%v` форматирует её значение. Внутренний путь файла в ответ не попадает. Структурированные журналы с `slog` будут в [GB-8.02](/lab/youtube/gb#gb-8-02).
+
+## Копировать под блокировкой, вызывать yield после её снятия
+
+Хранилище возвращается к упорядоченному `[]Product` из GB-3.06. `map` из GB-4.07 был небольшой лабораторией параллельных обращений. В хранилище добавляется `mu sync.Mutex`; `Add`, `Sell`, `Restock` и `Get` начинаются с `Lock` и `defer Unlock`. Все receiver остаются `*Store`, поэтому мьютекс не копируется.
+
+`All` устраняет deadlock из первого вопроса:
+
+```go
+func (s *Store) All() iter.Seq[Product] {
+	return func(yield func(Product) bool) {
+		s.mu.Lock()
+		products := slices.Clone(s.products)
+		s.mu.Unlock()
+		for _, p := range products {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–2 | вернуть `iter.Seq[Product]`: функция итератора принимает `yield` |
+| 3–5 | захватить блокировку, скопировать слайс товаров в локальный `products`, сразу освободить блокировку |
+| 6 | обойти эту копию |
+| 7–10 | передать каждый скопированный товар в `yield`; при `false` остановиться, в том числе после `break` вызывающей стороны |
+| 11–12 | завершить функцию итератора и метод |
+
+| Момент | Общий каталог | Итератор | Блокировка |
+|---|---|---|---|
+| копирование | читается `slices.Clone` | создаёт собственный слайс | удерживается |
+| `yield(p)` | другой запрос может его изменить | читает только свою копию | снята |
+| тело цикла вызывает `Sell` | остаток безопасно меняется | прежняя копия остаётся такой же | `Sell` может её захватить |
+
+`defer Unlock` здесь держал бы блокировку до завершения итератора, включая все вызовы `yield`. Явный `Unlock` поставлен намеренно. Теперь `All` даёт копию на момент начала обхода вместо прежнего живого представления.
+
+Обработчик списка собирает этот итератор:
+
+```go
+func (a *api) listProducts(w http.ResponseWriter, r *http.Request) {
+	products := slices.Collect(a.st.All())
+	if products == nil {
+		products = []store.Product{} // boʻsh katalog JSON'da null emas, [] boʻlsin (GB-3.06)
+	}
+	writeJSON(w, http.StatusOK, products)
+}
+```
+
+`slices.Collect` собирает значения в слайс. Пустой итератор даёт `nil`, который закодировался бы как `null`; строки 3–5 заменяют его на `[]store.Product{}`, пустой ненулевой слайс, поэтому ответ — `[]`. Последний вызов отправляет 200 и этот слайс.
+
+## Проверяйте маршруты через настоящий mux
+
+`send` использует настоящую таблицу маршрутов, не открывая порт:
+
+```go
+func send(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+```
+
+Строка 2 создаёт запрос; `strings.NewReader(body)` задаёт его тело. Строка 3 создаёт recorder. Строка 4 вызывает `ServeHTTP` обработчика; строка 5 возвращает записанные статус и тело. В отличие от функции из GB-4.06, теперь она возвращает recorder, а не печатает его.
+
+`testStore(t)` создаёт новое хранилище с четырьмя товарами выше. Это полная функция `TestRoutes` из `api_test.go`:
+
+```go
+func TestRoutes(t *testing.T) {
+	tests := []struct {
+		name, method, path, body string
+		status                   int
+		want                     string // body'da boʻlishi kerak boʻlgan boʻlak
+	}{
+		{"katalog", "GET", "/products", "", 200, `"name":"choy"`},
+		{"bitta", "GET", "/products/4", "", 200, `"name":"oʻrik"`},
+		{"yoq_id", "GET", "/products/99", "", 404, `"code":"not_found"`},
+		{"xato_id", "GET", "/products/abc", "", 400, `"code":"bad_id"`},
+		{"yangi", "POST", "/products", `{"name":"anor","price":1800000,"stock":7}`, 201, `"id":5`},
+		{"bosh_nom", "POST", "/products", `{"name":"","price":1800000}`, 422, `"name":"boʻsh boʻlmasin"`},
+		{"uzun_nom", "POST", "/products", `{"name":"` + strings.Repeat("a", 21) + `","price":1}`, 422, `"validation_failed"`},
+		{"buzuq_json", "POST", "/products", `{"name":`, 400, `"code":"bad_json"`},
+		{"katta_body", "POST", "/products", `{"name":"` + strings.Repeat("a", 2000) + `"}`, 413, `"code":"too_large"`},
+		{"juda_qimmat", "POST", "/products", `{"name":"oltin","price":1000000001}`, 422, `"validation_failed"`},
+		{"buyurtma", "POST", "/orders", `{"product_id":1,"quantity":3}`, 201, `"total":3600000`},
+		{"qoldiq_yetmaydi", "POST", "/orders", `{"product_id":4,"quantity":5}`, 409, `"code":"insufficient_stock"`},
+		{"yoq_mahsulot", "POST", "/orders", `{"product_id":99,"quantity":1}`, 404, `"code":"not_found"`},
+		{"nol_dona", "POST", "/orders", `{"product_id":1,"quantity":0}`, 422, `"quantity"`},
+		{"health", "GET", "/health", "", 200, "ok"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := send(newMux(testStore(t)), tc.method, tc.path, tc.body)
+			if rec.Code != tc.status {
+				t.Errorf("%s %s: status %d, kutilgan %d: %s", tc.method, tc.path, rec.Code, tc.status, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("%s %s: body %q, unda %q yoʻq", tc.method, tc.path, rec.Body, tc.want)
+			}
+		})
+	}
+}
+```
+
+| Часть | Значение |
+|---|---|
+| `[]struct{…}{…}` | таблица из GB-1.08: имя, метод, путь, тело, ожидаемый статус, обязательный фрагмент тела |
+| `name, method, path, body string` | четыре строковых поля объявлены вместе |
+| 15 строк | все маршруты и основные ошибки, включая 413 и валидацию обработчика/хранилища |
+| сырые строки в обратных кавычках | JSON без экранирования двойных кавычек |
+| `t.Run(tc.name, …)` | отдельный именованный подтест для каждой строки |
+| `newMux(testStore(t))` | новый каталог для каждой строки с настоящими паттернами маршрутов |
+| `rec.Code != tc.status` | сообщить несовпадение статуса через `t.Errorf`; `%s` — текст, `%d` — целое число |
+| `strings.Contains(rec.Body.String(), tc.want)` | проверить обязательный фрагмент ответа; `%q` заключает текст сообщения об ошибке в кавычки |
+
+`TestCreateLocation` проверяет адрес нового ресурса. `TestInternalError` проверяет 500 без внутренних подробностей. `TestOrderChangesStock` использует один mux для POST и следующего GET и ожидает остаток 37. `TestServer` проверяет ограничение времени и обработчик состояния. Эти функции находятся в том же файле.
+
+Предскажите результат готового варианта из урока: **A)** три строки `ok` · **B)** ошибки задания на удаление · **C)** открывается порт сервера.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `final` убирает только проверки домашнего задания. `./...` проверяет API, CLI и хранилище; `-count=1` принудительно запускает тесты заново. **B** относится к корню стартовой папки; **C** смешивает тест с recorder и работающий сервер.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.028s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.107s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.047s
+(chiqish kodi: 0)
+```
+
+Это мои времена. В видео были API 0.003 с, CLI 0.040 с, хранилище 0.017 с: этот запуск дал примерно 9.3×, 2.7× и 2.8× этих значений. Такие короткие тесты на загруженной машине не служат измерением производительности. Сравнивайте прохождение трёх пакетов, а не их места по скорости.
+
+## Даже Get с блокировкой может выпустить указатель
+
+Прежний вариант в `_video/01-pointer/internal/store/store.go` возвращал указатель, найденный внутри слайса:
+
+```go
+func (s *Store) Get(id int64) (*Product, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.find(id)
+	if p == nil {
+		return nil, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	return p, nil
+}
+```
+
+Строка 1 возвращает `*Product`. Строки 2–3 захватывают блокировку и откладывают её снятие. Строка 4 находит `&s.products[i]`; строки 5–7 возвращают обёрнутую ошибку для отсутствующего товара. Строка 8 возвращает тот же указатель. Отложенный `Unlock` срабатывает при возврате из `Get`.
+
+Обычные тесты на этом варианте тоже проходят:
+
+```console
+$ ./_video/run.sh 01-pointer go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.007s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.093s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.022s
+(chiqish kodi: 0)
+```
+
+Параллельный тест использует один mux и одно хранилище для всех запросов:
+
+```go
+func TestParallel(t *testing.T) {
+	st := testStore(t)
+	h := newMux(st)
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Go(func() { send(h, "POST", "/orders", `{"product_id":1,"quantity":1}`) })
+		wg.Go(func() { send(h, "GET", "/products/1", "") })
+	}
+	wg.Wait()
+	if p, _ := st.Get(1); p.Stock != 10 {
+		t.Errorf("30 ta buyurtmadan keyin olma qoldigʻi %d, kutilgan 10", p.Stock)
+	}
+}
+```
+
+В `st` изначально 40 яблок. `h` — его mux. `wg.Go` запускает функцию в горутине; `wg.Wait` ждёт их завершения. Каждая из 30 итераций запускает один заказ и одно чтение, поэтому ожидаемый остаток — `40 − 30 = 10`. Финальный `if` проверяет его, игнорируя ошибку через `_`, поскольку товар заведомо существует. Полное объяснение `sync.WaitGroup` будет в [GB-7.01](/lab/youtube/gb#gb-7-01).
+
+Предскажите `go test -race` с `Get`, возвращающим указатель:
+
+**A)** `ok`, ведь записи под блокировкой · **B)** `WARNING: DATA RACE` · **C)** тест упадёт, потому что остаток не 10
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Изменения остатка защищены, поэтому итоговое количество может быть правильным. Но после снятия блокировки в `Get` JSON-кодирование продолжает читать общий `Product` через указатель. **A** проверяет только записи; **C** предполагает потерянное обновление (lost update), которую здесь предотвращает блокировка записи.
+
+</details>
+
+Это мой повторный запуск через Docker, а не цитата из видео. `…` сокращает пути и опускает кадры стека:
+
+```console
+$ ./_video/race.sh 01-pointer go test -race -count=1 ./cmd/api
+==================
+WARNING: DATA RACE
+Write at 0x00c0001b6340 by goroutine 29:
+  github.com/abdurahmon27/bozor/internal/store.(*Store).Sell()
+      …/internal/store/store.go:160 +0x6a4
+  github.com/abdurahmon27/bozor/cmd/api.(*api).createOrder()
+      …/cmd/api/handlers.go:143 +0x364
+…
+Previous read at 0x00c0001b6340 by goroutine 86:
+  reflect.Value.Int()
+      …/src/reflect/value.go:1461 +0x453
+…
+  github.com/abdurahmon27/bozor/cmd/api.writeJSON()
+      …/cmd/api/json.go:24 +0x1fb
+  github.com/abdurahmon27/bozor/cmd/api.(*api).getProduct()
+      …/cmd/api/handlers.go:61 +0xae
+…
+==================
+--- FAIL: TestParallel (0.01s)
+    testing.go:1867: race detected during execution of test
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.029s
+FAIL
+(chiqish kodi: 1)
+```
+
+| Строка отчёта | Как читать |
+|---|---|
+| `WARNING: DATA RACE` | найдена пара конфликтующих обращений |
+| `Write at … goroutine 29` | `Sell`, строка 160, записывает остаток через обработчик заказа |
+| `Previous read at … goroutine 86` | другая горутина прочитала тот же адрес |
+| `reflect.Value.Int()` | внутренний вызов JSON, читающий целочисленное поле структуры |
+| `writeJSON`, `getProduct`, `handlers.go:61` | чтение относится к ответу с одним товаром |
+| `testing.go:1867` | пакет testing Go сообщает «гонка обнаружена во время выполнения теста»; `TestParallel` падает |
+| `(chiqish kodi: 1)` | тестовая команда внутри скрипта завершилась с ошибкой |
+
+Шестнадцатеричный адрес должен совпадать у обоих обращений. Адреса, номера горутин и смещения внутри функций (`+0x…`) меняются от запуска к запуску. В видео сначала шёл `Read at`, затем `Previous write`; у меня порядок обратный. Ошибка та же.
+
+| Шаг | Запрос A: GET | Запрос B: заказ | Память |
+|---|---|---|---|
+| 1 | `Get` возвращает указатель `p`, затем снимает блокировку | | `p` указывает внутрь каталога, остаток 40 |
+| 2 | JSON читает через `p` без блокировки | `Sell` пишет остаток 39 под блокировкой | оба обращаются к одной ячейке |
+| 3 | race detector находит чтение/запись | изменения остатка по-прежнему последовательны | нет синхронизации, упорядочивающей JSON-чтение и запись |
+
+Для отчёта обращениям необязательно физически совпасть по времени. Детектор проверяет синхронизацию между обращениями, выполненными в этом запуске. Он не найдёт гонку в ветке, которую тесты вообще не выполнили.
+
+Исправьте `Get`: скопируйте значение, **пока блокировка ещё удерживается**:
+
+```go
+func (s *Store) Get(id int64) (Product, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.find(id)
+	if p == nil {
+		return Product{}, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	return *p, nil
+}
+```
+
+Теперь возвращаемый тип — `Product`. При ошибке возвращается `Product{}`, нулевое значение, вместе с ошибкой. При успехе `*p` читает значение по указателю и копирует его в результат **до** выполнения отложенного `Unlock`.
+
+| После возврата из `Get` | Каталог | `p` обработчика |
+|---|---|---|
+| сначала | остаток яблок 40 | независимая копия, остаток 40 |
+| другой заказ | остаток 39 | всё ещё 40 |
+| JSON-кодирование | читать каталог не нужно | читает свою копию |
+
+Такой копии достаточно: `Product` содержит целые числа и строку. Если позже появится изменяемая map или слайс, одна копия структуры всё ещё будет разделять их внутренние данные.
+
+Предскажите исправленный вариант: **A)** три строки `ok` · **B)** та же гонка · **C)** deadlock.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `Get` копирует под блокировкой; `All` тоже копирует под блокировкой, но вызывает `yield` после её снятия. Для **B** нужно ещё одно несинхронизированное обращение к общим данным; для **C** — ожидание уже захваченной в этой цепочке вызовов блокировки.
+
+</details>
+
+```console
+$ ./_video/race.sh final go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.037s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	1.075s
+ok  	github.com/abdurahmon27/bozor/internal/store	1.037s
+(chiqish kodi: 0)
+```
+
+В видео были 1.014 с, 1.046 с и 1.017 с. Мои значения — примерно 1.02×, 1.03× и 1.02× от них. Примерно секунда на пакет объясняется главным образом стандартной паузой race runtime перед выходом: опция `GORACE` `atexit_sleep_ms=1000`. Это не означает, что маленький тест выполняет секунду полезной работы.
+
+Чтобы отделить ожидание, `env` задаёт `GORACE` для команды внутри контейнера. Я повторил запуск и с отключённой паузой перед выходом:
+
+```console
+$ ./_video/race.sh final env GORACE=atexit_sleep_ms=0 go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.023s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.083s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.026s
+(chiqish kodi: 0)
+```
+
+Показанное время первого пакета меняется примерно в 45 раз (`1.037 / 0.023`), но удаление паузы перед выходом не ускоряет API в 45 раз. Инструментирование race по-прежнему требует дополнительных ресурсов; это не измерение пропускной способности API.
+
+## Глубже (необязательно): правила остаются в хранилище
+
+Обработчик валидирует входные данные ради понятных сообщений по полям. Хранилище проверяет снова, потому что им пользуются также CLI и загружаемый файл. `maxPrice` — 1 000 000 000 тийинов, или 10 миллионов сумов; `maxStock` — 1 000 000 штук. `Restock` проверяет и итоговый остаток. Цена из API не должна обходить прежний верхний предел CLI. При количестве в заказе не более 100 сумма не превышает `10¹¹` тийинов и помещается в `int64`.
+
+`Save` также копирует слайс под блокировкой, затем пишет файл без неё. Этот API не вызывает его на каждый запрос; параллельные процессы и постоянное хранение — тема следующего модуля. `ReadHeaderTimeout` ограничивает только чтение заголовков, а не весь запрос. Другие ограничения времени и остановка сервера будут в [GB-8.03](/lab/youtube/gb#gb-8-03).
+
+`Add` по-прежнему выбирает наибольший текущий ID плюс один. Поэтому после удаления наибольшего ID он может использоваться снова. Ограничение этого учебного хранилища описано в README; не считайте его ID постоянными идентификаторами ресурсов.
+
+## Частые ошибки
+
+**1. «В Get есть Lock, значит результат защищён».** Неверный `Get` и настоящий отчёт race приведены выше. Указатель остаётся связан с общими данными после снятия блокировки. Возвращайте копию `Product`, полученную под блокировкой; запускайте тесты маршрутов и параллельных обращений с `-race`.
+
+**2. Режим race не запускается.** На этой машине с `CGO_ENABLED=0`:
+
+```console
+$ go test -race ./cmd/api
+go: -race requires cgo; enable cgo by setting CGO_ENABLED=1
+```
+
+Сообщение говорит, что режиму race нужна интеграция с C. В Linux включите cgo **и** обеспечьте C-компилятор, например `gcc`; одно `CGO_ENABLED=1` его не установит. Я повторил все команды race через приложенный Docker-скрипт. На машине с нужным компилятором запускайте `go test -race ./...` напрямую. Docker разбирается в GB-5.02.
+
+**3. Удерживать блокировку во время `yield` или вызывать `Get` внутри заблокированного `Delete`.** В обоих случаях можно дважды ждать один мьютекс. Используйте копирование из `All`; внутри `Delete` ищите непосредственно в `s.products`, захватив блокировку один раз.
+
+**4. Использовать `writeJSON(w, 204, nil)`.** Он пытается закодировать `null`. Настоящий сервер отклоняет тело для 204; recorder может его записать и провалить проверку пустого тела. Нужен только `w.WriteHeader(http.StatusNoContent)`.
+
+**5. Запускать вне корня урока.** `bozor.json` — относительный путь. Для `Load` отсутствие файла означает пустой каталог, а не ошибку старта. Запускайте из папки с этим файлом. Если порт 8765 занят, остановите свой прежний сервер перед запуском нового.
+
+## Проверьте себя
+
+**1.** Почему `Get` должен возвращать копию?
+
+<details>
+<summary>Ответ</summary>
+
+Указатель внутрь хранилища живёт дольше блокировки. После её снятия JSON читает через него, пока `Sell` может изменить то же значение. Копирование под блокировкой отделяет чтение обработчика от общего каталога.
+
+</details>
+
+**2.** Где ошибка хранилища становится статусом? Что происходит с непредвиденной ошибкой?
+
+<details>
+<summary>Ответ</summary>
+
+В `writeStoreError`: 404, 409, 422, иначе 500. Подробности непредвиденной ошибки идут в журнал; клиент получает `internal` и общее сообщение, а не внутренний текст.
+
+</details>
+
+**3.** Из [GB-4.05](/lab/youtube/gb/gb-4-05/ru): вызовите обработчик напрямую с новым запросом без mux. Что вернёт `r.PathValue("id")`?
+
+<details>
+<summary>Ответ</summary>
+
+Пустую строку: mux не заполнил wildcard. Поэтому тесты отправляют запрос через `newMux(st)`, проверяя также выбор маршрута.
+
+</details>
+
+**4.** Предскажите: `All` копирует под `mu`, снимает блокировку, затем тело цикла вызывает `Sell`. **A)** deadlock · **B)** может завершиться · **C)** `Sell` изменит копию итератора.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Sell` может захватить освобождённую блокировку и изменить каталог. **A** описывает прежний вариант с `yield` под блокировкой; **C** смешивает скопированный слайс с общим каталогом.
+
+</details>
+
+## Домашнее задание
+
+Задание — [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-08-katalog-api/TASK.md) в папке [lessons/gb-4-08-katalog-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api). Отметки сложности ниже добавлены для письменного урока.
+
+- 🟢 **Шаг 1:** реализуйте `Store.Delete(id int64) error` в `internal/store/store.go`. В начале захватите `Lock` и поставьте `defer Unlock`. Удалите товар, сохраните порядок остальных, при отсутствии верните ошибку с обёрнутым `ErrNotFound`.
+- 🟡 **Шаг 2:** зарегистрируйте `DELETE /products/{id}` с `a.deleteProduct`. Используйте `pathID` для 400, `writeStoreError` для 404, при успехе только `WriteHeader(http.StatusNoContent)`: 204 без тела.
+- 🟡 **Шаг 3:** напишите `TestDeleteProduct(t *testing.T)` в `cmd/api/api_test.go`. Проверьте существующий ID → 204, отсутствующий → 404, `abc` → 400, GET после удаления → 404.
+- 🟡 **Итоговая проверка:** добейтесь прохождения `go test ./...`; при наличии компилятора или Docker обязателен и чистый `go test -race ./...`.
+
+Не меняйте оба `tekshiruv_test.go`. Подсказка: найдите индекс, затем `slices.Delete(s.products, i, i+1)` удалит этот полуоткрытый интервал с сохранением порядка. `slices.IndexFunc` возвращает первый подходящий индекс или −1. Поиск и удаление должны быть под **одной** блокировкой.
+
+В стартовом коде `Delete` намеренно не реализован:
+
+```go
+func (s *Store) Delete(id int64) error {
+	return errors.New("Delete hali yozilmagan (TASK.md, 1-qadam)")
+}
+```
+
+Сначала форматирование и vet:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Обе команды ничего не напечатали. Предскажите неизменённый стартовый вариант: **A)** всё пройдёт · **B)** проверки задания упадут · **C)** ошибка компиляции.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Стартовый код компилируется, но `Delete` — заглушка, маршрут DELETE отсутствует, вашего теста ещё нет. Проверки называют недостающие шаги.
+
+</details>
+
+Мой запуск стартового варианта, сокращённо (`…` опускает другие ошибки и строки пакетов):
+
+```console
+$ go test -count=1 ./...
+--- FAIL: TestVazifaDeleteRoute (0.00s)
+    tekshiruv_test.go:17: DELETE /products/2: 405 — route yoʻq: newMux'ga "DELETE /products/{id}" pattern'ini a.deleteProduct bilan qoʻshing (TASK.md, 2-qadam)
+--- FAIL: TestVazifaOzTest (0.00s)
+    tekshiruv_test.go:73: cmd/api'da func TestDeleteProduct(t *testing.T) yoʻq: DELETE /products/{id} uchun oʻz testingizni yozing (TASK.md, 3-qadam)
+…
+--- FAIL: TestVazifaDelete (0.00s)
+    tekshiruv_test.go:41: Delete(2) xato qaytardi: Delete hali yozilmagan (TASK.md, 1-qadam) — non (ID 2) katalogda bor, xato boʻlmasligi kerak
+…
+FAIL
+```
+
+`tekshiruv_test.go:17` — файл и строка проверки; узбекское сообщение говорит об отсутствии маршрута и даёт точную регистрацию. Строка 73 просит написать свой тест. Строка 41 проверки хранилища сообщает, что `Delete(2)` должен пройти: хлеб существует. Дополнительные проверки блокировки и параллельного удаления тоже падают, пока `Delete` не ищет и не удаляет под одной блокировкой. Таймаут в две секунды сообщает о deadlock, не оставляя проверку зависшей.
+
+<details>
+<summary>Ответ: реализация и объяснение</summary>
+
+Образец — [`solution/`](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api/solution). Два изменённых метода:
+
+```go
+func (s *Store) Delete(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := slices.IndexFunc(s.products, func(p Product) bool { return p.ID == id })
+	if i < 0 {
+		return fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	s.products = slices.Delete(s.products, i, i+1)
+	return nil
+}
+
+func (a *api) deleteProduct(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := a.st.Delete(id); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+`Delete` захватывает мьютекс один раз. `IndexFunc` ищет по ID; отрицательный индекс возвращает обёрнутую ошибку. `slices.Delete` удаляет один элемент, возвращённый слайс заменяет `s.products`. `defer` снимает блокировку при обоих возвратах. `deleteProduct` один раз разбирает ID, один раз удаляет, затем пишет либо сопоставленную ошибку, либо 204 без тела.
+
+Дополнительная строка маршрута внутри `newMux`:
+
+```go
+mux.HandleFunc("DELETE /products/{id}", a.deleteProduct)
+```
+
+Образец теста:
+
+```go
+func TestDeleteProduct(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		status int
+	}{
+		{"bor", "/products/3", 204},
+		{"yoq", "/products/99", 404},
+		{"xato_id", "/products/abc", 400},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newMux(testStore(t))
+			if rec := send(h, "DELETE", tc.path, ""); rec.Code != tc.status {
+				t.Errorf("DELETE %s: status %d, kutilgan %d: %s", tc.path, rec.Code, tc.status, rec.Body)
+			}
+		})
+	}
+	// oʻchirilgan mahsulot GET'da ham yoʻq
+	h := newMux(testStore(t))
+	send(h, "DELETE", "/products/3", "")
+	if rec := send(h, "GET", "/products/3", ""); rec.Code != 404 {
+		t.Errorf("DELETE'dan keyin GET /products/3: status %d, kutilgan 404", rec.Code)
+	}
+}
+```
+
+Три строки получают свежие хранилища. Финальная последовательность использует один mux для DELETE и следующего GET, доказывая фактическое удаление товара. `bor`, `yoq`, `xato_id` означают «существует», «отсутствует», «неверный ID».
+
+Перейдите в `solution/` командой `cd solution` (`cd` меняет текущую папку), затем запустите обычную проверку. Мой результат:
+
+```console
+$ go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.012s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.115s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.233s
+```
+
+Из корня урока Docker-скрипт также проверяет полное решение:
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.040s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	1.096s
+ok  	github.com/abdurahmon27/bozor/internal/store	1.283s
+(chiqish kodi: 0)
+```
+
+Все три пакета проходят. Примерно секундная пауза race перед выходом остаётся; проверки задания в хранилище добавляют и собственные ожидания.
+
+</details>
+
+## Источники
+
+- [Go net/http](https://pkg.go.dev/net/http), [ServeMux](https://pkg.go.dev/net/http#ServeMux), [Server](https://pkg.go.dev/net/http#Server), [Request.PathValue](https://pkg.go.dev/net/http#Request.PathValue), [изменения маршрутизации](https://go.dev/blog/routing-enhancements).
+- [Спецификация Go: значения методов](https://go.dev/ref/spec#Method_values), [defer](https://go.dev/ref/spec#Defer_statements), [errors.Is и errors.As](https://pkg.go.dev/errors).
+- [sync.Mutex](https://pkg.go.dev/sync#Mutex), [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [Data Race Detector и параметры GORACE](https://go.dev/doc/articles/race_detector), [модель памяти Go](https://go.dev/ref/mem).
+- [slices.Clone](https://pkg.go.dev/slices#Clone), [slices.Collect](https://pkg.go.dev/slices#Collect), [slices.Delete](https://pkg.go.dev/slices#Delete), [slices.IndexFunc](https://pkg.go.dev/slices#IndexFunc), [iter](https://pkg.go.dev/iter).
+- [Табличные тесты](https://go.dev/wiki/TableDrivenTests), [httptest](https://pkg.go.dev/net/http/httptest), [параметры curl](https://curl.se/docs/manpage.html).
+- RFC 9110: [201 Created](https://www.rfc-editor.org/rfc/rfc9110#name-201-created), [204 No Content](https://www.rfc-editor.org/rfc/rfc9110#name-204-no-content), [409 Conflict](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict), [422 Unprocessable Content](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content), [500 Internal Server Error](https://www.rfc-editor.org/rfc/rfc9110#name-500-internal-server-error).
+- [Код курса и README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api), [файлы API](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api/cmd/api).
+
+Результаты: `go1.27.4 linux/amd64`, 2026-11-27, `CGO_ENABLED=0`; все результаты `-race` повторно получены скриптом урока в Docker с включённым cgo. Живой API запускался на свободном локальном порту и остановлен после проверки. Времена из видео явно отмечены как цитируемые для сравнения; показанный вывод команд — из моих запусков.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api)
+
+---
+
+← Предыдущий урок: [GB-4.07](/lab/youtube/gb/gb-4-07/ru) · Следующий урок: [GB-5.01](/lab/youtube/gb#gb-5-01) → · [Все уроки](/lab/youtube/gb)
+
+</div>

@@ -1,0 +1,969 @@
+---
+title: "Checkpoint: catalog API (CRUD, tests, clean -race)"
+date: "2026/11/27"
+description: "Assemble bozor's catalog API, map store errors to HTTP statuses, test every route, and fix a pointer escaping the lock."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-4-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-4-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-4-08"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-4-08) · [Русский](/lab/youtube/gb/gb-4-08/ru) · **English**  
+Lesson GB-4.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-4-08) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Hundreds of requests can reach the bozor catalog together. How do the server, routes, JSON helpers and store share one catalog safely? Where should each error become an HTTP response?
+
+**The one idea:** a request follows one path: server → mux → handler → locked store → response. The lock protects access while it is held. Return copies from the store so JSON encoding does not read shared data after the lock is released.
+
+By the end you will:
+
+- assemble `cmd/api` on top of the catalog from Module 3;
+- map store errors to HTTP statuses in one place;
+- test routes through the real mux and find a race that ordinary tests miss;
+- add `DELETE /products/{id}` with your own test.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| API wiring | one catalog passed to server, mux and handlers | API wiring |
+| store error mapping | one function chooses the HTTP status for a store error | store error mapping |
+| value copy | the handler receives its own `Product`, not a pointer into the catalog | value copy |
+
+**CRUD** means create, read, update and delete. Here orders update stock; the delete operation is your task. Two helper statuses: **500 Internal Server Error** for an unexpected server failure, and **204 No Content** for success with no response body.
+
+## Before you start
+
+This checkpoint combines earlier lessons:
+
+- [GB-4.07 · Mutex and races](/lab/youtube/gb/gb-4-07/en): goroutines, `sync.Mutex`, `Lock`, `defer Unlock`, data race, race detector and iterator deadlock.
+- [GB-4.03 · Handler and httptest](/lab/youtube/gb/gb-4-03/en): `w`, `r`, recorder, header → status → body.
+- [GB-4.04 · The first server](/lab/youtube/gb/gb-4-04/en), [GB-4.05 · Routes and id](/lab/youtube/gb/gb-4-05/en), [GB-4.06 · JSON input and output](/lab/youtube/gb/gb-4-06/en): server settings, patterns, `PathValue`, strict decoding and validation.
+- [GB-4.01 · HTTP request text](/lab/youtube/gb/gb-4-01/en): `curl`, HTTP methods and status codes.
+- [GB-3.06 · bozor CLI v0](/lab/youtube/gb/gb-3-06/en), [GB-3.05 · Iterators](/lab/youtube/gb/gb-3-05/en), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/en): `Store`, `Load`, `All`, `yield`, `slices.Clone`, `slices.Collect`, struct tags, `[]` and `null`.
+- [GB-2.04 · Pointers](/lab/youtube/gb/gb-2-04/en), [GB-2.05 · Methods](/lab/youtube/gb/gb-2-05/en), [GB-2.06 · Packages](/lab/youtube/gb/gb-2-06/en), [GB-2.08 · Errors](/lab/youtube/gb/gb-2-08/en), [GB-2.09 · defer](/lab/youtube/gb/gb-2-09/en): `*Store`, `&`, `*p`, `internal/`, `errors.Is`, `errors.As`, `%w`.
+- [GB-1.08 · Table tests](/lab/youtube/gb/gb-1-08/en), [GB-1.05 · if and switch](/lab/youtube/gb/gb-1-05/en), [GB-1.03 · Integers and money](/lab/youtube/gb/gb-1-03/en): `t.Run`, tagless `switch`, integer overflow, prices in tiyin.
+
+**Run locally in the course folder** [lessons/gb-4-08-katalog-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api). It has its own `go.mod` (`go 1.27`) and uses only the standard library. The examples need its files and HTTP server, so use this folder rather than the Playground.
+
+For the same Go version as this page, set these variables in each terminal before running commands:
+
+```bash
+export GOTOOLCHAIN=go1.27.4
+export CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` chooses the Go toolchain; `CGO_ENABLED=0` disables C integration. This machine has no `gcc`. All `-race` runs below were rerun with the lesson's `./_video/race.sh` in Docker: its image has `gcc`, and the mounted toolchain is Go 1.27.4. Docker itself is covered in [GB-5.02](/lab/youtube/gb/gb-5-02/en).
+
+`./_video/run.sh final <command>` copies the lesson into a temporary folder without the homework checkers. `01-pointer` additionally installs the earlier pointer-returning `Get`; `solution` selects the answer. These scripts append `(chiqish kodi: N)` ("exit code"): `0` means success, `1` means failure. The starter includes `tekshiruv_test.go` and intentionally fails until you finish the task.
+
+Recall [GB-4.07](/lab/youtube/gb/gb-4-07/en): `All` calls `yield` while holding the lock, and the loop body calls `Sell`. What happens?
+
+**A)** data race · **B)** deadlock · **C)** `Sell` waits, then everything finishes
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Sell` waits for the lock held by `All`. `All` cannot release it until the loop body returns. **A** confuses unsynchronized access with waiting; **C** misses that neither call can finish. This is recall from GB-4.07, not a new run here. We fix `All` below.
+
+</details>
+
+## One catalog, one request path
+
+The code is the Module 3 CLI plus a new HTTP entry point:
+
+| File | Responsibility |
+|---|---|
+| `cmd/bozor/` | the existing CLI |
+| `cmd/api/main.go` | load the catalog and start the server |
+| `cmd/api/handlers.go` | `api`, routes, handlers, ID parsing and error mapping |
+| `cmd/api/json.go` | the JSON helpers from GB-4.06 |
+| `cmd/api/api_test.go` | route, stock, server and parallel tests |
+| `internal/store/store.go` | products and stock rules, now protected by a mutex |
+| `internal/store/file.go` | `Load` and atomic `Save` from GB-3.06 |
+| `internal/store/restock_test.go` | the earlier restock exercise's tests |
+| `cmd/api/tekshiruv_test.go`, `internal/store/tekshiruv_test.go` | the new homework checkers |
+
+| Stage | Input → action → result |
+|---|---|
+| `http.Server` | connection → read request headers within 5 seconds → mux |
+| `ServeMux` | method and path → choose a pattern → handler |
+| handler | path or body → parse and validate → store call |
+| store | take `mu` → read or change catalog → copy result → release `mu` |
+| response | success → `writeJSON`; store error → `writeStoreError` |
+
+First the wiring fragment from `handlers.go`:
+
+```go
+type api struct {
+	st *store.Store
+}
+
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{st: st}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.HandleFunc("GET /products", a.listProducts)
+	mux.HandleFunc("GET /products/{id}", a.getProduct)
+	mux.HandleFunc("POST /products", a.createProduct)
+	mux.HandleFunc("POST /orders", a.createOrder)
+	// VAZIFA (TASK.md, 2-qadam): DELETE /products/{id} → a.deleteProduct
+	return mux
+}
+```
+
+| Code | What it does |
+|---|---|
+| `type api struct`, `st *store.Store` | names the handler dependencies; `st` points to the single catalog |
+| `newMux(st *store.Store) *http.ServeMux` | receives that catalog as a parameter and returns a mux |
+| `a := &api{st: st}` | creates `api`; the field `st` gets the argument `st` |
+| `http.NewServeMux()` | creates an independent route table |
+| five `HandleFunc` calls | register health, list, single product, create product and create order |
+| `a.listProducts` | a **method value**: a function bound to `a`; no parentheses, so registration does not call it |
+| task comment, `return mux` | marks the missing delete route, then returns the configured mux |
+
+There is no global catalog. Each test can pass its own store to `newMux`, so one test's order does not change another test's starting stock. `healthHandler` needs no catalog and returns plain text `ok`.
+
+The complete `main.go`:
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor katalog API'si (GB-4.08, 4-modul nazorat nuqtasi): GB-3.06'dagi internal/store
+// katalogi HTTP orqali. Katalog ishga tushishda bozor.json'dan oʻqiladi (CLI yozgan fayl) va keyin
+// xotirada turadi: API'dagi oʻzgarishlar faylga yozilmaydi, server toʻxtasa yoʻqoladi.
+// Saqlash Postgres'ga 5-modulda koʻchadi (GB-5.01: nega baza kerak).
+//
+//	go run ./cmd/api        → bozor API: http://localhost:8765
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+const dataFile = "bozor.json"
+
+// newServer — bozor API serveri (GB-4.04): route'lar newMux'da (GB-4.05), sarlavhalar uchun vaqt chegarasi.
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newMux(st),
+		ReadHeaderTimeout: 5 * time.Second, // soʻrov sarlavhalari 5 s'da kelmasa, ulanish yopiladi
+	}
+}
+
+func main() {
+	st, err := store.Load(dataFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+	srv := newServer(":8765", st)
+	fmt.Println("bozor API: http://localhost:8765")
+	err = srv.ListenAndServe()
+	fmt.Fprintln(os.Stderr, "xato:", err)
+	os.Exit(1)
+}
+```
+
+| Lines | What they do |
+|---|---|
+| 1–6 | comments describe the in-memory API and its run command |
+| 7–16 | `package main`; import output, HTTP, process and time packages plus `internal/store` |
+| 18 | `dataFile` names the relative file `bozor.json` |
+| 20–27 | `newServer`: address from its argument, `Handler: newMux(st)`, header read limit `5 * time.Second` |
+| 29–34 | `main` calls `store.Load`; loading errors go to `os.Stderr`, then exit code 1 |
+| 35–36 | construct the server on `:8765` and print its address |
+| 37–40 | `ListenAndServe` waits for requests; when it returns, print its non-nil error; the program exits |
+
+Only startup reads `bozor.json`. API changes stay in memory and disappear when the process stops. It does not call `Save` per request. Persistent storage follows in Module 5.
+
+## Run the routes and read the responses
+
+I checked that local port `8765` was free, ran this API and stopped it after the requests. Start it in one terminal, from the lesson root:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+`go run ./cmd/api` builds and runs the package. Keep it running; use a second terminal for `curl`. `-s` hides the progress display, `-i` includes response headers, `-d` supplies the body and selects POST, `-X DELETE` explicitly selects DELETE. In header outputs, `…` replaces `Date`, `Content-Length` and, where present, `X-Content-Type-Options`.
+
+The catalog IDs come from GB-3.06: `olma` (apple) 1, `non` (bread) 2, `choy` (tea) 3, `oʻrik` (apricot) 4. The smaller labs used different IDs. Read apricot:
+
+```console
+$ curl -s localhost:8765/products/4
+{"id":4,"name":"oʻrik","price":3500000,"stock":2}
+```
+
+`price` is in tiyin: `3500000` means 35,000 soʻm; `stock` is 2 pieces.
+
+Predict: an order requests 5 pieces of product 4. Quantity validation allows 1–100, but stock is 2. Which status?
+
+**A)** 422 · **B)** 409 · **C)** 201
+
+<details>
+<summary>Answer</summary>
+
+**B: 409 Conflict.** Five is a valid quantity, but the request conflicts with current stock. **A** would apply to an invalid quantity such as zero; **C** would claim success without enough stock. This is the API's chosen status contract.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/orders -d '{"product_id":4,"quantity":5}'
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+…
+
+{"error":{"code":"insufficient_stock","message":"oʻrik: qoldiq 2, soʻralgan 5"}}
+```
+
+`insufficient_stock` is the stable error code; the Uzbek message says "apricot: stock 2, requested 5". There is no `-H Content-Type` option: this server does not check the request media type and reads the body as JSON. GB-4.01's demonstration server checked it; that was a different contract.
+
+Now request the remaining 2 pieces. Predict both the total and the next stock value:
+
+**A)** `7000000`, stock 0 · **B)** `70000`, stock 0 · **C)** error, stock 2
+
+<details>
+<summary>Answer</summary>
+
+**A.** `3500000 × 2 = 7000000` tiyin, or 70,000 soʻm. The order consumes both pieces. **B** mixes tiyin and soʻm; **C** forgets that buying exactly the available quantity is allowed.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/orders -d '{"product_id":4,"quantity":2}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+…
+
+{"product_id":4,"quantity":2,"total":7000000}
+$ curl -s localhost:8765/products/4
+{"id":4,"name":"oʻrik","price":3500000,"stock":0}
+```
+
+An unknown path does not reach our handlers. Predict its status and format: **A)** 404 text · **B)** 404 JSON · **C)** 200.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `ServeMux` writes its own plain text 404. **B** assumes `writeError` ran; **C** would require a matching success handler.
+
+</details>
+
+```console
+$ curl -s -i localhost:8765/narsalar
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+…
+
+404 page not found
+```
+
+Before the task, only GET exists for `/products/{id}`. What does DELETE return?
+
+**A)** 404 · **B)** 405 text · **C)** 405 in our JSON error shape
+
+<details>
+<summary>Answer</summary>
+
+**B.** The path matches but the method does not. The mux writes `405 Method Not Allowed` and `Allow: GET, HEAD`; GET also allows HEAD. **A** confuses path and method; **C** again assumes our handler ran.
+
+</details>
+
+```console
+$ curl -s -i -X DELETE localhost:8765/products/1
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+…
+
+Method Not Allowed
+```
+
+The mux's 404 and 405 keep their correct status and `Allow` header. Making these responses JSON needs a layer around the mux, **middleware**, taught in [GB-6.01](/lab/youtube/gb#gb-6-01). Adding a methodless `"/"` catch-all would intercept wrong methods too and spoil the 405 behavior.
+
+Three more requests from the README, also rerun: predict **422 validation error**, **400 bad ID**, then **201 with `Location: /products/5`**.
+
+```console
+$ curl -s localhost:8765/products -d '{"name":"","price":-5}'
+{"error":{"code":"validation_failed","message":"qiymatlar notoʻgʻri","fields":{"name":"boʻsh boʻlmasin","price":"0 dan katta boʻlsin"}}}
+$ curl -s localhost:8765/products/abc
+{"error":{"code":"bad_id","message":"id butun son boʻlishi kerak"}}
+$ curl -s -i localhost:8765/products -d '{"name":"anor","price":1800000,"stock":7}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /products/5
+…
+
+{"id":5,"name":"anor","price":1800000,"stock":7}
+```
+
+The messages mean "invalid values", "must not be empty", "must be greater than 0" and "id must be an integer". `anor` means pomegranate. `Location` points to the newly created product. I also ran `GET /health` (text `ok`) and `GET /products` (the four-product JSON array before these changes).
+
+Stop the first terminal with `Ctrl+C`. I verified that port `8765` stopped listening afterward.
+
+## One handler path, one place for store errors
+
+`getProduct` and its ID helper, verbatim fragments from `handlers.go`:
+
+```go
+func (a *api) getProduct(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	p, err := a.st.Get(id)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, apiError{Code: "bad_id", Message: "id butun son boʻlishi kerak"})
+		return 0, false
+	}
+	return id, true
+}
+```
+
+| Lines in each function | Meaning |
+|---|---|
+| `getProduct` 1–5 | `a *api` is the receiver; `w` writes the response, `r` is the request; `pathID` writes an error itself and returns `false` on failure |
+| `getProduct` 6–10 | call this API's `a.st.Get(id)`; on error, map it once and stop with `return` |
+| `getProduct` 11–12 | encode the product with status 200 |
+| `pathID` 1–2 | read the wildcard using `r.PathValue("id")`; `ParseInt` parses base 10 into 64 bits |
+| `pathID` 3–8 | on parse failure write `400 bad_id`, return `0, false`; otherwise return the ID and `true` |
+
+The two POST handlers use the same path. These are their complete function bodies, using the input types and validation functions already present in this file:
+
+```go
+func (a *api) createProduct(w http.ResponseWriter, r *http.Request) {
+	var in productInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validate(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	p, err := a.st.Add(in.Name, in.Price, in.Stock)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.Header().Set("Location", fmt.Sprintf("/products/%d", p.ID)) // yangi resursning manzili (RFC 9110 §15.3.2)
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (a *api) createOrder(w http.ResponseWriter, r *http.Request) {
+	var in orderInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateOrder(in); len(f) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: "qiymatlar notoʻgʻri", Fields: f})
+		return
+	}
+	p, err := a.st.Sell(in.ProductID, in.Quantity)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	// Narx ≤ maxPrice (store), dona ≤ 100 (validateOrder): koʻpaytma int64'ga sigʻadi.
+	writeJSON(w, http.StatusCreated, orderResponse{ProductID: p.ID, Quantity: in.Quantity, Total: p.Price * int64(in.Quantity)})
+}
+```
+
+`productInput` has `Name string`, `Price int64`, `Stock int`; `orderInput` has `ProductID int64`, `Quantity int`. Their JSON tags match the request keys. `orderResponse` contains `ProductID`, `Quantity`, `Total`: the name `Order` is reserved for the domain type later.
+
+| Code | What it does |
+|---|---|
+| `var in …`, `decodeJSON(w, r, &in)` | allocate input and decode through its address; on failure the helper writes the response, so return |
+| `validate` / `validateOrder`, `len(f) > 0` | collect field errors; nonempty map → 422 with `fields` |
+| `a.st.Add` / `a.st.Sell` | change the shared catalog under its lock; store errors → `writeStoreError`, then return |
+| `w.Header().Set("Location", fmt.Sprintf(…))` | set the new product's address before the status is sent |
+| `writeJSON(…, http.StatusCreated, …)` | 201 and the created product or order result |
+| `p.Price * int64(in.Quantity)` | convert quantity to `int64` and multiply tiyin, not soʻm |
+
+The helpers in [`json.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-08-katalog-api/cmd/api/json.go) are the GB-4.06 code: maximum body 1024 bytes, unknown fields rejected, exactly one JSON value. Decode errors become 400, excess size 413, invalid values 422. `writeJSON` sets `Content-Type`, writes the status, then encodes the body. `writeError` wraps `apiError{Code, Message, Fields}` inside `error`; absent `fields` is omitted.
+
+The new **store error mapping** lives in one function:
+
+```go
+func writeStoreError(w http.ResponseWriter, err error) {
+	var se *store.StockError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, apiError{Code: "not_found", Message: err.Error()})
+	case errors.As(err, &se):
+		writeError(w, http.StatusConflict, apiError{Code: "insufficient_stock", Message: err.Error()})
+	case errors.Is(err, store.ErrBadQuantity), errors.Is(err, store.ErrBadProduct):
+		writeError(w, http.StatusUnprocessableEntity, apiError{Code: "validation_failed", Message: err.Error()})
+	default:
+		log.Printf("ichki xato: %v", err) // tafsilot server logiga (slog: GB-8.02), mijozga emas
+		writeError(w, http.StatusInternalServerError, apiError{Code: "internal", Message: "ichki xato"})
+	}
+}
+```
+
+| Branch | Status and code | Why |
+|---|---|---|
+| `errors.Is(err, store.ErrNotFound)` | 404 `not_found` | no product with that ID, including a wrapped error |
+| `errors.As(err, &se)` | 409 `insufficient_stock` | find `*StockError` through wrapping; `se` is the target pointer |
+| either error in the comma-separated `case` | 422 `validation_failed` | quantity or product violates a store rule |
+| `default` | 500 `internal` | unexpected failure; the client gets only `ichki xato` ("internal error") |
+
+`switch` has no expression: each `case` is a condition. The two conditions separated by a comma mean either one may match. `log.Printf("ichki xato: %v", err)` writes the actual error to the server log; `%v` formats its value. It does not expose an internal file path in the response. Structured logging with `slog` follows in [GB-8.02](/lab/youtube/gb#gb-8-02).
+
+## Copy under the lock; call yield after unlocking
+
+The store returns to the ordered `[]Product` from GB-3.06. GB-4.07's `map` was a smaller concurrency lab. The store adds `mu sync.Mutex`; `Add`, `Sell`, `Restock` and `Get` begin with `Lock` and `defer Unlock`. All receivers remain `*Store`, so the mutex is not copied.
+
+`All` solves the opening deadlock:
+
+```go
+func (s *Store) All() iter.Seq[Product] {
+	return func(yield func(Product) bool) {
+		s.mu.Lock()
+		products := slices.Clone(s.products)
+		s.mu.Unlock()
+		for _, p := range products {
+			if !yield(p) {
+				return
+			}
+		}
+	}
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1–2 | return an `iter.Seq[Product]`: the iterator function receives `yield` |
+| 3–5 | lock, clone the product slice into local `products`, unlock immediately |
+| 6 | loop over that copy |
+| 7–10 | give each copied product to `yield`; stop if it returns `false`, including a caller's `break` |
+| 11–12 | end the iterator function and method |
+
+| Moment | Shared catalog | Iterator | Lock |
+|---|---|---|---|
+| copy | read by `slices.Clone` | builds its own slice | held |
+| `yield(p)` | another request may change it | reads only its copy | released |
+| loop body calls `Sell` | stock changes safely | its earlier copy stays the same | `Sell` can take it |
+
+`defer Unlock` here would keep the lock until the iterator finishes, including every `yield` call. The explicit `Unlock` is deliberate. This `All` now gives a copy captured when iteration starts, rather than the earlier live view.
+
+The list handler collects that iterator:
+
+```go
+func (a *api) listProducts(w http.ResponseWriter, r *http.Request) {
+	products := slices.Collect(a.st.All())
+	if products == nil {
+		products = []store.Product{} // boʻsh katalog JSON'da null emas, [] boʻlsin (GB-3.06)
+	}
+	writeJSON(w, http.StatusOK, products)
+}
+```
+
+`slices.Collect` gathers the values into a slice. An empty iterator gives `nil`, which would encode as `null`; lines 3–5 replace it with `[]store.Product{}`, an empty non-nil slice, so the response is `[]`. The final call sends 200 and that slice.
+
+## Test routes through the real mux
+
+`send` runs the real routing table without opening a port:
+
+```go
+func send(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+```
+
+Line 2 makes a request, with `strings.NewReader(body)` supplying its body. Line 3 makes a recorder. Line 4 calls the handler's `ServeHTTP`; line 5 returns the recorded status and body. Unlike the GB-4.06 helper, it returns the recorder instead of printing it.
+
+`testStore(t)` builds a fresh store with the four products above. This is the complete `TestRoutes` function from `api_test.go`:
+
+```go
+func TestRoutes(t *testing.T) {
+	tests := []struct {
+		name, method, path, body string
+		status                   int
+		want                     string // body'da boʻlishi kerak boʻlgan boʻlak
+	}{
+		{"katalog", "GET", "/products", "", 200, `"name":"choy"`},
+		{"bitta", "GET", "/products/4", "", 200, `"name":"oʻrik"`},
+		{"yoq_id", "GET", "/products/99", "", 404, `"code":"not_found"`},
+		{"xato_id", "GET", "/products/abc", "", 400, `"code":"bad_id"`},
+		{"yangi", "POST", "/products", `{"name":"anor","price":1800000,"stock":7}`, 201, `"id":5`},
+		{"bosh_nom", "POST", "/products", `{"name":"","price":1800000}`, 422, `"name":"boʻsh boʻlmasin"`},
+		{"uzun_nom", "POST", "/products", `{"name":"` + strings.Repeat("a", 21) + `","price":1}`, 422, `"validation_failed"`},
+		{"buzuq_json", "POST", "/products", `{"name":`, 400, `"code":"bad_json"`},
+		{"katta_body", "POST", "/products", `{"name":"` + strings.Repeat("a", 2000) + `"}`, 413, `"code":"too_large"`},
+		{"juda_qimmat", "POST", "/products", `{"name":"oltin","price":1000000001}`, 422, `"validation_failed"`},
+		{"buyurtma", "POST", "/orders", `{"product_id":1,"quantity":3}`, 201, `"total":3600000`},
+		{"qoldiq_yetmaydi", "POST", "/orders", `{"product_id":4,"quantity":5}`, 409, `"code":"insufficient_stock"`},
+		{"yoq_mahsulot", "POST", "/orders", `{"product_id":99,"quantity":1}`, 404, `"code":"not_found"`},
+		{"nol_dona", "POST", "/orders", `{"product_id":1,"quantity":0}`, 422, `"quantity"`},
+		{"health", "GET", "/health", "", 200, "ok"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := send(newMux(testStore(t)), tc.method, tc.path, tc.body)
+			if rec.Code != tc.status {
+				t.Errorf("%s %s: status %d, kutilgan %d: %s", tc.method, tc.path, rec.Code, tc.status, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("%s %s: body %q, unda %q yoʻq", tc.method, tc.path, rec.Body, tc.want)
+			}
+		})
+	}
+}
+```
+
+| Part | Meaning |
+|---|---|
+| `[]struct{…}{…}` | table from GB-1.08: name, method, path, body, expected status, required body fragment |
+| `name, method, path, body string` | declare four string fields together |
+| 15 rows | every route and its main errors, including 413 and both handler/store validation |
+| raw strings between backticks | JSON text without escaping double quotes |
+| `t.Run(tc.name, …)` | one named subtest per row |
+| `newMux(testStore(t))` | a new catalog for each row, with the actual route patterns |
+| `rec.Code != tc.status` | report a status mismatch using `t.Errorf`; `%s` is text, `%d` an integer |
+| `strings.Contains(rec.Body.String(), tc.want)` | check the required response fragment; `%q` quotes text in the failure message |
+
+`TestCreateLocation` checks the new resource URL. `TestInternalError` checks 500 without internal text. `TestOrderChangesStock` reuses one mux for POST then GET and expects stock 37. `TestServer` checks the timeout and its health handler. These functions are in the same file.
+
+Predict the guided version's result: **A)** three `ok` lines · **B)** delete-task failures · **C)** it opens a server port.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `final` removes only the homework checkers. `./...` tests API, CLI and store; `-count=1` forces a fresh run. **B** describes the starter root; **C** confuses a recorder test with a running server.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.028s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.107s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.047s
+(chiqish kodi: 0)
+```
+
+These are my timings. The video showed API 0.003 s, CLI 0.040 s, store 0.017 s: this run is roughly 9.3×, 2.7× and 2.8× those values. Such tiny runs on a loaded machine are not performance benchmarks. The result to compare is three passing packages, not a speed ranking.
+
+## A locked Get can still leak a pointer
+
+The earlier version in `_video/01-pointer/internal/store/store.go` returned the pointer found inside the slice:
+
+```go
+func (s *Store) Get(id int64) (*Product, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.find(id)
+	if p == nil {
+		return nil, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	return p, nil
+}
+```
+
+Line 1 returns `*Product`. Lines 2–3 lock and arrange unlocking. Line 4 finds `&s.products[i]`; lines 5–7 return a wrapped missing-product error. Line 8 returns that same pointer. The deferred unlock runs as `Get` returns.
+
+Ordinary tests on this version still pass:
+
+```console
+$ ./_video/run.sh 01-pointer go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.007s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.093s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.022s
+(chiqish kodi: 0)
+```
+
+The parallel test uses the same mux and store for all requests:
+
+```go
+func TestParallel(t *testing.T) {
+	st := testStore(t)
+	h := newMux(st)
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Go(func() { send(h, "POST", "/orders", `{"product_id":1,"quantity":1}`) })
+		wg.Go(func() { send(h, "GET", "/products/1", "") })
+	}
+	wg.Wait()
+	if p, _ := st.Get(1); p.Stock != 10 {
+		t.Errorf("30 ta buyurtmadan keyin olma qoldigʻi %d, kutilgan 10", p.Stock)
+	}
+}
+```
+
+`st` starts with 40 apples. `h` is its mux. `wg.Go` starts a function in a goroutine; `wg.Wait` waits for those functions. Each of 30 iterations starts one order and one read, so the expected stock is `40 − 30 = 10`. The final `if` checks it, ignoring the error with `_` because the product is known to exist. The full `sync.WaitGroup` explanation is in [GB-7.01](/lab/youtube/gb#gb-7-01).
+
+With pointer-returning `Get`, predict `go test -race`:
+
+**A)** `ok`, since writes are locked · **B)** `WARNING: DATA RACE` · **C)** failure because stock is not 10
+
+<details>
+<summary>Answer</summary>
+
+**B.** Stock updates are locked, so the final quantity can be correct. But after `Get` unlocks, JSON encoding still reads the shared `Product` through its pointer. **A** checks only the writers; **C** assumes a lost update, which the writer's lock prevents here.
+
+</details>
+
+This is my rerun via Docker, not a quotation of the video. `…` shortens paths and omits stack frames:
+
+```console
+$ ./_video/race.sh 01-pointer go test -race -count=1 ./cmd/api
+==================
+WARNING: DATA RACE
+Write at 0x00c0001b6340 by goroutine 29:
+  github.com/abdurahmon27/bozor/internal/store.(*Store).Sell()
+      …/internal/store/store.go:160 +0x6a4
+  github.com/abdurahmon27/bozor/cmd/api.(*api).createOrder()
+      …/cmd/api/handlers.go:143 +0x364
+…
+Previous read at 0x00c0001b6340 by goroutine 86:
+  reflect.Value.Int()
+      …/src/reflect/value.go:1461 +0x453
+…
+  github.com/abdurahmon27/bozor/cmd/api.writeJSON()
+      …/cmd/api/json.go:24 +0x1fb
+  github.com/abdurahmon27/bozor/cmd/api.(*api).getProduct()
+      …/cmd/api/handlers.go:61 +0xae
+…
+==================
+--- FAIL: TestParallel (0.01s)
+    testing.go:1867: race detected during execution of test
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.029s
+FAIL
+(chiqish kodi: 1)
+```
+
+| Report line | How to read it |
+|---|---|
+| `WARNING: DATA RACE` | a conflicting access pair was found |
+| `Write at … goroutine 29` | `Sell`, line 160, writes stock through the order handler |
+| `Previous read at … goroutine 86` | the same address was read by another goroutine |
+| `reflect.Value.Int()` | JSON's internal call that reads an integer struct field |
+| `writeJSON`, `getProduct`, `handlers.go:61` | the read belongs to the single-product response |
+| `testing.go:1867` | Go's testing package reports "race detected during execution of test"; `TestParallel` fails |
+| `(chiqish kodi: 1)` | the wrapped test command failed |
+
+The hexadecimal address must match on the two accesses; addresses, goroutine numbers and frame offsets (`+0x…`) change between runs. The video showed `Read at` followed by `Previous write`; my run showed the reverse. The bug is the same.
+
+| Step | Request A: GET | Request B: order | Memory |
+|---|---|---|---|
+| 1 | `Get` returns pointer `p`, then unlocks | | `p` points into the catalog, stock 40 |
+| 2 | JSON reads through `p` without the lock | `Sell` writes stock 39 under the lock | both access the same cell |
+| 3 | race detector reports read/write | stock updates remain serialized | no synchronization orders the JSON read and write |
+
+The accesses need not physically overlap for the detector to report them. It checks synchronization between the accesses executed in this run. It cannot find a race on a path the tests never run.
+
+Fix `Get` by copying the value **while the lock is still held**:
+
+```go
+func (s *Store) Get(id int64) (Product, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.find(id)
+	if p == nil {
+		return Product{}, fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	return *p, nil
+}
+```
+
+The return type is now `Product`. On failure return `Product{}`, the zero value, with the error. On success `*p` reads the pointed-to value and copies it into the return value **before** deferred `Unlock` runs.
+
+| After `Get` returns | Catalog | Handler's `p` |
+|---|---|---|
+| initially | apple stock 40 | independent copy, stock 40 |
+| another order | stock 39 | still 40 |
+| JSON encoding | no read of catalog needed | reads its own copy |
+
+This copy is sufficient because `Product` contains integers and a string. If a future product contains a mutable map or slice, a struct copy alone would still share its underlying data.
+
+Predict the fixed version: **A)** three `ok` lines · **B)** the same race · **C)** a deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `Get` copies under the lock; `All` clones under the lock and calls `yield` after unlocking. **B** would need another unsynchronized shared access; **C** would require waiting for a lock already held in this call chain.
+
+</details>
+
+```console
+$ ./_video/race.sh final go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.037s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	1.075s
+ok  	github.com/abdurahmon27/bozor/internal/store	1.037s
+(chiqish kodi: 0)
+```
+
+The video printed 1.014 s, 1.046 s and 1.017 s. My values are about 1.02×, 1.03× and 1.02× those figures. The roughly one second per package is mainly the race runtime's default exit sleep: `GORACE` option `atexit_sleep_ms=1000`. It is not evidence that this tiny test does one second of work.
+
+To isolate that wait, `env` sets `GORACE` for the command inside the container. I also reran it with the exit sleep disabled:
+
+```console
+$ ./_video/race.sh final env GORACE=atexit_sleep_ms=0 go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.023s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.083s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.026s
+(chiqish kodi: 0)
+```
+
+The first package's displayed time changes by about 45× (`1.037 / 0.023`), but removing an exit sleep does not make the API 45× faster. Race instrumentation still has overhead; these figures are not an API throughput measurement.
+
+## Going deeper (optional): keep the rules in the store
+
+The handler validates input to return useful field messages. The store validates again because the CLI and loaded file also use it. `maxPrice` is 1,000,000,000 tiyin (10 million soʻm), `maxStock` is 1,000,000 pieces; `Restock` checks the resulting stock too. An API price must not bypass the CLI's old upper bound. With order quantity at most 100, the total is at most `10¹¹` tiyin and fits `int64`.
+
+`Save` also takes its slice copy under the lock, then writes the file without holding it. This API does not use it per request; concurrent processes and persistent storage are the next module's problem. `ReadHeaderTimeout` limits only header reading, not the entire request. Further server timeouts and shutdown are covered in [GB-8.03](/lab/youtube/gb#gb-8-03).
+
+`Add` still chooses the largest current ID plus one. Deleting the largest ID can therefore allow reuse. This teaching store's limitation is documented in the README; do not treat its IDs as permanent resource identities.
+
+## Common mistakes
+
+**1. "Get has Lock, so its result stays protected."** The broken `Get` and real race report are above. A pointer still refers to shared data after the method unlocks. Return a `Product` copy obtained under the lock; run both route and parallel tests with `-race`.
+
+**2. Race mode does not start.** With this machine's `CGO_ENABLED=0`:
+
+```console
+$ go test -race ./cmd/api
+go: -race requires cgo; enable cgo by setting CGO_ENABLED=1
+```
+
+The message says race mode requires C integration. On Linux enable cgo **and** have a C compiler such as `gcc`; setting `CGO_ENABLED=1` alone does not install it. I reran all race commands with the supplied Docker script. On a machine with the required compiler, run `go test -race ./...` directly. Docker is explained in GB-5.02.
+
+**3. Hold the lock across `yield`, or call `Get` inside locked `Delete`.** Both can wait for the same mutex twice. Use the `All` copy pattern; inside `Delete`, search `s.products` directly while holding the lock once.
+
+**4. Use `writeJSON(w, 204, nil)`.** It tries to encode `null`. A real server rejects a body for 204; a recorder can record it and fail the empty-body check. Use only `w.WriteHeader(http.StatusNoContent)`.
+
+**5. Start outside the lesson root.** `bozor.json` is a relative path. A missing file means an empty catalog in `Load`, not a startup error. Run from the folder containing this file. If port 8765 is busy, stop your earlier server before starting another.
+
+## Check yourself
+
+**1.** Why must `Get` return a copy?
+
+<details>
+<summary>Answer</summary>
+
+A pointer into the store outlives the lock. JSON reads it after unlocking while `Sell` can change the same value. Copying under the lock separates the handler's read from the shared catalog.
+
+</details>
+
+**2.** Where does a store error become a status? What happens to an unexpected error?
+
+<details>
+<summary>Answer</summary>
+
+In `writeStoreError`: 404, 409, 422, otherwise 500. The unexpected error's details go to the log; the client gets `internal` and the generic message, not the internal text.
+
+</details>
+
+**3.** From [GB-4.05](/lab/youtube/gb/gb-4-05/en): call a handler directly on a new request without the mux. What does `r.PathValue("id")` return?
+
+<details>
+<summary>Answer</summary>
+
+An empty string: the mux did not fill the wildcard. That is why these tests send through `newMux(st)`, which tests route selection too.
+
+</details>
+
+**4.** Predict: `All` clones while holding `mu`, unlocks, then its loop body calls `Sell`. **A)** deadlock · **B)** it can complete · **C)** `Sell` modifies the iterator's copy.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Sell` can take the released lock and change the catalog. **A** describes the old version with `yield` under the lock; **C** confuses the cloned slice with the shared catalog.
+
+</details>
+
+## Homework
+
+The task is [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-4-08-katalog-api/TASK.md) in [lessons/gb-4-08-katalog-api](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api). The level marks below are added for the written lesson.
+
+- 🟢 **Step 1:** implement `Store.Delete(id int64) error` in `internal/store/store.go`. Take `Lock` and `defer Unlock` at the start. Remove the product, preserve remaining order, and return an error wrapping `ErrNotFound` when absent.
+- 🟡 **Step 2:** register `DELETE /products/{id}` with `a.deleteProduct`. Use `pathID` for 400, `writeStoreError` for 404, and only `WriteHeader(http.StatusNoContent)` for success: 204 with no body.
+- 🟡 **Step 3:** write `TestDeleteProduct(t *testing.T)` in `cmd/api/api_test.go`. Test an existing ID → 204, missing ID → 404, `abc` → 400, and GET after deletion → 404.
+- 🟡 **Final check:** make `go test ./...` pass; when a compiler or Docker is available, also require a clean `go test -race ./...`.
+
+Do not edit either `tekshiruv_test.go`. Hints: find the slice index, then `slices.Delete(s.products, i, i+1)` removes that half-open interval while preserving order. `slices.IndexFunc` returns the first matching index, or −1. Search and deletion belong under **one** lock.
+
+The starter's current `Delete` is deliberately unfinished:
+
+```go
+func (s *Store) Delete(id int64) error {
+	return errors.New("Delete hali yozilmagan (TASK.md, 1-qadam)")
+}
+```
+
+First, formatting and vet:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Neither printed anything. Predict the untouched starter: **A)** all pass · **B)** task failures · **C)** compilation failure.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The starter compiles, but `Delete` is a stub, the DELETE route is missing, and your test does not exist yet. The checkers name the missing steps.
+
+</details>
+
+My starter run, shortened (`…` omits other failures and package lines):
+
+```console
+$ go test -count=1 ./...
+--- FAIL: TestVazifaDeleteRoute (0.00s)
+    tekshiruv_test.go:17: DELETE /products/2: 405 — route yoʻq: newMux'ga "DELETE /products/{id}" pattern'ini a.deleteProduct bilan qoʻshing (TASK.md, 2-qadam)
+--- FAIL: TestVazifaOzTest (0.00s)
+    tekshiruv_test.go:73: cmd/api'da func TestDeleteProduct(t *testing.T) yoʻq: DELETE /products/{id} uchun oʻz testingizni yozing (TASK.md, 3-qadam)
+…
+--- FAIL: TestVazifaDelete (0.00s)
+    tekshiruv_test.go:41: Delete(2) xato qaytardi: Delete hali yozilmagan (TASK.md, 1-qadam) — non (ID 2) katalogda bor, xato boʻlmasligi kerak
+…
+FAIL
+```
+
+`tekshiruv_test.go:17` is the checker's file and line; its Uzbek message says the route is missing and gives the exact registration. Line 73 asks for your test. Store line 41 says `Delete(2)` must succeed because bread exists. The additional lock and parallel checks also fail until `Delete` searches and removes under one lock. A two-second timeout reports a deadlock instead of leaving the checker hanging.
+
+<details>
+<summary>Answer: implementation and why it works</summary>
+
+The reference is [`solution/`](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api/solution). Its two changed methods:
+
+```go
+func (s *Store) Delete(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := slices.IndexFunc(s.products, func(p Product) bool { return p.ID == id })
+	if i < 0 {
+		return fmt.Errorf("mahsulot %d: %w", id, ErrNotFound)
+	}
+	s.products = slices.Delete(s.products, i, i+1)
+	return nil
+}
+
+func (a *api) deleteProduct(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := a.st.Delete(id); err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+`Delete` takes the mutex once. `IndexFunc` searches by ID; a negative index returns the wrapped error. `slices.Delete` removes one element and its returned slice replaces `s.products`. `defer` releases the mutex on both returns. `deleteProduct` parses once, deletes once, and writes either the mapped error or a bodyless 204.
+
+The additional route line inside `newMux`:
+
+```go
+mux.HandleFunc("DELETE /products/{id}", a.deleteProduct)
+```
+
+The reference test:
+
+```go
+func TestDeleteProduct(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		status int
+	}{
+		{"bor", "/products/3", 204},
+		{"yoq", "/products/99", 404},
+		{"xato_id", "/products/abc", 400},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newMux(testStore(t))
+			if rec := send(h, "DELETE", tc.path, ""); rec.Code != tc.status {
+				t.Errorf("DELETE %s: status %d, kutilgan %d: %s", tc.path, rec.Code, tc.status, rec.Body)
+			}
+		})
+	}
+	// oʻchirilgan mahsulot GET'da ham yoʻq
+	h := newMux(testStore(t))
+	send(h, "DELETE", "/products/3", "")
+	if rec := send(h, "GET", "/products/3", ""); rec.Code != 404 {
+		t.Errorf("DELETE'dan keyin GET /products/3: status %d, kutilgan 404", rec.Code)
+	}
+}
+```
+
+The three rows get fresh stores. The final sequence uses one mux for DELETE then GET, proving the product was actually removed. `bor`, `yoq`, `xato_id` mean "exists", "missing", "invalid ID".
+
+Enter `solution/` with `cd solution` (`cd` changes the current folder), then run the ordinary check. My result:
+
+```console
+$ go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.012s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.115s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.233s
+```
+
+From the lesson root, the Docker script also checks the full solution:
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.040s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	1.096s
+ok  	github.com/abdurahmon27/bozor/internal/store	1.283s
+(chiqish kodi: 0)
+```
+
+All three packages pass. The roughly one-second race exit wait still applies; the store's task checks add their own waiting too.
+
+</details>
+
+## Sources
+
+- [Go net/http](https://pkg.go.dev/net/http), [ServeMux](https://pkg.go.dev/net/http#ServeMux), [Server](https://pkg.go.dev/net/http#Server), [Request.PathValue](https://pkg.go.dev/net/http#Request.PathValue), [routing enhancements](https://go.dev/blog/routing-enhancements).
+- [Go specification: method values](https://go.dev/ref/spec#Method_values), [defer statements](https://go.dev/ref/spec#Defer_statements), [errors.Is and errors.As](https://pkg.go.dev/errors).
+- [sync.Mutex](https://pkg.go.dev/sync#Mutex), [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [Data Race Detector and GORACE options](https://go.dev/doc/articles/race_detector), [Go memory model](https://go.dev/ref/mem).
+- [slices.Clone](https://pkg.go.dev/slices#Clone), [slices.Collect](https://pkg.go.dev/slices#Collect), [slices.Delete](https://pkg.go.dev/slices#Delete), [slices.IndexFunc](https://pkg.go.dev/slices#IndexFunc), [iter](https://pkg.go.dev/iter).
+- [Table-driven tests](https://go.dev/wiki/TableDrivenTests), [httptest](https://pkg.go.dev/net/http/httptest), [curl parameters](https://curl.se/docs/manpage.html).
+- RFC 9110: [201 Created](https://www.rfc-editor.org/rfc/rfc9110#name-201-created), [204 No Content](https://www.rfc-editor.org/rfc/rfc9110#name-204-no-content), [409 Conflict](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict), [422 Unprocessable Content](https://www.rfc-editor.org/rfc/rfc9110#name-422-unprocessable-content), [500 Internal Server Error](https://www.rfc-editor.org/rfc/rfc9110#name-500-internal-server-error).
+- [Course code and README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api), [API files](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api/cmd/api).
+
+Results: `go1.27.4 linux/amd64`, 2026-11-27, `CGO_ENABLED=0`; all `-race` results rerun with the lesson's Docker script and cgo enabled. The live API ran on a free local port and was stopped after verification. Video timings are explicitly quoted for comparison; the displayed command outputs are from my runs.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-4-08-katalog-api)
+
+---
+
+← Previous lesson: [GB-4.07](/lab/youtube/gb/gb-4-07/en) · Next lesson: [GB-5.01](/lab/youtube/gb#gb-5-01) → · [All lessons](/lab/youtube/gb)
+
+</div>
