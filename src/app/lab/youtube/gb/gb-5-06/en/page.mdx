@@ -1,0 +1,688 @@
+---
+title: "goose migrations: versioning schema changes"
+date: "2026/11/27"
+description: "Manage a Postgres schema with numbered SQL files: goose up, status, down, a NOT NULL failure, and its DEFAULT fix."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-5-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-5-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-5-06"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-5-06) · [Русский](/lab/youtube/gb/gb-5-06/ru) · **English**  
+Lesson GB-5.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-5-06) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+`orders.sql` has created the tables once. What happens if you run it during the next server update? How can you update the schema while keeping the data?
+
+**The one idea:** each schema change lives in a numbered SQL file. The database records applied versions in `goose_db_version`; goose applies the missing files.
+Normally, each file runs in one transaction: if it fails, that file's changes roll back.
+
+After this lesson you will:
+
+- install goose and run `status`, `up`, and `down`;
+- read the database state from its version table;
+- fix a column addition on a populated table with `DEFAULT`;
+- write the fourth migration and check it with tests.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| migration file | a numbered SQL file that changes the schema | migration file |
+| goose | a tool that compares files with applied versions in the database | goose |
+| failed migration | an unsuccessful change rolled back within the usual transaction | failed migration |
+
+**ALTER TABLE** changes an existing table's structure. **`\dt`** lists tables in psql.
+Here, schema means the structure of tables; `public` is the named schema containing the tables.
+
+## Before you start
+
+- [GB-5.05 · Go → Postgres](/lab/youtube/gb/gb-5-05/en): connection addresses and `pgx.ErrNoRows`.
+- [GB-5.03 · SQL tables](/lab/youtube/gb/gb-5-03/en): `products`, types, `NOT NULL`, `CHECK`, `DEFAULT`.
+- [GB-5.04 · Related tables and NULL](/lab/youtube/gb/gb-5-04/en): `orders`, `order_items`, `REFERENCES`, NULL versus empty text.
+- [GB-5.02 · Postgres lab](/lab/youtube/gb/gb-5-02/en): Compose, volumes, ports, and `psql`.
+- [GB-3.03 · Team tools](/lab/youtube/gb/gb-3-03/en): `go install`, `PATH`.
+- [GB-2.06 · Packages](/lab/youtube/gb/gb-2-06/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.08 · Tests](/lab/youtube/gb/gb-1-08/en): modules, `var`, `go test`.
+
+You need Docker, Compose, and Go 1.27.4. Go Playground cannot run this Postgres experiment.
+Work in a temporary copy of the course folder `lessons/gb-5-06-goose-migratsiya`.
+The original folder already contains the fixed third migration. To replay the video, remove `00003_orders_status.sql` only from your copy; we recreate it below.
+Check that port `5486` is free; otherwise change the copied Compose port and both connection addresses together.
+
+Run the following commands in one terminal, inside that copy. `export` passes values to later commands.
+`COMPOSE_PROJECT_NAME` separates the experiment from other projects. This run uses `gb506docs`; the video uses `bozor`, and the original folder uses `gb506`.
+`CGO_ENABLED=0` builds without an external C compiler. `GOTOOLCHAIN` selects the Go version.
+The sample names are fictional; `bozor-lab` is only the local lab password.
+
+```bash
+export CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4
+export COMPOSE_PROJECT_NAME=gb506docs
+```
+
+Recall the previous lesson: no row matches `Get(ctx, 99)`. What does `Scan` return?
+**A)** `pgx.ErrNoRows` · **B)** `nil` and an empty `Product` · **C)** `panic`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `pgx.ErrNoRows`, with the message `no rows in result set`. The store maps it to its own `ErrNotFound`. No matching row means neither success nor `panic`.
+
+</details>
+
+## Repeating a SQL file manually
+
+`docker compose up -d --wait` starts the database in the background and waits for readiness.
+`exec db psql` runs the client inside container `db`. `-f` reads the given file; `/lab/` is our copy's path inside the container.
+First, create the video's starting state:
+
+```console
+$ docker compose up -d --wait
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Creating 
+ Volume gb506docs_pgdata Creating 
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Created 
+ Volume gb506docs_pgdata Created 
+ Network gb506docs_default Created 
+ Network gb506docs_default Created 
+ Container gb506docs-db-1 Creating 
+ Container gb506docs-db-1 Created 
+ Container gb506docs-db-1 Starting 
+ Container gb506docs-db-1 Started 
+ Container gb506docs-db-1 Waiting 
+ Container gb506docs-db-1 Healthy 
+```
+
+```console
+$ docker compose exec db psql -f /lab/products.sql -f /lab/orders.sql
+CREATE TABLE
+INSERT 0 4
+CREATE TABLE
+CREATE TABLE
+```
+
+`Creating`, `Created`, `Starting`, `Started`, `Waiting`, and `Healthy` are stages from creation to readiness.
+`Network` is the project network; `Volume` stores database data. Repeated progress lines also come from the actual output.
+`CREATE TABLE` means a table was created. `INSERT 0 4` means four rows were inserted; `0` is the unused OID field in this form.
+
+What happens when `orders.sql` runs again? **A)** both tables are recreated · **B)** two “table already exists” errors · **C)** goose records a new version.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Those names are already taken for `CREATE TABLE`. Goose has not run yet; executing the file through psql does not record a version.
+
+</details>
+
+```console
+$ docker compose exec db psql -f /lab/orders.sql
+psql:/lab/orders.sql:5: ERROR:  relation "orders" already exists
+psql:/lab/orders.sql:12: ERROR:  relation "order_items" already exists
+```
+
+`orders.sql:5` and `:12` identify file lines. `relation … already exists` means a table with that name exists.
+This call has exit code `0`: psql normally continues after SQL errors. In automation, use `-v ON_ERROR_STOP=1` to stop on an error.
+Clear only this experiment's database: `down -v` removes its container, network, and named volume. The next `up` creates an empty database.
+
+```console
+$ docker compose down -v
+ Container gb506docs-db-1 Stopping 
+ Container gb506docs-db-1 Stopped 
+ Container gb506docs-db-1 Removing 
+ Container gb506docs-db-1 Removed 
+ Volume gb506docs_pgdata Removing 
+ Network gb506docs_default Removing 
+ Volume gb506docs_pgdata Removed 
+ Network gb506docs_default Removed 
+```
+
+```console
+$ docker compose up -d --wait
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Creating 
+ Volume gb506docs_pgdata Creating 
+ Network gb506docs_default Creating 
+ Volume gb506docs_pgdata Created 
+ Volume gb506docs_pgdata Created 
+ Network gb506docs_default Created 
+ Network gb506docs_default Created 
+ Container gb506docs-db-1 Creating 
+ Container gb506docs-db-1 Created 
+ Container gb506docs-db-1 Starting 
+ Container gb506docs-db-1 Started 
+ Container gb506docs-db-1 Waiting 
+ Container gb506docs-db-1 Healthy 
+```
+
+`Stopping`, `Stopped`, `Removing`, and `Removed` report stopping and removal. Do not delete a running production database to update its schema.
+
+## Migration files and goose
+
+Each change is a separate **migration file**. Its number gives the order; goose compares files with database versions.
+
+| Before | Action | After |
+|---|---|---|
+| files 1, 2; database at initial 0 | `goose up` | 1, 2 applied; version 2 |
+| files 1, 2; database has 1, 2 | `goose up` | no change |
+| files 1, 2, 3; database has 1, 2 | `goose up` | only 3 runs |
+
+Install a specific goose version. In the module path, `v3` is the major version, `cmd/goose` is the command package, and `@v3.30.2` selects the version.
+`go install` writes the executable to `GOBIN`, or usually `~/go/bin` when unset. Put that folder in `PATH`.
+
+```console
+$ go install github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+```console
+$ goose -version
+goose version: v3.30.2
+```
+
+Installation printed nothing in this repeat run; a first run may print download messages. `-version` shows the installed version.
+Goose needs three values: `GOOSE_DRIVER` selects the database type; `GOOSE_DBSTRING` is the connection address; `GOOSE_MIGRATION_DIR` selects the file directory.
+One `export` can set several values.
+
+```bash
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING=postgres://bozor:bozor-lab@localhost:5486/bozor
+export DATABASE_URL=postgres://bozor:bozor-lab@localhost:5486/bozor
+```
+
+Later Go tests read `DATABASE_URL`; goose uses its own `GOOSE_DBSTRING`.
+The URL contains user `bozor`, lab password `bozor-lab`, host and port `localhost:5486`, and database name `bozor` at the end.
+`ls migrations` lists the files:
+
+```console
+$ ls migrations
+00001_products.sql
+00002_orders.sql
+```
+
+```sql filename="migrations/00001_products.sql" showLineNumbers
+-- +goose Up
+CREATE TABLE products (
+    id     bigint
+           GENERATED ALWAYS AS IDENTITY
+           PRIMARY KEY,
+    name   text    NOT NULL UNIQUE CHECK (name <> ''),
+    price  bigint  NOT NULL CHECK (price > 0),
+    stock  integer NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    active boolean NOT NULL DEFAULT true
+);
+
+-- +goose Down
+DROP TABLE products;
+```
+
+| Line | What it does |
+|---|---|
+| 1 | In SQL, `--` starts a comment; goose reads `-- +goose Up` as the apply-section marker |
+| 2 | `CREATE TABLE products (` opens the table and column definition |
+| 3–5 | `id` is a large integer; the database assigns its number; the primary key makes it unique |
+| 6 | `name` is text; NULL, duplicates, and empty text are rejected |
+| 7 | `price` is a large integer in tiyin; NULL and nonpositive values are rejected |
+| 8 | `stock` is an integer, defaulting to 0; negatives and NULL are rejected |
+| 9 | `active` is a boolean, defaulting to true; NULL is rejected |
+| 10 | `);` closes the table definition and SQL statement |
+| 12–13 | `Down` begins the rollback section; `DROP TABLE` deletes the table |
+
+`<>` means not equal; `''` is empty text. The second file creates related tables:
+
+```sql filename="migrations/00002_orders.sql" showLineNumbers
+-- +goose Up
+CREATE TABLE orders (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer text   NOT NULL,
+    note     text
+);
+CREATE TABLE order_items (
+    id         bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id   bigint  NOT NULL REFERENCES orders (id),
+    product_id bigint  NOT NULL REFERENCES products (id),
+    quantity   integer NOT NULL CHECK (quantity > 0),
+    unit_price bigint  NOT NULL CHECK (unit_price > 0)
+);
+
+-- +goose Down
+DROP TABLE order_items;
+DROP TABLE orders;
+```
+
+Lines 2–6: `orders` stores orders; `customer` is the customer name, and `note` is an optional note.
+Lines 7–13: `order_items` stores order lines; `order_id` and `product_id` are foreign keys.
+The `quantity` and `unit_price` must be positive.
+Lines 15–17: the referencing `order_items` table is dropped before `orders`. The first migration rolls back after the second.
+
+## Status, Up, and the version table
+
+`goose status` shows each file's state. `Applied At` gives the application time; `Migration` identifies the file.
+`Pending` means not applied yet. All console blocks below were rerun; date prefixes are preserved exactly.
+
+```console
+$ goose status
+2026/11/27 20:34:28     Applied At                  Migration
+2026/11/27 20:34:28     =======================================
+2026/11/27 20:34:28     Pending                  -- 00001_products.sql
+2026/11/27 20:34:28     Pending                  -- 00002_orders.sql
+```
+
+`goose up` runs unapplied files in numeric order. Which files run in this empty database?
+**A)** only 2 · **B)** 1 followed by 2 · **C)** neither.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Both are `Pending`. The highest number identifies the newest version; it does not mean only that file should run.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00001_products.sql (8.94ms)
+2026/11/27 20:34:28 OK   00002_orders.sql (9.83ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 2
+```
+
+`OK` means the file was applied; parentheses contain the duration, and `ms` means milliseconds. The last line reports current database version `2`.
+`psql -c` executes one command. `\dt` lists tables:
+
+```console
+$ docker compose exec db psql -c '\dt'
+              List of tables
+ Schema |       Name       | Type  | Owner 
+--------+------------------+-------+-------
+ public | goose_db_version | table | bozor
+ public | order_items      | table | bozor
+ public | orders           | table | bozor
+ public | products         | table | bozor
+(4 rows)
+```
+
+`Schema` is the named group (`public`); `Name` is the table name; `Type` is `table`; `Owner` identifies the owner.
+There are three project tables and goose's `goose_db_version`. `(4 rows)` counts result rows.
+Read the version records ordered by `id`:
+
+```console
+$ docker compose exec db psql -c 'SELECT id, version_id, is_applied FROM goose_db_version ORDER BY id'
+ id | version_id | is_applied 
+----+------------+------------
+  1 |          0 | t
+  2 |          1 | t
+  3 |          2 | t
+(3 rows)
+```
+
+`id` is the record key; `version_id` is the migration number; `t` in `is_applied` means true, applied.
+`0` is goose's initial record, not a migration file. Two files therefore produce three records.
+
+Repeat the same `goose up`. **A)** existing-table error · **B)** no change · **C)** tables are recreated.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Goose sees that both versions are applied. A describes repeating the raw SQL file; C would lose data.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 goose: no migrations to run. current version: 2
+```
+
+`no migrations to run` means there are no new files. With the schema managed this way, `up` can run on each deployment.
+This does not guarantee repair of manual schema edits or coordination of concurrent deployments.
+
+## A NOT NULL error on a populated table
+
+`seed.sql` inserts four products, three orders, and four order lines:
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+INSERT 0 4
+INSERT 0 3
+INSERT 0 4
+```
+
+`N` in each `INSERT 0 N` counts inserted rows.
+Orders need a status. `goose create` creates a template; `-s` selects sequential numbering, `orders_status` is the name, and `sql` is the file type.
+Without `-s`, the name starts with a timestamp; choose one numbering scheme per project.
+
+```console
+$ goose create -s orders_status sql
+2026/11/27 20:34:28 Created new file: migrations/00003_orders_status.sql
+```
+
+```console
+$ ls migrations
+00001_products.sql
+00002_orders.sql
+00003_orders_status.sql
+```
+
+`Created new file` confirms file creation. Replace the template's example `SELECT` statements. Start with this deliberately broken version:
+
+```sql
+-- +goose Up
+ALTER TABLE orders ADD COLUMN status text NOT NULL;
+
+-- +goose Down
+ALTER TABLE orders DROP COLUMN status;
+```
+
+Line 1 starts Up. Line 2: `ALTER TABLE orders` changes the existing table; `ADD COLUMN` adds a text column named `status`.
+`NOT NULL` forbids NULL. Lines 4–5 form Down; `DROP COLUMN` removes the column.
+Without a `DEFAULT`, existing rows receive NULL in the new column. NULL differs from empty text.
+
+Three orders already exist. What happens? **A)** status becomes `''` · **B)** the database rejects it · **C)** NULL is accepted.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The three existing rows would receive NULL, which `NOT NULL` forbids. A has no empty-text value configured; C violates the constraint.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 goose run: ERROR 00003_orders_status.sql: failed to run SQL migration: failed to execute SQL query "ALTER TABLE orders ADD COLUMN status text NOT NULL;": ERROR: column "status" of relation "orders" contains null values (SQLSTATE 23502)
+```
+
+Goose has exit code `1`. `ERROR 00003_orders_status.sql` identifies the file; the unsuccessful SQL follows.
+`column "status" of relation "orders" contains null values` explains the conflicting values.
+`SQLSTATE 23502` is Postgres's `not_null_violation` code: a NOT NULL violation.
+
+A **transaction** saves either all its commands or none. [GB-5.07](/lab/youtube/gb/gb-5-07/en) explains it further.
+Goose normally executes each file in one transaction. This does not mean one transaction covers every file in one `up`.
+
+| Stage | Files 1–2 | File 3 | orders.status |
+|---|---|---|---|
+| before failure | committed | not started | absent |
+| failure | committed | rolled back | absent |
+| next attempt | not executed again | executed again | depends on success |
+
+Midway question: what is `orders` like after failure? **A)** status exists with NULL · **B)** status is absent · **C)** the table is partly changed.
+
+<details>
+<summary>Answer</summary>
+
+**B.** This file's change was not committed. This `ALTER TABLE` is itself atomic; in a file with several commands, the transaction also rolls back earlier commands.
+
+</details>
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders LIMIT 1'
+ id | customer | note 
+----+----------+------
+  1 | Dilnoza  | 
+(1 row)
+```
+
+```console
+$ goose status
+2026/11/27 20:34:28     Applied At                  Migration
+2026/11/27 20:34:28     =======================================
+2026/11/27 20:34:28     Fri Nov 27 15:34:28 2026 -- 00001_products.sql
+2026/11/27 20:34:28     Fri Nov 27 15:34:28 2026 -- 00002_orders.sql
+2026/11/27 20:34:28     Pending                  -- 00003_orders_status.sql
+```
+
+Only `id`, `customer`, and `note` exist. `00003` remains `Pending`.
+The `Applied At` date depends on the database time zone; line prefixes depend on the CLI environment. They differ in this output.
+A file containing `-- +goose NO TRANSACTION` opts out of the usual guarantee: commands before an error may remain committed.
+This lesson's files do not contain that annotation.
+
+## Fixing an unapplied file
+
+Rule: do not edit a migration already applied to any database. Goose does not check content changes or automatically rerun it.
+Otherwise different databases can have different schemas under the same number. Write a new numbered file for a change.
+This third file has not been applied to any database, so we can fix it:
+
+```sql filename="migrations/00003_orders_status.sql" showLineNumbers
+-- +goose Up
+ALTER TABLE orders
+    ADD COLUMN status text NOT NULL DEFAULT 'yangi' CHECK (status <> '');
+
+-- +goose Down
+ALTER TABLE orders DROP COLUMN status;
+```
+
+The change is line 3. `DEFAULT 'yangi'` gives existing orders a value and applies to new rows when status is omitted.
+`yangi` means “new”. `CHECK (status <> '')` rejects empty text; this is separate from `NOT NULL`.
+How many files now apply? **A)** all three · **B)** only 3 · **C)** none.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The first two files are committed. The third remained unapplied after failure; we fix it and retry.
+
+</details>
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.12ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 3
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT id, customer, status FROM orders'
+ id | customer | status 
+----+----------+--------
+  1 | Dilnoza  | yangi
+  2 | Jasur    | yangi
+  3 | Malika   | yangi
+(3 rows)
+```
+
+All three existing orders have status `yangi`. This query does not guarantee ordering: add `ORDER BY id` when order matters.
+
+The video timings below are **quoted**; the adjacent measurements were rerun for this page.
+
+| Action | Video, ms | This run, ms | This / video |
+|---|---|---|---|
+| Up 00001 | 10.27 | 8.94 | 0.87× |
+| Up 00002 | 7.37 | 9.83 | 1.33× |
+| Up 00003 | 7.18 | 4.12 | 0.57× |
+| Down 00003 | 5.05 | 4.71 | 0.93× |
+
+Milliseconds vary on a loaded machine. The ratios describe this single run's difference, not a performance guarantee.
+The useful result is the behavior: only the required file ran, failure did not commit the change, and retry worked.
+
+## Down: rolling back the latest migration
+
+`goose down` executes the `Down` section of the latest applied migration. At version 3, how many files roll back?
+**A)** all · **B)** the latest · **C)** none.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Only `DROP COLUMN status` from file 3. `docker compose down -v` removes the entire experiment database; goose down executes that SQL.
+
+</details>
+
+```console
+$ goose down
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.71ms)
+```
+
+```console
+$ docker compose exec db psql -c 'SELECT * FROM orders LIMIT 1'
+ id | customer | note 
+----+----------+------
+  1 | Dilnoza  | 
+(1 row)
+```
+
+`status` is absent; the original three columns remain. `DROP COLUMN` also deletes status data; Down is not a backup.
+Production changes often use a new corrective migration. Down is useful in development and tests.
+Run `up` again: file 3 applies again, and status values return to the DEFAULT.
+
+```console
+$ goose up
+2026/11/27 20:34:28 OK   00003_orders_status.sql (4.02ms)
+2026/11/27 20:34:28 goose: successfully migrated database to version: 3
+```
+
+## Going deeper (optional): SQL inside the binary
+
+The server may have no separate goose command. Go can include files in the binary at compilation.
+This is an excerpt from `migrate.go`, not a standalone program:
+
+```go
+//go:embed migrations/*.sql
+var files embed.FS
+```
+
+Line 1 is the `//go:embed` directive. `migrations/*.sql` selects SQL files in that folder; `*` matches the variable part of each name.
+Line 2 uses `var` to declare `files` with type `embed.FS`. That type reads embedded files; the complete file imports `embed`.
+
+Numbered SQL files travel with the binary. Changing a file requires rebuilding the binary.
+The folder's `NewProvider` uses goose as a library and coordinates multiple instances with a Postgres session lock.
+[GB-8.06](/lab/youtube/gb#gb-8-06) covers the library API and deployment calls; for now, tests use the supplied `migrate.go`.
+
+## Common mistakes
+
+1. **Editing an applied file.** Goose sees the version, not content changes. The second `up` above will not discover new work. Fix: a new numbered file.
+2. **NOT NULL without DEFAULT on a populated table.** The full `23502` error appears above; `DEFAULT 'yangi'` in `00003` supplies values for existing rows.
+3. **Treating NULL and empty text as equivalent.** `NOT NULL` does not forbid `''`. Also use `CHECK (status <> '')`.
+4. **Expecting Down to restore data.** `DROP COLUMN` removes old statuses. Repeating Up restores only the DEFAULT.
+5. **Thinking one failed file rolls back every file.** Files 1 and 2 remain applied after file 3 fails. The transaction boundary is one file.
+
+## Check yourself
+
+**1.** Where does goose store applied versions? Why do two files have three records?
+
+<details>
+<summary>Answer</summary>
+
+In `goose_db_version`. `0` is the initial record; `1` and `2` are file versions.
+
+</details>
+
+**2.** Why does a failed migration not leave partial table changes? What is the exception?
+
+<details>
+<summary>Answer</summary>
+
+Normally, one file runs in one transaction. Failure rolls back that file. `NO TRANSACTION` disables this protection.
+
+</details>
+
+**3.** At version 3, run `goose down`, then `goose up`. **A)** 1–3 run again · **B)** only 3 rolls back and reapplies · **C)** up fails.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Down reverts the latest file; Up then sees file 3 as unapplied. Old status data does not return.
+
+</details>
+
+**4.** From GB-5.03: can a row with price `0` be stored under `CHECK (price > 0)`?
+
+<details>
+<summary>Answer</summary>
+
+No. The condition is false; the database rejects the row with a CHECK violation.
+
+</details>
+
+## Homework
+
+🟢 **Write one migration.** Complete [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-5-06-goose-migratsiya/TASK.md) in the [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya):
+
+1. Create `migrations/00004_products_category.sql`; `goose create -s products_category sql` can also create the template.
+2. Up: `products.category` of type `text`, with `NOT NULL DEFAULT 'boshqa'` and `CHECK (category <> '')`.
+3. Down: remove that column. Keep `00001`–`00003` and `migrate_test.go` unchanged.
+
+The third file removed for replay must now contain the fixed migration. First check the starter test:
+
+```console
+$ CGO_ENABLED=0 go test .
+--- FAIL: TestCategoryMigration (0.01s)
+    migrate_test.go:171: 4-migratsiya yoʻq: migrations/ papkasida 00004_ bilan boshlanadigan .sql fayl yarating (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.136s
+FAIL
+```
+
+This is the expected failure: `migrate_test.go:171` reports the missing fourth file.
+In a clean temporary schema, the test applies 1–3, inserts products, applies 4, checks DEFAULT and CHECK, runs Down, and runs Up again.
+It deletes that schema afterward; data in `public` is untouched. Without PostgreSQL, the test reports a connection failure instead of skipping.
+After adding the file, work until `CGO_ENABLED=0 go test .` passes. Applied files' contents are also checked.
+Open the [answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya/solution) after trying it yourself.
+
+<details>
+<summary>Answer</summary>
+
+Reuse the shape of `00003` with the new table and column names. `boshqa` means “other”, the default category:
+
+```sql filename="solution/migrations/00004_products_category.sql" showLineNumbers
+-- +goose Up
+ALTER TABLE products
+    ADD COLUMN category text NOT NULL DEFAULT 'boshqa' CHECK (category <> '');
+
+-- +goose Down
+ALTER TABLE products DROP COLUMN category;
+```
+
+`DEFAULT` fills existing products. `NOT NULL` rejects NULL; CHECK rejects empty text.
+Down drops the column; the next Up assigns the DEFAULT again. The test checks these exact states.
+
+</details>
+
+To check the answer separately, enter its folder with `cd solution`. The next command ran inside solution:
+
+```console
+$ CGO_ENABLED=0 go test .
+ok  	github.com/abdurahmon27/bozor	0.225s
+```
+
+`ok` means tests passed; the module path and elapsed seconds follow. Return to the experiment copy's root before cleanup.
+Finally, remove the container and volume:
+
+```console
+$ docker compose down -v
+ Container gb506docs-db-1 Stopping 
+ Container gb506docs-db-1 Stopped 
+ Container gb506docs-db-1 Removing 
+ Container gb506docs-db-1 Removed 
+ Volume gb506docs_pgdata Removing 
+ Network gb506docs_default Removing 
+ Volume gb506docs_pgdata Removed 
+ Network gb506docs_default Removed 
+```
+
+## Sources
+
+- [goose](https://pressly.github.io/goose/): the migration tool; [CLI commands](https://pressly.github.io/goose/documentation/cli-commands/) and [environment variables](https://pressly.github.io/goose/documentation/environment-variables/).
+- [SQL annotations and transactions](https://pressly.github.io/goose/documentation/annotations/): Up, Down, NO TRANSACTION.
+- [goose v3.30.2 source](https://github.com/pressly/goose/tree/v3.30.2): `internal/sqlparser/parser.go`, `create.go`, version storage, and transactions.
+- [go install](https://pkg.go.dev/cmd/go#hdr-Compile_and_install_packages_and_dependencies), [embed](https://pkg.go.dev/embed).
+- [pgx.ErrNoRows](https://pkg.go.dev/github.com/jackc/pgx/v5#pkg-variables).
+- PostgreSQL 18: [CREATE TABLE](https://www.postgresql.org/docs/18/sql-createtable.html), [INSERT](https://www.postgresql.org/docs/18/sql-insert.html), [ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html), [error codes](https://www.postgresql.org/docs/18/errcodes-appendix.html), [psql](https://www.postgresql.org/docs/18/app-psql.html).
+- [Docker Compose down](https://docs.docker.com/reference/cli/docker/compose/down/).
+- [Course README and recorded video outputs](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya).
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, goose `v3.30.2`, pgx `v5.13.0`, PostgreSQL `18.7`, Docker Compose `5.4.0`, 2026-11-27.
+Only the video timings are quoted; all other console outputs were rerun for this page.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-5-06-goose-migratsiya)
+
+---
+
+← Previous lesson: [GB-5.05](/lab/youtube/gb/gb-5-05/en) · Next lesson: [GB-5.07](/lab/youtube/gb/gb-5-07/en) → · [All lessons](/lab/youtube/gb)
+
+</div>
