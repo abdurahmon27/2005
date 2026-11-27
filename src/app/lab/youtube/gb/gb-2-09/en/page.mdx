@@ -1,0 +1,1027 @@
+---
+title: "defer, panic and recover: what each one is for"
+date: "2026/11/27"
+description: "Close the report file with defer on every return, know how panic runs your defers, and turn a panic into an ordinary error with recover."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-2-09"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-2-09"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-2-09) · [Русский](/lab/youtube/gb/gb-2-09/ru) · **English**  
+Lesson GB-2.09 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-2-09) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The `saveReport` function in bozor writes the report to a file. `main` calls it 2000 times and prints every new error with the attempt number.
+At first there is one error: a write error. But on attempt 1020 the error text changes to `too many open files`.
+Every call opens one file and returns. Where did the files pile up, and how does one line fix it?
+
+**One idea:** every function has its own **defer list**. A `defer` line adds a call (with its arguments evaluated right away) to the end of the list.
+However the function ends, by `return` or by a panic, the list runs from the end to the start. A panic climbs up the chain of calls
+and runs every function's list. `recover` stops a panic only when it is called directly inside a function from that list. `os.Exit` does not run the lists.
+
+By the end of the lesson you will:
+
+- fix the file leak in `saveReport` (`too many open files`) with `defer f.Close()`;
+- say in which order several `defer`s run and when their arguments are evaluated, without running the program;
+- know when a panic is appropriate and when to return an `error`, and turn a panic into an `error` with `recover` and a named result;
+- understand why `os.Exit` skips `defer` and fix it with `run() error`.
+
+Today's three core new words:
+
+| Word | Plain meaning | English |
+|---|---|---|
+| `defer` | does not run the call now, postpones it until the function ends | defer |
+| `panic` | stops the function's normal work; after the defers have run, the program exits with code 2 | panic |
+| `recover` | inside a function from the defer list, stops a panic and returns its value | recover |
+
+Two helpers: a named result (`(err error)` — giving the result a name) and `os.Exit` (ends the program at once).
+
+## Before you start
+
+The lesson builds on [GB-2.08 · Errors in depth: %w, errors.Is and errors.As](/lab/youtube/gb/gb-2-08/en): the `error` value and wrapping with `%w`. You also need:
+
+- [GB-2.07 · Interface: io.Writer and two real implementations](/lab/youtube/gb/gb-2-07/en): `writeReport(w io.Writer, …)`, `os.Create`, `f.Close()`.
+- [GB-2.04 · Pointers: a copy or a shared value](/lab/youtube/gb/gb-2-04/en): `*T`, `&x`, `findProduct` returns `nil` when it finds nothing; writing through a nil pointer causes a panic.
+- [GB-2.06 · Packages: capital letters, internal/ and project layout](/lab/youtube/gb/gb-2-06/en): a lower-case name is visible only inside its own package.
+- [GB-1.08 · The first test: go test, t.Errorf and table-driven tests](/lab/youtube/gb/gb-1-08/en): the anonymous function passed to `t.Run`, and `go test`.
+- [GB-1.07 · Function and the first error: os.Args and strconv.Atoi](/lab/youtube/gb/gb-1-07/en): `(result, error)`, `if err != nil`, `os.Exit(1)`, `os.Stderr`, the exit code.
+- [GB-1.06 · Repetition: the only for in Go and its forms](/lab/youtube/gb/gb-1-06/en): `for i := 1; i <= n; i++`.
+
+**How to run the code.** The lesson code is in a folder of the course repository:
+[lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic). Clone the repository and
+open the terminal in that folder (`cd` moves the terminal to another folder):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-2-09-defer-panic
+```
+
+The folder holds the final `main.go`, `tekshiruv_test.go` (checks the task), `TASK.md` (the task) and `solution/` (the answer). Every step of the video is in
+`_video/<step>/main.go`. The command `./_video/run.sh <step> <command>` copies the step into a temporary `bozor/` folder and runs the command there:
+your folder stays clean. At the end the script prints its own `(chiqish kodi: N)` line ("exit code: N"); I left it out on this page.
+When a panic or `os.Exit(1)` happens, `go run` itself prints `exit status N`: that line comes from Go.
+
+The module is written for Go 1.27 (`go 1.27` in `go.mod`). If you have an older Go installed, `go` downloads the right version itself.
+The results on this page come from `go1.27.4 linux/amd64` with `CGO_ENABLED=0`. The experiment in the first part (`ulimit`, `/dev/full`) works on **Linux** only:
+macOS has no `/dev/full`. Everything else works on any system. I ran the two small programs that are not in the course folder (the text says which)
+in a separate folder; their full code is on this page.
+
+The names in the code are Uzbek; a one-time gloss: `hisobot` — "report", `tiyin` — one hundredth of a som, `olma`, `non`, `oʻrik` — apple, bread, apricot,
+`sotildi` — "sold", `ikki` — "two", `natija` — "result", `sikl` — "loop". The strings and comments in the programs stay in Uzbek.
+
+One question from the previous lesson. `Sell` wrapped the error with `fmt.Errorf`, but wrote `%v` instead of `%w`:
+
+```go
+return fmt.Errorf("mahsulot %d: %v", id, ErrNotFound)
+```
+
+In `main`, `err` holds this value. What does `errors.Is(err, store.ErrNotFound)` return?
+
+**A)** `true`: the text is the same · **B)** `false` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B: `false`.** `%v` takes only the **text** of the error; the original error does not stay inside the new one, and the chain breaks (GB-2.08). If you chose **A**, you thought
+`errors.Is` compares texts: it actually searches the chain for a **value**. Today's question is the other side of the error path: if a function returns early with an error,
+the resource it opened must be closed too.
+
+</details>
+
+## The problem: a file that is never closed
+
+The starting program is `_video/01-leak/main.go`. Most of it is familiar from earlier lessons; the new parts are `saveReport` and `main`:
+
+```go filename="_video/01-leak/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+)
+
+const tiyinPerSom = 100 // 1 soʻm = 100 tiyin
+
+// Product — katalogdagi bitta mahsulot.
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64 // tiyin
+	Stock int
+}
+
+// writeReport katalog hisobotini w'ga yozadi (GB-2.07).
+func writeReport(w io.Writer, products []Product) error {
+	for _, p := range products {
+		_, err := fmt.Fprintf(w, "%-6s %6d soʻm %4d dona\n", p.Name, p.Price/tiyinPerSom, p.Stock)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// saveReport katalog hisobotini path fayliga yozadi.
+func saveReport(path string, products []Product) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	err = writeReport(f, products)
+	if err != nil {
+		return err // f ochiq qoldi
+	}
+	return f.Close()
+}
+
+func main() {
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	var last string
+	for i := 1; i <= 2000; i++ {
+		err := saveReport("/dev/full", products)
+		if err != nil && err.Error() != last {
+			fmt.Printf("%d: %v\n", i, err)
+			last = err.Error()
+		}
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 11–17 | `type Product struct { … }` | a catalog product: `ID`, `Name`, `Price` (in tiyin), `Stock` (GB-2.03) |
+| 20–28 | `writeReport` | writes one line per product; if a write fails, it returns the error (GB-2.07) |
+| 31 | `func saveReport(path string, products []Product) error` | `path` is the file path; the function assembles `writeReport`'s steps (GB-2.07) |
+| 32–35 | `f, err := os.Create(path)` and the check | `os.Create` opens the file (empties it if it exists); on an error the function returns at once |
+| 36–39 | `err = writeReport(f, products)` and the check | writes to the open `f`; if the write fails, the function returns the error at once and **never reaches** `f.Close()` on line 40 |
+| 40 | `return f.Close()` | closes the file: tells the operating system the work is done |
+| 44–48 | `products := []Product{ … }` | the catalog: apple, bread and apricot |
+| 49 | `var last string` | the text of the previous error |
+| 50–56 | `for i := 1; i <= 2000; i++ { … }` | calls `saveReport` 2000 times; prints the error with the attempt number only if it is **new** (`err.Error() != last`), so at most two lines appear on screen |
+| 51 | `saveReport("/dev/full", products)` | the report is written to the file `/dev/full` |
+
+`/dev/full` is a special file (a device) on Linux: writing to it **always** fails with `no space left on device`, that is, "the disk is full". That is how we force
+a write error. Now the answer: `ulimit -n 1024` lowers to 1024 the number of files a process in this terminal may have open at the same time, so that the error shows up quickly.
+`bash -c '…'` asks bash to run the command string it is given, so that `ulimit` and `go run` are in the same process:
+
+```console
+$ ./_video/run.sh 01-leak bash -c 'ulimit -n 1024; go run .'
+1: write /dev/full: no space left on device
+1020: open /dev/full: too many open files
+```
+
+The first line is expected: on attempt 1 the write to `/dev/full` failed. On attempts 2–1019 the error is the same, so nothing was printed. On attempt 1020 the error
+**changed**: it did not even get as far as writing, `os.Create` itself (`open`) returned the error. The reason:
+
+- every open file takes one slot in the operating system (a **file descriptor**): a small number for an open file or connection in a process;
+  `ulimit` limits the number of such slots;
+- on a write error the function returns from line 38, `f.Close()` on line 40 does not run, the file stays open and its slot stays taken;
+- after 1019 leaked files the slots ran out.
+
+| Call | `os.Create` | Write | `f.Close()` | Open files |
+|---|---|---|---|---|
+| 1 | opened | error | **not reached** | 1 |
+| 2 | opened | error | **not reached** | 2 |
+| … | … | … | … | … |
+| 1019 | opened | error | **not reached** | 1019 |
+| 1020 | **error**: `too many open files` | — | — | 1019 |
+
+Why 1020 and not 1024? The limit gives 1024 slots, but the program itself takes five: stdin, stdout, stderr (descriptors 0, 1, 2) and two internal files
+of the Go runtime (opened at the first `os.Create`). That leaves 1019. This number is not from a book, we measured it on this machine: three runs, always 1020.
+
+> **About the limit.** In bash, `ulimit -n` sets both the soft and the **hard** limit. Since Go 1.19 a program that imports `os` raises its soft limit
+> to the hard limit at startup ([Go 1.19 release notes](https://go.dev/doc/go1.19#os/exec)); it cannot go above the hard limit.
+> That is why the experiment works in bash. In zsh `ulimit -n` sets only the soft limit: there, write `ulimit -Hn 1024` (the course README says so).
+> I did not re-run this part for the page; it comes from the README.
+
+## defer: writing the call into a list
+
+The fix is one line: `defer f.Close()`. Below is the new `saveReport` (`_video/02-defer/main.go`; everything else is as before, the only difference is in this function):
+
+```go
+func saveReport(path string, products []Product) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	err = writeReport(f, products)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+```
+
+The keyword `defer` **does not run the call now**: it writes it into this function's **defer list**. The list runs when the function ends, and
+it can end in three ways:
+
+1. at any `return` line;
+2. at the function's last closing brace `}`;
+3. in a panic (below).
+
+So both `return`s after `defer` close the file too. The first `return` after `os.Create` does not close it: it is before the `defer`, and there is nothing to close yet.
+
+**Why `defer` comes after the `err` check.** If `os.Create` failed, `f` is not a working file: there is nothing to close, and calling a method on `nil`
+panics for many types (GB-2.04). So the check first, then `defer`: once you are sure the resource was acquired.
+
+**Why `return f.Close()` stays.** Closing a written file can fail too, and the caller must get that error. After it, the `Close` in `defer`
+is called again; for `*os.File` the second `Close` returns an error, and `defer` throws it away. For `*os.File` this is safe, the documentation says so:
+
+```console
+$ go doc os.File.Close
+package os // import "os"
+
+func (f *File) Close() error
+    Close closes the File, rendering it unusable for I/O. On files that support
+    File.SetDeadline, any pending I/O operations will be canceled and return
+    immediately with an ErrClosed error. Close will return an error if it has
+    already been called.
+```
+
+(For an arbitrary `io.Closer` a second `Close` is not guaranteed; this rule is only for `*os.File`.) We run it with the same limit. Does a second line appear?
+
+<details>
+<summary>Answer</summary>
+
+No: out of 2000 calls only the "disk full" error is left. Every call closed its own file, so the slots never ran out.
+
+```console
+$ ./_video/run.sh 02-defer bash -c 'ulimit -n 1024; go run .'
+1: write /dev/full: no space left on device
+```
+
+</details>
+
+## Several defers: the last one runs first
+
+What if one function has several `defer`s? The program below (`_video/03-tartib/main.go`) is made of two ordinary `Println`s and two `Println`s with `defer`:
+
+```go filename="_video/03-tartib/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("hisobot boshlandi")
+	defer fmt.Println("defer 1: fayl yopildi")
+	defer fmt.Println("defer 2: buyurtma yopildi")
+	fmt.Println("hisobot tugadi")
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `fmt.Println("hisobot boshlandi")` | an ordinary call: runs at once |
+| 7 | `defer fmt.Println("defer 1: …")` | writes the call into `main`'s defer list, prints nothing now |
+| 8 | `defer fmt.Println("defer 2: …")` | writes the second call at the end of the list |
+| 9 | `fmt.Println("hisobot tugadi")` | an ordinary call: runs at once |
+| 10 | `}` | `main` has ended: the list runs |
+
+In which order does it print?
+
+**A)** the defers where they are written · **B)** the defers at the end, in written order (1, 2) · **C)** the defers at the end, in reverse order (2, 1)
+
+<details>
+<summary>Answer</summary>
+
+**C.** Ordinary lines print where they are, but the `defer`s run when `main` ends and in **reverse** order: the one written last runs first (**LIFO**, last in — first out).
+If you chose **A**, you took `defer` for an ordinary call; **B** is queue order, but the list runs from the end to the start.
+
+```console
+$ ./_video/run.sh 03-tartib go run .
+hisobot boshlandi
+hisobot tugadi
+defer 2: buyurtma yopildi
+defer 1: fayl yopildi
+```
+
+</details>
+
+The state of the list line by line:
+
+| Line executed | `main`'s defer list | Screen |
+|---|---|---|
+| 6 | empty | `hisobot boshlandi` |
+| 7 | `[defer 1]` | — |
+| 8 | `[defer 1, defer 2]` | — |
+| 9 | `[defer 1, defer 2]` | `hisobot tugadi` |
+| 10 (`}`) | from the end to the start: `defer 2` first, then `defer 1` | `defer 2: …`, `defer 1: …` |
+
+The use of reverse order: a resource acquired later often uses one acquired earlier, so it has to be closed first. The specification gives only the order;
+this reason is reasoning (a concrete pair comes in later lessons, for example GB-3.01).
+
+## Arguments of defer are evaluated at once
+
+Now arguments (`_video/04-arg/main.go`). `stock` is 40, we print it in `defer`; then we sell 3 items and print the current stock:
+
+```go filename="_video/04-arg/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := 40
+	defer fmt.Println("defer: qoldiq", stock)
+	stock -= 3
+	fmt.Println("hozir: qoldiq", stock)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 6 | `stock := 40` | the variable `stock`, value 40 |
+| 7 | `defer fmt.Println("defer: qoldiq", stock)` | writes the `Println` call into the defer list |
+| 8 | `stock -= 3` | `stock = stock - 3`: `stock` becomes 37 (in GB-2.04 that was `p.Stock -= quantity`) |
+| 9 | `fmt.Println("hozir: qoldiq", stock)` | prints at once |
+
+What does the `defer` line print?
+
+**A)** `40` · **B)** `37` · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**A: 40.** When the `defer` line runs, `Println` is not called yet, but its **arguments are evaluated at once**: the current value of `stock` (40)
+is copied and written into the list. Then `stock` becomes 37, and the copy does not change. If you chose **B**, you thought the argument is read when the list runs.
+
+```console
+$ ./_video/run.sh 04-arg go run .
+hozir: qoldiq 37
+defer: qoldiq 40
+```
+
+</details>
+
+| Line | `stock` | Call in the list | Screen |
+|---|---|---|---|
+| 6 | 40 | — | — |
+| 7 | 40 | `Println("defer: qoldiq", 40)` — **a copy of 40** | — |
+| 8 | 37 | `Println("defer: qoldiq", 40)` | — |
+| 9 | 37 | `Println("defer: qoldiq", 40)` | `hozir: qoldiq 37` |
+| 10 (`}`) | 37 | the list runs | `defer: qoldiq 40` |
+
+If you need the last value, give `defer` an **anonymous function** (in GB-1.08 we gave one to `t.Run`). `_video/05-closure/main.go`:
+
+```go filename="_video/05-closure/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := 40
+	defer func() {
+		fmt.Println("defer: qoldiq", stock)
+	}()
+	stock -= 3
+	fmt.Println("hozir: qoldiq", stock)
+}
+```
+
+- Lines 7–9: `func() { … }` is an anonymous function; the empty parentheses `()` at the end **call** it right there, and `defer` writes that call into the list.
+- The call has **no arguments**, so there is nothing to copy.
+- `stock` inside the function is the outer variable **itself**, not a copy (a **closure**): it is read when `main` ends, that is, when `stock` is already 37.
+
+Now what does it print? It is read when `main` ends: 37.
+
+```console
+$ ./_video/run.sh 05-closure go run .
+hozir: qoldiq 37
+defer: qoldiq 37
+```
+
+The rule: `defer fmt.Println(…, stock)` — the value **now**; `defer func() { … stock … }()` — the value when the function **ends**.
+
+## panic: when you cannot go on
+
+In GB-2.04, writing through a nil pointer caused a panic. Now we look at a panic together with defer. Below is `_video/06-panic/main.go`: `Product` and `findProduct` are the same as in GB-2.04,
+the new parts are `sell` and `main` (the whole file is in the folder):
+
+```go
+// sell p mahsulotdan quantity dona sotadi.
+func sell(p *Product, quantity int) {
+	defer fmt.Println("defer: sell tugadi")
+	p.Stock -= quantity
+	fmt.Println("sotildi")
+}
+
+func main() {
+	defer fmt.Println("defer: main tugadi")
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	p := findProduct(products, 9) // topilmadi: nil
+	sell(p, 1)
+	fmt.Println("main oxiri")
+}
+```
+
+- `sell`: first `defer`, then `p.Stock -= quantity` — decreasing the stock through a nil pointer, that is, the panic from GB-2.04.
+- `main` has a `defer` too. `findProduct` does not find ID 9 and returns `nil`; `main` calls `sell` with that `nil`.
+
+What appears on screen when `sell(nil, 1)` is called?
+
+**A)** only `sell`'s defer line, then the panic · **B)** both defer lines, then the panic · **C)** first the panic message, then both defer lines
+
+<details>
+<summary>Answer</summary>
+
+**B.** The panic stopped `sell`'s normal work on that line: neither `sotildi` nor `main oxiri` was printed. Then Go climbs up the chain of calls and runs each
+function's defer list: `sell`'s first, then `main`'s. Only after that is the message printed, and the program ends with exit code 2. If you chose **C**, you thought
+the message comes at once; **A** — you forgot that `main`'s list runs too.
+
+Below is my run; the addresses in the `[signal …]` line (a signal), the temporary folder path in the stack trace and the `+0x…` offsets differ on every run, so they were replaced with `…`
+(the course README looks the same):
+
+```console
+$ ./_video/run.sh 06-panic go run .
+defer: sell tugadi
+defer: main tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x20 pc=…]
+
+goroutine 1 [running]:
+main.sell(…)
+	/tmp/…/bozor/main.go:26 +0x51
+main.main()
+	/tmp/…/bozor/main.go:38 +0x…
+exit status 2
+```
+
+How to read the last lines: `main.go:26` is the line where the panic happened (`p.Stock -= quantity`), `main.go:38` is `sell(p, 1)` in `main`. This is the **stack trace**, the chain of calls
+at the moment of the panic. `goroutine 1` is `main` itself: we open goroutines in GB-7.01, for now this is enough. `exit status 2` is `go run`'s line: the program ended with exit code 2.
+
+</details>
+
+This refines the sentence in GB-1.07, "a panic stops the program at once": first the defer lists run, then the program ends. The official documentation says the same:
+
+```console
+$ go doc builtin.panic
+package builtin // import "builtin"
+
+func panic(v any)
+    The panic built-in function stops normal execution of the current goroutine.
+    When a function F calls panic, normal execution of F stops immediately.
+    Any functions whose execution was deferred by F are run in the usual way,
+    and then F returns to its caller. To the caller G, the invocation of F then
+    behaves like a call to panic, terminating G's execution and running any
+    deferred functions. This continues until all functions in the executing
+    goroutine have stopped, in reverse order. At that point, the program is
+    terminated with a non-zero exit code. This termination sequence is called
+    panicking and can be controlled by the built-in function recover.
+
+    Starting in Go 1.21, calling panic with a nil interface value or an untyped
+    nil causes a run-time error (a different panic). The GODEBUG setting
+    panicnil=1 disables the run-time error.
+```
+
+**When is a panic appropriate?**
+
+- **For an expected error, do not panic, return an `error`:** the caller decides (file missing, not enough stock, bad input).
+- A panic is for a **programmer's mistake**: with a nil pointer or an index out of range, the runtime itself panics.
+- You can call the built-in `panic(v)` yourself with any value (`v` is `any`, any type).
+- In the standard library, functions whose name starts with `Must` work this way: for example `MustCompile` in the `regexp` package (regular expression — a pattern for text)
+  panics on a bad pattern and is used at the start of the program:
+
+```console
+$ go doc regexp.MustCompile
+package regexp // import "regexp"
+
+func MustCompile(str string) *Regexp
+    MustCompile is like Compile but panics if the expression cannot be parsed.
+    It simplifies safe initialization of global variables holding compiled
+    regular expressions.
+```
+
+- **An `error` leaves the package:** even if a package uses panic inside, its outer API returns the error as a value (Go blog, Effective Go).
+
+## recover and the named result: turning a panic into an error
+
+So that a panic does not bring the whole program down, `recover` stops it at a **boundary**: the place where the work of one command, or of one request that reached a server, begins.
+Below is `safely` (`_video/07-recover/main.go`) and the `main` that calls it:
+
+```go
+// safely fn'ni chaqiradi; fn panic qilsa, panic'ni error qilib qaytaradi.
+func safely(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	fn()
+	return nil
+}
+
+func main() {
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	p := findProduct(products, 9) // topilmadi: nil
+	err := safely(func() {
+		sell(p, 1)
+	})
+	fmt.Println("xato:", err)
+	fmt.Println("main oxiri")
+}
+```
+
+Line numbers are inside the fragment (1 is the comment line):
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `func safely(fn func()) (err error)` | `fn` is a parameter of type `func()`: a function with no parameters and no result (a function value). `(err error)` — we gave the result a **name** |
+| 3 | `defer func() { … }()` | writes an anonymous function into the defer list |
+| 4 | `if r := recover(); r != nil {` | the built-in `recover`, if a panic is under way, **stops** it and returns the panic value; otherwise `nil`. `r` has type `any` |
+| 5 | `err = fmt.Errorf("panic: %v", r)` | makes an `error` from the value and writes it to the result `err`; `r` has type `any`, hence `%v` |
+| 8 | `fn()` | the body calls `fn` |
+| 9 | `return nil` | if there was no panic, `nil` is returned |
+
+**The rule:** `recover` works only when it is called **directly** inside a function from the defer list. The official documentation:
+
+```console
+$ go doc builtin.recover
+package builtin // import "builtin"
+
+func recover() any
+    The recover built-in function allows a program to manage behavior of
+    a panicking goroutine. Executing a call to recover inside a deferred
+    function (but not any function called by it) stops the panicking sequence
+    by restoring normal execution and retrieves the error value passed to the
+    call of panic. If recover is called outside the deferred function it will
+    not stop a panicking sequence. In this case, or when the goroutine is not
+    panicking, recover returns nil.
+
+    Prior to Go 1.21, recover would also return nil if panic is called with a
+    nil argument. See [panic] for details.
+```
+
+**The named result.** In GB-2.07 we said result names are "for documentation". In fact `(err error)` is an ordinary variable created at the start of the function
+with its zero value (`nil`). `return x` first writes `x` into that variable, **then** the defers run, and a function in defer can change it; the caller gets
+the changed value. A small program that is not in the course folder (`natija/main.go`, full code here):
+
+```go
+package main
+
+import "fmt"
+
+func ikki() (n int) {
+	defer func() {
+		n *= 2
+	}()
+	return 21
+}
+
+func main() {
+	fmt.Println(ikki())
+}
+```
+
+`return 21` first writes 21 into `n`, then `defer` doubles `n`: 42.
+
+```console
+$ go run main.go
+42
+```
+
+`safely` works the same way: if there was a panic, the function in defer writes an error into `err`, and the code that called `safely` gets exactly that `err`; if there was no panic, `return nil`
+first writes `nil` into `err`, and only after that do the defers run. In `main`, now without `defer`, we pass `sell` to `safely` inside an anonymous function. What does it print?
+
+<details>
+<summary>Answer</summary>
+
+```console
+$ ./_video/run.sh 07-recover go run .
+defer: sell tugadi
+xato: panic: runtime error: invalid memory address or nil pointer dereference
+main oxiri
+```
+
+First `sell`'s defer ran, then `safely`'s: `recover` stopped the panic and it came back as an ordinary error, and `main` carried on (`main oxiri`).
+A server wraps each request (an incoming call) the same way: a panic in one request does not bring the server down. But this error does not say **where** the panic happened, that is,
+there is no stack trace: we will write it to the log in GB-6.01.
+
+</details>
+
+## Where recover does not work
+
+Someone moved `recover` into a separate function `toError` to use it in other places too. The function in defer now only calls `toError` and writes its result
+into `err`. `main` is the same (`_video/08-quiz/main.go`):
+
+```go
+// safely fn'ni chaqiradi; fn panic qilsa, panic'ni error qilib qaytaradi.
+func safely(fn func()) (err error) {
+	defer func() {
+		err = toError() // recover endi shu yerda
+	}()
+	fn()
+	return nil
+}
+
+// toError — recover defer'dagi funksiya chaqirgan boshqa funksiyada: panic'ni toʻxtatmaydi.
+func toError() error {
+	if r := recover(); r != nil {
+		return fmt.Errorf("panic: %v", r)
+	}
+	return nil
+}
+```
+
+What happens?
+
+**A)** an error is returned and `main` carries on (`xato: panic: …`, `main oxiri`) · **B)** the program crashes with the panic · **C)** a compile error
+
+<details>
+<summary>Answer</summary>
+
+**B.** `recover` works only **directly** inside a function from defer. `toError` is a **different** function called from it: there `recover` returned `nil`, and the panic went on.
+If you chose **A**, you thought a `recover` call "belongs" to the defer; Go counts only the direct call. Below is my run
+(the trace lines are replaced with `…`):
+
+```console
+$ ./_video/run.sh 08-quiz go run .
+defer: sell tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+…
+exit status 2
+```
+
+`recover` does not stop the panic either when it is called without defer, before `fn`: there is no defer itself, and during a panic only defers run (`_video/12-defersiz/main.go`,
+the video only mentions it):
+
+```console
+$ ./_video/run.sh 12-defersiz go run .
+defer: sell tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+…
+exit status 2
+```
+
+`recover` does not catch a panic in another goroutine either: a goroutine is a separate function in Go that runs at the same time as others; we open it in GB-7.01.
+
+</details>
+
+## Going deeper (optional): defer inside a loop
+
+What if we put `defer` in a loop inside `main`? `defer` belongs not to the **loop step** but to the **function**. Each step adds one more `Close` to the list, and they all run when
+`main` ends, while the files stay open until then. `_video/11-sikl/main.go` (the whole file is in the folder), the loop:
+
+```go
+	for i := 1; i <= 2000; i++ {
+		f, err := os.Create("hisobot.txt")
+		if err != nil {
+			fmt.Printf("%d: %v\n", i, err)
+			return
+		}
+		defer f.Close() // sikl ichida: main tugaguncha yopilmaydi
+		err = writeReport(f, products)
+		if err != nil {
+			fmt.Printf("%d: %v\n", i, err)
+			return
+		}
+	}
+```
+
+```console
+$ ./_video/run.sh 11-sikl bash -c 'ulimit -n 1024; go run .'
+1020: open hisobot.txt: too many open files
+```
+
+The result is the same error as at the start: step 1020. The fix is to move the loop body into a separate function; `saveReport` is exactly such a function: every call has its own list and its own `Close`.
+
+The reverse order and the argument rule can be seen together in a `defer` inside a loop. A small program that is not in the course folder (`tsikl/main.go`, full code here):
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	for i := 0; i < 3; i++ {
+		defer fmt.Println("defer", i)
+	}
+	fmt.Println("sikl tugadi")
+}
+```
+
+```console
+$ go run main.go
+sikl tugadi
+defer 2
+defer 1
+defer 0
+```
+
+Three `defer`s were written on three steps, the argument `i` was copied **at once** each time (0, 1, 2), and when `main` ended the list ran in reverse order: 2, 1, 0.
+
+## Common mistakes
+
+**1. `os.Exit` does not run defers.** The most common mistake: `main` has a `defer`, and on an error it leaves through `os.Exit(1)`. The `defer` in `main` stands in for cleanup
+(for example deleting a temporary file). `_video/09-exit/main.go`; `products` is moved to package level for brevity, `saveReport` is as before:
+
+```go
+func main() {
+	defer fmt.Println("defer: main tugadi")
+	err := saveReport("/dev/full", products)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+The save fails. What appears on screen?
+
+**A)** the error, then the defer line · **B)** only the error line · **C)** first the defer line, then the error
+
+<details>
+<summary>Answer</summary>
+
+**B: there is no defer line.** `os.Exit` ends the program immediately, the defer lists do not run:
+
+```console
+$ ./_video/run.sh 09-exit go run .
+xato: write /dev/full: no space left on device
+exit status 1
+```
+
+```console
+$ go doc os.Exit
+package os // import "os"
+
+func Exit(code int)
+    Exit causes the current program to exit with the given status code.
+    Conventionally, code zero indicates success, non-zero an error. The program
+    terminates immediately; deferred functions are not run.
+
+    For portability, the status code should be in the range [0, 125].
+```
+
+`Fatal` in the `log` package, which prints a message and stops the program, also calls `os.Exit(1)` inside (`go doc log.Fatal`: "Fatal is equivalent to Print followed by a call to os.Exit(1)").
+The operating system closes the open files itself, but the rest of the work in defer (cleanup) is lost.
+
+</details>
+
+**The fix.** Move the main work into a function `run` that returns an `error`, and keep the `defer`s there. `main` only calls `run` and exits through `os.Exit` on an error
+(`_video/10-run/main.go`):
+
+```go
+// run dasturning asosiy ishi: defer'lari main'dagi os.Exit'dan oldin ishlab boʻladi.
+func run() error {
+	defer fmt.Println("defer: run tugadi")
+	return saveReport("/dev/full", products)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+Does the defer line appear now?
+
+<details>
+<summary>Answer</summary>
+
+Yes: by the time of `os.Exit`, `run` has already returned and its defers have already run, so the defer line came **before** the error message.
+
+```console
+$ ./_video/run.sh 10-run go run .
+defer: run tugadi
+xato: write /dev/full: no space left on device
+exit status 1
+```
+
+**The rule:** `os.Exit` only in `main`, as the very last step. The `main.go` in the course folder has this shape too; only `run` writes the report to the file `hisobot.txt`, not to `/dev/full`, so
+`go run .` works without an error:
+
+```console
+$ ./_video/run.sh final bash -c 'go run . && cat hisobot.txt'
+defer: run tugadi
+olma    12000 soʻm   40 dona
+non      4000 soʻm  100 dona
+oʻrik   35000 soʻm    5 dona
+```
+
+</details>
+
+**2. Calling `recover` not inside the defer function itself.** We saw it above ("Where recover does not work"): `recover` inside `toError` or before `fn` does not stop the panic, and the program
+ends with `exit status 2`. The fix: call `recover()` in the body of the anonymous function in `defer`, as in `safely`.
+
+**3. Using `defer` in a loop to close resources.** We saw it above ("Going deeper"): the files stay open until the function ends, and at step 1020 you get `too many open files`. The fix: move the loop body into a separate function.
+
+**4. Writing `defer f.Close()` before the error check.** If `os.Create` failed, `f` is not a working file and there is nothing to close. The order: `os.Create` → `if err != nil { return err }` → `defer f.Close()`.
+
+## Check yourself
+
+**1.** Why is `defer f.Close()` written after the `err` check?
+
+<details>
+<summary>Answer</summary>
+
+If `os.Create` failed, `f` is not a working file and there is nothing to close; and calling a method on `nil` panics for many types. The check first, then `defer`.
+
+</details>
+
+**2.** Why is `recover` called directly in the function from defer?
+
+<details>
+<summary>Answer</summary>
+
+During a panic only the functions in the defer list run, and they have to call `recover` themselves. In another function called from defer (`toError`), `recover` returns `nil` and the panic goes on.
+
+</details>
+
+**3.** From GB-2.06: can `main` read the lower-case `products` field of the `store` package?
+
+<details>
+<summary>Answer</summary>
+
+No. A name that starts with a lower-case letter is visible only in its own package: if `main` tries to read it, the compiler rejects it as `unexported`.
+
+</details>
+
+**4.** What does it print? Unlike `tsikl/main.go` above, there is now an anonymous function inside `defer`:
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	for i := 0; i < 3; i++ {
+		defer func() {
+			fmt.Println("defer", i)
+		}()
+	}
+	fmt.Println("sikl tugadi")
+}
+```
+
+**A)** `defer 2`, `defer 1`, `defer 0` · **B)** `defer 3`, `defer 3`, `defer 3` · **C)** `defer 0`, `defer 1`, `defer 2`
+
+<details>
+<summary>Answer</summary>
+
+**A.** This program is not in the course folder (`tsikl2/main.go`); I ran it:
+
+```console
+$ go run main.go
+sikl tugadi
+defer 2
+defer 1
+defer 0
+```
+
+The anonymous function reads `i` not as a copy but as the variable itself (a closure, like `stock` in `05-closure`), and the list runs when `main` ends, in reverse order.
+Why each defer saw its own `i`: since Go 1.22 the `for` loop creates a **new** `i` on every step ([Go 1.22 release notes](https://go.dev/doc/go1.22#language)).
+In earlier versions `i` was one variable shared by the whole loop, and all defers read the last value (3), so **B** would have been printed; I did not re-run this part,
+it comes from the release notes. If you chose **C**, you forgot to reverse the order.
+
+</details>
+
+## Homework
+
+The task is in the file [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-09-defer-panic/TASK.md) in the course folder;
+the folder: [lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic). Two things are left unfinished in `main.go`:
+
+- 🟢 **Step 1, `handle(name string, fn func() error) (err error)`.** The boundary that runs a bozor command (`fn`). If `fn` returns an error, `handle` must return exactly that error, unchanged;
+  if there is no error, `nil`. If `fn` panics, the program must not crash: `handle` returns an error with the text `<name>: panic: <panic value>` (for example `sotish: panic: kutilmagan holat`),
+  and the caller must be able to recognise it with `errors.Is(err, ErrPanic)`. Right now `handle` just does `return fn()`.
+- 🟡 **Step 2, `reserve(products []Product, items []OrderItem) (err error)`.** Decreases the stock for the order lines: **all or nothing**. If any line has an error
+  (the quantity is not positive, the product does not exist or the stock is not enough), the stock already decreased in the earlier lines must go back, and the error must be returned unchanged.
+  Right now apple goes 40 → 37, then `non` fails, and apple stays at 37.
+
+The level characters (🟢🟡) are not in the course folder: I added them. Do not change `saveReport`, `safely`, `findProduct`, the error types and the error texts. Hints are in `TASK.md`. To check, run `go test` in this folder
+(do not change `tekshiruv_test.go`). With the starting code the test fails and says which step (my run):
+
+```console
+$ go test
+--- FAIL: TestVazifaHandle (0.00s)
+    --- FAIL: TestVazifaHandle/sotish (0.00s)
+        tekshiruv_test.go:89: handle("sotish") panic'ni ushlamadi («kutilmagan holat»): handle'da defer va recover kerak (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaHandle/qoldiq (0.00s)
+        tekshiruv_test.go:89: handle("qoldiq") panic'ni ushlamadi («runtime error: invalid memory address or nil pointer dereference»): handle'da defer va recover kerak (TASK.md, 1-qadam)
+--- FAIL: TestVazifaReserve (0.00s)
+    --- FAIL: TestVazifaReserve/qoldiq_yetmaydi (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («non: qoldiq 100, soʻralgan 500»), lekin qoldiq: olma 37, non 100, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/mahsulot_yoq (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («mahsulot 9: mahsulot topilmadi»), lekin qoldiq: olma 37, non 90, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/dona_soni (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («dona soni musbat boʻlishi kerak, hozir 0»), lekin qoldiq: olma 40, non 100, oʻrik 3; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/bir_mahsulot_ikki_qator (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («olma: qoldiq 10, soʻralgan 30»), lekin qoldiq: olma 10, non 100, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.002s
+```
+
+Work until you see `ok`. The answer is [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-09-defer-panic/solution/main.go).
+
+<details>
+<summary>Answers: step 1 (handle) and step 2 (reserve)</summary>
+
+**Step 1** — `handle` is the lesson's `safely` with two differences: `fn` now returns an `error` (`return fn()`), and the error text keeps `ErrPanic` inside with `%w` (GB-2.08):
+
+```go
+func handle(name string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%s: %w: %v", name, ErrPanic, r)
+		}
+	}()
+	return fn()
+}
+```
+
+`return fn()` first writes `fn`'s error into `err`; if there was no panic, the function in defer does not touch it. `%w` keeps `ErrPanic` inside (`errors.Is(err, ErrPanic)` is `true`), `%v` adds the panic value to the text.
+
+**Step 2** — `reserve`: at the start we collect a copy of the stock values with `append` (GB-2.01), write `ok := false`, and in `defer` we put the stock back when `!ok`. Before `return nil` we set `ok = true`:
+
+```go
+func reserve(products []Product, items []OrderItem) (err error) {
+	var saved []int // boshidagi qoldiqlar
+	for _, p := range products {
+		saved = append(saved, p.Stock)
+	}
+	ok := false
+	defer func() {
+		if !ok { // xato bilan qaytdik yoki panic boʻldi: qoldiqni tiklaymiz
+			for i := range saved {
+				products[i].Stock = saved[i]
+			}
+		}
+	}()
+	// … oldingi sikl: har qatorni tekshirish va p.Stock -= it.Quantity (oʻzgarmagan) …
+	ok = true
+	return nil
+}
+```
+
+The anonymous function reads `ok` when the function **ends** (like `stock` in `05-closure`), so we do not touch every `return fmt.Errorf(…)`. If a panic happens in the middle, the stock is restored too: defers run during a panic as well.
+The copy of the original stock values also restores correctly when one product comes in two lines. This "all or nothing" shape comes back later in `defer tx.Rollback()` (GB-5.07).
+
+The whole `reserve` and `handle` are in `solution/main.go`. Checking with the answer (in this folder; `solution/` holds the same test file next to its `main.go`; my run):
+
+```console
+$ go test ./solution/...
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+</details>
+
+## Sources
+
+- [Go spec: Defer statements](https://go.dev/ref/spec#Defer_statements) — arguments are evaluated at the `defer` line; reverse order; return, last brace or panic
+- [Go spec: Handling panics](https://go.dev/ref/spec#Handling_panics) — where `recover` works
+- [Go spec: Run-time panics](https://go.dev/ref/spec#Run_time_panics) — access through a nil pointer panics
+- [Go spec: Function literals](https://go.dev/ref/spec#Function_literals) — an anonymous function refers to outer variables (a closure)
+- [Go blog: Defer, Panic, and Recover](https://go.dev/blog/defer-panic-and-recover) — `CopyFile`, three rules, panic inside a package and `error` outside
+- [Effective Go: Defer](https://go.dev/doc/effective_go#defer) and [Panic, Recover](https://go.dev/doc/effective_go#panic)
+- [pkg.go.dev: os.Exit](https://pkg.go.dev/os#Exit) — "deferred functions are not run"; [os.File.Close](https://pkg.go.dev/os#File.Close); [builtin.panic and recover](https://pkg.go.dev/builtin#recover)
+- [pkg.go.dev: regexp.MustCompile](https://pkg.go.dev/regexp#MustCompile) and [log.Fatal](https://pkg.go.dev/log#Fatal)
+- [Go 1.22 release notes: the for loop](https://go.dev/doc/go1.22#language) — a new loop variable on every step
+- [Go 1.19 release notes: os](https://go.dev/doc/go1.19#os/exec) — the program raises its soft `RLIMIT_NOFILE` to the hard limit itself
+- [bash: ulimit](https://www.gnu.org/software/bash/manual/html_node/Bash-Builtins.html) — without `-H`/`-S` both limits are set
+- [Linux: /dev/full](https://man7.org/linux/man-pages/man4/full.4.html) — writing returns the `ENOSPC` error
+- [Linux: _exit(2)](https://man7.org/linux/man-pages/man2/_exit.2.html) — open descriptors are closed when the process ends
+- [Go Code Review Comments: Don't Panic](https://go.dev/wiki/CodeReviewComments#dont-panic) — use `error` for an expected failure
+- [Go by Example: Exit](https://gobyexample.com/exit) — defers do not run on `os.Exit`
+- [Course folder: lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+---
+
+← Previous lesson: [GB-2.08](/lab/youtube/gb/gb-2-08/en) · Next lesson: [GB-2.10](/lab/youtube/gb/gb-2-10/en) → · [All lessons](/lab/youtube/gb)
+
+</div>
