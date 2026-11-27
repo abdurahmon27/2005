@@ -1,0 +1,1027 @@
+---
+title: "defer, panic и recover: зачем нужен каждый"
+date: "2026/11/27"
+description: "Закрываете файл отчёта через defer при любом return, знаете, как panic выполняет defer-ы, и превращаете panic в обычную ошибку через recover."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-2-09"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-2-09/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-2-09"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-2-09) · **Русский** · [English](/lab/youtube/gb/gb-2-09/en)  
+Урок GB-2.09 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-2-09) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Функция `saveReport` в bozor записывает отчёт в файл. `main` вызывает её 2000 раз и печатает каждую новую ошибку с номером попытки.
+Сначала ошибка одна: ошибка записи. Но на 1020-й попытке текст ошибки меняется: `too many open files`, то есть «слишком много открытых файлов».
+Каждый вызов открывает один файл и возвращается. Откуда накопились файлы и как одна строка это исправляет?
+
+**Одна идея:** у каждой функции есть свой **список defer**. Строка `defer` записывает вызов (с аргументами, вычисленными сразу) в конец списка.
+Как бы функция ни закончилась, через `return` или через panic, список выполняется с конца к началу. Panic поднимается вверх по цепочке вызовов
+и выполняет список каждой функции. `recover` останавливает panic, только если вызван прямо внутри функции из этого списка. А `os.Exit` списки не выполняет.
+
+К концу урока вы:
+
+- исправите утечку файлов в `saveReport` (`too many open files`) через `defer f.Close()`;
+- назовёте порядок выполнения нескольких `defer` и момент вычисления их аргументов, не запуская программу;
+- будете знать, когда уместен panic, а когда нужно вернуть `error`, и превратите panic в `error` через `recover` и именованный результат;
+- поймёте, почему `os.Exit` пропускает `defer`, и исправите это через `run() error`.
+
+Три главных новых слова сегодня:
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| `defer` | не выполняет вызов сразу, откладывает его до конца функции | defer |
+| `panic` | прерывает обычную работу функции; после выполнения defer-ов программа завершается с кодом 2 | panic |
+| `recover` | внутри функции из списка defer останавливает panic и возвращает его значение | recover |
+
+Два вспомогательных: именованный результат (`(err error)` — результату даётся имя) и `os.Exit` (сразу завершает программу).
+
+## Что нужно знать заранее
+
+Урок опирается на [GB-2.08 · Ошибки в Go глубже: %w, errors.Is и errors.As](/lab/youtube/gb/gb-2-08/ru): значение `error`, обёртывание через `%w`. Нужно также:
+
+- [GB-2.07 · Интерфейс: io.Writer и две настоящие реализации](/lab/youtube/gb/gb-2-07/ru): `writeReport(w io.Writer, …)`, `os.Create`, `f.Close()`.
+- [GB-2.04 · Указатель: копия или общее значение](/lab/youtube/gb/gb-2-04/ru): `*T`, `&x`, `findProduct` возвращает `nil`, если ничего не нашла; запись через nil-указатель вызывает panic.
+- [GB-2.06 · Пакеты: заглавная буква, internal/ и структура проекта](/lab/youtube/gb/gb-2-06/ru): имя со строчной буквы видно только в своём пакете.
+- [GB-1.08 · Первый тест: go test, t.Errorf и табличные тесты](/lab/youtube/gb/gb-1-08/ru): анонимная функция, переданная в `t.Run`, и `go test`.
+- [GB-1.07 · Функция и первая ошибка: os.Args и strconv.Atoi](/lab/youtube/gb/gb-1-07/ru): `(результат, error)`, `if err != nil`, `os.Exit(1)`, `os.Stderr`, код выхода.
+- [GB-1.06 · Повторение: единственный for в Go и его формы](/lab/youtube/gb/gb-1-06/ru): `for i := 1; i <= n; i++`.
+
+**Как запустить код.** Код урока лежит в папке репозитория курса:
+[lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic). Скачайте репозиторий и
+откройте терминал в этой папке (`cd` переводит терминал в другую папку):
+
+```bash
+git clone https://github.com/abdurahmon27/go-backend-uz.git
+cd go-backend-uz/lessons/gb-2-09-defer-panic
+```
+
+В папке лежат итоговый `main.go`, `tekshiruv_test.go` (проверяет задание), `TASK.md` (задание) и `solution/` (ответ). Каждый шаг видео находится в файле
+`_video/<шаг>/main.go`. Команда `./_video/run.sh <шаг> <команда>` копирует шаг во временную папку `bozor/` и выполняет команду там:
+ваша папка остаётся чистой. В конце скрипт печатает собственную строку `(chiqish kodi: N)` («код выхода: N»); на странице я её не привожу.
+Если случается panic или `os.Exit(1)`, `go run` сам печатает `exit status N`: это строка Go.
+
+Модуль написан для Go 1.27 (`go 1.27` в `go.mod`). Если у вас установлен более старый Go, `go` сам скачает нужную версию.
+Результаты на странице получены на `go1.27.4 linux/amd64` с `CGO_ENABLED=0`. Опыт из первой части (`ulimit`, `/dev/full`) работает только на **Linux**:
+на macOS нет `/dev/full`. Всё остальное работает в любой системе. Две маленькие программы, которых нет в папке курса (это сказано в тексте),
+я запускал в отдельной папке; их полный код приведён на этой странице.
+
+Имена в коде узбекские, поясню один раз: `hisobot` — «отчёт», `tiyin` — сотая часть сума, `olma`, `non`, `oʻrik` — яблоко, хлеб, абрикос,
+`sotildi` — «продано», `ikki` — «два», `natija` — «результат», `sikl` — «цикл». Строки в тексте программ и комментарии остаются на узбекском.
+
+Один вопрос с прошлого урока. `Sell` обернул ошибку через `fmt.Errorf`, но вместо `%w` написал `%v`:
+
+```go
+return fmt.Errorf("mahsulot %d: %v", id, ErrNotFound)
+```
+
+В `main` переменная `err` хранит это значение. Что вернёт `errors.Is(err, store.ErrNotFound)`?
+
+**A)** `true`: текст одинаковый · **B)** `false` · **C)** ошибка компиляции
+
+<details>
+<summary>Ответ</summary>
+
+**B: `false`.** `%v` берёт у ошибки только **текст**; исходная ошибка внутри новой не остаётся, и цепочка рвётся (GB-2.08). Если вы выбрали **A**, вы решили,
+что `errors.Is` сравнивает тексты: на самом деле он ищет по цепочке **значение**. Сегодняшний вопрос — другая сторона пути ошибки: если функция
+вернулась с ошибкой раньше времени, ресурс, который она открыла, тоже нужно закрыть.
+
+</details>
+
+## Проблема: незакрытый файл
+
+Начальная программа — `_video/01-leak/main.go`. Большая её часть знакома по прошлым урокам, новое — `saveReport` и `main`:
+
+```go filename="_video/01-leak/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+)
+
+const tiyinPerSom = 100 // 1 soʻm = 100 tiyin
+
+// Product — katalogdagi bitta mahsulot.
+type Product struct {
+	ID    int64
+	Name  string
+	Price int64 // tiyin
+	Stock int
+}
+
+// writeReport katalog hisobotini w'ga yozadi (GB-2.07).
+func writeReport(w io.Writer, products []Product) error {
+	for _, p := range products {
+		_, err := fmt.Fprintf(w, "%-6s %6d soʻm %4d dona\n", p.Name, p.Price/tiyinPerSom, p.Stock)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// saveReport katalog hisobotini path fayliga yozadi.
+func saveReport(path string, products []Product) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	err = writeReport(f, products)
+	if err != nil {
+		return err // f ochiq qoldi
+	}
+	return f.Close()
+}
+
+func main() {
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	var last string
+	for i := 1; i <= 2000; i++ {
+		err := saveReport("/dev/full", products)
+		if err != nil && err.Error() != last {
+			fmt.Printf("%d: %v\n", i, err)
+			last = err.Error()
+		}
+	}
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 11–17 | `type Product struct { … }` | товар каталога: `ID`, `Name`, `Price` (в тиинах), `Stock` (GB-2.03) |
+| 20–28 | `writeReport` | пишет по строке на каждый товар; если запись вернула ошибку, возвращает её (GB-2.07) |
+| 31 | `func saveReport(path string, products []Product) error` | `path` — путь к файлу; функция собирает шаги `writeReport` (GB-2.07) |
+| 32–35 | `f, err := os.Create(path)` и проверка | `os.Create` открывает файл (если он есть, очищает его); при ошибке функция сразу возвращается |
+| 36–39 | `err = writeReport(f, products)` и проверка | пишет в открытый `f`; если запись вернула ошибку, функция сразу возвращает её и **не доходит** до `f.Close()` в строке 40 |
+| 40 | `return f.Close()` | закрывает файл: сообщает операционной системе, что работа окончена |
+| 44–48 | `products := []Product{ … }` | каталог: яблоко, хлеб и абрикос |
+| 49 | `var last string` | текст предыдущей ошибки |
+| 50–56 | `for i := 1; i <= 2000; i++ { … }` | вызывает `saveReport` 2000 раз; печатает ошибку с номером попытки, только если она **новая** (`err.Error() != last`), поэтому на экране самое большее две строки |
+| 51 | `saveReport("/dev/full", products)` | отчёт записывается в файл `/dev/full` |
+
+`/dev/full` — специальный файл (устройство) в Linux: запись в него **всегда** завершается ошибкой `no space left on device`, то есть «диск заполнен». Так мы принудительно получаем
+ошибку записи. Теперь ответ: `ulimit -n 1024` снижает до 1024 число файлов, которые процесс в этом терминале может открыть одновременно; так ошибка появится быстро.
+`bash -c '…'` просит bash выполнить переданную строку команд, чтобы `ulimit` и `go run` оказались в одном процессе:
+
+```console
+$ ./_video/run.sh 01-leak bash -c 'ulimit -n 1024; go run .'
+1: write /dev/full: no space left on device
+1020: open /dev/full: too many open files
+```
+
+Первая строка ожидаема: на 1-й попытке запись в `/dev/full` вернула ошибку. На попытках 2–1019 ошибка та же, поэтому ничего не печаталось. На 1020-й попытке ошибка
+**изменилась**: дело даже не дошло до записи, ошибку вернул сам `os.Create` (`open`). Причина:
+
+- каждый открытый файл занимает в операционной системе одно место (**файловый дескриптор**, file descriptor): небольшой номер открытого файла или соединения в процессе;
+  `ulimit` ограничивает число таких мест;
+- при ошибке записи функция возвращается из строки 38, `f.Close()` в строке 40 не выполняется, файл остаётся открытым, и его место остаётся занятым;
+- после 1019 утёкших файлов места кончились.
+
+| Вызов | `os.Create` | Запись | `f.Close()` | Открытых файлов |
+|---|---|---|---|---|
+| 1 | открыт | ошибка | **не достигнут** | 1 |
+| 2 | открыт | ошибка | **не достигнут** | 2 |
+| … | … | … | … | … |
+| 1019 | открыт | ошибка | **не достигнут** | 1019 |
+| 1020 | **ошибка**: `too many open files` | — | — | 1019 |
+
+Почему 1020, а не 1024? Лимит даёт 1024 места, но пять занимает сама программа: stdin, stdout, stderr (дескрипторы 0, 1, 2) и два внутренних файла
+Go runtime (они открываются при первом `os.Create`). Остаётся 1019. Это число не из книги, мы измерили его на этой машине: три запуска, везде 1020.
+
+> **О лимите.** В bash `ulimit -n` задаёт и мягкий (soft), и **жёсткий** (hard) лимит. Начиная с Go 1.19 программа, импортирующая `os`, при старте
+> сама поднимает мягкий лимит до жёсткого ([Go 1.19 release notes](https://go.dev/doc/go1.19#os/exec)); выше жёсткого она подняться не может.
+> Поэтому опыт работает в bash. В zsh `ulimit -n` задаёт только мягкий лимит: там напишите `ulimit -Hn 1024` (так сказано в README курса).
+> Эту часть я на странице заново не запускал, она взята из README.
+
+## defer: записать вызов в список
+
+Исправление — одна строка: `defer f.Close()`. Ниже новый вид `saveReport` (`_video/02-defer/main.go`; всё остальное как раньше, отличие только в этой функции):
+
+```go
+func saveReport(path string, products []Product) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	err = writeReport(f, products)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+```
+
+Ключевое слово `defer` **не выполняет вызов сразу**: оно записывает его в **список defer** этой функции. Список выполняется, когда функция заканчивается, и
+закончиться она может тремя способами:
+
+1. на любой строке `return`;
+2. на последней закрывающей скобке `}` функции;
+3. при panic (ниже).
+
+Поэтому оба `return` после `defer` тоже закрывают файл. Первый `return` после `os.Create` файл не закрывает: он стоит до `defer`, закрывать пока нечего.
+
+**Почему `defer` стоит после проверки `err`.** Если `os.Create` вернул ошибку, `f` — не рабочий файл: закрывать нечего, а вызов метода у `nil`
+у многих типов вызывает panic (GB-2.04). Поэтому сначала проверка, потом `defer`: когда вы убедились, что ресурс получен.
+
+**Почему остался `return f.Close()`.** При закрытии записанного файла тоже может случиться ошибка, и её нужно вернуть вызывающему. После этого `Close` из `defer`
+вызывается ещё раз; для `*os.File` второй `Close` возвращает ошибку, а `defer` её отбрасывает. Для `*os.File` это безопасно, так написано в документации:
+
+```console
+$ go doc os.File.Close
+package os // import "os"
+
+func (f *File) Close() error
+    Close closes the File, rendering it unusable for I/O. On files that support
+    File.SetDeadline, any pending I/O operations will be canceled and return
+    immediately with an ErrClosed error. Close will return an error if it has
+    already been called.
+```
+
+(Для произвольного `io.Closer` второй `Close` не гарантирован; это правило относится только к `*os.File`.) Запускаем с тем же лимитом. Появится ли вторая строка?
+
+<details>
+<summary>Ответ</summary>
+
+Нет: из 2000 вызовов осталась только ошибка «диск заполнен». Каждый вызов закрыл свой файл, поэтому места никогда не кончались.
+
+```console
+$ ./_video/run.sh 02-defer bash -c 'ulimit -n 1024; go run .'
+1: write /dev/full: no space left on device
+```
+
+</details>
+
+## Несколько defer: последний выполняется первым
+
+А если в одной функции несколько `defer`? Программа ниже (`_video/03-tartib/main.go`) состоит из двух обычных `Println` и двух `Println` с `defer`:
+
+```go filename="_video/03-tartib/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("hisobot boshlandi")
+	defer fmt.Println("defer 1: fayl yopildi")
+	defer fmt.Println("defer 2: buyurtma yopildi")
+	fmt.Println("hisobot tugadi")
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 6 | `fmt.Println("hisobot boshlandi")` | обычный вызов: выполняется сразу |
+| 7 | `defer fmt.Println("defer 1: …")` | записывает вызов в список defer функции `main`, сейчас ничего не печатает |
+| 8 | `defer fmt.Println("defer 2: …")` | записывает второй вызов в конец списка |
+| 9 | `fmt.Println("hisobot tugadi")` | обычный вызов: выполняется сразу |
+| 10 | `}` | `main` закончилась: выполняется список |
+
+В каком порядке всё выведется?
+
+**A)** defer-ы на своих местах · **B)** defer-ы в конце, в порядке записи (1, 2) · **C)** defer-ы в конце, в обратном порядке (2, 1)
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Обычные строки выводятся на своих местах, а `defer`-ы — когда `main` заканчивается и в **обратном** порядке: записанный последним выполняется первым (**LIFO**, last in — first out).
+Если вы выбрали **A**, вы приняли `defer` за обычный вызов; **B** — порядок очереди, но список выполняется с конца к началу.
+
+```console
+$ ./_video/run.sh 03-tartib go run .
+hisobot boshlandi
+hisobot tugadi
+defer 2: buyurtma yopildi
+defer 1: fayl yopildi
+```
+
+</details>
+
+Состояние списка по строкам:
+
+| Выполненная строка | Список defer функции `main` | Экран |
+|---|---|---|
+| 6 | пуст | `hisobot boshlandi` |
+| 7 | `[defer 1]` | — |
+| 8 | `[defer 1, defer 2]` | — |
+| 9 | `[defer 1, defer 2]` | `hisobot tugadi` |
+| 10 (`}`) | с конца к началу: сначала `defer 2`, потом `defer 1` | `defer 2: …`, `defer 1: …` |
+
+Польза обратного порядка: ресурс, полученный позже, часто использует ресурс, полученный раньше, поэтому его нужно закрыть первым. Спецификация задаёт только порядок;
+эта причина — рассуждение (конкретная пара встретится в следующих уроках, например GB-3.01).
+
+## Аргументы defer вычисляются сразу
+
+Теперь аргументы (`_video/04-arg/main.go`). `stock` равен 40, в `defer` мы его печатаем; потом продаём 3 штуки и печатаем текущий остаток:
+
+```go filename="_video/04-arg/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := 40
+	defer fmt.Println("defer: qoldiq", stock)
+	stock -= 3
+	fmt.Println("hozir: qoldiq", stock)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 6 | `stock := 40` | переменная `stock`, значение 40 |
+| 7 | `defer fmt.Println("defer: qoldiq", stock)` | записывает вызов `Println` в список defer |
+| 8 | `stock -= 3` | `stock = stock - 3`: `stock` становится 37 (в GB-2.04 так было в `p.Stock -= quantity`) |
+| 9 | `fmt.Println("hozir: qoldiq", stock)` | печатает сразу |
+
+Что выведет строка `defer`?
+
+**A)** `40` · **B)** `37` · **C)** ошибка компиляции
+
+<details>
+<summary>Ответ</summary>
+
+**A: 40.** Когда выполняется строка `defer`, `Println` ещё не вызывается, но его **аргументы вычисляются сразу**: текущее значение `stock` (40)
+копируется и записывается в список. Потом `stock` становится 37, а копия не меняется. Если вы выбрали **B**, вы решили, что аргумент читается при выполнении списка.
+
+```console
+$ ./_video/run.sh 04-arg go run .
+hozir: qoldiq 37
+defer: qoldiq 40
+```
+
+</details>
+
+| Строка | `stock` | Вызов в списке | Экран |
+|---|---|---|---|
+| 6 | 40 | — | — |
+| 7 | 40 | `Println("defer: qoldiq", 40)` — **копия 40** | — |
+| 8 | 37 | `Println("defer: qoldiq", 40)` | — |
+| 9 | 37 | `Println("defer: qoldiq", 40)` | `hozir: qoldiq 37` |
+| 10 (`}`) | 37 | список выполняется | `defer: qoldiq 40` |
+
+Если нужно последнее значение, передаём в `defer` **анонимную функцию** (в GB-1.08 мы передавали такую в `t.Run`). `_video/05-closure/main.go`:
+
+```go filename="_video/05-closure/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	stock := 40
+	defer func() {
+		fmt.Println("defer: qoldiq", stock)
+	}()
+	stock -= 3
+	fmt.Println("hozir: qoldiq", stock)
+}
+```
+
+- Строки 7–9: `func() { … }` — анонимная функция; пустые скобки `()` в конце **вызывают** её на месте, а `defer` записывает в список именно этот вызов.
+- У вызова **нет аргументов**, копировать нечего.
+- `stock` внутри функции — **сама** внешняя переменная, а не копия (**замыкание**, closure): она читается, когда `main` заканчивается, то есть когда `stock` уже 37.
+
+Теперь что выведет? Она читается при завершении `main`: 37.
+
+```console
+$ ./_video/run.sh 05-closure go run .
+hozir: qoldiq 37
+defer: qoldiq 37
+```
+
+Правило: `defer fmt.Println(…, stock)` — значение **сейчас**; `defer func() { … stock … }()` — значение на момент **завершения** функции.
+
+## panic: когда продолжать нельзя
+
+В GB-2.04 запись через nil-указатель вызвала panic. Теперь посмотрим на panic вместе с defer. Ниже `_video/06-panic/main.go`: `Product` и `findProduct` те же, что в GB-2.04,
+новое — `sell` и `main` (весь файл в папке):
+
+```go
+// sell p mahsulotdan quantity dona sotadi.
+func sell(p *Product, quantity int) {
+	defer fmt.Println("defer: sell tugadi")
+	p.Stock -= quantity
+	fmt.Println("sotildi")
+}
+
+func main() {
+	defer fmt.Println("defer: main tugadi")
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	p := findProduct(products, 9) // topilmadi: nil
+	sell(p, 1)
+	fmt.Println("main oxiri")
+}
+```
+
+- `sell`: сначала `defer`, потом `p.Stock -= quantity` — уменьшение остатка через nil-указатель, то есть panic из GB-2.04.
+- В `main` тоже есть `defer`. `findProduct` не находит ID 9 и возвращает `nil`; `main` вызывает `sell` с этим `nil`.
+
+Что выведется на экран при вызове `sell(nil, 1)`?
+
+**A)** только строка defer из `sell`, затем panic · **B)** обе строки defer, затем panic · **C)** сначала сообщение о panic, затем обе строки defer
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Panic прервала обычную работу `sell` на этой строке: ни `sotildi`, ни `main oxiri` не вывелись. Затем Go поднимается по цепочке вызовов и выполняет список defer
+каждой функции: сначала `sell`, потом `main`. Только после этого печатается сообщение, и программа завершается с кодом выхода 2. Если вы выбрали **C**, вы решили, что
+сообщение появляется сразу; **A** — вы забыли, что список `main` тоже выполняется.
+
+Ниже мой запуск; адреса в строке `[signal …]` (сигнал), путь временной папки в stack trace и смещения `+0x…` каждый раз разные, поэтому они заменены на `…`
+(в README курса вид такой же):
+
+```console
+$ ./_video/run.sh 06-panic go run .
+defer: sell tugadi
+defer: main tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x20 pc=…]
+
+goroutine 1 [running]:
+main.sell(…)
+	/tmp/…/bozor/main.go:26 +0x51
+main.main()
+	/tmp/…/bozor/main.go:38 +0x…
+exit status 2
+```
+
+Как читать последние строки: `main.go:26` — строка, где случилась panic (`p.Stock -= quantity`), `main.go:38` — `sell(p, 1)` в `main`. Это **stack trace**, то есть цепочка вызовов
+в момент panic. `goroutine 1` — сам `main`: горутины мы разберём в GB-7.01, пока достаточно этого. `exit status 2` — строка `go run`: программа завершилась с кодом выхода 2.
+
+</details>
+
+Это уточнение фразы GB-1.07 «panic сразу останавливает программу»: сначала выполняются списки defer, потом программа завершается. Официальная документация говорит то же:
+
+```console
+$ go doc builtin.panic
+package builtin // import "builtin"
+
+func panic(v any)
+    The panic built-in function stops normal execution of the current goroutine.
+    When a function F calls panic, normal execution of F stops immediately.
+    Any functions whose execution was deferred by F are run in the usual way,
+    and then F returns to its caller. To the caller G, the invocation of F then
+    behaves like a call to panic, terminating G's execution and running any
+    deferred functions. This continues until all functions in the executing
+    goroutine have stopped, in reverse order. At that point, the program is
+    terminated with a non-zero exit code. This termination sequence is called
+    panicking and can be controlled by the built-in function recover.
+
+    Starting in Go 1.21, calling panic with a nil interface value or an untyped
+    nil causes a run-time error (a different panic). The GODEBUG setting
+    panicnil=1 disables the run-time error.
+```
+
+**Когда panic уместен?**
+
+- **Для ожидаемой ошибки не panic, а вернуть `error`:** решает вызывающий (файла нет, остатка не хватает, неверный ввод).
+- Panic — для **ошибки программиста**: при обращении через nil-указатель или выходе за индекс сам runtime вызывает panic.
+- Встроенную функцию `panic(v)` можно вызвать самому с любым значением (`v` — `any`, любой тип).
+- В стандартной библиотеке так устроены функции, имя которых начинается с `Must`: например, `MustCompile` из пакета `regexp` (regular expression — регулярное выражение, шаблон для текста)
+  вызывает panic на неверном шаблоне и применяется в начале программы:
+
+```console
+$ go doc regexp.MustCompile
+package regexp // import "regexp"
+
+func MustCompile(str string) *Regexp
+    MustCompile is like Compile but panics if the expression cannot be parsed.
+    It simplifies safe initialization of global variables holding compiled
+    regular expressions.
+```
+
+- **Наружу из пакета выходит `error`:** даже если пакет внутри использует panic, его внешний API возвращает ошибку как значение (Go blog, Effective Go).
+
+## recover и именованный результат: превращаем panic в ошибку
+
+Чтобы panic не обрушила всю программу, её на **границе** — в месте, где начинается работа одной команды или одного пришедшего на сервер запроса, — останавливает `recover`.
+Ниже `safely` (`_video/07-recover/main.go`) и вызывающий её `main`:
+
+```go
+// safely fn'ni chaqiradi; fn panic qilsa, panic'ni error qilib qaytaradi.
+func safely(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	fn()
+	return nil
+}
+
+func main() {
+	products := []Product{
+		{ID: 1, Name: "olma", Price: 1_200_000, Stock: 40},
+		{ID: 2, Name: "non", Price: 400_000, Stock: 100},
+		{ID: 3, Name: "oʻrik", Price: 3_500_000, Stock: 5},
+	}
+	p := findProduct(products, 9) // topilmadi: nil
+	err := safely(func() {
+		sell(p, 1)
+	})
+	fmt.Println("xato:", err)
+	fmt.Println("main oxiri")
+}
+```
+
+Номера строк — внутри фрагмента (1 — строка комментария):
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 2 | `func safely(fn func()) (err error)` | `fn` — параметр типа `func()`: функция без параметров и без результата (значение-функция). `(err error)` — результату дали **имя** |
+| 3 | `defer func() { … }()` | записывает анонимную функцию в список defer |
+| 4 | `if r := recover(); r != nil {` | встроенная `recover`, если идёт panic, **останавливает** её и возвращает значение panic; иначе `nil`. `r` имеет тип `any` |
+| 5 | `err = fmt.Errorf("panic: %v", r)` | делает из значения `error` и записывает в результат `err`; `r` имеет тип `any`, поэтому `%v` |
+| 8 | `fn()` | в теле вызывается `fn` |
+| 9 | `return nil` | если panic не было, возвращается `nil` |
+
+**Правило:** `recover` работает, только когда вызван **прямо** внутри функции из списка defer. Официальная документация:
+
+```console
+$ go doc builtin.recover
+package builtin // import "builtin"
+
+func recover() any
+    The recover built-in function allows a program to manage behavior of
+    a panicking goroutine. Executing a call to recover inside a deferred
+    function (but not any function called by it) stops the panicking sequence
+    by restoring normal execution and retrieves the error value passed to the
+    call of panic. If recover is called outside the deferred function it will
+    not stop a panicking sequence. In this case, or when the goroutine is not
+    panicking, recover returns nil.
+
+    Prior to Go 1.21, recover would also return nil if panic is called with a
+    nil argument. See [panic] for details.
+```
+
+**Именованный результат.** В GB-2.07 мы говорили, что имена результатов «для документации». На деле `(err error)` — обычная переменная, которая создаётся в начале функции
+с нулевым значением (`nil`). `return x` сначала записывает `x` в эту переменную, **потом** выполняются defer-ы, и функция из defer может её изменить; вызывающий получает
+уже изменённое значение. Маленькая программа, которой нет в папке курса (`natija/main.go`, полный код здесь):
+
+```go
+package main
+
+import "fmt"
+
+func ikki() (n int) {
+	defer func() {
+		n *= 2
+	}()
+	return 21
+}
+
+func main() {
+	fmt.Println(ikki())
+}
+```
+
+`return 21` сначала записывает 21 в `n`, потом `defer` удваивает `n`: 42.
+
+```console
+$ go run main.go
+42
+```
+
+В `safely` то же самое: если была panic, функция из defer записывает ошибку в `err`, и вызвавший `safely` код получает именно этот `err`; если panic не было, `return nil`
+сначала записывает в `err` значение `nil`, и только после этого выполняются defer-ы. В `main` теперь уже без `defer` передаём `sell` в `safely` внутри анонимной функции. Что выведется?
+
+<details>
+<summary>Ответ</summary>
+
+```console
+$ ./_video/run.sh 07-recover go run .
+defer: sell tugadi
+xato: panic: runtime error: invalid memory address or nil pointer dereference
+main oxiri
+```
+
+Сначала сработал defer из `sell`, потом defer из `safely`: `recover` остановил panic, и она вернулась как обычная ошибка, `main` продолжился (`main oxiri`).
+Сервер оборачивает так же каждый запрос (пришедшее обращение): panic в одном запросе не роняет сервер. Но в такой ошибке нет информации, **где** случилась panic, то есть
+stack trace: его мы запишем в лог в GB-6.01.
+
+</details>
+
+## Где recover не работает
+
+Кто-то вынес `recover` в отдельную функцию `toError`, чтобы использовать её и в других местах. Функция из defer теперь только вызывает `toError` и записывает её результат
+в `err`. `main` тот же (`_video/08-quiz/main.go`):
+
+```go
+// safely fn'ni chaqiradi; fn panic qilsa, panic'ni error qilib qaytaradi.
+func safely(fn func()) (err error) {
+	defer func() {
+		err = toError() // recover endi shu yerda
+	}()
+	fn()
+	return nil
+}
+
+// toError — recover defer'dagi funksiya chaqirgan boshqa funksiyada: panic'ni toʻxtatmaydi.
+func toError() error {
+	if r := recover(); r != nil {
+		return fmt.Errorf("panic: %v", r)
+	}
+	return nil
+}
+```
+
+Что произойдёт?
+
+**A)** вернётся ошибка, и `main` продолжится (`xato: panic: …`, `main oxiri`) · **B)** программа упадёт с panic · **C)** ошибка компиляции
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `recover` работает только **прямо** внутри функции из defer. `toError` — **другая** функция, вызванная из неё: там `recover` вернул `nil`, и panic продолжилась.
+Если вы выбрали **A**, вы решили, что вызов `recover` «принадлежит» defer; Go считает только прямой вызов. Ниже мой запуск
+(строки trace заменены на `…`):
+
+```console
+$ ./_video/run.sh 08-quiz go run .
+defer: sell tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+…
+exit status 2
+```
+
+`recover` не останавливает panic и тогда, когда он вызван без defer, перед `fn`: самого defer нет, а во время panic работают только defer-ы (`_video/12-defersiz/main.go`,
+в видео об этом только говорится):
+
+```console
+$ ./_video/run.sh 12-defersiz go run .
+defer: sell tugadi
+panic: runtime error: invalid memory address or nil pointer dereference
+…
+exit status 2
+```
+
+`recover` не ловит и panic в другой горутине: горутина — это отдельная функция в Go, которая работает одновременно с другими; её мы разберём в GB-7.01.
+
+</details>
+
+## Глубже (необязательно): defer внутри цикла
+
+А если поставить `defer` в цикл внутри `main`? `defer` относится не к **шагу цикла**, а к **функции**. Каждый шаг добавляет в список ещё один `Close`, и все они выполняются, когда
+`main` заканчивается, а файлы до тех пор остаются открытыми. `_video/11-sikl/main.go` (весь файл в папке), цикл:
+
+```go
+	for i := 1; i <= 2000; i++ {
+		f, err := os.Create("hisobot.txt")
+		if err != nil {
+			fmt.Printf("%d: %v\n", i, err)
+			return
+		}
+		defer f.Close() // sikl ichida: main tugaguncha yopilmaydi
+		err = writeReport(f, products)
+		if err != nil {
+			fmt.Printf("%d: %v\n", i, err)
+			return
+		}
+	}
+```
+
+```console
+$ ./_video/run.sh 11-sikl bash -c 'ulimit -n 1024; go run .'
+1020: open hisobot.txt: too many open files
+```
+
+Результат — та же ошибка, что в начале: 1020-й шаг. Решение — вынести тело цикла в отдельную функцию; `saveReport` как раз такая функция: у каждого вызова свой список и свой `Close`.
+
+Обратный порядок и правило аргументов в `defer` внутри цикла видны вместе. Маленькая программа, которой нет в папке курса (`tsikl/main.go`, полный код здесь):
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	for i := 0; i < 3; i++ {
+		defer fmt.Println("defer", i)
+	}
+	fmt.Println("sikl tugadi")
+}
+```
+
+```console
+$ go run main.go
+sikl tugadi
+defer 2
+defer 1
+defer 0
+```
+
+Три `defer` записаны на трёх шагах, аргумент `i` каждый раз скопирован **сразу** (0, 1, 2), а когда `main` закончилась, список выполнился в обратном порядке: 2, 1, 0.
+
+## Частые ошибки
+
+**1. `os.Exit` не выполняет defer.** Самая частая ошибка: в `main` есть `defer`, а при ошибке выходят через `os.Exit(1)`. `defer` в `main` стоит вместо уборки
+(например, удаления временного файла). `_video/09-exit/main.go`; `products` вынесен на уровень пакета для краткости, `saveReport` как раньше:
+
+```go
+func main() {
+	defer fmt.Println("defer: main tugadi")
+	err := saveReport("/dev/full", products)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+Сохранение завершается ошибкой. Что выведется на экран?
+
+**A)** ошибка, затем строка defer · **B)** только строка с ошибкой · **C)** сначала строка defer, потом ошибка
+
+<details>
+<summary>Ответ</summary>
+
+**B: строки defer нет.** `os.Exit` завершает программу немедленно, списки defer не выполняются:
+
+```console
+$ ./_video/run.sh 09-exit go run .
+xato: write /dev/full: no space left on device
+exit status 1
+```
+
+```console
+$ go doc os.Exit
+package os // import "os"
+
+func Exit(code int)
+    Exit causes the current program to exit with the given status code.
+    Conventionally, code zero indicates success, non-zero an error. The program
+    terminates immediately; deferred functions are not run.
+
+    For portability, the status code should be in the range [0, 125].
+```
+
+`Fatal` из пакета `log`, который печатает сообщение и останавливает программу, тоже вызывает внутри `os.Exit(1)` (`go doc log.Fatal`: «Fatal is equivalent to Print followed by a call to os.Exit(1)»).
+Открытые файлы операционная система закрывает сама, но остальная работа из defer (уборка) пропадает.
+
+</details>
+
+**Исправление.** Выносим основную работу в функцию `run`, возвращающую `error`, а `defer`-ы оставляем там. `main` только вызывает `run` и при ошибке выходит через `os.Exit`
+(`_video/10-run/main.go`):
+
+```go
+// run dasturning asosiy ishi: defer'lari main'dagi os.Exit'dan oldin ishlab boʻladi.
+func run() error {
+	defer fmt.Println("defer: run tugadi")
+	return saveReport("/dev/full", products)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+```
+
+Выведется ли теперь строка defer?
+
+<details>
+<summary>Ответ</summary>
+
+Да: к моменту `os.Exit` функция `run` уже вернулась, её defer-ы уже выполнены, поэтому строка defer вышла **раньше** сообщения об ошибке.
+
+```console
+$ ./_video/run.sh 10-run go run .
+defer: run tugadi
+xato: write /dev/full: no space left on device
+exit status 1
+```
+
+**Правило:** `os.Exit` — только в `main`, последним шагом. `main.go` в папке курса устроен так же; только `run` пишет отчёт не в `/dev/full`, а в файл `hisobot.txt`, поэтому
+`go run .` работает без ошибки:
+
+```console
+$ ./_video/run.sh final bash -c 'go run . && cat hisobot.txt'
+defer: run tugadi
+olma    12000 soʻm   40 dona
+non      4000 soʻm  100 dona
+oʻrik   35000 soʻm    5 dona
+```
+
+</details>
+
+**2. Вызывать `recover` не внутри самой функции из defer.** Мы видели выше («Где recover не работает»): `recover` внутри `toError` или перед `fn` не останавливает panic, программа
+завершается с `exit status 2`. Исправление: вызывайте `recover()` в теле анонимной функции из `defer`, как в `safely`.
+
+**3. Использовать `defer` в цикле для закрытия ресурсов.** Мы видели выше («Глубже»): файлы открыты до конца функции, на 1020-м шаге `too many open files`. Исправление: вынесите тело цикла в отдельную функцию.
+
+**4. Писать `defer f.Close()` до проверки ошибки.** Если `os.Create` вернул ошибку, `f` — не рабочий файл, и закрывать нечего. Порядок: `os.Create` → `if err != nil { return err }` → `defer f.Close()`.
+
+## Проверьте себя
+
+**1.** Почему `defer f.Close()` пишут после проверки `err`?
+
+<details>
+<summary>Ответ</summary>
+
+Если `os.Create` вернул ошибку, `f` — не рабочий файл, закрывать нечего; а вызов метода у `nil` у многих типов вызывает panic. Сначала проверка, потом `defer`.
+
+</details>
+
+**2.** Почему `recover` вызывают прямо в функции из defer?
+
+<details>
+<summary>Ответ</summary>
+
+Во время panic работают только функции из списка defer, и `recover` должны вызывать они сами. В другой функции, вызванной из defer (`toError`), `recover` вернёт `nil`, и panic продолжится.
+
+</details>
+
+**3.** Из GB-2.06: может ли `main` прочитать поле `products` пакета `store`, написанное со строчной буквы?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. Имя со строчной буквы видно только в своём пакете: если `main` попробует его прочитать, компилятор отклонит это как `unexported`.
+
+</details>
+
+**4.** Что выведется? В отличие от `tsikl/main.go` выше, теперь внутри `defer` анонимная функция:
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	for i := 0; i < 3; i++ {
+		defer func() {
+			fmt.Println("defer", i)
+		}()
+	}
+	fmt.Println("sikl tugadi")
+}
+```
+
+**A)** `defer 2`, `defer 1`, `defer 0` · **B)** `defer 3`, `defer 3`, `defer 3` · **C)** `defer 0`, `defer 1`, `defer 2`
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Этой программы нет в папке курса (`tsikl2/main.go`); я её запустил:
+
+```console
+$ go run main.go
+sikl tugadi
+defer 2
+defer 1
+defer 0
+```
+
+Анонимная функция читает `i` не как копию, а как саму переменную (замыкание, как `stock` в `05-closure`), а список выполняется при завершении `main` в обратном порядке.
+Почему каждый defer увидел своё `i`: начиная с Go 1.22 цикл `for` на каждом шаге создаёт **новую** `i` ([Go 1.22 release notes](https://go.dev/doc/go1.22#language)).
+В более ранних версиях `i` была одной общей переменной на весь цикл, и все defer-ы читали последнее значение (3), то есть выводилось бы **B**; эту часть я заново не запускал,
+она взята из release notes. Если вы выбрали **C**, вы забыли перевернуть порядок.
+
+</details>
+
+## Домашнее задание
+
+Задание лежит в файле [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-09-defer-panic/TASK.md) в папке курса;
+папка: [lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic). В `main.go` недописаны две вещи:
+
+- 🟢 **Шаг 1, `handle(name string, fn func() error) (err error)`.** Граница, выполняющая команду bozor (`fn`). Если `fn` вернула ошибку, `handle` должна вернуть именно её, не меняя;
+  если ошибки нет — `nil`. Если `fn` вызвала panic, программа не должна падать: `handle` возвращает ошибку с текстом `<name>: panic: <значение panic>` (например `sotish: panic: kutilmagan holat`),
+  и вызывающий должен узнавать её через `errors.Is(err, ErrPanic)`. Сейчас `handle` просто делает `return fn()`.
+- 🟡 **Шаг 2, `reserve(products []Product, items []OrderItem) (err error)`.** Уменьшает остаток для строк заказа: **всё или ничего**. Если в какой-то строке ошибка
+  (количество не положительное, товара нет или остатка не хватает), остатки, уже уменьшенные в предыдущих строках, должны вернуться на место, а ошибка вернуться без изменений.
+  Сейчас яблоко 40 → 37, потом ошибка на `non`, а яблоко так и остаётся 37.
+
+Символов уровня (🟢🟡) в папке курса нет: их поставил я. Не меняйте `saveReport`, `safely`, `findProduct`, типы ошибок и тексты ошибок. Подсказки в `TASK.md`. Проверка — `go test` в этой папке
+(`tekshiruv_test.go` не меняйте). В начальном коде тест падает и сообщает, на каком шаге (мой запуск):
+
+```console
+$ go test
+--- FAIL: TestVazifaHandle (0.00s)
+    --- FAIL: TestVazifaHandle/sotish (0.00s)
+        tekshiruv_test.go:89: handle("sotish") panic'ni ushlamadi («kutilmagan holat»): handle'da defer va recover kerak (TASK.md, 1-qadam)
+    --- FAIL: TestVazifaHandle/qoldiq (0.00s)
+        tekshiruv_test.go:89: handle("qoldiq") panic'ni ushlamadi («runtime error: invalid memory address or nil pointer dereference»): handle'da defer va recover kerak (TASK.md, 1-qadam)
+--- FAIL: TestVazifaReserve (0.00s)
+    --- FAIL: TestVazifaReserve/qoldiq_yetmaydi (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («non: qoldiq 100, soʻralgan 500»), lekin qoldiq: olma 37, non 100, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/mahsulot_yoq (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («mahsulot 9: mahsulot topilmadi»), lekin qoldiq: olma 37, non 90, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/dona_soni (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («dona soni musbat boʻlishi kerak, hozir 0»), lekin qoldiq: olma 40, non 100, oʻrik 3; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+    --- FAIL: TestVazifaReserve/bir_mahsulot_ikki_qator (0.00s)
+        tekshiruv_test.go:144: reserve xato qaytardi («olma: qoldiq 10, soʻralgan 30»), lekin qoldiq: olma 10, non 100, oʻrik 5; kutilgan 40, 100, 5: xato boʻlsa, oldin kamaytirilgan qoldiqlarni defer bilan qaytaring (TASK.md, 2-qadam)
+FAIL
+exit status 1
+FAIL	github.com/abdurahmon27/bozor	0.002s
+```
+
+Работайте, пока не появится `ok`. Ответ — [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-2-09-defer-panic/solution/main.go).
+
+<details>
+<summary>Ответы: шаг 1 (handle) и шаг 2 (reserve)</summary>
+
+**Шаг 1** — `handle` это та же `safely` из урока с двумя отличиями: `fn` теперь возвращает `error` (`return fn()`), а текст ошибки через `%w` хранит внутри `ErrPanic` (GB-2.08):
+
+```go
+func handle(name string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%s: %w: %v", name, ErrPanic, r)
+		}
+	}()
+	return fn()
+}
+```
+
+`return fn()` сначала записывает в `err` ошибку из `fn`; если panic не было, функция из defer её не трогает. `%w` хранит `ErrPanic` внутри (`errors.Is(err, ErrPanic)` — `true`), `%v` добавляет значение panic в текст.
+
+**Шаг 2** — `reserve`: в начале копируем остатки через `append` (GB-2.01), пишем `ok := false`, а в `defer` при `!ok` возвращаем остатки. Перед `return nil` ставим `ok = true`:
+
+```go
+func reserve(products []Product, items []OrderItem) (err error) {
+	var saved []int // boshidagi qoldiqlar
+	for _, p := range products {
+		saved = append(saved, p.Stock)
+	}
+	ok := false
+	defer func() {
+		if !ok { // xato bilan qaytdik yoki panic boʻldi: qoldiqni tiklaymiz
+			for i := range saved {
+				products[i].Stock = saved[i]
+			}
+		}
+	}()
+	// … oldingi sikl: har qatorni tekshirish va p.Stock -= it.Quantity (oʻzgarmagan) …
+	ok = true
+	return nil
+}
+```
+
+Анонимная функция читает `ok` при **завершении** функции (как `stock` в `05-closure`), поэтому не нужно трогать каждый `return fmt.Errorf(…)`. Если panic случилась посередине, остаток тоже восстановится: при panic defer-ы тоже работают.
+Копия исходных остатков правильно восстановит и случай, когда один товар пришёл в двух строках. Эта форма «всё или ничего» встретится позже в `defer tx.Rollback()` (GB-5.07).
+
+Весь `reserve` и `handle` — в `solution/main.go`. Проверка ответом (в этой папке; в `solution/` вместе с `main.go` лежит тот же тестовый файл; мой запуск):
+
+```console
+$ go test ./solution/...
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+</details>
+
+## Источники
+
+- [Go spec: Defer statements](https://go.dev/ref/spec#Defer_statements) — аргументы вычисляются в строке `defer`; обратный порядок; return, последняя скобка или panic
+- [Go spec: Handling panics](https://go.dev/ref/spec#Handling_panics) — где работает `recover`
+- [Go spec: Run-time panics](https://go.dev/ref/spec#Run_time_panics) — обращение через nil-указатель вызывает panic
+- [Go spec: Function literals](https://go.dev/ref/spec#Function_literals) — анонимная функция обращается к внешним переменным (замыкание)
+- [Go blog: Defer, Panic, and Recover](https://go.dev/blog/defer-panic-and-recover) — `CopyFile`, три правила, panic внутри пакета и `error` снаружи
+- [Effective Go: Defer](https://go.dev/doc/effective_go#defer) и [Panic, Recover](https://go.dev/doc/effective_go#panic)
+- [pkg.go.dev: os.Exit](https://pkg.go.dev/os#Exit) — «deferred functions are not run»; [os.File.Close](https://pkg.go.dev/os#File.Close); [builtin.panic и recover](https://pkg.go.dev/builtin#recover)
+- [pkg.go.dev: regexp.MustCompile](https://pkg.go.dev/regexp#MustCompile) и [log.Fatal](https://pkg.go.dev/log#Fatal)
+- [Go 1.22 release notes: цикл for](https://go.dev/doc/go1.22#language) — новая переменная цикла на каждом шаге
+- [Go 1.19 release notes: os](https://go.dev/doc/go1.19#os/exec) — программа сама поднимает мягкий `RLIMIT_NOFILE` до жёсткого
+- [bash: ulimit](https://www.gnu.org/software/bash/manual/html_node/Bash-Builtins.html) — без `-H`/`-S` задаются оба лимита
+- [Linux: /dev/full](https://man7.org/linux/man-pages/man4/full.4.html) — запись возвращает ошибку `ENOSPC`
+- [Linux: _exit(2)](https://man7.org/linux/man-pages/man2/_exit.2.html) — при завершении процесса открытые дескрипторы закрываются
+- [Go Code Review Comments: Don't Panic](https://go.dev/wiki/CodeReviewComments#dont-panic) — для ожидаемой ошибки `error`
+- [Go by Example: Exit](https://gobyexample.com/exit) — при `os.Exit` defer не выполняется
+- [Папка курса: lessons/gb-2-09-defer-panic](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+Результаты получены на `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-27.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-2-09-defer-panic)
+
+---
+
+← Предыдущий урок: [GB-2.08](/lab/youtube/gb/gb-2-08/ru) · Следующий урок: [GB-2.10](/lab/youtube/gb/gb-2-10/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>
