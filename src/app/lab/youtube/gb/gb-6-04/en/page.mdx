@@ -1,0 +1,1048 @@
+---
+title: "Login and revocable sessions"
+date: "2026/11/28"
+description: "Build login, cookies, hashed tokens in Postgres, session expiry checks and logout; verify them with real requests."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-04/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-04"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-04) · [Русский](/lab/youtube/gb/gb-6-04/ru) · **English**  
+Lesson GB-6.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-04) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+bozor verifies passwords. How does it identify the sender of the next `GET /me`? How does logout invalidate an old cookie copy?
+
+**The one idea:** a session is a server record saying “this token belongs to this user until this time.” The cookie carries the token; the database stores only its hash. Every protected request checks the record.
+
+By the end you will:
+
+- create a random token and store only its SHA-256 hash;
+- pass the user through request context in middleware;
+- verify expiry, restarts and logout against Postgres;
+- implement logout everywhere until its tests pass.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| session | record linking a user, token and expiry | session |
+| session token | random secret proving identity | session token |
+| session revocation | deleting the record so the next check rejects the token | session revocation |
+
+Two helpers: a **cookie** is a value issued through `Set-Cookie` and returned through `Cookie`. A **request context** carries request-specific values between handlers.
+
+## Before you start
+
+The planned prerequisites: [GB-6.03 · argon2id](/lab/youtube/gb#gb-6-03), [GB-6.01 · middleware](/lab/youtube/gb/gb-6-01/en). Also needed:
+
+[GB-6.02 · problem details](/lab/youtube/gb/gb-6-02/en), [GB-5.10 · API/Postgres](/lab/youtube/gb/gb-5-10/en), [GB-5.08 · RowsAffected](/lab/youtube/gb/gb-5-08/en), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/en), [GB-5.05 · pgx/context](/lab/youtube/gb/gb-5-05/en), [GB-5.04 · JOIN](/lab/youtube/gb/gb-5-04/en), [GB-5.03 · SQL](/lab/youtube/gb/gb-5-03/en), [GB-5.02 · Docker](/lab/youtube/gb/gb-5-02/en), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08/en), [GB-4.06 · JSON](/lab/youtube/gb/gb-4-06/en), [GB-4.05 · ServeMux](/lab/youtube/gb/gb-4-05/en), [GB-4.03 · Handler](/lab/youtube/gb/gb-4-03/en), [GB-4.01 · HTTP](/lab/youtube/gb/gb-4-01/en), [GB-2.09 · panic](/lab/youtube/gb/gb-2-09/en), [GB-2.08 · errors.Is/%w](/lab/youtube/gb/gb-2-08/en), [GB-2.07 · any](/lab/youtube/gb/gb-2-07/en), [GB-2.04 · &T\{\}](/lab/youtube/gb/gb-2-04/en), [GB-2.01 · []byte](/lab/youtube/gb/gb-2-01/en).
+
+**Run the code.** Work in the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session). Go Playground is insufficient: you need Docker, Postgres, goose, curl and jq. Ports `5514` and `8765` must be free. Users now live in Postgres; GB-6.03 kept them in memory. Catalog and orders are integrated in GB-6.08.
+
+Use Bash in the first terminal. `CGO_ENABLED=0` builds without a C compiler. `GOTOOLCHAIN` selects the recorded version. If goose is not installed:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`no_sqlite3` excludes the unused SQLite driver. Put the Go `bin` directory containing `goose` on `PATH`. Then:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5514/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+The connection string comes from the lab container without being printed. `-T` disables terminal allocation. Migrations create tables; the seed adds two test users:
+
+```console
+$ goose up 2>&1 | sed -E 's/^[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9:]{8} //'
+OK   00001_products.sql (10.82ms)
+OK   00002_orders.sql (12.95ms)
+OK   00003_orders_status.sql (2.82ms)
+OK   00004_users.sql (6.2ms)
+OK   00005_sessions.sql (6.76ms)
+goose: successfully migrated database to version: 5
+$ docker compose exec -T db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 2
+```
+
+`sed` removes only the date prefix. Repeating `goose up` produces different output. The seed clears users and sessions: use it only in the lab. Start the server:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Open the same folder in a second terminal. The following `jq` filters omit personal fields and request IDs. Outputs were rerun; video figures are marked as quoted.
+
+**Recall:** what does GB-6.03’s `Verify` do? **A)** decrypt the hash · **B)** recompute using the stored salt and parameters · **C)** compare strings with a new salt.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Recompute argon2id and compare the result in constant time. A hash is not an encrypted password; a new salt produces a different result.
+
+</details>
+
+## A session and state on both sides
+
+Sending a password on every request transmits it again and runs argon2id again. Login checks it once, then uses a random token.
+
+`401 Unauthorized` means identity was not authenticated. What does `/me` return without a cookie? **A)** `200` · **B)** `401` · **C)** `404`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The route exists but identity is unproven. `404` means a missing route; `200` needs a session.
+
+</details>
+
+```console
+$ curl -sS localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+| Step | Client | Postgres |
+|---|---|---|
+| Before login | no cookie | no row |
+| Login | receives token through `Set-Cookie` | hash, user ID, expiry |
+| `/me` | sends token through `Cookie` | hash and expiry checked |
+| Logout | a copy may retain the token | row absent: next check returns `401` |
+
+`avval login qiling` means “log in first.”
+
+## Random token, only its hash in the database
+
+```go
+func newToken() string {
+	b := make([]byte, 32)
+	rand.Read(b) // Go 1.24+: xato qaytarmaydi
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// hashToken — bazaga yoziladigan va bazadan qidiriladigan qiymat: tokenning SHA-256 hash'i.
+func hashToken(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+```
+
+This is an excerpt from `cmd/api/auth.go`; the complete file is below. Do not run the excerpt alone.
+
+| Line | What it does |
+|---|---|
+| 1 | `newToken` returns a string |
+| 2 | `make([]byte, 32)` creates a 32-byte slice |
+| 3 | `crypto/rand.Read` fills it with cryptographic randomness |
+| 4 | `RawURLEncoding` encodes bytes as URL-safe text without `=` padding |
+| 5 | ends the function |
+| 7–8 | comment and `hashToken`: accepts text, returns bytes |
+| 9 | `Sum256([]byte(token))` hashes the token string itself: `[32]byte` |
+| 10–11 | `sum[:]` returns the whole array as a slice; ends the function |
+
+32 random bytes provide 256 bits; base64url occupies 43 characters. Its alphabet uses letters, digits, `-` and `_`. Encoding is not encryption. SHA-256 produces 32 bytes, or 64 hex characters. Since Go 1.24, `rand.Read` fills the slice completely and never returns an error; failed randomness terminates the program without returning.
+
+Human passwords need argon2id. A random 256-bit token can use fast SHA-256. A read-only database leak does not provide a usable cookie. This does not protect stolen cookies or database write access. [OWASP storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#server-side-session-token-storage) specifies at least 128 random bits and prefers 160 or more.
+
+`00004_users.sql` creates users. `users_email_lower_idx` prevents duplicates by `lower(email)`; login searches using that expression too. The session table is:
+
+```sql filename="migrations/00005_sessions.sql"
+-- +goose Up
+CREATE TABLE sessions (
+    token_hash bytea       PRIMARY KEY,
+    user_id    bigint      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+-- "Hamma qurilmadan chiqish" (DELETE … WHERE user_id = $1) jadvalni oxirigacha oʻqimasin.
+CREATE INDEX sessions_user_id_idx ON sessions (user_id);
+
+-- +goose Down
+DROP TABLE sessions;
+```
+
+`Up` creates; `Down` drops. `bytea` stores bytes; the primary key automatically creates a unique index. `user_id` is a foreign key; `ON DELETE CASCADE` removes sessions with their user. `timestamptz` stores a UTC instant, not the original time zone. `sessions_user_id_idx` supports deletion by user.
+
+## Login: password verification and a cookie
+
+```go
+type loginInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// login — POST /login: parol toʻgʻri boʻlsa yangi session ochadi va tokenni cookie'da qaytaradi.
+// Har login yangi token oladi, so'rovda eski session cookie'si bo'lsa, uning qatori o'chiriladi: OWASP
+// "Renew the Session ID After Any Privilege Level Change" — yangi ID, eskisi yo'q qilinsin (session fixation).
+func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	var in loginInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	u, err := a.checkPassword(r.Context(), in.Email, in.Password)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	token := newToken()
+	expires := time.Now().Add(sessionTTL)
+	err = a.st.CreateSession(r.Context(), hashToken(token), u.ID, expires)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	setSessionCookie(w, token, expires)
+	writeJSON(w, http.StatusOK, u)
+}
+```
+
+The tags in `loginInput` map `Email` and `Password` to JSON body fields. `a *api` provides store access. `in` holds input; `&in` is its address. `!decodeJSON` means decoding failed: a response was already written, so return.
+
+`u, err :=` receives a user and error. `checkPassword` is a new method using GB-6.03’s `password.Verify`. Each `err != nil` branch ends with `writeError` and `return`.
+
+`endCurrentSession` deletes the presented old cookie’s record. Then generate a token. `time.Now().Add(sessionTTL)` adds `24 * time.Hour` to now. `err =` assigns to an existing variable. `CreateSession` inserts the hash, user ID and expiry. Only after storage succeeds are the cookie and `200` JSON sent. The `json:"-"` tag on `User.PasswordHash` excludes the hash from responses.
+
+**Predict:** the address is absent. **A)** `404` · **B)** `401`, “address missing” · **C)** the same generic `401` as a wrong password.
+
+<details>
+<summary>Answer</summary>
+
+**C.** A and B permit checking account existence. The internal cause stays in logs.
+
+</details>
+
+In the second terminal’s Bash, enter the first test user’s address and password from the README. Use lab fixtures only. `read -r` reads text, `-s` hides the password. `jq -n --arg` builds JSON. These commands print nothing:
+
+```bash
+read -r LAB_EMAIL
+read -r -s LAB_PASSWORD
+jq -n --arg email "$LAB_EMAIL" --arg password "$LAB_PASSWORD" '{email:$email,password:$password}' > login.json
+jq '.password += "-wrong"' login.json > wrong.json
+jq '.email = ("missing-" + .email)' login.json > missing.json
+```
+
+`--data-binary @file` sends file contents as the body. `-H` sets its type; a body selects `POST`. `-sS` hides progress but shows connection errors. `jq` retains three fields:
+
+```console
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @wrong.json | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "email yoki parol notoʻgʻri"
+}
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @missing.json | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "email yoki parol notoʻgʻri"
+}
+```
+
+`email yoki parol notoʻgʻri` means “incorrect address or password.”
+
+```go
+func setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+```
+
+`http.SetCookie` creates a header from `&http.Cookie{...}`. `Name` is `session`; `Value` is the token; `Path: "/"` covers this host’s paths; `Expires` is client retention. `HttpOnly` prevents page scripts from reading it. `Secure` requires HTTPS; curl treats `http://localhost` as an exception. `SameSite=Lax` excludes cookies on cross-site POST. Full limits are in [GB-6.07 · cookies and CSRF](/lab/youtube/gb#gb-6-07). `no-store` forbids caching the response.
+
+**Predict:** two logins without sending an old cookie. **A)** one row · **B)** zero · **C)** two.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Each login creates a row. A presented old cookie deletes that specific record. Phone and laptop cookie stores are separate.
+
+</details>
+
+```console
+$ curl -sS -D login.headers -o login.response -c jar.txt localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json
+$ sed -n -E '/^HTTP\/|^Cache-Control:|^Set-Cookie:/ { s/(session=)[^;]*/\1[redacted]/; p; }' login.headers
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Set-Cookie: session=[redacted]; Path=/; Expires=Sun, 29 Nov 2026 05:25:06 GMT; HttpOnly; Secure; SameSite=Lax
+$ jq '{id}' login.response
+{
+  "id": 1
+}
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json | jq '{id}'
+{
+  "id": 1
+}
+```
+
+The first command is silent: `-D` saves headers, `-o` saves the body, and `-c` writes cookies. `sed` inserts `[redacted]`; the actual token is 43 characters. Do not share it. The second login omits `-b`, representing another device. Inspect the stored shape without secrets:
+
+```console
+$ docker compose exec -T db psql -c "SELECT user_id, octet_length(token_hash) AS bytes, length(encode(token_hash, 'hex')) AS hex_chars, expires_at > now() AS valid FROM sessions ORDER BY expires_at"
+ user_id | bytes | hex_chars | valid 
+---------+-------+-----------+-------
+       1 |    32 |        64 | t
+       1 |    32 |        64 | t
+(2 rows)
+```
+
+`AS` names a column; `octet_length` counts bytes, and `length(encode(..., 'hex'))` counts hex characters. `t` means true. Both rows belong to `user_id=1`; hashes occupy 32 bytes or 64 hex characters. The cookie text is absent from the database.
+
+## Every request: cookie → database → context
+
+```go
+type userKey struct{}
+
+// requireUser — himoyalangan route'lar uchun middleware (GB-6.01 shakli): cookie'dagi token hash'i
+// boʻyicha session egasini topadi va uni soʻrov context'iga qoʻyadi. Topilmasa — 401, handler ishlamaydi.
+func (a *api) requireUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil {
+			writeError(w, err) // http.ErrNoCookie → 401
+			return
+		}
+		u, err := a.st.UserBySession(r.Context(), hashToken(c.Value))
+		if err != nil {
+			writeError(w, err) // store.ErrNoSession → 401
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store") // shaxsiy javob: keshda qolmasin (OWASP)
+		ctx := context.WithValue(r.Context(), userKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+`userKey struct{}` defines a custom key type with no fields. Keys must be comparable. Go documentation recommends custom types instead of built-in `string` to avoid package collisions.
+
+`requireUser` takes a handler and returns a closure converted to `http.HandlerFunc`. `r.Cookie` reads by name; if absent: `http.ErrNoCookie` → `401` → `return`.
+
+`UserBySession` searches using `hashToken(c.Value)`. Missing or expired session: `ErrNoSession` → `401`. Database failure gives `500`. Success sets `no-store`. `WithValue` derives a new `ctx` from the old context: `userKey{}` → `u`. `r.WithContext(ctx)` returns a shallow request copy with that context. `next.ServeHTTP` calls the handler. The store:
+
+```go
+func (s *Store) UserBySession(ctx context.Context, tokenHash []byte) (User, error) {
+	var u User
+	err := s.pool.QueryRow(ctx, `
+		SELECT u.id, u.email
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1 AND s.expires_at > now()`,
+		tokenHash).Scan(&u.ID, &u.Email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, ErrNoSession
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("session oʻqilmadi: %w", err)
+	}
+	return u, nil
+}
+```
+
+`var u User` receives the result. `QueryRow` expects one row; backticks delimit SQL. `s` and `u` are table aliases; `JOIN` attaches the user. `$1` is the hash parameter. `Scan(&u.ID, &u.Email)` fills fields. `pgx.ErrNoRows` becomes a missing session; other errors are wrapped with `%w`. `return u, nil` means success.
+
+`now()` is the **current transaction start time**. For this standalone query it is close to the check. It does not advance with each SELECT in a long transaction.
+
+```go
+func currentUser(r *http.Request) store.User {
+	u, ok := r.Context().Value(userKey{}).(store.User)
+	if !ok {
+		panic("currentUser: route requireUser bilan oʻralmagan")
+	}
+	return u
+}
+```
+
+The `any` from `Value` is checked with the `.(store.User)` type assertion. `u, ok :=` detects a missing value or wrong type. `!ok` means a programming error: the route lacks its wrapper. An explicit `panic` becomes `500` through `recoverPanic`. Normally, `return u`. The complete routes file:
+
+```go filename="cmd/api/handlers.go" showLineNumbers
+package main
+
+// Route'lar (GB-4.05). Ochiq: /health, POST /users (GB-6.03), POST /login, POST /logout. Himoyalangan
+// route'lar requireUser bilan oʻralgan (auth.go): cookie'dagi session tirik boʻlmasa, handler'gacha
+// yetib bormaydi — 401. POST body'li route'lar requireJSON bilan (GB-6.01, 415).
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// api — handler'lar bazani shu struct orqali koʻradi (GB-5.10).
+type api struct {
+	st *store.Store
+}
+
+// newMux — hamma route'lar shu yerda: main ham, testlar ham bir xil mux'ni ishlatadi.
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{st: st}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.Handle("POST /users", requireJSON(http.HandlerFunc(a.register))) // GB-6.03
+	mux.Handle("POST /login", requireJSON(http.HandlerFunc(a.login)))
+	mux.Handle("GET /me", a.requireUser(http.HandlerFunc(a.me)))
+	mux.HandleFunc("POST /logout", a.logout) // requireUser'siz: eskirgan cookie ham tozalansin
+	// VAZIFA (TASK.md, 2-qadam): POST /logout-all → a.logoutAll, requireUser bilan oʻralgan
+	return mux
+}
+
+// healthHandler — server tirikligini tekshirish: har soʻrovga «ok» (GB-4.03).
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+// me — GET /me: session egasi. requireUser uni context'ga qoʻygan.
+func (a *api) me(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, currentUser(r))
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1, 7–12 | package `main`; output, HTTP and store imports |
+| 15–17 | `api.st` holds a store pointer |
+| 20–22 | creates `api` and mux |
+| 23–25 | health, registration, login; body routes use `requireJSON` |
+| 26–27 | `/me` is protected, logout is open |
+| 28–30 | task location, mux return, function end |
+| 33–35 | health prints `ok` |
+| 38–40 | context user → `200` JSON |
+
+`http.HandlerFunc(a.me)` converts the function to a Handler; `Handle` takes an existing Handler. `me` does not query the database again. Comments and blank lines do not execute.
+
+| Stage | Context | Result |
+|---|---|---|
+| Request arrives | no user | read cookie |
+| Database check | still no user | obtain `u` |
+| `WithValue` + `WithContext` | `userKey{}` → `u` | new request copy |
+| `currentUser` | `store.User` | `200` JSON |
+
+**Predict:** stop the server with Ctrl+C and restart against the same database. What does `/me` with `jar.txt` return? **A)** `200` · **B)** `401`, memory was lost · **C)** `500`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The client holds the cookie; Postgres holds the row. A new process does not delete it. Restart with `go run ./cmd/api`.
+
+</details>
+
+```console
+$ curl -sS -b jar.txt localhost:8765/me | jq '{id}'
+{
+  "id": 1
+}
+```
+
+`-b jar.txt` sends saved cookies. **Predict:** the stored hex hash as a cookie? **A)** `200`, it matches the database · **B)** `401` · **C)** `500`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The supplied text is hashed again; it is not the original token. `leaked` stays local; `psql -At` gives unaligned output without headings.
+
+</details>
+
+```console
+$ leaked=$(docker compose exec -T db psql -At -c "SELECT encode(token_hash, 'hex') FROM sessions ORDER BY expires_at LIMIT 1"); curl -sS -b "session=$leaked" localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+## Removing the expiry condition
+
+The classic silent bug is checking only the hash in `UserBySession`. In a separate lab copy, replace its SQL with this and restart:
+
+```sql
+SELECT u.id, u.email
+FROM sessions s JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1
+```
+
+**Predict:** both rows expire. Broken and correct versions? **A)** both `401` · **B)** both `200` · **C)** broken `200`, correct `401`.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Postgres does not automatically delete expired rows. The cookie’s `Expires` is still tomorrow; the server must check its own expiry.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "UPDATE sessions SET expires_at = now() - interval '1 minute'"
+UPDATE 2
+$ curl -sS -b jar.txt localhost:8765/me | jq '{id}'
+{
+  "id": 1
+}
+```
+
+`interval '1 minute'` means one minute; `UPDATE 2` means two changed rows. The broken version returned `200`. Restore `AND s.expires_at > now()` and restart:
+
+```console
+$ curl -sS -b jar.txt localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+There is no compile error: the program runs but accepts expired sessions. Fix the server-side SQL check.
+
+## Logout: the cookie and row are separate
+
+```go
+func (a *api) endCurrentSession(r *http.Request) error {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil // cookie yoʻq: oʻchiradigan session ham yoʻq
+	}
+	return a.st.DeleteSession(r.Context(), hashToken(c.Value))
+}
+
+// logout — POST /logout: cookie'dagi session qatorini o'chiradi va brauzerga cookie'ni o'chirishni aytadi.
+// requireUser'siz: session allaqachon eskirgan yoki o'chirilgan bo'lsa ham javob 204 va cookie tozalanadi.
+func (a *api) logout(w http.ResponseWriter, r *http.Request) {
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+```go
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+```
+
+With no cookie, `endCurrentSession` has nothing to delete: return `nil`. Otherwise `DeleteSession` executes `DELETE FROM sessions WHERE token_hash = $1` using its hash. An absent row also counts as success.
+
+`if err := ...; err != nil` declares and checks an error. Failed deletion calls `writeError` and returns. Otherwise clear the cookie and send `204 No Content`, without a body.
+
+Clearing sends an empty value with the same name and `Path`. Go’s `MaxAge: -1` becomes `Max-Age=0`. Other attributes match login. DELETE revokes the session.
+
+The previous two rows expired: log in again. **Predict:** login → copy → logout → `/me` with the old copy? **A)** `401` · **B)** `200`, Expires is tomorrow · **C)** `404`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The copy retains the token, but the row is gone. Client retention does not replace server validation.
+
+</details>
+
+```console
+$ curl -sS -c jar.txt localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json | jq '{id}'
+{
+  "id": 1
+}
+$ cp jar.txt eski.txt
+$ curl -sS -D logout.headers -o /dev/null -X POST -b jar.txt -c jar.txt localhost:8765/logout
+$ sed -n -E '/^HTTP\/|^Set-Cookie:/p' logout.headers
+HTTP/1.1 204 No Content
+Set-Cookie: session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+$ curl -sS -b eski.txt localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+`cp` and the logout command printed nothing. `-X POST` selects POST without a body; `-b` sends cookies and `-c` updates the jar. `eski.txt` stays unchanged. **Predict:** logout without a cookie? **A)** `401` · **B)** `204` · **C)** `500`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Logout has no `requireUser`. Repetition preserves the resulting state: it is idempotent. `-o /dev/null` discards the body; `-w` prints status.
+
+</details>
+
+```console
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST localhost:8765/logout
+204
+```
+
+Revocation affects subsequent checks. DELETE does not undo a concurrent handler that already passed authentication.
+
+## Going deeper (optional): timing and security limits
+
+`checkPassword` runs argon2id against `dummyHash` for unknown addresses too. Otherwise early return could reveal account existence through timing. `dummyHash` is computed once at startup. A malformed hash gives `500`. Success clears `u.PasswordHash = ""`: later code does not need it.
+
+The comparison inside `password.Verify` is constant-time. `WHERE token_hash = $1` **has no such guarantee**. Recovering a high-entropy token from its hash is impractical. This does not prove all timing channels safe. A split-token design separates a public identifier and secret; the secret’s hash is compared separately in constant time.
+
+Measure each case five times. `time_total` is in seconds; `for` repeats, and `-w` prints time:
+
+```console
+$ for i in 1 2 3 4 5; do curl -sS -o /dev/null -w '%{time_total}\n' localhost:8765/login -H 'Content-Type: application/json' --data-binary @wrong.json; done
+0.048716
+0.044513
+0.055996
+0.046747
+0.041252
+$ for i in 1 2 3 4 5; do curl -sS -o /dev/null -w '%{time_total}\n' localhost:8765/login -H 'Content-Type: application/json' --data-binary @missing.json; done
+0.041623
+0.034553
+0.047727
+0.053169
+0.048297
+```
+
+| Case | Video, quoted | Rerun |
+|---|---|---|
+| Wrong password | 24.8–26.2 ms | 41.3–56.0 ms |
+| Unknown address | 25.1–31.0 ms | 34.6–53.2 ms |
+
+Video figures are quoted from `_video/chiqishlar.txt`. New medians are 46.747 and 47.727 ms: a ratio of about 1.02. Load changes absolute times. The important check: unknown addresses do not bypass argon2id. Five samples prove neither equal timing nor the impossibility of account enumeration.
+
+The 24-hour TTL is a lab choice. It is the maximum lifetime: absolute timeout. An inactivity limit, idle timeout, is not implemented yet. Sliding expiry and the absolute limit need separate storage. The application writes using `time.Now()` while Postgres checks: keep clocks aligned.
+
+Each login generates a fresh token and deletes the presented old session. This limits session fixation: retaining a previously known token through login. `SameSite` alone does not replace CSRF protection. Login throttling comes in GB-6.07; real deployment requires HTTPS.
+
+RFC 9110 requires `WWW-Authenticate` on `401`. The lab sends `Cookie realm="bozor"`. It is a custom challenge, not a standard cookie auth-scheme providing automatic login.
+
+The complete file below runs with the rest of the folder using `go run ./cmd/api`:
+
+<details>
+<summary>Complete auth.go</summary>
+
+```go filename="cmd/api/auth.go" showLineNumbers
+package main
+
+// Login va bekor qilinadigan session'lar (GB-6.04).
+//
+//	POST /login        parol toʻgʻri → yangi session: tokenning hash'i bazaga, tokenning oʻzi cookie'ga
+//	requireUser        cookie → hash → sessions qatori → foydalanuvchi context'ga; yoʻq yoki eski → 401
+//	POST /logout       cookie'dagi session qatorini oʻchiradi: shu token bilan keyingi soʻrov 401
+//	POST /logout-all   foydalanuvchining hamma session'larini oʻchiradi (VAZIFA, TASK.md)
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/password"
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// sessionCookie — cookie nomi. sessionTTL — session'ning eng uzun umri: login'dan 24 soat keyin u
+// baribir tugaydi (absolute timeout). 24 soat — bizning tanlov; OWASP Session Management Cheat Sheet'ning
+// misoli ish kuni ilovasi uchun 4–8 soat, harakatsizlik (idle) muddati esa alohida (README).
+const (
+	sessionCookie = "session"
+	sessionTTL    = 24 * time.Hour
+)
+
+// newToken — session tokeni: 32 tasodifiy bayt (256 bit), cookie'ga sigʻadigan matn qilib (43 belgi).
+func newToken() string {
+	b := make([]byte, 32)
+	rand.Read(b) // Go 1.24+: xato qaytarmaydi
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// hashToken — bazaga yoziladigan va bazadan qidiriladigan qiymat: tokenning SHA-256 hash'i.
+func hashToken(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+
+// loginInput — POST /login body'si.
+type loginInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// login — POST /login: parol toʻgʻri boʻlsa yangi session ochadi va tokenni cookie'da qaytaradi.
+// Har login yangi token oladi, so'rovda eski session cookie'si bo'lsa, uning qatori o'chiriladi: OWASP
+// "Renew the Session ID After Any Privilege Level Change" — yangi ID, eskisi yo'q qilinsin (session fixation).
+func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	var in loginInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	u, err := a.checkPassword(r.Context(), in.Email, in.Password)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	token := newToken()
+	expires := time.Now().Add(sessionTTL)
+	err = a.st.CreateSession(r.Context(), hashToken(token), u.ID, expires)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	setSessionCookie(w, token, expires)
+	writeJSON(w, http.StatusOK, u)
+}
+
+// setSessionCookie — tokenni cookie qilib yuboradi. Atributlar GB-6.07'da batafsil:
+// HttpOnly — sahifadagi skript cookie'ni oʻqiy olmaydi; Secure — brauzer uni faqat HTTPS orqali
+// yuboradi (brauzerlar va curl http://localhost'ni istisno qiladi, MDN: Set-Cookie); SameSite=Lax — boshqa
+// saytdan kelgan POST'ga qoʻshilmaydi. Cache-Control: no-store — session ID bor javob keshda qolmasin (OWASP).
+func setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// clearSessionCookie — brauzerga cookie'ni oʻchirishni aytadi (MaxAge: -1 → "Max-Age=0").
+// Bu faqat mijoz tomoni: session'ni bekor qiladigan narsa — bazadagi qatorni oʻchirish.
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// errBadLogin — email yoki parol notoʻgʻri (problemFor → 401, ikkalasiga bir xil matn).
+var errBadLogin = errors.New("email yoki parol notoʻgʻri")
+
+// dummyHash — yoʻq email uchun ham argon2id bir marta ishlaydi: javob vaqti email bazada bor-yoʻqligini
+// bildirmasin (OWASP Authentication Cheat Sheet, "Authentication Responses").
+var dummyHash = password.Hash("bozor: email topilmadi")
+
+// checkPassword — Verify (GB-6.03) ustidagi login tekshiruvi: email boʻyicha foydalanuvchi, keyin argon2id Verify.
+func (a *api) checkPassword(ctx context.Context, email, pw string) (store.User, error) {
+	u, err := a.st.UserByEmail(ctx, email)
+	if errors.Is(err, store.ErrUserNotFound) {
+		password.Verify(pw, dummyHash)
+		return store.User{}, fmt.Errorf("%w: %w", errBadLogin, err)
+	}
+	if err != nil {
+		return store.User{}, err
+	}
+	ok, err := password.Verify(pw, u.PasswordHash)
+	if err != nil {
+		return store.User{}, fmt.Errorf("foydalanuvchi %d: %w", u.ID, err)
+	}
+	if !ok {
+		return store.User{}, fmt.Errorf("%w: foydalanuvchi %d", errBadLogin, u.ID)
+	}
+	u.PasswordHash = "" // hash bundan keyin kerak emas: javobga yoki log'ga tasodifan chiqmasin
+	return u, nil
+}
+
+// userKey — context'dagi kalit turi. Oʻz turimiz: boshqa paketning kaliti bilan toʻqnashmaydi
+// (go doc context.WithValue: kalit string yoki boshqa ichki tur boʻlmasin).
+type userKey struct{}
+
+// requireUser — himoyalangan route'lar uchun middleware (GB-6.01 shakli): cookie'dagi token hash'i
+// boʻyicha session egasini topadi va uni soʻrov context'iga qoʻyadi. Topilmasa — 401, handler ishlamaydi.
+func (a *api) requireUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil {
+			writeError(w, err) // http.ErrNoCookie → 401
+			return
+		}
+		u, err := a.st.UserBySession(r.Context(), hashToken(c.Value))
+		if err != nil {
+			writeError(w, err) // store.ErrNoSession → 401
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store") // shaxsiy javob: keshda qolmasin (OWASP)
+		ctx := context.WithValue(r.Context(), userKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// currentUser — requireUser context'ga qoʻygan foydalanuvchi. Route requireUser bilan oʻralmagan
+// boʻlsa — bu dasturchi xatosi: panic, recoverPanic uni 500 qiladi (jim User{} qaytarishdan xavfsizroq).
+func currentUser(r *http.Request) store.User {
+	u, ok := r.Context().Value(userKey{}).(store.User)
+	if !ok {
+		panic("currentUser: route requireUser bilan oʻralmagan")
+	}
+	return u
+}
+
+// endCurrentSession — so'rovdagi session cookie'sining qatorini o'chiradi; cookie yo'q bo'lsa hech narsa
+// qilmaydi. logout va login (eski session'ni yo'q qilish) ishlatadi.
+func (a *api) endCurrentSession(r *http.Request) error {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil // cookie yoʻq: oʻchiradigan session ham yoʻq
+	}
+	return a.st.DeleteSession(r.Context(), hashToken(c.Value))
+}
+
+// logout — POST /logout: cookie'dagi session qatorini o'chiradi va brauzerga cookie'ni o'chirishni aytadi.
+// requireUser'siz: session allaqachon eskirgan yoki o'chirilgan bo'lsa ham javob 204 va cookie tozalanadi.
+func (a *api) logout(w http.ResponseWriter, r *http.Request) {
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+`package main` selects the executable package. Imports provide context, randomness, SHA, encoding, errors, formatting, HTTP, time, password and store packages. `const` defines the name and TTL. Comments and blank lines do not execute. `errBadLogin` is the shared error; two `%w` verbs preserve underlying causes. In `checkPassword`, `ok` means the password matched; `err` means verification failed to execute.
+
+</details>
+
+## Common mistakes
+
+1. **Checking only the hash.** In “Removing the expiry condition,” an expired row returned `200`. Restoring `AND s.expires_at > now()` and restarting changed it to `401`.
+2. **Deleting only the cookie.** An old copy works while the record exists. Finish logout after `DeleteSession` succeeds.
+3. **Calling `currentUser` on an open route.** `panic("currentUser: route requireUser bilan oʻralmagan")` means the route was not wrapped: a programming error. `recoverPanic` returns `500`. Fix: `a.requireUser(http.HandlerFunc(a.me))`.
+4. **Wrapping ordinary logout in `requireUser`.** Expired sessions never reach cookie clearing. Ordinary logout is open; logout-all is protected to obtain the current user.
+5. **Treating `Expires` as server expiry.** Client retention differs from server acceptance. Cleanup also cannot replace the expiry check.
+
+The following test verifies the `500` case is handled correctly:
+
+```console
+$ go test ./cmd/api -run '^TestCurrentUserWithoutMiddleware$' -count=1
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.057s
+```
+
+## Check yourself
+
+1. Why store a hash rather than the token itself?
+
+<details>
+<summary>Answer</summary>
+
+So a read-only database copy does not provide ready-to-use login tokens. SHA-256 suffices for high entropy; it does not prevent cookie theft.
+
+</details>
+
+2. Predict: login → `cp jar.txt eski.txt` → logout → `/me` with the old copy. `200`, `401` or `404`?
+
+<details>
+<summary>Answer</summary>
+
+`401`: the token exists, its server record does not.
+
+</details>
+
+3. From GB-6.01: what if middleware never calls `next.ServeHTTP`?
+
+<details>
+<summary>Answer</summary>
+
+The inner handler does not run. That is how `requireUser` stops after `401`.
+
+</details>
+
+4. Is the expiry predicate still needed with `DeleteExpiredSessions`?
+
+<details>
+<summary>Answer</summary>
+
+Yes. Cleanup can lag; validation must still reject expired rows.
+
+</details>
+
+## Homework
+
+[Lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-04-login-session/TASK.md), [answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session/solution).
+
+🟢 **Required: log out everywhere.** Implement `DeleteUserSessions(ctx, userID)` using `DELETE FROM sessions WHERE user_id = $1`. Return `RowsAffected()` and the error; add context with `%w`. Let `logoutAll` obtain the user ID from `currentUser(r)`. Wrap `POST /logout-all` in `requireUser`. On success clear the cookie and return `204`.
+
+Tests expect `401` for both sessions of one user, `200` for another user, and `401` for logout-all without a cookie. Do not change test files.
+
+🟡 **Optional:** implement `DeleteExpiredSessions(ctx)` for `expires_at <= now()` only. The starter skips `TestDeleteExpiredSessions`: only this optional part, not the required task.
+
+**Predict:** starter `go test ./...`? **A)** all pass · **B)** two required tests fail · **C)** Postgres is unnecessary.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `TestLogoutAll` receives `404`: the route is absent. `TestDeleteUserSessions` is unimplemented. Real Postgres is needed; each test uses its own schema. The command below filters request IDs.
+
+</details>
+
+```console
+$ set -o pipefail
+$ go test ./... 2>&1 | sed -E 's/"request_id":"[^"]*"/"request_id":"[redacted]"/g'
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestLogoutAll (0.16s)
+    tekshiruv_test.go:18: POST /logout-all: status 404, kutilgan 204 (TASK.md, 2-qadam): {"type":"about:blank","title":"Not Found","status":404,"detail":"bunday yoʻl yoʻq","request_id":"[redacted]"}
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	1.230s
+ok  	github.com/abdurahmon27/bozor/internal/password	(cached)
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+--- FAIL: TestDeleteUserSessions (0.06s)
+    tekshiruv_test.go:27: DeleteUserSessions(1): DeleteUserSessions hali yozilmagan (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.338s
+FAIL
+```
+
+`tekshiruv_test.go:18` identifies the API test file and line; `:27` identifies the store test. `kutilgan` means “expected”; `hali yozilmagan` means “not implemented yet.” Implement the method and route, rather than deleting tests. Answer:
+
+<details>
+<summary>Answer and explanation</summary>
+
+```go
+func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) (int64, error) {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
+	if err != nil {
+		return 0, fmt.Errorf("foydalanuvchi %d session'lari oʻchirilmadi: %w", userID, err)
+	}
+	return tag.RowsAffected(), nil
+}
+```
+
+```go
+func (a *api) logoutAll(w http.ResponseWriter, r *http.Request) {
+	_, err := a.st.DeleteUserSessions(r.Context(), currentUser(r).ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+```go
+mux.Handle("POST /logout-all", a.requireUser(http.HandlerFunc(a.logoutAll)))
+```
+
+The first excerpt belongs in store, the second in auth.go, the last in `newMux`. `RowsAffected()` returns the number of deleted rows. The handler discards it with `_`. `WHERE user_id` preserves the other user; omitting it fails the test. Optional cleanup uses the same `Exec` with `WHERE expires_at <= now()`.
+
+</details>
+
+**Prediction for the solution:** with Postgres running, all packages pass. `cd` changes into solution, which has its own `go.mod`:
+
+```console
+$ cd solution && go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	2.255s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.412s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.613s
+```
+
+Run `go test ./...` on your implementation until required tests pass. Formatting and static analysis:
+
+```console
+$ gofmt -l cmd internal migrate.go && go vet ./...
+```
+
+This printed nothing. Stop the server with Ctrl+C when finished. In the original folder, remove the container and lab data:
+
+```bash
+docker compose down -v
+unset LAB_EMAIL LAB_PASSWORD DATABASE_URL GOOSE_DBSTRING
+```
+
+## Sources
+
+- [RFC 9110: 401 Unauthorized](https://www.rfc-editor.org/rfc/rfc9110#name-401-unauthorized)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [RFC 6265: HTTP State Management (cookies)](https://www.rfc-editor.org/rfc/rfc6265#section-3)
+- [Go crypto/rand: Read](https://pkg.go.dev/crypto/rand#Read)
+- [OWASP · Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+- [Go crypto/sha256: Sum256](https://pkg.go.dev/crypto/sha256#Sum256)
+- [PostgreSQL 18: Indexes on Expressions](https://www.postgresql.org/docs/18/indexes-expressional.html)
+- [PostgreSQL 18: Binary Data Types (bytea)](https://www.postgresql.org/docs/18/datatype-binary.html)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Authentication Responses](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-responses)
+- [Go time: Time.Add, Hour](https://pkg.go.dev/time#Time.Add)
+- [MDN: Set-Cookie (Secure, localhost)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)
+- [curl: --cookie-jar](https://curl.se/docs/manpage.html#-c)
+- [PostgreSQL 18: encode(bytea, 'hex')](https://www.postgresql.org/docs/18/functions-binarystring.html)
+- [Go net/http: Request.Cookie, ErrNoCookie](https://pkg.go.dev/net/http#Request.Cookie)
+- [Go context: WithValue (key type)](https://pkg.go.dev/context#WithValue)
+- [PostgreSQL 18: now() (current date/time)](https://www.postgresql.org/docs/18/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT)
+- [Go net/http: Request.WithContext](https://pkg.go.dev/net/http#Request.WithContext)
+- [Go net/http: ServeMux.Handle](https://pkg.go.dev/net/http#ServeMux.Handle)
+- [curl: --cookie](https://curl.se/docs/manpage.html#-b)
+- [OWASP: Session Expiration (server-side invalidation)](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#session-expiration)
+- [PostgreSQL 18: interval](https://www.postgresql.org/docs/18/datatype-datetime.html#DATATYPE-INTERVAL-INPUT)
+- [PostgreSQL 18: DELETE](https://www.postgresql.org/docs/18/sql-delete.html)
+- [OWASP: renew the session ID after login](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#renew-the-session-id-after-any-privilege-level-change)
+- [RFC 9110: 204 No Content](https://www.rfc-editor.org/rfc/rfc9110#name-204-no-content)
+- [Go net/http: Handler](https://pkg.go.dev/net/http#Handler)
+- [RFC 6265 · cookies](https://www.rfc-editor.org/rfc/rfc6265)
+- [RFC 9110 · WWW-Authenticate](https://www.rfc-editor.org/rfc/rfc9110#name-www-authenticate)
+- [Go · RawURLEncoding](https://pkg.go.dev/encoding/base64#pkg-variables)
+- [Go · Cookie](https://pkg.go.dev/net/http#Cookie)
+- [PostgreSQL 18 · timestamptz](https://www.postgresql.org/docs/18/datatype-datetime.html)
+- [PostgreSQL 18 · foreign key](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK)
+- [curl · manual](https://curl.se/docs/manpage.html)
+- [curl · HTTP Cookies](https://curl.se/docs/http-cookies.html)
+- [jq · manual](https://jqlang.org/manual/)
+
+Results from `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-28; PostgreSQL 18.7 in Docker, curl 8.22.0, goose v3.30.2. Outputs were rerun except the explicitly quoted video timings. Tokens, dates, request IDs and test durations vary between runs.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session)
+
+---
+
+← Previous lesson: [GB-6.03](/lab/youtube/gb#gb-6-03) · Next lesson: [GB-6.05](/lab/youtube/gb#gb-6-05) → · [All lessons](/lab/youtube/gb)
+
+</div>

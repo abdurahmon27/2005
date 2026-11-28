@@ -1,0 +1,876 @@
+---
+title: "Whose order is this? Authorization and BOLA"
+date: "2026/11/28"
+description: "Login is not permission: check order ownership in SQL, return the same 404 for another user's order and protect the admin route with a role."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-06) · [Русский](/lab/youtube/gb/gb-6-06/ru) · **English**  
+Lesson GB-6.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-06) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Dilnoza signed in and fetched her own order with `GET /orders/41`. If she changes `41` to `42` in the path, whose order does the server return?
+
+**The one idea:** login only says **who** sent the request. **Permission** is a separate question, and **every** request that touches an order must ask it itself. At object level the answer is in the SQL condition: `WHERE id = $1 AND user_id = $2`. `$1` comes from the client (the ID in the path), `$2` from the server (the session owner). At function level the answer is a role: `requireAdmin`.
+
+By the end you will:
+
+- reproduce and close the bug where a signed-in user receives another user's order;
+- return the same `404` for a foreign order and a missing order, and write the full reason only to the server log;
+- see a test that catches the bug: FAIL on the old code, ok on the new code;
+- protect an admin route with a `users.role` column and a `requireAdmin` middleware, and fix the same bug in `PATCH /orders/{id}` yourself.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| authorization | the check «may you do this action?» | authorization |
+| BOLA | the permission for this specific order (object) was not checked | Broken Object Level Authorization |
+| role | a group of actions open to a user (`xaridor`, `admin`) | role |
+
+Helper words are explained where they appear: **authentication**, **BFLA** (a function-level bug), **mass assignment**.
+
+## Before you start
+
+This lesson builds on [GB-6.05 · Session or JWT](/lab/youtube/gb#gb-6-05) and [GB-6.04 · Login and sessions](/lab/youtube/gb/gb-6-04/en): `requireUser`, `currentUser`, the cookie, and Dilnoza and Jasur come from there. You also need [GB-6.03 · Passwords: argon2id](/lab/youtube/gb#gb-6-03), [GB-6.02 · Error responses](/lab/youtube/gb/gb-6-02/en), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/en), [GB-5.10 · the bozor API on Postgres](/lab/youtube/gb/gb-5-10/en), [GB-5.08 · RowsAffected](/lab/youtube/gb/gb-5-08/en), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/en), [GB-5.05 · pgx and `$1`](/lab/youtube/gb/gb-5-05/en), [GB-4.08 · pathID](/lab/youtube/gb/gb-4-08/en) and [GB-1.08 · go test](/lab/youtube/gb/gb-1-08/en).
+
+**Where to work.** This example does not run in the Go Playground: it needs a real Postgres. Make a temporary copy of the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki). You will put the broken versions into the copy; the lesson folder itself stays unchanged. You need Go 1.27, Docker, curl, jq and goose v3.30.2. Ports `5516` and `8765` must be free. `cd` is the command «go to this folder».
+
+```bash
+work=$(mktemp -d)
+cp -a . "$work/bozor"
+cd "$work/bozor"
+cp cmd/api/handlers.go handlers.fixed
+cp internal/store/orders.go orders.fixed
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`GOTOOLCHAIN` selects the Go version the lesson was recorded with; `CGO_ENABLED=0` builds without a C compiler. `handlers.fixed` and `orders.fixed` are copies of the folder's fixed files: after a broken version you put them back. The directory where goose was installed must be on your `PATH`. Now the database:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5516/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+`up -d --wait` starts the container in the background and waits until the database is ready. The connection string is read from the container and is not printed. Then the migrations and the seed:
+
+```console
+$ goose up
+2026/11/28 11:15:20 OK   00001_products.sql (5.92ms)
+2026/11/28 11:15:20 OK   00002_orders.sql (8.61ms)
+2026/11/28 11:15:20 OK   00003_orders_status.sql (2.26ms)
+2026/11/28 11:15:20 OK   00004_users.sql (4.61ms)
+2026/11/28 11:15:20 OK   00005_sessions.sql (5.22ms)
+2026/11/28 11:15:20 OK   00006_orders_owner.sql (4.18ms)
+2026/11/28 11:15:20 OK   00007_users_role.sql (2.52ms)
+2026/11/28 11:15:20 goose: successfully migrated database to version: 7
+```
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 3
+INSERT 0 4
+ALTER TABLE
+INSERT 0 2
+INSERT 0 4
+```
+
+goose applied seven migrations. `seed.sql` writes three users, four products and two orders. The lab users' emails and passwords are in the folder's README and in the test file; this page does not show them. We pull the login data out of ready-made strings in the test into files:
+
+```bash
+sed -n 's/^[[:space:]]*dilnozaLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > login.json
+sed -n 's/^[[:space:]]*adminLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > admin-login.json
+sed -n 's/^[[:space:]]*jasurLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > jasur-login.json
+```
+
+`sed -n '…/p'` prints only the matching line; the JSON between the backticks lands in `login.json`. In the first terminal start the server; let the log go to a file too (`2>&1` joins the log to normal output, `tee` writes to the screen and to the file):
+
+```bash
+go run ./cmd/api 2>&1 | tee server.log
+```
+
+The first line is `bozor API: http://localhost:8765`. When you change code, stop the server with `Ctrl+C` and start it again. In a second terminal open the same copy and sign in as Dilnoza:
+
+```console
+$ curl -s -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json > /dev/null
+```
+
+The command prints nothing: `--data-binary @login.json` takes the body from the file, `-c jar.txt` saves the cookie to `jar.txt` (later `-b jar.txt` sends it), and `> /dev/null` throws the response away — it contains the user's email.
+
+**Recall, GB-6.05.** A user signed in with a JWT and logged out. What is that token to the server now? **A)** gets `401` at once · **B)** valid until `exp` · **C)** the server deletes it.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The server has no record of a JWT, so the token works until `exp` (its expiry time). Revoking it earlier needs a separate denylist. That is why bozor stayed with sessions: a session is a record on the server, and deleting it revokes the login.
+
+</details>
+
+## Who are you? And may you do this? — two questions
+
+The first question is **authentication**: «who are you?». In bozor `requireUser` answers it: cookie → session → user in the context. No answer — `401 Unauthorized`.
+
+The second question is **authorization**: «may you do this?». No permission — usually `403 Forbidden`. A signed-in user is not allowed everything. bozor does not ask this second question anywhere yet.
+
+| Step | Question | If not | Who answers |
+|---|---|---|---|
+| 1 | is the session valid? (who?) | `401` | `requireUser` (GB-6.04) |
+| 2 | is this order yours? | `404` | the SQL condition, written today |
+| 3 | is this action open to your role? | `403` | `requireAdmin`, written today |
+
+## The problem: the owner is in the database, not in the query
+
+Every order's owner is already stored: the sixth migration added a `user_id` column to `orders`. Here is the file (lines starting with `--` are comments; `+goose Up` and `+goose Down` are goose's apply and rollback sections):
+
+```sql filename="migrations/00006_orders_owner.sql" showLineNumbers
+-- +goose Up
+-- Har buyurtmaning egasi bor (GB-6.06): orders.user_id → users.id. Avvalgi customer matni kerak emas:
+-- buyurtma kimniki ekanini endi session aytadi, mijoz yozgan ism emas.
+-- NOT NULL default'siz qoʻshish faqat boʻsh jadvalda ishlaydi (laboratoriyada orders boʻsh, seed.sql keyin
+-- toʻldiradi). Qatorlari bor bazada: avval ustun NULL bilan, eski qatorlarga egasi yoziladi, keyin SET NOT NULL.
+ALTER TABLE orders
+    ADD COLUMN user_id bigint NOT NULL REFERENCES users (id),
+    DROP COLUMN customer;
+-- "Shu foydalanuvchining buyurtmalari" (WHERE user_id = …) jadvalni oxirigacha oʻqimasin.
+CREATE INDEX orders_user_id_idx ON orders (user_id);
+
+-- +goose Down
+DROP INDEX orders_user_id_idx;
+ALTER TABLE orders
+    ADD COLUMN customer text NOT NULL DEFAULT '',
+    DROP COLUMN user_id;
+```
+
+| Line | What it does |
+|---|---|
+| 6–8 | one `ALTER TABLE` with two actions separated by a comma: adds `user_id` (`NOT NULL`, a foreign key to `users.id`, GB-5.04) and drops the old `customer` text: who you are is now told by the session |
+| 10 | `CREATE INDEX` builds an index on `user_id`: one user's orders are found without reading the whole table |
+| 12–16 | `Down`: drops the index and restores `customer` as an empty string (the old text cannot come back) |
+
+`NOT NULL` without a `DEFAULT` works only on an **empty** table — that was the error in GB-5.06. In the lab `orders` is empty and `seed.sql` fills it later. On a running database this is not one file but several releases: first the column with `NULL` and a `NOT VALID` foreign key, then validate the constraint; you fill the owners of old rows by a business decision (free-text `customer` cannot be mapped to `users.id` automatically); `SET NOT NULL` through a validated `CHECK`; the index with `CREATE INDEX CONCURRENTLY`; the old column is dropped in a later release. The steps are in the lesson folder's README.
+
+The state after the seed, with `psql`:
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders"
+ id | user_id |                note                 
+----+---------+-------------------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+ 42 |       2 | Yunusobod 4-kvartal, 17-uy, ertalab
+(2 rows)
+```
+
+Order 41 belongs to the first user (Dilnoza), order 42 to the second (Jasur). The addresses are made up. Now stop the server (`Ctrl+C`), put in the broken version and start again:
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+The connected route and the start of the handler:
+
+```go
+	mux.Handle("GET /orders/{id}", a.requireUser(http.HandlerFunc(a.getOrder)))
+
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id)
+```
+
+First line: the path `GET /orders/{id}` is connected to `getOrder`; the outer `requireUser` keeps a request without a cookie from reaching the handler (GB-5.10). `pathID` turns `{id}` from the path into a number; not a number — `400` (GB-4.08). The last line asks the store for the order with this ID. The store's SQL query:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+```
+
+The first line selects the columns `user_id`, `status` and `note`; `note` is the delivery note, usually with a home address. The second line is the condition: `id` equals `$1`. Who is asking appears nowhere in the condition.
+
+Dilnoza is signed in; her ID is 1. She sends `GET /orders/42`; order 42 is Jasur's. What is the response? **A)** `401`: sign in first · **B)** `403`: no permission · **C)** `200`: Jasur's order.
+
+<details>
+<summary>Answer</summary>
+
+**C.** The cookie is there, the session is alive, `requireUser` let Dilnoza through: `401` comes from the identity check, and here the identity is correct. For `403` the code would need a permission check — there is none. The row exists in the database and matches the condition, so it is returned.
+
+</details>
+
+First Dilnoza's own order, then the request with the number in the path changed:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/41
+{"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy","items":[{"product_id":1,"quantity":2,"unit_price":1200000},{"product_id":2,"quantity":3,"unit_price":400000}],"total":3600000}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/42
+{"id":42,"user_id":2,"status":"yangi","note":"Yunusobod 4-kvartal, 17-uy, ertalab","items":[{"product_id":4,"quantity":1,"unit_price":3500000},{"product_id":3,"quantity":1,"unit_price":2500000}],"total":6000000}
+```
+
+The second response is `200`: Jasur's order with his home address and the total (in tiyin). That is the bug. What each step checked:
+
+| Step | What happened | Not checked |
+|---|---|---|
+| `requireUser` | cookie → session → Dilnoza into the context | whose order |
+| `getOrder` | `42` from the path → store | the asker's ID |
+| `WHERE id = $1` | 42 found → response | whose is 42? |
+
+In the OWASP API Security Top 10 (2023) this is the **first** item: **Broken Object Level Authorization**, **BOLA** for short. The OWASP Authorization Cheat Sheet calls it a form of Insecure Direct Object Reference (**IDOR**). IDs are sequential: an attacker will also try 43, 44 and onwards. The OWASP rule: **every** function that uses an ID from the client to reach a record in the database must check that the user may perform that action, and you should pin this down with tests.
+
+## The fix: the ownership condition in the SQL itself
+
+Stop the server and put back the saved fixed files:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+The fix is in the query itself, one new line:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+  AND user_id = $2
+```
+
+`AND`: a row is found only if both conditions are true. `$1` is the ID the client sent (from the path), `$2` is the ID of the asker, that is the session owner (from the server). The client cannot choose `$2`. Here is the store method:
+
+```go
+func (s *Store) Order(ctx context.Context, id, userID int64) (Order, error) {
+	o := Order{ID: id, Items: []OrderItem{}}
+	var note *string // orders.note NULL boʻlishi mumkin: NULL → nil
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, note FROM orders
+		WHERE id = $1
+		  AND user_id = $2`,
+		id, userID).Scan(&o.UserID, &o.Status, &note)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	if err != nil {
+		return Order{}, err
+	}
+	if note != nil {
+		o.Note = *note
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY id", id)
+	if err != nil {
+		return Order{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPrice); err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := rows.Err(); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | the method takes `id` and `userID`; `int64` is written once for both (`id, userID int64`) |
+| 2 | `o` is the order to return |
+| 3 | `note` is a `*string`: if the column is `NULL`, it stays `nil` (GB-2.04) |
+| 4–8 | `QueryRow` runs the query (GB-5.05): the condition is the same `WHERE id = $1 AND user_id = $2`; `$1` ← `id`, `$2` ← `userID`; `Scan` writes the columns into `o` and `note` |
+| 9–11 | no row — `pgx.ErrNoRows`; we wrap it in `ErrOrderNotFound` (`%w`, GB-5.10). A foreign order gives exactly the same: the condition is false, there is no row |
+| 12–14 | any other error is returned as it is |
+| 15–36 | as in earlier lessons: copies `note` if present, reads the order's rows and computes the total |
+
+The handler takes the owner from `currentUser` (GB-6.04):
+
+```go
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id, currentUser(r).ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+```
+
+Line 6 changed: `currentUser(r).ID` is the session owner. The ID comes from the client (line 2, from the path) and the owner from the session: the client does not choose it. The store can no longer be called without an owner: the signature requires `userID`. But both parameters are `int64`, so swapping the arguments is not a compile error — a test checks the order.
+
+Restart the server. Dilnoza sends two requests: Jasur's order 42 and the order 999, which does not exist. How do the responses differ? **A)** `42` → `403`, `999` → `404` · **B)** both the same `404` · **C)** `42` → `404`, `999` → `400`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** In both requests no row matches the condition, so the store returns `ErrOrderNotFound` in both. If you chose A, you thought «it exists, but it is not yours» (`403`) — below is why that is dangerous. C: `999` is a valid number, `pathID` accepts it, so it is not `400`.
+
+</details>
+
+With `-i` the response headers are printed too:
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/42
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: KNBI4DSAZOBX2A7LIZSPLVVBGK
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"KNBI4DSAZOBX2A7LIZSPLVVBGK"}
+```
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/999
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: BBSKMXA7MJX34EUFPSDY4XARRX
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"BBSKMXA7MJX34EUFPSDY4XARRX"}
+```
+
+Both are `404 Not Found` with the same text «bunday buyurtma yoʻq» («no such order»); only the `request_id` differs (each request gets its own, GB-6.01).
+
+**Why not `403`?** `403` says «this order exists, but it is not yours». Then an attacker tries IDs one by one and learns which orders exist. [RFC 9110 §15.5.4](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden) says it plainly: a server that wants to hide the existence of a resource MAY answer `404` instead of `403`. This is bozor's choice, not a mandatory rule for every API. Note also: sequential IDs still reveal the *number* of orders — `404` does not hide that (see the «Going deeper» section).
+
+The detail is in the server log (first terminal): which user asked for which order. These are the two paths from GB-6.02: a safe text for the client, the full error in the log. We take only the `xato` («error») lines:
+
+```console
+$ grep ' xato ' server.log
+2026/11/28 11:15:22 KNBI4DSAZOBX2A7LIZSPLVVBGK xato 404: "buyurtma 42, foydalanuvchi 1: buyurtma topilmadi"
+2026/11/28 11:15:22 BBSKMXA7MJX34EUFPSDY4XARRX xato 404: "buyurtma 999, foydalanuvchi 1: buyurtma topilmadi"
+```
+
+`buyurtma` is order, `foydalanuvchi` is user, `topilmadi` is not found. The log says «user 1 asked for order 42»; it does not tell a foreign order from a missing one by itself, both lines have the same form.
+
+## The test: FAIL on the old code, ok on the new code
+
+OWASP also recommends pinning this down with tests («Write tests …»). The test is in `cmd/api/api_test.go`:
+
+```go
+func TestOrderOwner(t *testing.T) {
+	h, _ := testAPI(t)
+	dilnoza := login(t, h, dilnozaLogin)
+	for id, want := range map[string]int{"41": 200, "42": 404, "999": 404} {
+		rec := send(h, "GET", "/orders/"+id, "", dilnoza.Value)
+		if rec.Code != want {
+			t.Errorf("Dilnoza GET /orders/%s: %d, kutilgan %d", id, rec.Code, want)
+		}
+	}
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | a test function (GB-1.08) |
+| 2 | `testAPI` prepares a real Postgres with a fresh schema and the seed; `h` is the ready handler |
+| 3 | `login` signs in with the JSON `dilnozaLogin` and returns the cookie |
+| 4 | `map[string]int`: ID → expected status; `range` walks all three pairs. Her own (`41`) — `200`, the others — `404` |
+| 5 | `send` gives the request to the handler: method, path, empty body and the cookie value |
+| 6–8 | if the status is not the expected one, `t.Errorf` fails the test: `%s` is the ID, `%d` are both statuses |
+
+First we run this test on the old, unfixed code. Which of the three IDs fail? **A)** only `42` · **B)** `42` and `999` · **C)** none: the test passes.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `41` is Dilnoza's, `200` on the old code too. `999` is a missing order on the old code too, that is `404`. Only `42` gets `200` instead of `404` on the old code. If you chose B, you thought the old code also fails on `999`; it does not — the bug here is for `42`.
+
+</details>
+
+Put in the broken version's files and run the test; then put the fixed ones back and repeat (`-run` runs only tests whose name matches):
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+--- FAIL: TestOrderOwner (0.16s)
+    api_test.go:294: Dilnoza GET /orders/42: 200, kutilgan 404
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.214s
+FAIL
+```
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.202s
+```
+
+`api_test.go:294` is the file and line where the check failed; `kutilgan` means «expected». This is not a compile error: the code ran, but handed out a foreign order. If you repeat the same command unchanged, Go takes the result from its cache:
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	(cached)
+```
+
+Add `-count=1` to run it again.
+
+Timings. The numbers from the video are a quote (not re-run in this text); the right column is measured in this run on this computer:
+
+| Result | Number from the video (quote) | This run |
+|---|---|---|
+| old code | FAIL, `0.278s` | FAIL, `0.214s` |
+| fixed code | ok, `0.283s` | ok, `0.202s` |
+
+The seconds depend on how busy the computer is, so comparing them means nothing: they include creating the schema, the seed and the login. What matters is the result itself: FAIL on the foreign order, ok after the fix. A test you have seen fail once will catch the same bug tomorrow.
+
+The folder has more tests: `TestForeignOrderLooksMissing` (the response to a foreign and to a missing order is the same except for `request_id`; Jasur does not see 41 either), `TestCreateOrderOwner`, `TestAdminUsers`, `TestProductsAdminOnly`, `TestRequireAdminOutside`.
+
+## The role: the second layer of permission
+
+Object level settled «is this order yours?». The second layer is function level: some actions are for admins only. The seventh migration adds a `role` column to `users`:
+
+```sql filename="migrations/00007_users_role.sql" showLineNumbers
+-- +goose Up
+-- Rol (GB-6.06): oddiy xaridor yoki admin. Yangi foydalanuvchi har doim xaridor: eng kam huquq
+-- (OWASP Authorization Cheat Sheet, "Enforce Least Privileges"). Admin'ni faqat baza egasi tayinlaydi.
+ALTER TABLE users
+    ADD COLUMN role text NOT NULL
+    DEFAULT 'xaridor'
+    CHECK (role IN ('xaridor', 'admin'));
+
+-- +goose Down
+ALTER TABLE users DROP COLUMN role;
+```
+
+| Line | What it does |
+|---|---|
+| 4–7 | `ALTER TABLE users` adds a required text column `role`; `DEFAULT 'xaridor'` gives `xaridor` to existing and new users; `CHECK (role IN ('xaridor', 'admin'))` allows only these two values |
+| 9–10 | `Down`: drops the column |
+
+A newly registered user is always `xaridor`: OWASP calls this least privilege. An admin is assigned only in the database. `store.User` now has a `Role` field, and `UserBySession` reads it too. The new `cmd/api/authz.go`:
+
+```go filename="cmd/api/authz.go" showLineNumbers
+package main
+
+// Authorization — «nima qila olasiz» (GB-6.06). Authentication (requireUser, auth.go) faqat kim ekaningizni
+// aniqlaydi. Ruxsatning ikki qavati:
+//
+//	obyekt   «bu buyurtma sizniki?» — har store metodida, SQL shartida: WHERE id = $1 AND user_id = $2.
+//	         Begona buyurtma → 404, xuddi yoʻq buyurtma kabi (RFC 9110 §15.5.4: mavjudligini yashirish).
+//	funksiya «bu amal sizning rolingizga ochiq?» — requireAdmin middleware'i, /admin/… route'larida → 403.
+//
+// OWASP API Security Top 10 2023: API1 Broken Object Level Authorization, API5 Broken Function Level Authorization.
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// errForbidden — foydalanuvchi kim ekani maʼlum, lekin bu amal uning roliga ruxsat etilmagan (problemFor → 403).
+var errForbidden = errors.New("bu amal uchun ruxsat yoʻq")
+
+// requireAdmin — faqat admin rolidagi foydalanuvchini oʻtkazadi, qolganlarga 403.
+// requireUser'ning ICHIDA turishi shart: foydalanuvchini context'ga requireUser qoʻyadi.
+// Tashqarida tursa currentUser panic qiladi → 500 (GB-6.04): jim oʻtkazib yuborishdan xavfsizroq.
+func requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if currentUser(r).Role != store.RoleAdmin {
+			writeError(w, errForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `package main` — the same package as the other files in `cmd/api` |
+| 3–10 | comment: the two layers of permission and the OWASP items |
+| 12–17 | imports: `errors`, `net/http` and the `store` package (for the role constant) |
+| 19–20 | `errForbidden` is a plain error value; `problemFor` (GB-6.02) turns it into `403 Forbidden` |
+| 22–24 | comment: `requireAdmin` must stand **inside** `requireUser` |
+| 25 | `requireAdmin` — the middleware shape from GB-6.01: takes a handler, returns a handler |
+| 26 | the returned handler function (a closure) |
+| 27 | is the role `currentUser(r).Role` not admin? The value of `store.RoleAdmin` is `"admin"` |
+| 28–30 | not admin: `errForbidden` is written and `return` |
+| 31 | admin: `next.ServeHTTP` calls the next handler |
+| 32–33 | both functions close |
+
+We choose `403`: that an admin section exists is no secret, and the user knows who they are.
+
+Now the admin section: `GET /admin/users` returns the list of all users (the `listUsers` handler). Stop the server, put in the `v1-admin-yoq` step and start again. In the current code the route is connected like this:
+
+```bash
+cp _video/stages/v1-admin-yoq/handlers.go cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(http.HandlerFunc(a.listUsers)))
+```
+
+`requireAdmin` is written, but it is not on this line. Dilnoza is an ordinary customer. What does she get on this route? **A)** `401` · **B)** `403`: no permission · **C)** `200`: all the emails.
+
+<details>
+<summary>Answer</summary>
+
+**C.** The route has only `requireUser`: the identity is known, and nobody checks the role. That `requireAdmin` is written does not connect it by itself. If you chose B, you took the existence of the function for its being connected.
+
+</details>
+
+The real response contains the emails of all three users; on this page we keep only `id` and `role` with `jq` (`-c` prints the result on one line, `map({id,role})` takes two fields from each list element):
+
+```console
+$ curl -s -b jar.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+Dilnoza got the list of all users (3 is the admin). This is **BFLA**, Broken Function Level Authorization, OWASP API5:2023: not an object but a **function** (an admin action) left unprotected. It is a common mistake. OWASP: «Don't assume that an API endpoint is regular or administrative only based on the URL path» — the name `/admin` alone protects nothing.
+
+The fix: `requireAdmin` inside `requireUser`. Put back the fixed files and restart the server:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(requireAdmin(http.HandlerFunc(a.listUsers))))
+	mux.Handle("DELETE /products/{id}", a.requireUser(requireAdmin(http.HandlerFunc(a.deleteProduct))))
+```
+
+The outer layer (`requireUser`) puts the user into the context; the inner layer (`requireAdmin`) checks the user's role. `deleteProduct`, which deletes a product (the `DELETE` route from GB-5.10), is connected with the same two layers; so is `POST /products`. The role is read from the database on every request: if admin rights are taken away, they stop working from the next request. Dilnoza's same request, now with `-i`:
+
+```console
+$ curl -i -b jar.txt localhost:8765/admin/users
+HTTP/1.1 403 Forbidden
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: T3X6VTCETJ3752AI2JHD5KXA6M
+Date: Sat, 28 Nov 2026 06:15:24 GMT
+Content-Length: 136
+
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"bu amal uchun ruxsat yoʻq","request_id":"T3X6VTCETJ3752AI2JHD5KXA6M"}
+```
+
+The admin signs in (`-c admin.txt` writes the cookie to a separate file), then with `-b admin.txt` sees the list:
+
+```console
+$ curl -s -c admin.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @admin-login.json > /dev/null
+```
+
+```console
+$ curl -s -b admin.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+**Check yourself.** Swap the order: `requireAdmin` outside, `requireUser` inside. What does the admin get on this route? **A)** `200`: the list · **B)** `403` · **C)** `500`.
+
+```go
+	mux.Handle("GET /admin/users", requireAdmin(a.requireUser(http.HandlerFunc(a.listUsers))))
+```
+
+<details>
+<summary>Answer</summary>
+
+**C.** `requireAdmin` runs first, and there is no user in the context yet: `currentUser` panics (GB-2.09), and `recoverPanic` (GB-6.01) turns the response into `500`. The admin gets `500` too. A: the admin would get the list only by getting inside. B: `403` comes after the role check, and the check never started.
+
+</details>
+
+```bash
+cp _video/stages/v2-teskari/handlers.go cmd/api/handlers.go
+```
+
+After restarting the server:
+
+```console
+$ curl -i -b admin.txt localhost:8765/admin/users
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/problem+json
+X-Request-Id: WUCC4DHZMAADKTSKYACONOMYJU
+Date: Sat, 28 Nov 2026 06:15:25 GMT
+Content-Length: 110
+
+{"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"WUCC4DHZMAADKTSKYACONOMYJU"}
+```
+
+The reason is in the server log:
+
+```console
+$ grep ' panic: ' server.log
+2026/11/28 11:15:25 WUCC4DHZMAADKTSKYACONOMYJU panic: currentUser: route requireUser bilan oʻralmagan
+```
+
+`route requireUser bilan oʻralmagan` means «the route is not wrapped in requireUser». This is a programmer's mistake, and it does not pass silently: `500` and a log entry on the very first request. (If `currentUser` quietly returned an empty user, the check would work wrongly and the mistake would stay hidden.) Put the fixed file back:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+## Going deeper (optional): `user_id` in the body and sequential IDs
+
+Dilnoza adds `"user_id":2` to the body of `POST /orders` to write an order in Jasur's name. What happens? **A)** the order is Jasur's · **B)** the order is Dilnoza's · **C)** `400`: unknown key.
+
+<details>
+<summary>Answer</summary>
+
+**C.** The main defense: the input struct has no `user_id` field — a field that would write the owner does not exist at all. `DisallowUnknownFields` in `decodeJSON` does not drop the unknown key silently but turns it into an explicit `400`. In a request without the key the owner is the session owner, that is Dilnoza.
+
+</details>
+
+```go
+type orderInput struct {
+	Items []itemInput `json:"items"`
+	Note  string      `json:"note"`
+}
+```
+
+`orderInput` lists the fields the body of `POST /orders` accepts: only `items` and `note`. This is the defense against **mass assignment**: the client sends a field it must not set itself (OWASP API3:2023, Broken Object Property Level Authorization; its earlier name was *Mass Assignment*). The real requests:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"user_id":2,"items":[{"product_id":3,"quantity":1}]}'
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan","request_id":"MDQKKJMQOKGIVIVYJKIIZFUEEP"}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"items":[{"product_id":3,"quantity":1}]}'
+{"id":43,"user_id":1,"status":"yangi","items":[{"product_id":3,"quantity":1,"unit_price":2500000}],"total":2500000}
+```
+
+In the second response `"user_id":1` is Dilnoza, from the session. The new order got number `43`. That does not mean there are 43 orders: the seed starts counting at 41. But sequential IDs still reveal the overall volume: an attacker who creates two orders at different times counts how many orders appeared between them. OWASP recommends random, unpredictable IDs (for example UUIDs) as an extra layer. But the Authorization Cheat Sheet says it plainly: such hiding is «generally not sufficient by itself» — the check is needed on every request.
+
+Two more notes. Ownership is a relationship-based rule («this order belongs to this user»), while a role is RBAC (role-based access control). For complex systems OWASP prefers attribute- and relationship-based models (ABAC, ReBAC). The next step (GB-6.08): wrapping each admin route one by one is easy to forget; a safer shape is a separate `ServeMux` for `/admin/`, connected once through `requireUser(requireAdmin(…))`.
+
+## Common mistakes
+
+**1. «Login is enough».** The most common belief: `requireUser` is there, so it is safe. But `WHERE id = $1` happily returns another user's order, and neither the compiler nor the server complains — a silent bug (the «The problem» section above). Sign: `200` and another user's `user_id`. Fix: take the owner from the session and put it into the SQL condition; for reads and for changes.
+
+**2. Middleware written but not connected.** `requireAdmin` exists, the route does not use it: `/admin/users` gave the list to a customer (the «The role» section above). Fix: `requireUser(requireAdmin(…))` on every route that must be protected.
+
+**3. Order reversed.** `requireAdmin(requireUser(…))` — even the admin gets `500`; in the log: `panic: currentUser: route requireUser bilan oʻralmagan`. Fix: `requireUser` outside (who?), `requireAdmin` inside (is it an admin?).
+
+**4. Fixing only `GET`.** `PATCH`, `DELETE` and exports touch the record too, and each needs its own owner check. `PATCH /orders/{id}` in the starter is still broken — the homework closes exactly that. Even a half fix gives an error: if you change the store signature and forget the handler, `go vet` shows it at once. An extra experiment that is not in the lesson folder: the starter handler with the new `UpdateNote` signature (the function is given in full in the homework answer):
+
+```console
+$ go vet ./...
+# github.com/abdurahmon27/bozor/cmd/api
+# [github.com/abdurahmon27/bozor/cmd/api]
+vet: cmd/api/handlers.go:247:53: not enough arguments in call to a.st.UpdateNote
+	have (context.Context, int64, string)
+	want (context.Context, int64, int64, string)
+```
+
+`vet:` is the vet message; `cmd/api/handlers.go:247:53` is file, line, column; `not enough arguments` — an argument is missing, `have` — what was passed, `want` — what is needed. The signature forces the owner to be passed: add `currentUser(r).ID` in the handler.
+
+## Check yourself
+
+**1.** Which questions do authentication and authorization answer?
+
+<details>
+<summary>Answer</summary>
+
+Authentication — «who are you?» (in bozor `requireUser`, no answer — `401`). Authorization — «may you do this action?» (object: the SQL condition; function: `requireAdmin`, no permission — `403`).
+
+</details>
+
+**2.** Why `404`, not `403`, for another user's order?
+
+<details>
+<summary>Answer</summary>
+
+`403` says «this order exists, but it is not yours»; an attacker tries IDs and learns which orders exist. RFC 9110 §15.5.4 allows `404` to hide the existence of a resource. This does not replace the check: the ownership condition stays in SQL, and `404` is its response.
+
+</details>
+
+**3. Predict.** For Dilnoza (ID 1), what HTTP statuses do the calls `Order(ctx, id, 1)` give for `id` equal to `41`, `42`, `999`? **A)** `200`, `404`, `404` · **B)** `200`, `403`, `404` · **C)** all three `200`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Only `41` matches both conditions: `id = 41 AND user_id = 1`. For `42` the `user_id` is 2, the condition is false; `999` does not exist. In both cases there is no row → `ErrOrderNotFound` → `404`. B — we do not use `403` (question 2). C — that is the old code's result, and this is the fixed code.
+
+</details>
+
+**4. GB-6.03.** Why is a password stored with argon2id and not with SHA?
+
+<details>
+<summary>Answer</summary>
+
+Argon2id is deliberately slow and needs memory: every guess is expensive. A fast hash (SHA) gives no such barrier, and an attacker makes a huge number of guesses per second.
+
+</details>
+
+## Homework
+
+🟡 **Make `PATCH /orders/{id}` change only your own order.** The folder has one more route: `PATCH /orders/{id}`. **PATCH** is an HTTP method that changes part of a resource (RFC 5789); here it changes the order's delivery note (`note`). Its `UPDATE` has today's bug: the owner is not checked.
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $2 WHERE id = $1",
+		id, note)
+```
+
+This is the beginning of the method (`internal/store/orders.go`). Jasur tries to write his address into Dilnoza's order 41 (sign in as Jasur; `jasur-login.json` was created above):
+
+```console
+$ curl -s -c jasur.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @jasur-login.json > /dev/null
+```
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 204 No Content
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |       note        
+----+---------+-------------------
+ 41 |       1 | Jasurning manzili
+(1 row)
+```
+
+`-X PATCH` selects the HTTP method, `-d` gives the body, `| head -1` keeps only the first line of the response (the status). `204 No Content` — it changed, the response has no body; the database kept Jasur's text in Dilnoza's order. The task:
+
+1. **Store.** Make it `UpdateNote(ctx context.Context, id, userID int64, note string) error` and put the owner into the SQL condition: `UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2`. The numbers match the argument order: `$1` ← `id`, `$2` ← `userID`, `$3` ← `note`. For a foreign or missing order no row changes (`tag.RowsAffected() == 0`) → `ErrOrderNotFound` (with `%w`, as it is now).
+2. **Handler.** In `updateNote` in `cmd/api/handlers.go` pass `currentUser(r).ID` to the store. Do not take the owner from the body or the path.
+3. Do not change `cmd/api/tekshiruv_test.go`. The test checks three things: Jasur → `404` and the note does not change; Dilnoza on her own order → `204` and the note changes; the missing `999` → `404`.
+
+The task is in [TASK.md in the lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/TASK.md). On the starter copy, in the folder root (Postgres must be running):
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestUpdateNoteOwner (0.15s)
+    tekshiruv_test.go:28: Jasur PATCH /orders/41 (Dilnozaniki): status 204, kutilgan 404 — begona buyurtma yoʻq buyurtma kabi (TASK.md, 1–2-qadam)
+    tekshiruv_test.go:31: Jasur Dilnozaning 41-buyurtmasini oʻzgartirdi: izoh «Jasurning manzili», kutilgan «Chilonzor 9-kvartal, 12-uy» — UPDATE'da egasi tekshirilmayapti (TASK.md, 1-qadam: WHERE id = $1 AND user_id = $2)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	2.581s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.282s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.728s
+FAIL
+```
+
+`--- FAIL: TestUpdateNoteOwner` is the failed test; both messages say what is missing (204 instead of 404; the note changed). The line starting with `FAIL` is the package, `ok` marks passed packages, `[no test files]` a package without tests. Hint: look at `store.Order` — the shape is the same, only `Exec` and `RowsAffected()` instead of `QueryRow` (GB-5.08). The solution is [in the solution/ folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/solution).
+
+<details>
+<summary>Answer: explanation</summary>
+
+Store:
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id, userID int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2",
+		id, userID, note)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	return nil
+}
+```
+
+In the handler one line changes: `a.st.UpdateNote(r.Context(), id, currentUser(r).ID, *in.Note)`. In `solution/` these two files are fixed. To try it, first run the seed again (it restores order 41 and clears the sessions), put in the `solution/` files, restart the server and sign in as Jasur again:
+
+```bash
+docker compose exec -T db psql -f /lab/seed.sql > /dev/null
+cp solution/internal/store/orders.go internal/store/orders.go
+cp solution/cmd/api/handlers.go cmd/api/handlers.go
+```
+
+Jasur's same request and the database:
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 404 Not Found
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |            note            
+----+---------+----------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+(1 row)
+```
+
+The foreign order gets `404`, like a missing one, and the note does not change. The test also checks the database that the note did not change: returning the right status is not enough. The answer folder's tests:
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	3.010s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.360s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.888s
+```
+
+The format and static checks print nothing:
+
+```console
+$ gofmt -l cmd internal && go vet ./...
+```
+
+</details>
+
+After the experiment stop the server with `Ctrl+C`. The next command removes exactly this lab database and its volume:
+
+```bash
+docker compose down -v
+```
+
+## Sources
+
+- OWASP API Security Top 10 2023: [API1 · BOLA](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/), [API3 · BOPLA](https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/), [API5 · BFLA](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) · [lookup IDs](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#ensure-lookup-ids-are-not-accessible-even-when-guessed-or-cannot-be-tampered-with) · [least privilege](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#enforce-least-privileges) · [logging](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#implement-appropriate-logging)
+- [RFC 9110 §15.5.4 · 403 Forbidden](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden), [RFC 5789 · PATCH](https://www.rfc-editor.org/rfc/rfc5789)
+- [PostgreSQL 18 · ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html), [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html), [SELECT · WHERE](https://www.postgresql.org/docs/18/sql-select.html#SQL-WHERE)
+- [Go · net/http ServeMux](https://pkg.go.dev/net/http#ServeMux), [Go · testing flags](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [Go · function types](https://go.dev/ref/spec#Function_types)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [GB-6.05 lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, goose v3.30.2, PostgreSQL 18 (`postgres:18-alpine`), Docker; 2026-11-28. Times from the video are marked as quotes. Request IDs and dates differ on every run. Next lesson: [GB-6.07 · Cookie, CSRF, CORS and rate limit](/lab/youtube/gb#gb-6-07).
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+---
+
+← Previous lesson: [GB-6.05](/lab/youtube/gb#gb-6-05) · Next lesson: [GB-6.07](/lab/youtube/gb#gb-6-07) → · [All lessons](/lab/youtube/gb)
+
+</div>

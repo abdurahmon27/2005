@@ -1,0 +1,876 @@
+---
+title: "Чей это заказ? Авторизация и BOLA"
+date: "2026/11/28"
+description: "Вход — не разрешение: проверяйте владельца заказа в SQL, отвечайте одинаковым 404 на чужой заказ и закройте админ-маршрут ролью."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-06) · **Русский** · [English](/lab/youtube/gb/gb-6-06/en)  
+Урок GB-6.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Дилноза вошла в систему и запросила свой заказ: `GET /orders/41`. Если она заменит в пути `41` на `42`, чей заказ вернёт сервер?
+
+**Главная идея:** вход говорит только о том, **кто** отправил запрос. **Разрешение** — отдельный вопрос, и каждый запрос, который касается заказа, должен задавать его сам. На уровне объекта ответ лежит в самом SQL-условии: `WHERE id = $1 AND user_id = $2`. `$1` приходит от клиента (ID из пути), `$2` — от сервера (владелец сессии). На уровне функции ответ — роль: `requireAdmin`.
+
+К концу урока вы:
+
+- воспроизведёте и закроете ошибку, при которой вошедший пользователь получает чужой заказ;
+- вернёте одинаковый `404` на чужой и несуществующий заказ, а полную причину запишете только в лог сервера;
+- увидите тест, который ловит эту ошибку: FAIL на старом коде, ok на новом;
+- закроете админ-маршрут колонкой `users.role` и middleware `requireAdmin`, а ту же ошибку в `PATCH /orders/{id}` исправите сами.
+
+| Слово | Простое значение | Английский термин |
+|---|---|---|
+| авторизация | проверка «есть ли у вас разрешение на это действие?» | authorization |
+| BOLA | не проверено разрешение на конкретный заказ (объект) | Broken Object Level Authorization |
+| роль | группа действий, доступных пользователю (`xaridor`, `admin`) | role |
+
+Вспомогательные слова объясняются по ходу: **аутентификация** (authentication), **BFLA** (ошибка на уровне функции), **mass assignment**.
+
+## Что нужно знать заранее
+
+Урок опирается на [GB-6.05 · Сессия или JWT](/lab/youtube/gb#gb-6-05) и [GB-6.04 · Вход и сессии](/lab/youtube/gb/gb-6-04/ru): оттуда `requireUser`, `currentUser`, cookie, а также Дилноза и Жасур. Ещё понадобятся: [GB-6.03 · Пароли: argon2id](/lab/youtube/gb#gb-6-03), [GB-6.02 · Ответы с ошибками](/lab/youtube/gb/gb-6-02/ru), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/ru), [GB-5.10 · API bozor на Postgres](/lab/youtube/gb/gb-5-10/ru), [GB-5.08 · RowsAffected](/lab/youtube/gb/gb-5-08/ru), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/ru), [GB-5.05 · pgx и `$1`](/lab/youtube/gb/gb-5-05/ru), [GB-4.08 · pathID](/lab/youtube/gb/gb-4-08/ru), [GB-1.08 · go test](/lab/youtube/gb/gb-1-08/ru).
+
+**Где работать.** Пример не для Go Playground: нужен настоящий Postgres. Сделайте временную копию [папки урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki): ошибочные версии вы будете подставлять в копию, сама папка урока не изменится. Нужны Go 1.27, Docker, curl, jq и goose v3.30.2. Порты `5516` и `8765` должны быть свободны. `cd` — команда «перейти в эту папку».
+
+```bash
+work=$(mktemp -d)
+cp -a . "$work/bozor"
+cd "$work/bozor"
+cp cmd/api/handlers.go handlers.fixed
+cp internal/store/orders.go orders.fixed
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`GOTOOLCHAIN` выбирает версию Go, на которой записан урок, `CGO_ENABLED=0` собирает без компилятора C. `handlers.fixed` и `orders.fixed` — копии исправленных файлов папки: после ошибочной версии вы вернёте их обратно. Каталог, куда goose установился, должен быть в `PATH`. Теперь база:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5516/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+`up -d --wait` запускает контейнер в фоне и ждёт, пока база будет готова. Строка подключения берётся из контейнера и на экран не выводится. Затем миграции и seed:
+
+```console
+$ goose up
+2026/11/28 11:15:20 OK   00001_products.sql (5.92ms)
+2026/11/28 11:15:20 OK   00002_orders.sql (8.61ms)
+2026/11/28 11:15:20 OK   00003_orders_status.sql (2.26ms)
+2026/11/28 11:15:20 OK   00004_users.sql (4.61ms)
+2026/11/28 11:15:20 OK   00005_sessions.sql (5.22ms)
+2026/11/28 11:15:20 OK   00006_orders_owner.sql (4.18ms)
+2026/11/28 11:15:20 OK   00007_users_role.sql (2.52ms)
+2026/11/28 11:15:20 goose: successfully migrated database to version: 7
+```
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 3
+INSERT 0 4
+ALTER TABLE
+INSERT 0 2
+INSERT 0 4
+```
+
+goose применил семь миграций. `seed.sql` записывает трёх пользователей, четыре товара и два заказа. E-mail и пароли учебных пользователей лежат в README папки и в тестовом файле; на странице мы их не показываем. Данные для входа вынем из готовых строк теста в файлы:
+
+```bash
+sed -n 's/^[[:space:]]*dilnozaLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > login.json
+sed -n 's/^[[:space:]]*adminLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > admin-login.json
+sed -n 's/^[[:space:]]*jasurLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > jasur-login.json
+```
+
+`sed -n '…/p'` печатает только подошедшую строку; JSON из обратных кавычек попадает в `login.json`. В первом терминале запустите сервер; лог пусть пишется и в файл (`2>&1` добавляет лог к обычному выводу, `tee` пишет и на экран, и в файл):
+
+```bash
+go run ./cmd/api 2>&1 | tee server.log
+```
+
+Первая строка — `bozor API: http://localhost:8765`. Когда меняете код, остановите сервер через `Ctrl+C` и запустите снова. Во втором терминале откройте ту же копию и войдите как Дилноза:
+
+```console
+$ curl -s -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json > /dev/null
+```
+
+Команда ничего не печатает: `--data-binary @login.json` берёт тело из файла, `-c jar.txt` сохраняет cookie в `jar.txt` (потом `-b jar.txt` отправляет его), а `> /dev/null` выбрасывает ответ — в нём e-mail пользователя.
+
+**Вспомните, GB-6.05.** Пользователь вошёл с JWT и вышел. Что теперь с его токеном для сервера? **A)** сразу получает `401` · **B)** действителен до `exp` · **C)** сервер его удаляет.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** На сервере записи о JWT нет, поэтому токен действует до `exp` (срока). Чтобы отозвать его раньше, нужен отдельный denylist. Поэтому bozor остался на сессиях: сессия — запись на сервере, её удаление отзывает вход.
+
+</details>
+
+## Кто вы? И есть ли разрешение на это? — два вопроса
+
+Первый вопрос — **аутентификация** (authentication): «кто вы?». В bozor на него отвечает `requireUser`: cookie → сессия → пользователь в контексте. Нет ответа — `401 Unauthorized`.
+
+Второй вопрос — **авторизация** (authorization): «есть ли у вас разрешение на это?». Нет разрешения — обычно `403 Forbidden`. Вошедшему пользователю разрешено не всё. Этот второй вопрос bozor пока нигде не задаёт.
+
+| Шаг | Вопрос | Если нет | Кто отвечает |
+|---|---|---|---|
+| 1 | сессия действительна? (кто?) | `401` | `requireUser` (GB-6.04) |
+| 2 | этот заказ ваш? | `404` | SQL-условие, пишем сегодня |
+| 3 | это действие доступно вашей роли? | `403` | `requireAdmin`, пишем сегодня |
+
+## Проблема: владелец в базе есть, в запросе — нет
+
+Владелец каждого заказа уже записан в базе: шестая миграция добавила в `orders` колонку `user_id`. Вот этот файл (строки с `--` — комментарии, `+goose Up` и `+goose Down` — разделы применения и отката goose):
+
+```sql filename="migrations/00006_orders_owner.sql" showLineNumbers
+-- +goose Up
+-- Har buyurtmaning egasi bor (GB-6.06): orders.user_id → users.id. Avvalgi customer matni kerak emas:
+-- buyurtma kimniki ekanini endi session aytadi, mijoz yozgan ism emas.
+-- NOT NULL default'siz qoʻshish faqat boʻsh jadvalda ishlaydi (laboratoriyada orders boʻsh, seed.sql keyin
+-- toʻldiradi). Qatorlari bor bazada: avval ustun NULL bilan, eski qatorlarga egasi yoziladi, keyin SET NOT NULL.
+ALTER TABLE orders
+    ADD COLUMN user_id bigint NOT NULL REFERENCES users (id),
+    DROP COLUMN customer;
+-- "Shu foydalanuvchining buyurtmalari" (WHERE user_id = …) jadvalni oxirigacha oʻqimasin.
+CREATE INDEX orders_user_id_idx ON orders (user_id);
+
+-- +goose Down
+DROP INDEX orders_user_id_idx;
+ALTER TABLE orders
+    ADD COLUMN customer text NOT NULL DEFAULT '',
+    DROP COLUMN user_id;
+```
+
+| Строка | Что делает |
+|---|---|
+| 6–8 | в одном `ALTER TABLE` через запятую два действия: добавляет `user_id` (`NOT NULL`, внешний ключ на `users.id`, GB-5.04) и удаляет старый текст `customer`: теперь, кто вы, говорит сессия |
+| 10 | `CREATE INDEX` создаёт индекс по `user_id`: заказы одного пользователя находятся без полного чтения таблицы |
+| 12–16 | `Down`: удаляет индекс и возвращает `customer` пустой строкой (старый текст не восстановить) |
+
+`NOT NULL` без `DEFAULT` добавляется только в **пустую** таблицу — это была ошибка из GB-5.06. В лаборатории `orders` пуста, `seed.sql` заполняет её позже. В работающей базе это не один файл, а несколько релизов: сначала колонка с `NULL` и внешний ключ `NOT VALID`, потом проверка ограничения; владельцев старых строк вы проставляете по бизнес-решению (свободный текст `customer` нельзя автоматически сопоставить с `users.id`); `SET NOT NULL` — через проверенный `CHECK`; индекс — `CREATE INDEX CONCURRENTLY`; старая колонка удаляется в следующем релизе. Шаги описаны в README папки урока.
+
+Состояние после seed, через `psql`:
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders"
+ id | user_id |                note                 
+----+---------+-------------------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+ 42 |       2 | Yunusobod 4-kvartal, 17-uy, ertalab
+(2 rows)
+```
+
+Заказ 41 принадлежит первому пользователю (Дилноза), заказ 42 — второму (Жасур). Адреса вымышленные. Теперь остановите сервер (`Ctrl+C`), подставьте ошибочную версию и запустите снова:
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+Подключённый маршрут и начало обработчика:
+
+```go
+	mux.Handle("GET /orders/{id}", a.requireUser(http.HandlerFunc(a.getOrder)))
+
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id)
+```
+
+Первая строка: путь `GET /orders/{id}` подключён к `getOrder`, внешний `requireUser` не пропускает запрос без cookie до обработчика (GB-5.10). `pathID` превращает `{id}` из пути в число; не число — `400` (GB-4.08). Последняя строка просит у store заказ с этим ID. SQL-запрос store:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+```
+
+Первая строка выбирает колонки `user_id`, `status`, `note`; `note` — заметка к доставке, обычно в ней домашний адрес. Вторая строка — условие: `id` равен `$1`. О том, кто спрашивает, в условии ничего нет.
+
+Дилноза вошла, её ID — 1. Она отправляет `GET /orders/42`; заказ 42 принадлежит Жасуру. Какой ответ? **A)** `401`: сначала войдите · **B)** `403`: нет разрешения · **C)** `200`: заказ Жасура.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Cookie есть, сессия жива, `requireUser` пропустил Дилнозу: `401` выдаёт проверка личности, а здесь личность верна. Для `403` в коде должна быть проверка разрешения — её нет. Строка в базе есть и подходит под условие, значит, вернётся.
+
+</details>
+
+Сначала собственный заказ Дилнозы, затем запрос с заменённым числом в пути:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/41
+{"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy","items":[{"product_id":1,"quantity":2,"unit_price":1200000},{"product_id":2,"quantity":3,"unit_price":400000}],"total":3600000}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/42
+{"id":42,"user_id":2,"status":"yangi","note":"Yunusobod 4-kvartal, 17-uy, ertalab","items":[{"product_id":4,"quantity":1,"unit_price":3500000},{"product_id":3,"quantity":1,"unit_price":2500000}],"total":6000000}
+```
+
+Второй ответ — `200`: заказ Жасура с домашним адресом и общей суммой (в тийинах). Это ошибка. Что проверил каждый шаг:
+
+| Шаг | Что произошло | Не проверено |
+|---|---|---|
+| `requireUser` | cookie → сессия → Дилноза в контекст | чей заказ |
+| `getOrder` | `42` из пути → store | ID спрашивающего |
+| `WHERE id = $1` | 42 найден → ответ | чей 42? |
+
+В списке OWASP API Security Top 10 (2023) это **первый** пункт: **Broken Object Level Authorization**, коротко **BOLA**. OWASP Authorization Cheat Sheet называет это формой Insecure Direct Object Reference (**IDOR**). ID идут подряд: атакующий попробует и 43, 44 и дальше. Правило OWASP: **каждая** функция, которая по ID от клиента обращается к записи в базе, должна проверять разрешение пользователя на это действие, и это нужно закрепить тестами.
+
+## Исправление: условие владельца в самом SQL
+
+Остановите сервер и верните сохранённые исправленные файлы:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+Исправление в самом запросе, одна новая строка:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+  AND user_id = $2
+```
+
+`AND`: строка находится, только если истинны оба условия. `$1` — ID от клиента (из пути), `$2` — ID спрашивающего, то есть владельца сессии (от сервера). Выбрать `$2` клиент не может. Вот метод store:
+
+```go
+func (s *Store) Order(ctx context.Context, id, userID int64) (Order, error) {
+	o := Order{ID: id, Items: []OrderItem{}}
+	var note *string // orders.note NULL boʻlishi mumkin: NULL → nil
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, note FROM orders
+		WHERE id = $1
+		  AND user_id = $2`,
+		id, userID).Scan(&o.UserID, &o.Status, &note)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	if err != nil {
+		return Order{}, err
+	}
+	if note != nil {
+		o.Note = *note
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY id", id)
+	if err != nil {
+		return Order{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPrice); err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := rows.Err(); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | метод принимает `id` и `userID`; `int64` записан один раз для обоих (`id, userID int64`) |
+| 2 | `o` — возвращаемый заказ |
+| 3 | `note` — `*string`: если в колонке `NULL`, остаётся `nil` (GB-2.04) |
+| 4–8 | `QueryRow` выполняет запрос (GB-5.05): условие — то самое `WHERE id = $1 AND user_id = $2`; `$1` ← `id`, `$2` ← `userID`; `Scan` записывает колонки в `o` и `note` |
+| 9–11 | нет строки — `pgx.ErrNoRows`; оборачиваем его в `ErrOrderNotFound` (`%w`, GB-5.10). У чужого заказа то же самое: условие ложно, строки нет |
+| 12–14 | любая другая ошибка возвращается как есть |
+| 15–36 | как в прошлых уроках: переносит `note`, если он есть, читает строки заказа и считает общую сумму |
+
+Обработчик берёт владельца из `currentUser` (GB-6.04):
+
+```go
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id, currentUser(r).ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+```
+
+Изменилась строка 6: `currentUser(r).ID` — владелец сессии. ID приходит от клиента (строка 2, из пути), а владелец — из сессии: клиент его не выбирает. Вызвать store без владельца теперь нельзя: сигнатура требует `userID`. Но оба параметра — `int64`, и перепутанный порядок аргументов не будет ошибкой компиляции — порядок проверяет тест.
+
+Перезапустите сервер. Дилноза отправляет два запроса: заказ Жасура 42 и вообще несуществующий заказ 999. Чем отличаются ответы? **A)** `42` → `403`, `999` → `404` · **B)** оба одинаковые `404` · **C)** `42` → `404`, `999` → `400`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** В обоих запросах нет строки под условие, store в обоих случаях возвращает `ErrOrderNotFound`. Если вы выбрали A, вы думали «есть, но не ваш» (`403`) — ниже о том, чем это опасно. C: `999` — корректное число, `pathID` его принимает, поэтому не `400`.
+
+</details>
+
+С `-i` печатаются ещё и заголовки ответа:
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/42
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: KNBI4DSAZOBX2A7LIZSPLVVBGK
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"KNBI4DSAZOBX2A7LIZSPLVVBGK"}
+```
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/999
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: BBSKMXA7MJX34EUFPSDY4XARRX
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"BBSKMXA7MJX34EUFPSDY4XARRX"}
+```
+
+Оба — `404 Not Found` с одинаковым текстом «bunday buyurtma yoʻq» («такого заказа нет»); различается только `request_id` (он свой у каждого запроса, GB-6.01).
+
+**Почему не `403`?** `403` говорит «такой заказ есть, но не ваш». Тогда атакующий переберёт ID один за другим и узнает, какие заказы существуют. [RFC 9110 §15.5.4](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden) прямо допускает это: сервер, который хочет скрыть существование ресурса, может вернуть `404` вместо `403` («MAY»). Это выбор bozor, а не обязательное правило для любого API. Заметьте также: подряд идущие ID всё равно раскрывают *количество* заказов — `404` этого не скрывает (см. раздел «Глубже»).
+
+Подробности — в логе сервера (первый терминал): видно, какой пользователь какой заказ запрашивал. Это два пути из GB-6.02: клиенту безопасный текст, в лог — полная ошибка. Берём только строки `xato`:
+
+```console
+$ grep ' xato ' server.log
+2026/11/28 11:15:22 KNBI4DSAZOBX2A7LIZSPLVVBGK xato 404: "buyurtma 42, foydalanuvchi 1: buyurtma topilmadi"
+2026/11/28 11:15:22 BBSKMXA7MJX34EUFPSDY4XARRX xato 404: "buyurtma 999, foydalanuvchi 1: buyurtma topilmadi"
+```
+
+`buyurtma` — заказ, `foydalanuvchi` — пользователь, `topilmadi` — не найден. Лог говорит «пользователь 1 запросил заказ 42»; чужой и несуществующий заказ он сам не различает, обе строки одной формы.
+
+## Тест: FAIL на старом коде, ok на новом
+
+OWASP советует закреплять это тестами («Write tests …»). Тест лежит в `cmd/api/api_test.go`:
+
+```go
+func TestOrderOwner(t *testing.T) {
+	h, _ := testAPI(t)
+	dilnoza := login(t, h, dilnozaLogin)
+	for id, want := range map[string]int{"41": 200, "42": 404, "999": 404} {
+		rec := send(h, "GET", "/orders/"+id, "", dilnoza.Value)
+		if rec.Code != want {
+			t.Errorf("Dilnoza GET /orders/%s: %d, kutilgan %d", id, rec.Code, want)
+		}
+	}
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | тестовая функция (GB-1.08) |
+| 2 | `testAPI` готовит настоящий Postgres с новой схемой и seed; `h` — готовый обработчик |
+| 3 | `login` входит с JSON `dilnozaLogin` и возвращает cookie |
+| 4 | `map[string]int`: ID → ожидаемый статус; `range` обходит все три пары. Свой (`41`) — `200`, остальные — `404` |
+| 5 | `send` отдаёт запрос обработчику: метод, путь, пустое тело и значение cookie |
+| 6–8 | если статус не тот, `t.Errorf` проваливает тест: `%s` — ID, `%d` — оба статуса |
+
+Сначала запустим этот тест на старом, неисправленном коде. Какие из трёх ID дадут FAIL? **A)** только `42` · **B)** `42` и `999` · **C)** ни один: тест пройдёт.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `41` принадлежит Дилнозе, на старом коде тоже `200`. `999` и на старом коде несуществующий заказ, то есть `404`. Только `42` на старом коде получает `200` вместо `404`. Если вы выбрали B, вы думали, что старый код и на `999` ошибётся; он не ошибается — ошибка здесь для `42`.
+
+</details>
+
+Подставьте файлы ошибочной версии и запустите тест; затем верните исправленные и повторите (`-run` запускает только тесты с подходящим именем):
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+--- FAIL: TestOrderOwner (0.16s)
+    api_test.go:294: Dilnoza GET /orders/42: 200, kutilgan 404
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.214s
+FAIL
+```
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.202s
+```
+
+`api_test.go:294` — файл и строка, где проверка провалилась; `kutilgan` — «ожидалось». Это не ошибка компиляции: код отработал, но выдал чужой заказ. Если повторить ту же команду без изменений, Go возьмёт результат из кэша:
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	(cached)
+```
+
+Чтобы выполнить тест заново, добавьте `-count=1`.
+
+Время. Числа из видео — цитата (в этом тексте они не перезапускались); правый столбец — измерение этого прогона на этом компьютере:
+
+| Результат | Число из видео (цитата) | Этот прогон |
+|---|---|---|
+| старый код | FAIL, `0.278s` | FAIL, `0.214s` |
+| исправленный код | ok, `0.283s` | ok, `0.202s` |
+
+Секунды зависят от загрузки компьютера, сравнивать их бессмысленно: в эти секунды входит создание схемы, seed и вход. Важен сам результат: на чужом заказе FAIL, после исправления ok. Тест, который вы один раз увидели красным, завтра поймает ту же ошибку снова.
+
+В папке есть и другие тесты: `TestForeignOrderLooksMissing` (ответ на чужой и несуществующий заказ совпадает во всём, кроме `request_id`; Жасур тоже не видит 41), `TestCreateOrderOwner`, `TestAdminUsers`, `TestProductsAdminOnly`, `TestRequireAdminOutside`.
+
+## Роль: второй слой разрешения
+
+Уровень объекта решил «этот заказ ваш?». Второй слой — уровень функции: некоторые действия только для администратора. Седьмая миграция добавляет в `users` колонку `role`:
+
+```sql filename="migrations/00007_users_role.sql" showLineNumbers
+-- +goose Up
+-- Rol (GB-6.06): oddiy xaridor yoki admin. Yangi foydalanuvchi har doim xaridor: eng kam huquq
+-- (OWASP Authorization Cheat Sheet, "Enforce Least Privileges"). Admin'ni faqat baza egasi tayinlaydi.
+ALTER TABLE users
+    ADD COLUMN role text NOT NULL
+    DEFAULT 'xaridor'
+    CHECK (role IN ('xaridor', 'admin'));
+
+-- +goose Down
+ALTER TABLE users DROP COLUMN role;
+```
+
+| Строка | Что делает |
+|---|---|
+| 4–7 | `ALTER TABLE users` добавляет обязательную текстовую колонку `role`; `DEFAULT 'xaridor'` даёт `xaridor` существующим и новым пользователям; `CHECK (role IN ('xaridor', 'admin'))` допускает только эти два значения |
+| 9–10 | `Down`: удаляет колонку |
+
+Новый зарегистрированный пользователь всегда `xaridor`: OWASP называет это принципом наименьших привилегий (least privilege). Администратора назначают только в базе. В `store.User` теперь есть поле `Role`, `UserBySession` читает и его. Новый `cmd/api/authz.go`:
+
+```go filename="cmd/api/authz.go" showLineNumbers
+package main
+
+// Authorization — «nima qila olasiz» (GB-6.06). Authentication (requireUser, auth.go) faqat kim ekaningizni
+// aniqlaydi. Ruxsatning ikki qavati:
+//
+//	obyekt   «bu buyurtma sizniki?» — har store metodida, SQL shartida: WHERE id = $1 AND user_id = $2.
+//	         Begona buyurtma → 404, xuddi yoʻq buyurtma kabi (RFC 9110 §15.5.4: mavjudligini yashirish).
+//	funksiya «bu amal sizning rolingizga ochiq?» — requireAdmin middleware'i, /admin/… route'larida → 403.
+//
+// OWASP API Security Top 10 2023: API1 Broken Object Level Authorization, API5 Broken Function Level Authorization.
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// errForbidden — foydalanuvchi kim ekani maʼlum, lekin bu amal uning roliga ruxsat etilmagan (problemFor → 403).
+var errForbidden = errors.New("bu amal uchun ruxsat yoʻq")
+
+// requireAdmin — faqat admin rolidagi foydalanuvchini oʻtkazadi, qolganlarga 403.
+// requireUser'ning ICHIDA turishi shart: foydalanuvchini context'ga requireUser qoʻyadi.
+// Tashqarida tursa currentUser panic qiladi → 500 (GB-6.04): jim oʻtkazib yuborishdan xavfsizroq.
+func requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if currentUser(r).Role != store.RoleAdmin {
+			writeError(w, errForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | `package main` — тот же пакет, что и остальные файлы `cmd/api` |
+| 3–10 | комментарий: два слоя разрешения и пункты OWASP |
+| 12–17 | импорты: `errors`, `net/http` и пакет `store` (для константы роли) |
+| 19–20 | `errForbidden` — обычное значение ошибки; `problemFor` (GB-6.02) превращает его в `403 Forbidden` |
+| 22–24 | комментарий: `requireAdmin` обязан стоять **внутри** `requireUser` |
+| 25 | `requireAdmin` — форма middleware из GB-6.01: принимает handler, возвращает handler |
+| 26 | возвращаемая функция-обработчик (closure) |
+| 27 | роль `currentUser(r).Role` не admin? Значение `store.RoleAdmin` — `"admin"` |
+| 28–30 | не admin: пишется `errForbidden` и `return` |
+| 31 | admin: `next.ServeHTTP` вызывает следующий handler |
+| 32–33 | закрываются обе функции |
+
+Выбираем `403`: что админ-раздел существует, не секрет, а пользователь знает, кто он.
+
+Теперь админ-раздел: `GET /admin/users` возвращает список всех пользователей (обработчик `listUsers`). Остановите сервер, подставьте шаг `v1-admin-yoq` и запустите снова. В текущем коде маршрут подключён так:
+
+```bash
+cp _video/stages/v1-admin-yoq/handlers.go cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(http.HandlerFunc(a.listUsers)))
+```
+
+`requireAdmin` написан, но в этой строке его нет. Дилноза — обычный покупатель. Что она получит на этот маршрут? **A)** `401` · **B)** `403`: нет разрешения · **C)** `200`: все e-mail.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** У маршрута только `requireUser`: личность известна, а роль не проверяет никто. То, что `requireAdmin` написан, само его не подключает. Если вы выбрали B, вы приняли существование функции за её подключение.
+
+</details>
+
+В настоящем ответе есть e-mail всех трёх пользователей; на странице оставляем через `jq` только `id` и `role` (`-c` печатает результат в одну строку, `map({id,role})` берёт из каждого элемента списка два поля):
+
+```console
+$ curl -s -b jar.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+Дилноза получила список всех пользователей (3 — админ). Это **BFLA**, Broken Function Level Authorization, OWASP API5:2023: не объект, а **функция** (админ-действие) без защиты. Это частая ошибка. OWASP: «Don't assume that an API endpoint is regular or administrative only based on the URL path» — само имя `/admin` ничего не защищает.
+
+Исправление: `requireAdmin` внутри `requireUser`. Верните исправленные файлы и перезапустите сервер:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(requireAdmin(http.HandlerFunc(a.listUsers))))
+	mux.Handle("DELETE /products/{id}", a.requireUser(requireAdmin(http.HandlerFunc(a.deleteProduct))))
+```
+
+Внешний слой (`requireUser`) кладёт пользователя в контекст, внутренний (`requireAdmin`) проверяет его роль. `deleteProduct`, удаляющий товар (маршрут `DELETE` из GB-5.10), подключён теми же двумя слоями; `POST /products` тоже. Роль читается из базы при каждом запросе: если право администратора отозвали, со следующего запроса оно не действует. Тот же запрос Дилнозы, теперь с `-i`:
+
+```console
+$ curl -i -b jar.txt localhost:8765/admin/users
+HTTP/1.1 403 Forbidden
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: T3X6VTCETJ3752AI2JHD5KXA6M
+Date: Sat, 28 Nov 2026 06:15:24 GMT
+Content-Length: 136
+
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"bu amal uchun ruxsat yoʻq","request_id":"T3X6VTCETJ3752AI2JHD5KXA6M"}
+```
+
+Администратор входит (`-c admin.txt` пишет cookie в отдельный файл), затем с `-b admin.txt` видит список:
+
+```console
+$ curl -s -c admin.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @admin-login.json > /dev/null
+```
+
+```console
+$ curl -s -b admin.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+**Проверим себя.** Поменяем порядок: `requireAdmin` снаружи, `requireUser` внутри. Что получит сам администратор на этот маршрут? **A)** `200`: список · **B)** `403` · **C)** `500`.
+
+```go
+	mux.Handle("GET /admin/users", requireAdmin(a.requireUser(http.HandlerFunc(a.listUsers))))
+```
+
+<details>
+<summary>Ответ</summary>
+
+**C.** `requireAdmin` срабатывает первым, пользователя в контексте ещё нет: `currentUser` вызывает panic (GB-2.09), `recoverPanic` (GB-6.01) превращает ответ в `500`. `500` получит и администратор. A: список администратор получил бы, только дойдя внутрь. B: `403` выдаётся после проверки роли, а проверка не началась.
+
+</details>
+
+```bash
+cp _video/stages/v2-teskari/handlers.go cmd/api/handlers.go
+```
+
+После перезапуска сервера:
+
+```console
+$ curl -i -b admin.txt localhost:8765/admin/users
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/problem+json
+X-Request-Id: WUCC4DHZMAADKTSKYACONOMYJU
+Date: Sat, 28 Nov 2026 06:15:25 GMT
+Content-Length: 110
+
+{"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"WUCC4DHZMAADKTSKYACONOMYJU"}
+```
+
+Причина — в логе сервера:
+
+```console
+$ grep ' panic: ' server.log
+2026/11/28 11:15:25 WUCC4DHZMAADKTSKYACONOMYJU panic: currentUser: route requireUser bilan oʻralmagan
+```
+
+`route requireUser bilan oʻralmagan` — «маршрут не обёрнут в requireUser». Это ошибка программиста, и она не проходит молча: `500` и запись в логе уже на первом запросе. (Если бы `currentUser` молча возвращал пустого пользователя, проверка работала бы неверно, а ошибка оставалась бы скрытой.) Верните исправленный файл:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+## Глубже (необязательно): `user_id` в теле и подряд идущие ID
+
+Дилноза добавляет в тело `POST /orders` поле `"user_id":2`, чтобы записать заказ от имени Жасура. Что будет? **A)** заказ будет Жасура · **B)** заказ будет Дилнозы · **C)** `400`: неизвестный ключ.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Главная защита: в структуре входных данных нет поля `user_id` — поля, которое записывало бы владельца, просто не существует. `DisallowUnknownFields` в `decodeJSON` не отбрасывает неизвестный ключ молча, а превращает его в явный `400`. В запросе без ключа владелец — владелец сессии, то есть Дилноза.
+
+</details>
+
+```go
+type orderInput struct {
+	Items []itemInput `json:"items"`
+	Note  string      `json:"note"`
+}
+```
+
+`orderInput` — поля, которые принимает тело `POST /orders`: только `items` и `note`. Это защита от **mass assignment**: клиент присылает поле, которое сам задавать не должен (OWASP API3:2023, Broken Object Property Level Authorization; прежнее название — *Mass Assignment*). Настоящие запросы:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"user_id":2,"items":[{"product_id":3,"quantity":1}]}'
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan","request_id":"MDQKKJMQOKGIVIVYJKIIZFUEEP"}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"items":[{"product_id":3,"quantity":1}]}'
+{"id":43,"user_id":1,"status":"yangi","items":[{"product_id":3,"quantity":1,"unit_price":2500000}],"total":2500000}
+```
+
+Во втором ответе `"user_id":1` — Дилноза, из сессии. Новый заказ получил номер `43`. Это не значит, что заказов 43: seed начинает счёт с 41. Но подряд идущие ID всё равно раскрывают общий объём: атакующий, создавший два заказа в разное время, посчитает, сколько заказов появилось между ними. OWASP советует случайные, не угадываемые ID (например, UUID) как дополнительный слой. Но Authorization Cheat Sheet говорит прямо: такое сокрытие «generally not sufficient by itself» — проверка нужна в каждом запросе.
+
+Ещё два замечания. Владение — правило, основанное на отношении («этот заказ принадлежит этому пользователю»), а роль — это RBAC (управление доступом по ролям). Для сложных систем OWASP предпочитает модели на атрибутах и отношениях (ABAC, ReBAC). Следующий шаг (GB-6.08): обернуть каждый админ-маршрут по отдельности легко забыть; надёжнее отдельный `ServeMux` для `/admin/`, подключённый один раз через `requireUser(requireAdmin(…))`.
+
+## Частые ошибки
+
+**1. «Входа достаточно».** Самое частое заблуждение: `requireUser` есть, значит, безопасно. Но `WHERE id = $1` успешно возвращает чужой заказ, и ни компилятор, ни сервер не жалуются — это тихая ошибка (раздел «Проблема» выше). Признак: `200` и чужой `user_id`. Исправление: владельца берите из сессии и ставьте в SQL-условие; и при чтении, и при изменении.
+
+**2. Middleware написан, но не подключён.** `requireAdmin` есть, в маршруте его нет: `/admin/users` отдал список покупателю (раздел «Роль» выше). Исправление: на каждом маршруте, который нужно защитить, `requireUser(requireAdmin(…))`.
+
+**3. Порядок обратный.** `requireAdmin(requireUser(…))` — `500` получает даже администратор; в логе: `panic: currentUser: route requireUser bilan oʻralmagan`. Исправление: снаружи `requireUser` (кто?), внутри `requireAdmin` (админ ли?).
+
+**4. Исправить только `GET`.** `PATCH`, `DELETE` и экспорт тоже трогают запись, и в каждом нужна своя проверка владельца. `PATCH /orders/{id}` в starter всё ещё с ошибкой — домашнее задание закрывает именно её. Даже половинчатое исправление даёт ошибку: если поменять сигнатуру store и забыть handler, `go vet` сразу покажет. Дополнительный эксперимент, которого нет в папке урока: starter-обработчик с новой сигнатурой `UpdateNote` (функция полностью приведена в ответе к домашнему заданию):
+
+```console
+$ go vet ./...
+# github.com/abdurahmon27/bozor/cmd/api
+# [github.com/abdurahmon27/bozor/cmd/api]
+vet: cmd/api/handlers.go:247:53: not enough arguments in call to a.st.UpdateNote
+	have (context.Context, int64, string)
+	want (context.Context, int64, int64, string)
+```
+
+`vet:` — сообщение vet; `cmd/api/handlers.go:247:53` — файл, строка, столбец; `not enough arguments` — не хватает аргументов, `have` — передано, `want` — нужно. Сигнатура заставляет передать владельца: добавьте в handler `currentUser(r).ID`.
+
+## Проверьте себя
+
+**1.** На какие вопросы отвечают аутентификация и авторизация?
+
+<details>
+<summary>Ответ</summary>
+
+Аутентификация — «кто вы?» (в bozor `requireUser`, нет ответа — `401`). Авторизация — «есть ли у вас разрешение на это действие?» (объект: SQL-условие; функция: `requireAdmin`, нет разрешения — `403`).
+
+</details>
+
+**2.** Почему на чужой заказ отвечаем `404`, а не `403`?
+
+<details>
+<summary>Ответ</summary>
+
+`403` говорит «такой заказ есть, но не ваш»; атакующий перебирает ID и узнаёт, какие заказы существуют. RFC 9110 §15.5.4 разрешает `404`, чтобы скрыть существование ресурса. Это не заменяет проверку: условие владельца остаётся в SQL, а `404` — его ответ.
+
+</details>
+
+**3. Предскажите.** Для Дилнозы (ID 1) вызов `Order(ctx, id, 1)` с `id` равным `41`, `42`, `999` — какие HTTP-статусы? **A)** `200`, `404`, `404` · **B)** `200`, `403`, `404` · **C)** все три `200`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Оба условия выполняются только для `41`: `id = 41 AND user_id = 1`. У `42` `user_id` равен 2, условие ложно; `999` не существует. В обоих случаях строки нет → `ErrOrderNotFound` → `404`. B — `403` мы не используем (вопрос 2). C — это результат старого кода, а здесь исправленный.
+
+</details>
+
+**4. GB-6.03.** Почему пароль хранят с argon2id, а не с SHA?
+
+<details>
+<summary>Ответ</summary>
+
+Argon2id намеренно медленный и требует памяти: каждая догадка стоит дорого. Быстрый хеш (SHA) такого барьера не создаёт, атакующий делает огромное число догадок в секунду.
+
+</details>
+
+## Домашнее задание
+
+🟡 **`PATCH /orders/{id}` должен менять только ваш заказ.** В папке есть ещё один маршрут: `PATCH /orders/{id}`. **PATCH** — HTTP-метод, который изменяет часть ресурса (RFC 5789); здесь он меняет заметку к доставке (`note`). В его `UPDATE` сегодняшняя ошибка: владелец не проверяется.
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $2 WHERE id = $1",
+		id, note)
+```
+
+Это начало метода (`internal/store/orders.go`). Жасур пробует записать свой адрес в заказ 41 Дилнозы (войдите как Жасур, `jasur-login.json` создан выше):
+
+```console
+$ curl -s -c jasur.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @jasur-login.json > /dev/null
+```
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 204 No Content
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |       note        
+----+---------+-------------------
+ 41 |       1 | Jasurning manzili
+(1 row)
+```
+
+`-X PATCH` выбирает HTTP-метод, `-d` задаёт тело, `| head -1` оставляет только первую строку ответа (статус). `204 No Content` — изменилось, ответ без тела; база сохранила текст Жасура в заказе Дилнозы. Задание:
+
+1. **Store.** Сделайте `UpdateNote(ctx context.Context, id, userID int64, note string) error` и поставьте владельца в SQL-условие: `UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2`. Номера соответствуют порядку аргументов: `$1` ← `id`, `$2` ← `userID`, `$3` ← `note`. Если заказ чужой или не существует, ни одна строка не меняется (`tag.RowsAffected() == 0`) → `ErrOrderNotFound` (через `%w`, как сейчас).
+2. **Handler.** В `updateNote` из `cmd/api/handlers.go` передайте store `currentUser(r).ID`. Не берите владельца из тела или пути.
+3. Не меняйте `cmd/api/tekshiruv_test.go`. Тест проверяет три вещи: Жасур → `404`, заметка не меняется; Дилноза на свой заказ → `204`, заметка меняется; несуществующий `999` → `404`.
+
+Задание — в [TASK.md папки урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/TASK.md). На стартовой копии, в корне папки (Postgres должен работать):
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestUpdateNoteOwner (0.15s)
+    tekshiruv_test.go:28: Jasur PATCH /orders/41 (Dilnozaniki): status 204, kutilgan 404 — begona buyurtma yoʻq buyurtma kabi (TASK.md, 1–2-qadam)
+    tekshiruv_test.go:31: Jasur Dilnozaning 41-buyurtmasini oʻzgartirdi: izoh «Jasurning manzili», kutilgan «Chilonzor 9-kvartal, 12-uy» — UPDATE'da egasi tekshirilmayapti (TASK.md, 1-qadam: WHERE id = $1 AND user_id = $2)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	2.581s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.282s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.728s
+FAIL
+```
+
+`--- FAIL: TestUpdateNoteOwner` — упавший тест; оба сообщения говорят, чего не хватает (204 вместо 404; заметка изменилась). Строка с `FAIL` — пакет, `ok` — пройденные пакеты, `[no test files]` — пакет без тестов. Подсказка: посмотрите на `store.Order` — форма та же, только вместо `QueryRow` — `Exec` и `RowsAffected()` (GB-5.08). Решение — [в папке solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/solution).
+
+<details>
+<summary>Ответ: объяснение</summary>
+
+Store:
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id, userID int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2",
+		id, userID, note)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	return nil
+}
+```
+
+В handler меняется одна строка: `a.st.UpdateNote(r.Context(), id, currentUser(r).ID, *in.Note)`. В `solution/` исправлены эти два файла. Чтобы проверить, сначала заново выполните seed (он вернёт заказ 41 в исходное состояние и очистит сессии), подставьте файлы из `solution/`, перезапустите сервер и снова войдите как Жасур:
+
+```bash
+docker compose exec -T db psql -f /lab/seed.sql > /dev/null
+cp solution/internal/store/orders.go internal/store/orders.go
+cp solution/cmd/api/handlers.go cmd/api/handlers.go
+```
+
+Тот же запрос Жасура и база:
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 404 Not Found
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |            note            
+----+---------+----------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+(1 row)
+```
+
+Чужой заказ получает `404`, как несуществующий, и заметка не меняется. Тест проверяет по базе и то, что заметка не изменилась: возвращённого статуса недостаточно. Тесты папки с ответом:
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	3.010s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.360s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.888s
+```
+
+Проверка формата и статический анализ ничего не печатают:
+
+```console
+$ gofmt -l cmd internal && go vet ./...
+```
+
+</details>
+
+После эксперимента остановите сервер через `Ctrl+C`. Следующая команда удаляет именно эту лабораторную базу и её volume:
+
+```bash
+docker compose down -v
+```
+
+## Источники
+
+- OWASP API Security Top 10 2023: [API1 · BOLA](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/), [API3 · BOPLA](https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/), [API5 · BFLA](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) · [lookup ID](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#ensure-lookup-ids-are-not-accessible-even-when-guessed-or-cannot-be-tampered-with) · [наименьшие привилегии](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#enforce-least-privileges) · [logging](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#implement-appropriate-logging)
+- [RFC 9110 §15.5.4 · 403 Forbidden](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden), [RFC 5789 · PATCH](https://www.rfc-editor.org/rfc/rfc5789)
+- [PostgreSQL 18 · ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html), [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html), [SELECT · WHERE](https://www.postgresql.org/docs/18/sql-select.html#SQL-WHERE)
+- [Go · net/http ServeMux](https://pkg.go.dev/net/http#ServeMux), [Go · флаги go test](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [Go · типы функций](https://go.dev/ref/spec#Function_types)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [папка урока GB-6.05](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, goose v3.30.2, PostgreSQL 18 (`postgres:18-alpine`), Docker; 2026-11-28. Времена из видео помечены как цитата. ID запросов и даты при каждом запуске другие. Следующий урок: [GB-6.07 · Cookie, CSRF, CORS и rate limit](/lab/youtube/gb#gb-6-07).
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+---
+
+← Предыдущий урок: [GB-6.05](/lab/youtube/gb#gb-6-05) · Следующий урок: [GB-6.07](/lab/youtube/gb#gb-6-07) → · [Все уроки](/lab/youtube/gb)
+
+</div>
