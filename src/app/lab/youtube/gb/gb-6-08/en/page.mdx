@@ -1,0 +1,945 @@
+---
+title: "Checkpoint: the protected bozor"
+date: "2026/11/28"
+description: "Write the security rules as a table and prove them on real Postgres with two buyers, an admin and an anonymous user: 401, 403, 404 and 429."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-08/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-08"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-08/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-08/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-08"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-08) · [Русский](/lab/youtube/gb/gb-6-08/ru) · **English**  
+Lesson GB-6.08 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-08) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-08-himoyalangan-bozor)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Module 6 added five rules to bozor: the password, the session, the order owner, the admin role and the rate limit. Tomorrow someone adds a new route and breaks one rule. Who tells you?
+
+**The one idea:** a rule counts as proven only when a user who tries to **break** it has tested it. The specification becomes a table: "who · request · expected status". Every row is sent through the whole middleware chain on real Postgres. The table has **two buyers**: one asks for the other's order. A test with one user never asks for someone else's order, so it cannot see BOLA.
+
+By the end of the lesson you will:
+
+- read the specification of the protected bozor and see it in one full `curl` session: `401`, `403`, `404` and `429`;
+- write the rules as a `rule{who, method, path, body, want}` table and prove them with `go test` on real Postgres;
+- see for yourself that a one-user test passes even on code with BOLA, while a two-buyer table catches it;
+- write the routes `GET /orders` and `GET /admin/orders` and add their rows to the table.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| access table | the specification as a table: each row is who, which request, expected status | access table |
+| one wrap | every route under `/admin/` lives in one mux, and the mux is wrapped once: nothing to forget | one wrap for a route group |
+| two-user test | a test where a second buyer asks for an object that is not theirs | two-user test |
+
+Helper words are explained where they appear: the Postgres function `left(text, n)` and the regular expression in `go test -run` (`|`, `$`).
+
+## Before you start
+
+This is the checkpoint of Module 6: one API collects every lesson of the module. There is little new and much that you know. You need these lessons: [GB-6.07 · Cookie, CSRF, CORS and rate limit](/lab/youtube/gb/gb-6-07/en), [GB-6.06 · Whose order is this? Authorization and BOLA](/lab/youtube/gb/gb-6-06/en), [GB-6.05 · Session or JWT](/lab/youtube/gb/gb-6-05/en), [GB-6.04 · Login and revocable sessions](/lab/youtube/gb/gb-6-04/en), [GB-6.03 · Passwords: argon2id](/lab/youtube/gb/gb-6-03/en), [GB-6.02 · One shape for API errors](/lab/youtube/gb/gb-6-02/en) and [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/en). For Postgres and tests: [GB-5.10 · the orders API, tests on real Postgres](/lab/youtube/gb/gb-5-10/en), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/en), [GB-5.05 · pgx, connection pool and `Scan`](/lab/youtube/gb/gb-5-05/en), [GB-5.04 · JOIN, GROUP BY and NULL](/lab/youtube/gb/gb-5-04/en), [GB-4.05 · routes and `{id}`](/lab/youtube/gb/gb-4-05/en), [GB-1.08 · `go test`](/lab/youtube/gb/gb-1-08/en).
+
+**Where to work.** This example is not for the Go Playground: it needs real Postgres. Get the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-08-himoyalangan-bozor) onto your computer. You need Go 1.27, Docker (Compose), `curl` and goose v3.30.2. Ports `5518` and `8765` must be free. In the video the folder is called `bozor`; make a temporary copy with that name:
+
+```bash
+work=$(mktemp -d)
+cp -a . "$work/bozor"
+cd "$work/bozor"
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`cp -a . "$work/bozor"` copies the lesson folder (you are standing inside it) into the temporary folder, and `cd` means "go into that folder". `GOTOOLCHAIN` selects the Go version used in the lesson, `CGO_ENABLED=0` builds without a C compiler. The directory where goose was installed must be in `PATH`. The other commands are below, where they are used.
+
+**Recall, GB-6.07.** A foreign page on `localhost:9090` sends a `POST` from an HTML form to bozor. It is the same site, so the `Lax` cookie is sent too. What stops it on the server? **A)** CORS headers · **B)** `protectCSRF` · **C)** `requireUser`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `protectCSRF` — that is, `http.CrossOriginProtection` — answers `403` to a `POST` from a foreign origin (GB-6.07). A: CORS does not stop the request; it only decides whether the browser shows the response to the page, and a form submit does not go through a CORS check at all. C: `requireUser` sees that the cookie arrived and lets the request pass, because the cookie really did arrive.
+
+</details>
+
+## The specification: who can do what
+
+To prove a rule you first have to write it down exactly. The specification of the protected bozor is three groups and three more rules:
+
+```text
+open         GET /products, GET /products/{id}
+             POST /users · POST /login · POST /logout
+login needed GET /me · POST /orders
+             GET, PATCH /orders/{id}            no session → 401
+             someone else's order = no order    → 404
+admin        GET /admin/users · POST /admin/products
+             DELETE /admin/products/{id}        for a buyer → 403
+```
+
+| Group | Who gets in | If not | Which lesson |
+|---|---|---|---|
+| open | everyone: catalog, registration, login, logout | — | GB-5.10, GB-6.03, GB-6.04 |
+| login needed | a user with a session: orders and `GET /me` | `401 Unauthorized`: it is not known who you are | GB-6.04 |
+| order | the owner only: `WHERE id = $1 AND user_id = $2` | `404 Not Found`: someone else's order looks the same as a missing one | GB-6.06 |
+| admin | the `admin` role: users and catalog changes | `403 Forbidden`: you are known, but your role is not enough | GB-6.06 |
+
+Someone else's order gets `404`, not `403`: `403` says "such an order exists, but it is not yours". RFC 9110 §15.5.4 allows this: a server that wants to hide the existence of a resource **may** answer `404` instead of `403`.
+
+Three more rules:
+
+- **The password** never sits in the database as plain text: only the argon2id string from GB-6.03.
+- **Login limit**: 5 attempts from one IP, 10 attempts for one email. After that, `429 Too Many Requests` and a `Retry-After` header.
+- **Every error response** has the `application/problem+json` shape from GB-6.02.
+
+## The middleware chain, outside in
+
+`newHandler` (`cmd/api/middleware.go`) passes every request through these layers. Each layer wraps the next: the outer layer sees the request first.
+
+```go
+func newHandler(st *store.Store) http.Handler {
+	return requestID(
+		logRequests(
+			recoverPanic(
+				cors(
+					protectCSRF(
+						muxErrors(newMux(st)))))))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func newHandler(st *store.Store) http.Handler {` | builds the one handler for the whole API (GB-6.01) |
+| 2 | `requestID(` | gives each request an `X-Request-Id` (GB-6.01) |
+| 3 | `logRequests(` | writes a log line for each request (GB-6.01) |
+| 4 | `recoverPanic(` | turns a panic into a `500` response (GB-6.01) |
+| 5 | `cors(` | adds the CORS headers (GB-6.07) |
+| 6 | `protectCSRF(` | answers `403` to a state-changing request from a foreign origin (GB-6.07) |
+| 7 | `muxErrors(newMux(st))` | turns the mux's own `404` and `405` into problem responses (GB-6.01); `newMux` builds the routes |
+
+The many `)` at the end close the seven opened parentheses. A request goes inward from `requestID` to `muxErrors`; the response comes back the other way.
+
+The routes have their own layers too. This is a piece of `newMux` (`cmd/api/handlers.go`, lines 35–48):
+
+```go
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.HandleFunc("GET /products", a.listProducts)
+	mux.HandleFunc("GET /products/{id}", a.getProduct)
+	mux.Handle("POST /users", requireJSON(http.HandlerFunc(a.register))) // GB-6.03
+	mux.Handle("POST /login", a.loginIP.limitByIP(requireJSON(http.HandlerFunc(a.login))))
+	mux.HandleFunc("POST /logout", a.logout) // requireUser'siz: eskirgan cookie ham tozalansin (GB-6.04)
+
+	mux.Handle("GET /me", a.requireUser(http.HandlerFunc(a.me)))
+	mux.Handle("POST /logout-all", a.requireUser(http.HandlerFunc(a.logoutAll)))
+	// VAZIFA (TASK.md, 2-qadam): GET /orders — faqat oʻz buyurtmalari (requireUser bilan)
+	mux.Handle("POST /orders", a.requireUser(requireJSON(http.HandlerFunc(a.createOrder))))
+	mux.Handle("GET /orders/{id}", a.requireUser(http.HandlerFunc(a.getOrder)))
+	mux.Handle("PATCH /orders/{id}", a.requireUser(requireJSON(http.HandlerFunc(a.updateNote))))
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `mux := http.NewServeMux()` — a table "path → handler" (GB-4.04) |
+| 2–4 | `GET /health`, `GET /products`, `GET /products/{id}`: no wrapper, open |
+| 5 | `POST /users` — registration: open, only `requireJSON` (`415` for a body that is not JSON, GB-6.01) |
+| 6 | `POST /login` — `limitByIP` (GB-6.07) wraps `requireJSON`: the limit comes first |
+| 7 | `POST /logout` — without `requireUser`, so that even a stale cookie gets cleared (GB-6.04) |
+| 9–10 | `GET /me`, `POST /logout-all` — with `requireUser`: no session means `401` |
+| 11 | the homework comment: `GET /orders` goes here |
+| 12–14 | the order routes with `requireUser`; in `PATCH`, `requireJSON` is **inside**: first who you are (`401`), then the body (`415`) |
+
+## Admin routes: one mux, one wrap
+
+In GB-6.06 every admin route was wrapped separately. Forget one and an ordinary buyer gets in: this is OWASP API5:2023 (BFLA). OWASP recommends one authorization module that is easy to analyze, and denying everything by default. Today's solution: the admin routes live in a **separate mux**, and that mux is wrapped **once**.
+
+```go
+	admin := http.NewServeMux()
+	admin.HandleFunc("GET /admin/users", a.listUsers)
+	// VAZIFA (TASK.md, 2-qadam): GET /admin/orders — hamma buyurtmalar
+	admin.Handle("POST /admin/products", requireJSON(http.HandlerFunc(a.createProduct)))
+	admin.HandleFunc("DELETE /admin/products/{id}", a.deleteProduct)
+	mux.Handle("/admin/",
+		a.requireUser(requireAdmin(muxErrors(admin))))
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `admin := http.NewServeMux()` — one more "path → handler" table, only for the admin |
+| 2 | `GET /admin/users` — the path is written in full: the request path does not change |
+| 3 | the homework comment: `GET /admin/orders` goes here |
+| 4 | `POST /admin/products` — writing to the catalog now happens here (moved from `POST /products`); with `requireJSON` |
+| 5 | `DELETE /admin/products/{id}` — deletes a product, `{id}` is from GB-4.05 |
+| 6–7 | mounts the admin mux on the main mux and wraps it: `requireUser`, inside it `requireAdmin`, inside it `muxErrors` and the admin mux |
+
+The pattern `"/admin/"` ends with a slash and has no method. Both properties are in the [`net/http.ServeMux`](https://pkg.go.dev/net/http#ServeMux) documentation: a pattern that ends in a slash matches **every** path under it, and a pattern without a method matches **every** method. So every request under `/admin/` — present or future, existing or not — passes the two wrappers first:
+
+```text
+GET /admin/…  →  requireUser  →  requireAdmin  →  muxErrors  →  admin mux
+                 no session      buyer role        admin mux      handler or
+                 → 401           → 403             responses      404 / 405
+```
+
+Any new route added to the admin mux is protected by itself: there is no wrapper to write and none to forget. The outer `muxErrors` finds the `/admin/` pattern, so the inner mux's own `404` and `405` need their own `muxErrors(admin)`.
+
+## One curl session: every rule
+
+Now we walk through each item of the specification in one session. All output was produced on this computer with Go 1.27.4, PostgreSQL 18 and curl 8.22.0. Two notes:
+
+- I ran `curl -i` as `curl -s -i`: the output went to a file, and `-s` hides the progress line. In a terminal `curl -i` prints the same lines.
+- `X-Request-Id` and `Date` differ on every run. Every other line is the same.
+
+### 1. The database, migrations, seed and server
+
+In the first terminal we start Postgres:
+
+```console
+$ docker compose up -d --wait
+…
+ Container gb608-db-1 Waiting
+ Container gb608-db-1 Healthy
+```
+
+The port is `5518` and the container name is `gb608-db-1`: its beginning is the project name from `compose.yaml` (`gb608`). With `…` I shortened the compose lines about creating the network and container. Now the connection string (it is taken from the container and is not printed) and goose:
+
+```bash
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5518/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+```console
+$ goose up
+OK   00001_products.sql (8.04ms)
+OK   00002_orders.sql (10.22ms)
+OK   00003_orders_status.sql (2.88ms)
+OK   00004_users.sql (5.94ms)
+OK   00005_sessions.sql (6.03ms)
+OK   00006_orders_owner.sql (5.66ms)
+OK   00007_users_role.sql (2.5ms)
+goose: successfully migrated database to version: 7
+```
+
+goose writes a date and time at the start of every line; I removed them for brevity. Seven migrations were applied (GB-5.06). Then `seed.sql`:
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 3
+INSERT 0 4
+ALTER TABLE
+INSERT 0 2
+INSERT 0 4
+```
+
+`seed.sql` writes three users, four products and two orders: order 41 belongs to Dilnoza and order 42 to Jasur; the third user is the admin. Their emails and passwords are in the README of the lesson folder; this page does not repeat them. We start the server (`DATABASE_URL` is set above):
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+The server keeps running in this terminal; type the other commands in a second one. (I checked the server's first line with `go run ./cmd/api`; in the later session the same code was built with `go build`: the output is the same.)
+
+### 2. Registration: the database gives the role
+
+In the second terminal a new user, Aziza, registers: `POST /users`, an email and a password of at least 15 characters (GB-6.03):
+
+```console
+$ curl -i localhost:8765/users -H "Content-Type: application/json" -d '{"email":"aziza@bozor.test","password":"anor-behi-yongoq-uzum-5"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: GVAN7GMVLZRFTRELEHFJ4H7PG6
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 53
+
+{"id":4,"email":"aziza@bozor.test","role":"xaridor"}
+```
+
+The first line is `201 Created`. The body has the new user's `id`, 4, and `"role":"xaridor"` (`xaridor` means "buyer"). The client does not send the role: it is the default value of a database column (GB-6.06, least privilege).
+
+### 3. What is in the database
+
+The password must not sit in the database as plain text. We check: `psql -c` runs one SQL command, and the Postgres function `left(text, n)` takes the first `n` characters of the text. Here, the first 31 characters of `password_hash`:
+
+```console
+$ docker compose exec db psql -c "SELECT id, email, left(password_hash, 31) FROM users WHERE id = 4"
+ id |      email       |              left
+----+------------------+---------------------------------
+  4 | aziza@bozor.test | $argon2id$v=19$m=47104,t=1,p=1$
+(1 row)
+```
+
+The first 31 characters: `$argon2id$` (the algorithm), `v=19$` (the version), `m=47104,` (memory, KiB), `t=1,` (number of passes), `p=1$` (parallelism). The password itself is nowhere; the rest — the salt and the key — is in the following characters, and we do not print them (GB-6.03).
+
+### 4. Login, someone else's order and the admin path
+
+Aziza logs in. `-c aziza.txt` (a cookie jar) writes the cookie that the server gave into the file `aziza.txt`:
+
+```console
+$ curl -s -c aziza.txt localhost:8765/login -H "Content-Type: application/json" -d '{"email":"aziza@bozor.test","password":"anor-behi-yongoq-uzum-5"}'
+{"id":4,"email":"aziza@bozor.test","role":"xaridor"}
+```
+
+Now Dilnoza's order 41. `-b aziza.txt` reads the cookie from the file and adds it to the request:
+
+```console
+$ curl -i -b aziza.txt localhost:8765/orders/41
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+Vary: Origin
+X-Request-Id: VYB4UICCKXU5IOQQISOJJUHOBE
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"VYB4UICCKXU5IOQQISOJJUHOBE"}
+```
+
+`404 Not Found`, and `detail` says "no such order" (`bunday buyurtma yoʻq`). A nonexistent order (for example `/orders/999`) gets exactly this text: Aziza cannot find out whether order 41 exists. Now Aziza tries to add a product through the admin path:
+
+```console
+$ curl -i -b aziza.txt localhost:8765/admin/products -H "Content-Type: application/json" -d '{"name":"anor","price":1800000,"stock":5}'
+HTTP/1.1 403 Forbidden
+Cache-Control: no-store
+Content-Type: application/problem+json
+Vary: Origin
+X-Request-Id: 7SD2LKSDG4XJ7DOSAFAO3NLPI3
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 136
+
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"bu amal uchun ruxsat yoʻq","request_id":"7SD2LKSDG4XJ7DOSAFAO3NLPI3"}
+```
+
+`403 Forbidden`, "no permission for this action" (`bu amal uchun ruxsat yoʻq`): Aziza is known, but her role is `xaridor`.
+
+### Predict: an admin path that does not exist
+
+Now a path that is registered nowhere: `GET /admin/yoq` without a cookie. What is the response? **A)** `404 Not Found` · **B)** `401 Unauthorized` · **C)** `403 Forbidden`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The pattern `"/admin/"` catches this path too, and the first layer is `requireUser`: there is no cookie, so `401`. If you chose A, you pictured the mux saying "no such route" first; but a path under `/admin/` never reaches the mux itself. C — `403` goes only to a user who is known and whose role is not enough.
+
+</details>
+
+```console
+$ curl -i localhost:8765/admin/yoq
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+Vary: Origin
+Www-Authenticate: Cookie realm="bozor"
+X-Request-Id: CYYNR7FRKBUUGHBVKUPMT25RUC
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"CYYNR7FRKBUUGHBVKUPMT25RUC"}
+```
+
+And with Aziza it is `403`:
+
+```console
+$ curl -i -b aziza.txt localhost:8765/admin/yoq
+HTTP/1.1 403 Forbidden
+Cache-Control: no-store
+Content-Type: application/problem+json
+Vary: Origin
+X-Request-Id: LA7C4YWGALXYK5XIIZPKAS7263
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 136
+
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"bu amal uchun ruxsat yoʻq","request_id":"LA7C4YWGALXYK5XIIZPKAS7263"}
+```
+
+Only the admin sees `404` (this row is in the test table): users who are not admins do not learn what is in the admin section.
+
+### 5. Her own order: the owner comes from the session
+
+Aziza orders one `choy` (tea, product 3):
+
+```console
+$ curl -i -b aziza.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"items":[{"product_id":3,"quantity":1}]}'
+HTTP/1.1 201 Created
+Cache-Control: no-store
+Content-Type: application/json
+Location: /orders/43
+Vary: Origin
+X-Request-Id: PADQXAGZLD2TVMG7HA2FXJ6DP3
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 116
+
+{"id":43,"user_id":4,"status":"yangi","items":[{"product_id":3,"quantity":1,"unit_price":2500000}],"total":2500000}
+```
+
+`201 Created` and `Location: /orders/43` — the address of the new order. `"user_id":4` in the response is Aziza: the owner was taken from the session, not from the body (the body had no `user_id`).
+
+### 6. Logout: the old cookie no longer works
+
+`-X POST` sets the method. Logout returns `204 No Content`, and `Set-Cookie` tells the browser to delete the cookie (`Max-Age=0`):
+
+```console
+$ curl -i -b aziza.txt -X POST localhost:8765/logout
+HTTP/1.1 204 No Content
+Set-Cookie: __Host-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+Vary: Origin
+X-Request-Id: 4OJSRGUICLEDMVZUIJJEHC5YVT
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+```
+
+The old token is still in `aziza.txt` (`-b` only reads the file and does not change it). Order 43 with that same token:
+
+```console
+$ curl -i -b aziza.txt localhost:8765/orders/43
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+Vary: Origin
+Www-Authenticate: Cookie realm="bozor"
+X-Request-Id: KD4TCE3M76A6LOR4YDFKXP6R4P
+Date: Sat, 28 Nov 2026 09:43:17 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"KD4TCE3M76A6LOR4YDFKXP6R4P"}
+```
+
+`401`: the server deleted the session row of that token, so the token now means nobody. This is the answer to the GB-6.05 question "why sessions": logout works immediately.
+
+### 7. The login limit
+
+The last rule. Six logins in one line: five wrong passwords, the sixth is Aziza's correct password. In a terminal this is one line; here it is split so that it reads well:
+
+```bash
+for p in x1 x2 x3 x4 x5 anor-behi-yongoq-uzum-5; do
+  curl -s -o /dev/null -w "%{http_code} " localhost:8765/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"aziza@bozor.test","password":"'$p'"}'
+done; echo
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `for p in … ; do` | the variable `p` takes `x1` … `x5` in turn, then the correct password: six rounds |
+| 2 | `curl -s -o /dev/null -w "%{http_code} " …` | `-o /dev/null` throws the body away, `-w` prints only the status code and a space; the `\` at the end of the line continues the command on the next line |
+| 3 | `-H "Content-Type: application/json" \` | says that this is JSON |
+| 4 | `-d '{"email":…,"password":"'$p'"}'` | `'$p'` puts `p` inside the JSON: the quoted part closes, `$p` is expanded, a quoted part starts again |
+| 5 | `done; echo` | the loop is over; `echo` prints a newline at the end |
+
+### Predict: the sixth attempt
+
+More than 12 seconds have passed since Aziza's login: the bucket is full again (5 tokens, one is added every 12 seconds, GB-6.07). Five wrong passwords, and the sixth with the correct password. What is the sixth response? **A)** `200`: the password is correct · **B)** `401`: all of them · **C)** `429`: too many attempts.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Five attempts took five tokens; no token is left for the sixth, so the server does not even check the password. The limit does not know whether the password is right: it counts attempts. If you chose A, you thought a correct password beats everything; if you chose B, you forgot the limit.
+
+</details>
+
+```console
+$ for p in x1 x2 x3 x4 x5 anor-behi-yongoq-uzum-5; do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" -d '{"email":"aziza@bozor.test","password":"'$p'"}'; done; echo
+401 401 401 401 401 429
+```
+
+Five `401`, then `429`. Let us look at the sixth response in full:
+
+```console
+$ curl -i localhost:8765/login -H "Content-Type: application/json" -d '{"email":"aziza@bozor.test","password":"anor-behi-yongoq-uzum-5"}'
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/problem+json
+Retry-After: 12
+Vary: Origin
+X-Request-Id: PTMASP33DYC6MG2AABT4RKPXTS
+Date: Sat, 28 Nov 2026 09:43:30 GMT
+Content-Length: 166
+
+{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"urinishlar koʻp: keyinroq qayta urinib koʻring","request_id":"PTMASP33DYC6MG2AABT4RKPXTS"}
+```
+
+`429 Too Many Requests`, `Content-Type: application/problem+json` (GB-6.02) and `Retry-After: 12`: in 12 seconds one more attempt opens. The correct password is stopped too: otherwise an attacker would see the difference between `401` and `200` and keep guessing. In numbers: from one IP, 5 attempts, then one every 12 seconds; for one email, 10 attempts, then one per minute. The email limit works even if the attacker changes IP: after the first 10 attempts, one account cannot be guessed at more than once per minute.
+
+### Question: the admin and someone else's order
+
+The admin logs in and sends `GET /orders/41`: this is Dilnoza's order. What is the response? **A)** `200`: the admin sees everything · **B)** `403`: wrong role · **C)** `404`: the order is not theirs.
+
+<details>
+<summary>Answer</summary>
+
+**C.** `GET /orders/{id}` means "my order": the query has a `user_id` condition, for the admin too. The order does not belong to the admin, so it "does not exist". If you chose A, you thought the role opens everything; if you chose B, you assumed this route checks the role: it does not look at the role. We need a separate path where the admin sees all orders: `GET /admin/orders`. That is today's homework.
+
+</details>
+
+## The tests: proof of the rules
+
+The rules are visible. But if someone adds a new route tomorrow and breaks one, `curl` will not tell you. A test will. The tests are in `cmd/api/himoya_test.go`; they have no mocks: each test runs in its own schema on real Postgres (`internal/pgtest`, GB-5.10).
+
+### One row of the table
+
+```go
+// Jadvaldagi body'lar.
+const (
+	orderBody   = `{"items":[{"product_id":3,"quantity":1}]}`
+	productBody = `{"name":"anor","price":1800000,"stock":5}`
+	noteBody    = `{"note":"Jasurning manzili"}`
+)
+
+// rule — jadvalning bir qatori: kim, qaysi soʻrov, qaysi status kutiladi.
+type rule struct {
+	who                string // "anonim" (cookie'siz), "dilnoza", "jasur", "admin"
+	method, path, body string
+	want               int
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–6 | `const ( … )` | three ready-made bodies for the table: an order, a product and a note (GB-1.03) |
+| 9 | `type rule struct {` | `rule` — a struct that describes one row of the table (GB-2.03) |
+| 10 | `who string` | who: `"anonim"` (anonymous, no cookie), `"dilnoza"`, `"jasur"` or `"admin"` |
+| 11 | `method, path, body string` | the request: method, path and body (three `string` fields on one line) |
+| 12 | `want int` | the expected status code |
+
+The table itself is the specification (`accessRules`; this is the starter, so the homework rows are not in it yet):
+
+```go
+// accessRules — kim nima qila oladi (README, «Spetsifikatsiya»). Ikki xaridor shart: bitta foydalanuvchi
+// bilan yozilgan test begona buyurtmani hech qachon soʻramaydi va BOLA'ni koʻrmaydi.
+var accessRules = []rule{
+	{"anonim", "GET", "/products", "", 200},
+	{"anonim", "GET", "/orders/41", "", 401},
+	{"anonim", "POST", "/orders", orderBody, 401},
+	{"anonim", "POST", "/admin/products", productBody, 401},
+	{"dilnoza", "GET", "/orders/41", "", 200},
+	{"dilnoza", "GET", "/orders/42", "", 404},
+	{"jasur", "GET", "/orders/41", "", 404},
+	{"jasur", "PATCH", "/orders/41", noteBody, 404},
+	{"admin", "GET", "/orders/41", "", 404}, // /orders/{id} — «mening buyurtmam»: admin uchun ham
+	{"dilnoza", "POST", "/admin/products", productBody, 403},
+	{"jasur", "GET", "/admin/users", "", 403},
+	{"dilnoza", "GET", "/admin/yoq", "", 403}, // yoʻq admin yoʻli ham 403: ichida nima borligi bilinmaydi
+	{"admin", "GET", "/admin/yoq", "", 404},
+	{"admin", "GET", "/admin/users", "", 200},
+	{"admin", "POST", "/admin/products", productBody, 201},
+	{"admin", "DELETE", "/admin/products/1", "", 409}, // olma buyurtmalarda bor
+	// VAZIFA (TASK.md, 3-qadam): GET /orders va GET /admin/orders uchun qatorlar
+}
+```
+
+Each row is one rule of this lesson. `{"anonim", "GET", "/orders/41", "", 401}` means "`GET /orders/41` without a cookie — `401`". `{"jasur", "GET", "/orders/41", "", 404}` — someone else's order, `404`. `{"dilnoza", "POST", "/admin/products", productBody, 403}` — a buyer on the admin path, `403`. The rows `dilnoza … /orders/42` and `jasur … /orders/41` are the two buyers: Dilnoza and Jasur ask for each other's orders. `{"admin", "DELETE", "/admin/products/1", "", 409}` — product 1 (`olma`, "apple") is in orders, so it cannot be deleted: `409 Conflict`.
+
+### TestAccess: every row goes through the chain
+
+```go
+func TestAccess(t *testing.T) {
+	h, _ := testAPI(t)
+	cookies := map[string]string{
+		"anonim":  "",
+		"dilnoza": login(t, h, dilnozaLogin).Value,
+		"jasur":   login(t, h, jasurLogin).Value,
+		"admin":   login(t, h, adminLogin).Value,
+	}
+	for _, r := range accessRules {
+		rec := send(h, r.method, r.path, r.body, cookies[r.who])
+		if rec.Code != r.want {
+			t.Errorf("%s %s %s: %d, kutilgan %d", r.who, r.method, r.path, rec.Code, r.want)
+		}
+	}
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func TestAccess(t *testing.T) {` | the test function (GB-1.08) |
+| 2 | `h, _ := testAPI(t)` | a fresh schema and the **whole chain**: `h` is `newHandler` (GB-5.10); the second value (`pool`) is not needed in this test, and `_` discards it |
+| 3–8 | `cookies := map[string]string{ … }` | a `map`: the key is the user, the value is their session cookie (GB-2.02) |
+| 4 | `"anonim": ""` | an empty string for the anonymous user: no cookie is sent |
+| 5–7 | `login(t, h, dilnozaLogin).Value` | the others come from the login helper (GB-6.04): it returns a cookie, and `.Value` is its value |
+| 9 | `for _, r := range accessRules {` | for every row of the table |
+| 10 | `rec := send(h, r.method, r.path, r.body, cookies[r.who])` | sends the request into the chain; the cookie comes from the map by `r.who` (GB-5.10) |
+| 11 | `if rec.Code != r.want {` | if the status is not what was expected… |
+| 12 | `t.Errorf(…)` | …records an error, but the test **goes on**: the following rows are checked too, so all errors show up in one run |
+
+### The password test
+
+```go
+func TestPasswordNotStored(t *testing.T) {
+	h, pool := testAPI(t)
+	const pw = "anor-behi-yongoq-uzum-5"
+	rec := send(h, "POST", "/users", `{"email":"aziza@bozor.test","password":"`+pw+`"}`, "")
+	if rec.Code != http.StatusCreated || strings.Contains(rec.Body.String(), "argon2id") {
+		t.Fatalf("POST /users: %d %s; kutilgan 201, javobda hash yoʻq", rec.Code, rec.Body)
+	}
+	var hash string
+	err := pool.QueryRow(context.Background(),
+		"SELECT password_hash FROM users WHERE email = $1", "aziza@bozor.test").Scan(&hash)
+	if err != nil {
+		t.Fatalf("users qatori oʻqilmadi: %v", err)
+	}
+	if strings.Contains(hash, pw) || !strings.HasPrefix(hash, "$argon2id$") {
+		t.Errorf("password_hash = %q: parol ochiq turibdi yoki argon2id emas", hash)
+	}
+	login(t, h, `{"email":"aziza@bozor.test","password":"`+pw+`"}`) // hash'dan parolni tekshirish ishlaydi
+}
+```
+
+| Line | What it does |
+|---|---|
+| 2 | `h, pool := testAPI(t)` — now the second value is needed too: `pool` (a connection pool) is connected straight to the database |
+| 3 | `const pw = "…"` — Aziza's password (GB-1.03) |
+| 4 | registers Aziza with `POST /users`; the JSON is assembled from a backtick string and `+pw+` (GB-3.02) |
+| 5–7 | if the status is not `201` or the response contains `argon2id` (a hash) — `t.Fatalf`: the test stops here, because the next step depends on this |
+| 8–13 | `var hash string`, then `pool.QueryRow(…).Scan(&hash)` reads `password_hash` from the database; if that fails — `t.Fatalf` again (GB-5.05) |
+| 14–16 | `strings.Contains(hash, pw)` — is the password inside the hash; `!strings.HasPrefix(hash, "$argon2id$")` — does the string fail to start with argon2id (GB-3.01). If either is true — `t.Errorf` |
+| 17 | `login(…)`: login with this password works, so the password is checked against the hash |
+
+Without this test, if someone removes the `Hash` call, the API keeps working, but the password reaches the database as plain text and no error is visible.
+
+### The logout and rate limit tests
+
+Two more tests — the same steps as the `curl` session above:
+
+```go
+func TestLogoutRevokes(t *testing.T) {
+	h, pool := testAPI(t)
+	c := login(t, h, dilnozaLogin).Value
+	if rec := send(h, "GET", "/orders/41", "", c); rec.Code != http.StatusOK {
+		t.Fatalf("login'dan keyin GET /orders/41: %d, kutilgan 200", rec.Code)
+	}
+	if rec := send(h, "POST", "/logout", "", c); rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /logout: %d, kutilgan 204", rec.Code)
+	}
+	if rec := send(h, "GET", "/orders/41", "", c); rec.Code != http.StatusUnauthorized {
+		t.Errorf("logout'dan keyin oʻsha cookie bilan GET /orders/41: %d, kutilgan 401", rec.Code)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM sessions").Scan(&n); err != nil || n != 0 {
+		t.Errorf("sessions'da %d qator (%v), kutilgan 0", n, err)
+	}
+}
+```
+
+`TestLogoutRevokes`: login, `200` with that cookie, logout `204`, `401` with that same cookie; and the `sessions` table has zero rows (`count(*)`).
+
+```go
+	for i := 1; i <= 5; i++ {
+		if rec := send(h, "POST", "/login", wrong, ""); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%d-urinish: %d, kutilgan 401", i, rec.Code)
+		}
+	}
+	rec := send(h, "POST", "/login", dilnozaLogin, "")
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("6-urinish (toʻgʻri parol): %d, Retry-After %q; kutilgan 429 va Retry-After",
+			rec.Code, rec.Header().Get("Retry-After"))
+	}
+```
+
+`TestLoginRateLimit` (the start of the function is not shown: it calls `testAPI` and puts JSON with a wrong password into the variable `wrong` — with Dilnoza's email, which this page does not print). The `for` loop changes `i` from 1 to 5: five wrong passwords give five `401`; `t.Fatalf` — if an attempt did not go as expected, checking the next one is pointless. The sixth attempt uses the correct password (`dilnozaLogin`) but must give `429`, and `Retry-After` must not be empty.
+
+### Run them
+
+We run the four tests with `-v` and `-run`. `-run` takes a regular expression: `|` means "or", `$` means the end of the name. `TestAccess$` is only `TestAccess` itself; without `$`, every test whose name starts with `TestAccess` would run too (we will see this below).
+
+```console
+$ go test -v -run 'TestAccess$|TestPasswordNotStored|TestLogoutRevokes|TestLoginRateLimit' ./cmd/api
+=== RUN   TestAccess
+--- PASS: TestAccess (0.19s)
+=== RUN   TestPasswordNotStored
+--- PASS: TestPasswordNotStored (0.15s)
+=== RUN   TestLogoutRevokes
+--- PASS: TestLogoutRevokes (0.11s)
+=== RUN   TestLoginRateLimit
+--- PASS: TestLoginRateLimit (0.20s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.709s
+```
+
+The `=== RUN` lines are the start of a test, `--- PASS` is the end. All four passed. The times above are my run. In the video (the quoted values) they were `0.20s`, `0.14s`, `0.11s`, `0.21s` and `0.708s` in total: time depends on load, and yours will differ too. The order of magnitude is what matters: each test on its own schema on real Postgres takes about 0.1–0.25 seconds, under a second in total.
+
+## Common mistakes
+
+**The most common mistake is writing the protection test with one user.** Such a test is green while the code has a hole.
+
+`TestOrdersOneUser` uses only Dilnoza: her own order gives `200`, a missing order gives `404`, no cookie gives `401`. This file is not in the lesson folder: a wrong test must not live in the starter. It is under `_video/stages/bola/`:
+
+```go filename="_video/stages/bola/bitta_test.go" showLineNumbers
+// XATO USUL (video, «xato» bobi): bitta foydalanuvchi bilan yozilgan himoya testi.
+// U faqat Dilnozaning oʻz buyurtmasini va umuman yoʻq buyurtmani soʻraydi — begona buyurtmani hech kim
+// soʻramaydi, shuning uchun BOLA'li store'da ham oʻtadi. Papkada emas: chiqishlar.sh uni vaqtincha qoʻyadi.
+package main
+
+import "testing"
+
+func TestOrdersOneUser(t *testing.T) {
+	h, _ := testAPI(t)
+	dilnoza := login(t, h, dilnozaLogin).Value
+	if rec := send(h, "GET", "/orders/41", "", dilnoza); rec.Code != 200 {
+		t.Errorf("Dilnoza GET /orders/41 (oʻziniki): %d, kutilgan 200", rec.Code)
+	}
+	if rec := send(h, "GET", "/orders/999", "", dilnoza); rec.Code != 404 {
+		t.Errorf("Dilnoza GET /orders/999 (yoʻq): %d, kutilgan 404", rec.Code)
+	}
+	if rec := send(h, "GET", "/orders/41", "", ""); rec.Code != 401 {
+		t.Errorf("cookie'siz GET /orders/41: %d, kutilgan 401", rec.Code)
+	}
+}
+```
+
+We break the store on purpose: `AND user_id = $2` is removed from the `Order` query — this is the BOLA from GB-6.06. The current (correct) query:
+
+```go
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, note FROM orders
+		WHERE id = $1
+		  AND user_id = $2`,
+		id, userID).Scan(&o.UserID, &o.Status, &note)
+```
+
+The broken version (`_video/stages/bola/orders.go`):
+
+```go
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, note FROM orders
+		WHERE id = $1`, // XATO VERSIYA (video, «xato» bobi): egasi tekshirilmaydi — BOLA
+		id).Scan(&o.UserID, &o.Status, &note)
+```
+
+The owner is no longer checked: a row is found whoever the `id` belongs to. In the copy of the lesson folder we swap the files like this (the correct file is kept in `orders.fixed`):
+
+```bash
+cp internal/store/orders.go orders.fixed
+cp _video/stages/bola/orders.go internal/store/orders.go
+cp _video/stages/bola/bitta_test.go cmd/api/bitta_test.go
+```
+
+**Predict.** What does the one-user test say on the broken store? **A)** FAIL: 41 turns out to be someone else's · **B)** ok: the test passes · **C)** FAIL: 999 → `200`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The test asks for three things: Dilnoza's own order (41), a missing order (999) and a request without a cookie. On the broken store all three behave correctly: 41 really is Dilnoza's, 999 is not in the database, and the request without a cookie stops at `requireUser`. If you chose A, you thought 41 would turn out to be "someone else's", but the test asks as Dilnoza — 41 is hers. C: 999 is not in the database, and without the owner condition no row is found either.
+
+</details>
+
+```console
+$ go test -run TestOrdersOneUser ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.187s
+```
+
+The test passed (`0.155s` in the video). On the same code, `TestAccess` (`0.17s` and `0.218s` in the video):
+
+```console
+$ go test -run 'TestAccess$' ./cmd/api
+--- FAIL: TestAccess (0.17s)
+    himoya_test.go:61: dilnoza GET /orders/42: 200, kutilgan 404
+    himoya_test.go:61: jasur GET /orders/41: 200, kutilgan 404
+    himoya_test.go:61: admin GET /orders/41: 200, kutilgan 404
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.221s
+FAIL
+```
+
+How to read it: `himoya_test.go:61:` is the file and line (the `t.Errorf` that checks the table). Then comes the content of the row: `dilnoza GET /orders/42: 200, kutilgan 404` — Dilnoza got Jasur's order 42 (`kutilgan` means "expected"); `jasur GET /orders/41` — Jasur got Dilnoza's order 41; `admin GET /orders/41` — so did the admin. All `200`, `404` was expected. The reason:
+
+| Who | What they ask for | One-user test | Table |
+|---|---|---|---|
+| Dilnoza | 41 (her own) | `200` ✓ | `200` ✓ |
+| Dilnoza | 999 (missing) | `404` ✓ | — |
+| anonymous | 41 | `401` ✓ | `401` ✓ |
+| Dilnoza | 42 (Jasur's) | **nobody asks** | `404` expected, `200` returned ✗ |
+| Jasur | 41 (Dilnoza's) | **nobody asks** | `404` expected, `200` returned ✗ |
+
+BOLA shows up only with a second user. The fix: put the `AND user_id = $2` line back.
+
+```bash
+cp orders.fixed internal/store/orders.go
+rm cmd/api/bitta_test.go
+```
+
+```console
+$ go test -run 'TestAccess$' ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.238s
+```
+
+The same command is `ok` again (`0.231s` in the video). The rule: for every access rule the table needs at least these rows — anonymous, the owner, **another** user, the admin.
+
+## Check yourself
+
+1. Why are the admin routes in a separate mux?
+
+<details>
+<summary>Answer</summary>
+
+The mux is wrapped once: `requireUser(requireAdmin(muxErrors(admin)))`. Every route under `/admin/` — including one added later — passes this wrapper, so a new admin route cannot be left unprotected. When each route was wrapped separately, one could be forgotten (GB-6.06, OWASP API5).
+
+</details>
+
+2. Why does the protection test need two buyers?
+
+<details>
+<summary>Answer</summary>
+
+Without a second user who asks for someone else's order, BOLA is invisible: one user asks for their own order and for a missing one, and nobody asks for someone else's. Even a broken store passes such a test.
+
+</details>
+
+3. (GB-6.05) What did bozor choose so that logout works immediately, and why?
+
+<details>
+<summary>Answer</summary>
+
+The session. Logout deletes the session row in the database, and the old cookie gets `401` on the next request. A JWT has no record on the server: it stays valid until `exp` (the expiry time), unless there is a separate denylist.
+
+</details>
+
+4. Predict. We add the row `{"admin", "GET", "/orders/42", "", ?}` to the table. Order 42 belongs to Jasur. What status is expected?
+
+<details>
+<summary>Answer</summary>
+
+`404`. `/orders/{id}` means "my order": the owner is checked in SQL, for the admin too. Order 42 does not belong to the admin. This is the same row as `{"admin", "GET", "/orders/41", "", 404}` in the table, only with another ID.
+
+</details>
+
+5. Predict. What does `go test -run 'TestAccess' ./cmd/api` (without `$`) print on the starter? **A)** all ok · **B)** FAIL, because `TestAccess` fails · **C)** FAIL, but another test fails.
+
+<details>
+<summary>Answer</summary>
+
+**C.** `-run` is a regular expression: `TestAccess` matches every test that has this word in its name, including the homework check `TestAccessRulesCoverTask`. It fails on the starter because the table has no homework rows, while `TestAccess` itself passes:
+
+```console
+$ go test -run 'TestAccess' ./cmd/api
+--- FAIL: TestAccessRulesCoverTask (0.00s)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: anonim GET /orders → 401 (TASK.md, 3-qadam: himoya_test.go jadvali)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: anonim GET /admin/orders → 401 (TASK.md, 3-qadam: himoya_test.go jadvali)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: xaridor GET /admin/orders → 403 (TASK.md, 3-qadam: himoya_test.go jadvali)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.237s
+FAIL
+```
+
+That is why the lesson uses `'TestAccess$'`: `$` marks the end of the name.
+
+</details>
+
+## Homework
+
+The protected bozor can fetch one order by ID (`GET /orders/{id}`, owner only), but it has no **list**: a buyer cannot see their orders, and the admin cannot see all of them. The task is [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-08-himoyalangan-bozor/TASK.md): these two routes and their rows in the table. The folder: [gb-6-08-himoyalangan-bozor](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-08-himoyalangan-bozor). TASK.md gives no level (🟢🟡🟠🔴): it is one task, checked by a test.
+
+1. **Store** (`internal/store/orders.go`): the type `OrderSummary` (`ID`, `UserID`, `Status`, `Total`; JSON keys `id`, `user_id`, `status`, `total`) and two methods: `Orders(ctx, userID)` — only this user's orders (the owner in the SQL condition), `AllOrders(ctx)` — all orders.
+2. **Routes** (`cmd/api/handlers.go`): `GET /orders` — on the main mux, with `a.requireUser(…)`; `GET /admin/orders` — **on the admin mux**, with no wrapper.
+3. **Access table** (`cmd/api/himoya_test.go`): rows for the new routes — at least `anonim GET /orders → 401`, `anonim GET /admin/orders → 401` and one buyer `GET /admin/orders → 403`.
+
+To check: in the folder root run `docker compose up -d --wait`, then `go test ./...`. Right now, on the starter, it fails like this:
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestMyOrders (0.20s)
+    tekshiruv_test.go:25: Dilnoza GET /orders: 405 {"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"OSE674JZZZKHZYDMOL3TVEJNCY"}
+          kutilgan 200 [{"id":41,"user_id":1,"status":"yangi","total":3600000}] (TASK.md, 1–2-qadam: faqat oʻz buyurtmalari, boʻlmasa [])
+    tekshiruv_test.go:25: Jasur GET /orders: 405 {"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"2ADXKXCRUAONWSBWOGNEEMFNGT"}
+          kutilgan 200 [{"id":42,"user_id":2,"status":"yangi","total":6000000}] (TASK.md, 1–2-qadam: faqat oʻz buyurtmalari, boʻlmasa [])
+    tekshiruv_test.go:25: Malika (buyurtmasiz) GET /orders: 405 {"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"CF5MOMKA7ZBZOPQYJFCCAFPT5C"}
+          kutilgan 200 [] (TASK.md, 1–2-qadam: faqat oʻz buyurtmalari, boʻlmasa [])
+    tekshiruv_test.go:30: cookie'siz GET /orders: 405, kutilgan 401 (TASK.md, 2-qadam: requireUser)
+--- FAIL: TestAdminOrders (0.14s)
+    tekshiruv_test.go:39: admin GET /admin/orders: 404 {"type":"about:blank","title":"Not Found","status":404,"detail":"bunday yoʻl yoʻq","request_id":"24JJJBGYT3TYAZLQTBOPX3PPMG"}
+          kutilgan 200 [{"id":41,"user_id":1,"status":"yangi","total":3600000},{"id":42,"user_id":2,"status":"yangi","total":6000000}] (TASK.md, 1-qadam AllOrders, 2-qadam admin mux)
+--- FAIL: TestAccessRulesCoverTask (0.00s)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: anonim GET /orders → 401 (TASK.md, 3-qadam: himoya_test.go jadvali)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: anonim GET /admin/orders → 401 (TASK.md, 3-qadam: himoya_test.go jadvali)
+    tekshiruv_test.go:65: accessRules'da qator yoʻq: xaridor GET /admin/orders → 403 (TASK.md, 3-qadam: himoya_test.go jadvali)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	3.085s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.291s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.701s
+FAIL
+```
+
+The first three failures are `GET /orders`: `405 Method Not Allowed` (this path has only `POST` so far); then `GET /admin/orders` — `404` (the admin mux has no such route); the last one — the table is missing three rows. Work until everything is `ok`; when you finish, run `docker compose down -v`.
+
+<details>
+<summary>Solution and explanation</summary>
+
+The answer is in the `solution/` folder. The main parts:
+
+`internal/store/orders.go`: both methods rely on one helper; the difference is only in `WHERE`.
+
+```go
+func (s *Store) Orders(ctx context.Context, userID int64) ([]OrderSummary, error) {
+	return s.summaries(ctx, `
+		SELECT o.id, o.user_id, o.status, COALESCE(sum(i.quantity * i.unit_price), 0)::bigint
+		FROM orders o
+		LEFT JOIN order_items i ON i.order_id = o.id
+		WHERE o.user_id = $1
+		GROUP BY o.id
+		ORDER BY o.id`, userID)
+}
+```
+
+`LEFT JOIN` also returns an order with no items; `COALESCE(…, 0)` makes the total of such an order `0` instead of `NULL` (GB-5.04); `sum(bigint)` returns `numeric` in Postgres, and `::bigint` turns it back into a type that fits `int64`. Inside `summaries` the list starts as `[]OrderSummary{}`: with no orders the JSON is `[]`, not `null`.
+
+`cmd/api/handlers.go`:
+
+```go
+	mux.Handle("GET /orders", a.requireUser(http.HandlerFunc(a.listOrders)))
+	…
+	admin.HandleFunc("GET /admin/orders", a.allOrders)
+```
+
+`listOrders` takes the owner from `currentUser(r).ID`: the client cannot give it in the path or in the body. `allOrders` has no role check: the admin mux already wraps it once. If you put `GET /admin/orders` on the main mux, there is no wrapper and Dilnoza sees `200` instead of `403` — the test catches that.
+
+The three new rows in `cmd/api/himoya_test.go`:
+
+```go
+	{"anonim", "GET", "/orders", "", 401},
+	{"anonim", "GET", "/admin/orders", "", 401},
+	{"jasur", "GET", "/admin/orders", "", 403},
+```
+
+Checking the solution (`solution/` has its own `go.mod` and works on its own):
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	3.057s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.266s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.651s
+```
+
+In the lab `AllOrders` returns the whole list; in a running system it needs pagination (`LIMIT` and a next-page key): the task does not require it.
+
+</details>
+
+For work tomorrow: write every access rule into a two-user test. The next module is goroutines: [GB-7.01 · The goroutine and its life: who starts, who waits](/lab/youtube/gb/gb-7-01/en).
+
+## Sources
+
+- OWASP API Security Top 10 2023: [API1 BOLA](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/), [API2 Broken Authentication](https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/), [API5 BFLA](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/), [main page](https://owasp.org/API-Security/editions/2023/en/0x11-t10/)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html): [authorization tests](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#create-unit-and-integration-test-cases-for-authorization-logic), [validate on every request](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#validate-the-permissions-on-every-request), [least privilege](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#protect-against-automated-attacks), [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html), [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#session-expiration)
+- [RFC 9110 §15.5.4: 403 Forbidden (404 to hide existence)](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden), [RFC 6585 §4: 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585#section-4), [RFC 7519 §4.1.4: `exp`](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.4)
+- Go: [net/http: Handler](https://pkg.go.dev/net/http#Handler), [ServeMux](https://pkg.go.dev/net/http#ServeMux), [CrossOriginProtection](https://pkg.go.dev/net/http#CrossOriginProtection), [testing: T.Errorf](https://pkg.go.dev/testing#T.Errorf), [strings.HasPrefix](https://pkg.go.dev/strings#HasPrefix), [`go test` flags (`-run`)](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate#Limiter)
+- [PostgreSQL 18: string functions (`left`)](https://www.postgresql.org/docs/18/functions-string.html), [aggregate functions (`sum`)](https://www.postgresql.org/docs/18/functions-aggregate.html)
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, goose v3.30.2, PostgreSQL 18 (`postgres:18-alpine`), 2026-11-28. I re-ran the outputs on this computer: `chiqishlar.sh` and the commands on this page. Times, `X-Request-Id` and `Date` differ on every run. Previous lesson: [GB-6.07 · Cookie, CSRF, CORS and rate limit](/lab/youtube/gb/gb-6-07/en).
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-08-himoyalangan-bozor)
+
+---
+
+← Previous lesson: [GB-6.07](/lab/youtube/gb/gb-6-07/en) · Next lesson: [GB-7.01](/lab/youtube/gb/gb-7-01/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

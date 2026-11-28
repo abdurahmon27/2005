@@ -1,0 +1,913 @@
+---
+title: "Горутина и её время жизни: кто запускает, кто ждёт"
+date: "2026/11/28"
+description: "Запуск через go, завершение программы при возврате main, ожидание с WaitGroup и сбор результатов без гонки данных."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-01) · **Русский** · [English](/lab/youtube/gb/gb-7-01/en)  
+Урок GB-7.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+bozor получает прайс-листы от трёх поставщиков. Если каждый отвечает за секунду, зачем ждать три секунды?
+Как запустить все три операции сразу и узнать, что они завершены?
+
+**Одна идея:** запуск работы в новой горутине ещё не означает ожидание. Код, который запустил работу, должен управлять и её завершением.
+В лаборатории `sync.WaitGroup` ждёт завершения; `time.Sleep` лишь угадывает время.
+
+После урока вы сможете:
+
+- запускать функцию через `go` и объяснять, что происходит при возврате `main`;
+- запускать три операции через `wg.Go` и ждать их через `wg.Wait`;
+- находить ошибку общего `append` и записывать результаты по отдельным индексам;
+- проверять владельца работы в обработчике и выполнять задание `fetchAll`.
+
+| Слово | Простое значение | Английский термин |
+|---|---|---|
+| горутина | выполнение функции одновременно с другим кодом под управлением Go runtime | goroutine |
+| WaitGroup | тип пакета `sync`, который считает запущенные задачи и ждёт их завершения | WaitGroup |
+| владелец горутины | код, ответственный за запуск работы и ожидание её завершения | goroutine owner |
+
+## Что нужно знать заранее
+
+Основа: [GB-6.08 · Защищённый bozor](/lab/youtube/gb/gb-6-08/ru) и [GB-4.07 · Мьютекс и гонка данных](/lab/youtube/gb/gb-4-07/ru).
+Также: [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/ru), [GB-2.09 · defer, panic, recover](/lab/youtube/gb/gb-2-09/ru),
+[GB-5.05 · pgx и измерение времени](/lab/youtube/gb/gb-5-05/ru), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/ru),
+[GB-6.06 · Доступ к заказам](/lab/youtube/gb/gb-6-06/ru), [GB-5.10 · API заказов](/lab/youtube/gb/gb-5-10/ru) и [GB-4.02 · HTTP-клиент](/lab/youtube/gb/gb-4-02/ru).
+Базовый синтаксис: [GB-1.01](/lab/youtube/gb/gb-1-01/ru), [GB-1.02](/lab/youtube/gb/gb-1-02/ru), [GB-1.06](/lab/youtube/gb/gb-1-06/ru),
+[GB-1.07](/lab/youtube/gb/gb-1-07/ru), [GB-1.08](/lab/youtube/gb/gb-1-08/ru).
+
+[Папка урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti) — самостоятельный модуль с `go 1.27` в `go.mod`.
+Откройте терминал в `lessons/gb-7-01-goroutine-hayoti`. Здесь использованы Go 1.27.4 и Docker; Postgres не нужен.
+Все команды выполняются из этой папки. `./_video/run.sh ШАГ go run .` копирует шаг во временную папку и запускает его.
+Скрипт задаёт `CGO_ENABLED=0` и завершает вывод строкой `(chiqish kodi: N)` — «код выхода».
+На этой Linux-машине нет C-компилятора для `-race`: `race.sh` запускает Docker с `CGO_ENABLED=1` и gcc.
+Он также использует toolchain Go 1.27.4. Результаты ниже получены повторным запуском; числа из видео отмечены отдельно.
+
+**Вспомните GB-6.08.** Зачем в тесте защиты два покупателя?
+**A)** запросить чужой заказ · **B)** ограничить число попыток · **C)** проверить пароль
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Второй покупатель запрашивает заказ первого. Один покупатель не проверяет доступ к чужому заказу. B и C — другие проверки.
+
+</details>
+
+## Сначала последовательное выполнение
+
+Вместо сети здесь `time.Sleep(time.Second)`: поставщик как будто отвечает через секунду.
+`fetch` означает чтение списка, `name` — имя поставщика. Пока `fetch` ничего не возвращает.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `package main` | пакет исполняемой программы |
+| 3–6 | `import` | `fmt` выводит текст, `time` работает со временем |
+| 8 | `func fetch(name string)` | функция с текстовым параметром; `{}` ограничивают тело |
+| 9 | `fmt.Println` | выводит `boshlandi:` («началось») и имя |
+| 10 | `time.Sleep(time.Second)` | приостанавливает текущую горутину минимум на секунду |
+| 11–12 | `fmt.Println`, `}` | выводит `tayyor:` («готово») и завершает функцию |
+| 14 | `func main()` | входная функция программы |
+| 15 | `start := time.Now()` | сохраняет время начала в переменной `start` |
+| 16 | `for _, name := range []string{…}` | проходит слайс из трёх имён; `_` отбрасывает индекс |
+| 17–18 | `fetch(name)` | завершает один вызов перед следующим |
+| 19–20 | `time.Since(start)` | выводит прошедшее время с `jami:` («всего»), `main` возвращается |
+
+Точка выбирает член пакета; `()` вызывает, кавычки ограничивают текст. Пустые строки не выполняются.
+
+**Прогноз:** сколько времени? **A)** ~1 с · **B)** ~3 с · **C)** почти 0 с
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Три секундных ожидания идут последовательно. A предполагает перекрытие ожиданий, C — отсутствие ожидания.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+boshlandi: chorsu
+tayyor: chorsu
+boshlandi: oloy
+tayyor: oloy
+boshlandi: siyob
+tayyor: siyob
+jami: 3.001382105s
+(chiqish kodi: 0)
+```
+
+| Этап | Что делает `main` | Состояние |
+|---|---|---|
+| начало | ждёт внутри `fetch("chorsu")` | остальные ещё не запущены |
+| затем | ждёт внутри `fetch("oloy")` | chorsu завершён |
+| конец | ждёт завершения `fetch("siyob")` | затем `jami` |
+
+Время складывается из трёх искусственных ожиданий. Для ста последовательных секундных ожиданий модель даёт сто секунд.
+
+## `go`: запускает, не ждёт
+
+Добавим одно слово: `go fetch(name)`. **Горутина** — отдельное выполнение функции под управлением Go runtime.
+Runtime — вспомогательный код Go, работающий вместе с программой. `main` тоже выполняется в горутине.
+`go` вычисляет функцию и аргументы в вызывающей горутине, затем запускает новую.
+Завершения вызова он не ждёт; возвращённые результаты отбрасываются. [Официальное правило](https://go.dev/ref/spec#Go_statements).
+
+```go filename="_video/02-go/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Изменилась строка 17: перед `fetch(name)` стоит `go`. `main` запускает три задачи и переходит к `jami`.
+
+**Прогноз:** что увидим? **A)** всегда три `tayyor` · **B)** `jami`, возможно и `boshlandi` · **C)** ошибку о незавершённой работе
+
+<details>
+<summary>Ответ</summary>
+
+**B.** При возврате `main` программа завершается, не ожидая остальные горутины. A предполагает скрытое ожидание, C — обязательную ошибку; их нет.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-go go run .
+boshlandi: chorsu
+jami: 4.094µs
+(chiqish kodi: 0)
+```
+
+`µs` — микросекунды. Маленькое `jami` не означает выполненную работу: программа завершилась до результата.
+[Официальное правило](https://go.dev/ref/spec#Program_execution) говорит, что возврат `main` не ждёт остальные горутины.
+Это не их упорядоченное завершение; рассчитывать на выполнение их `defer` тоже нельзя.
+
+| Событие | `main` | Три задачи |
+|---|---|---|
+| `go fetch` | переходит к следующей строке | готовы выполняться или уже работают |
+| возврат `main` | программа завершается | незавершённая работа не продолжается |
+
+`olchov.sh go` один раз собирает программу и запускает её 200 раз. Вывод группируется по числу строк `boshlandi` и `tayyor`.
+
+```console
+$ ./_video/olchov.sh go
+    110 boshlandi=0 tayyor=0
+     35 boshlandi=1 tayyor=0
+     28 boshlandi=2 tayyor=0
+     27 boshlandi=3 tayyor=0
+```
+
+Записанное в видео распределение: `110 / 32 / 37 / 21`; это цитата, а не новый запуск.
+Сегодня получилось `110 / 35 / 28 / 27`, как показано выше. В обоих случаях `tayyor` — ноль.
+Проценты не задают правило: причина в отсутствии ожидания завершения.
+
+## `Sleep`: прошедшее время не доказывает завершение
+
+Добавим в `main` вызов `time.Sleep(500 * time.Millisecond)`. `*` умножает длительность на 500: получается полсекунды.
+
+```go filename="_video/03-sleep/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	time.Sleep(500 * time.Millisecond)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+**Прогноз:** `main` ждёт 0,5 с, `fetch` — 1 с. **A)** три `tayyor` · **B)** обычно три `boshlandi`, без `tayyor` · **C)** всегда только `jami`
+
+<details>
+<summary>Ответ</summary>
+
+**B — обычный результат.** Полсекунды хватило для запуска, но не завершения. A забывает секундное ожидание; C исключает запуск горутин. Порядок выполнения не гарантирован.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-sleep go run .
+boshlandi: siyob
+boshlandi: chorsu
+boshlandi: oloy
+jami: 500.059456ms
+(chiqish kodi: 0)
+```
+
+`Sleep` ждёт минимум указанное время, не ровно столько. Увеличение до двух секунд в этом примере создаёт лишнее ожидание.
+Если поставщик ответит через три секунды, двух уже мало. Эти числа иллюстрируют догадку, это не отдельные измерения.
+
+| Ожидание `main` | Состояние работы | Вывод |
+|---|---|---|
+| 0,5 с | секундная работа не завершена | результат теряется |
+| 2 с | секундная работа обычно завершена | лишнее ожидание |
+| 2 с | трёхсекундная работа ещё не завершена | результат снова теряется |
+
+## `WaitGroup`: ждать работу, а не время
+
+Нужно узнать, завершились ли запущенные задачи. **WaitGroup** ведёт их счётчик.
+`var wg sync.WaitGroup` готов к работе с нулевым значением. `wg` — имя переменной; в импорт добавлен `"sync"`.
+`wg.Go(func() { fetch(name) })` запускает анонимную функцию в новой горутине и учитывает задачу.
+При возврате функции задача снимается со счётчика. `wg.Wait()` блокирует вызывающую горутину, пока счётчик не станет нулём.
+`wg.Go` появился в Go 1.25.
+
+```go filename="_video/04-wg/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Новые строки: 5 — `sync`, 17 — `wg`, 19 — запуск задачи, 21 — ожидание всех задач.
+`func() { … }` — функция без параметров и результата; внутри выполняется `fetch(name)`.
+
+**Прогноз:** **A)** ~1 с и три `tayyor` · **B)** ~3 с и три `tayyor` · **C)** ~0 с, без `tayyor`
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Три ожидания перекрываются. B предполагает последовательную работу; C игнорирует `Wait`.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-wg go run .
+boshlandi: chorsu
+boshlandi: siyob
+boshlandi: oloy
+tayyor: oloy
+tayyor: siyob
+tayyor: chorsu
+jami: 1.000144574s
+(chiqish kodi: 0)
+```
+
+| Событие | Счётчик | `main` |
+|---|---|---|
+| регистрация задач | +1 за задачу | в цикле |
+| возврат задачи | −1 за задачу | может ждать в `Wait` |
+| все задачи вернулись | 0 | переходит за `Wait` |
+
+Задачи могут завершаться уже при регистрации следующих; счётчик не обязан сначала достичь трёх.
+Вызовы `wg.Go` при нулевом счётчике должны предшествовать `Wait`. Здесь они в цикле, а `Wait` — после цикла.
+
+| Вариант | Записано в видео, не новый запуск | Сегодняшний запуск |
+|---|---|---|
+| последовательно | 3.002459679 s | 3.001382105 s |
+| `wg.Go` + `Wait` | 1.003058399 s | 1.000144574 s |
+
+Важнее отношение примерно три к одному: ожидания перекрываются. Это не бенчмарк скорости вычислений CPU.
+Порядок начала и завершения не гарантирован.
+
+[Документация sync](https://pkg.go.dev/sync#WaitGroup.Go) упорядочивает записи задач до завершения относительно чтения после ожидания.
+Гарантия относится к задачам именно этой WaitGroup. Она не делает безопасными конфликтующие записи горутин в общий адрес.
+
+## Прежняя форма: `Add`, `go`, `Done`
+
+В рабочем коде встречается и эта форма. Для нового кода документация рекомендует `wg.Go`.
+
+```go filename="_video/08-adddone/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fetch(name)
+		}()
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Строка 19: `wg.Add(1)` учитывает задачу **до go**. Строки 20–23: `go func() { … }()` запускает анонимную функцию.
+Последние `()` означают вызов; `defer wg.Done()` уменьшает счётчик при возврате функции или раскрутке её стека из-за panic.
+Строка 25 ждёт всех. Если перенести `Add` внутрь горутины, `Wait` может увидеть ноль и вернуться раньше времени.
+Ошибка бывает незаметной; компилятор её не исправляет.
+
+**Прогноз:** **A)** ~1 с · **B)** ~3 с · **C)** счётчик никогда не уменьшается
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Задачи в отдельных горутинах, каждая вызывает `Done`. B предполагает последовательность, C — невыполнение `defer`.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-adddone go run .
+boshlandi: oloy
+boshlandi: siyob
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: siyob
+tayyor: oloy
+jami: 1.000167093s
+(chiqish kodi: 0)
+```
+
+При panic эта форма не полностью эквивалентна `wg.Go`; разница разобрана в необязательной части.
+
+## Результаты: гонка данных в общем `append`
+
+Теперь map `offers` связывает поставщика с числом товаров: `40`, `120`, `5`.
+`fetch(name string) int` возвращает число через `return offers[name]`. Map только читается, не изменяется.
+`counts` хранит количества товаров. `var counts []int` — пустой слайс; каждая задача записывает результат `append` в эту переменную.
+
+```go filename="_video/05-append/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	var counts []int
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { counts = append(counts, fetch(name)) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Новые строки: 9 — `offers`; 11 и 15 — результат `int` и `return`; 21 — `counts`; 23 — общие чтение и запись;
+26 — вывод результата. `mahsulotlar` означает «товары», здесь — список количеств.
+
+**Прогноз:** **A)** всегда `[40 120 5]` · **B)** число может потеряться · **C)** ошибка компиляции
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Несколько горутин читают и изменяют общий `counts` без синхронизации: это **гонка данных**.
+`Wait` ждёт в конце, но не разделяет записи между собой. A предполагает порядок и безопасность; C путает ошибку выполнения с ошибкой компиляции.
+
+</details>
+
+Следующая команда **повторно выполнена в Docker**. `-race` проверяет конфликтующие обращения к памяти в выполненном коде.
+`-trimpath` заменяет файловые пути путями модуля. `2>&1` включает поток ошибок; `| sed -n` выводит только выбранные строки.
+Выбраны первые 18 строк и итог; промежуточные строки стека не выводятся.
+
+```console
+$ ./_video/race.sh 05-append go run -trimpath -race . 2>&1 | sed -n '1,18p;/^mahsulotlar:/p;/^jami:/p;/^Found /p;/^exit status/p;/^(chiqish/p'
+boshlandi: oloy
+boshlandi: chorsu
+boshlandi: siyob
+tayyor: siyob
+tayyor: chorsu
+tayyor: oloy
+==================
+WARNING: DATA RACE
+Read at 0x00c000124030 by goroutine 8:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0x54
+
+Previous write at 0x00c000124030 by goroutine 10:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0xc9
+
+Goroutine 8 (running) created at:
+  sync.(*WaitGroup).Go()
+mahsulotlar: [5 40]
+jami: 1.001180388s
+Found 2 data race(s)
+exit status 66
+(chiqish kodi: 1)
+```
+
+`WARNING: DATA RACE` означает конфликтующие обращения. `Read at` — чтение по адресу, `Previous write` — предыдущая запись.
+Горутины `8` и `10` — идентификаторы выполнения. `main.main.func1` — первая анонимная функция внутри `main`.
+`main.go:23` — строка ошибки; `+0x54` и `+0xc9` — смещения машинного кода внутри функции.
+`Found 2 data race(s)` — два отчёта. В этом запуске потеряно `120`: осталось `[5 40]`.
+В видео `[40 5]` тоже потеряло `120`; это записанный ранее результат.
+
+`exit status 66` — стандартный код проверяемой программы при обнаружении гонки. Строка скрипта `chiqish kodi: 1` — код команды `go run`.
+Это разные уровни кодов выхода.
+
+`append` читает заголовок слайса, при необходимости выделяет массив и возвращает обновлённый заголовок.
+`counts = …` записывает его в общую переменную. Таблица показывает возможную последовательность потери:
+
+| Шаг | A | B | Последний `counts` |
+|---|---|---|---|
+| чтение | получил `[40]` | получил `[40]` | `[40]` |
+| A пишет | `[40 120]` | ещё держит старое значение | `[40 120]` |
+| B пишет | завершён | `[40 5]` | `[40 5]`: `120` потеряно |
+
+Это не перечень допустимых результатов программы: на код с гонкой полагаться нельзя.
+Потеря видна не при каждом запуске. Следующее измерение выполнено без `-race`, с секундным ожиданием в каждой задаче.
+
+```console
+$ ./_video/olchov.sh append
+      3 sonlar=1
+      8 sonlar=2
+    189 sonlar=3
+```
+
+`sonlar=1/2/3` — число оставшихся значений; слева — количество запусков.
+В старых измерениях видео значения терялись в 7 и 20 запусках из 200. Сегодняшнее распределение показано выше.
+Числа меняются, ошибка остаётся: несколько писателей изменяют общий заголовок слайса.
+Порядок тоже не связан с порядком поставщиков. Одно лишь добавление блокировки не задаст нужный порядок индексов.
+
+## Исправление: каждая задача пишет свой элемент
+
+Длина результата известна заранее. `make([]int, len(suppliers))` выделяет нужное число элементов.
+Заголовок слайса не меняется; каждая горутина записывает только свой `counts[i]`.
+
+```go filename="_video/06-index/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	suppliers := []string{"chorsu", "oloy", "siyob"}
+	counts := make([]int, len(suppliers))
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Строка 21: `suppliers` — слайс имён. Строка 22: длина `counts` тоже три.
+Строка 23 даёт индекс `i` и имя `name`. Строка 24 записывает свой элемент; строка 26 ждёт перед чтением.
+`:=` в `for i, name := range` создаёт отдельные переменные на каждой итерации, если версия `go` модуля не ниже 1.22.
+Здесь `go 1.27`. Присваивание через `=` заранее объявленным переменным под это правило не попадает.
+
+По [официальному правилу](https://go.dev/ref/spec#Variables) каждый элемент слайса считается отдельной переменной.
+[Гарантия sync](https://pkg.go.dev/sync#WaitGroup.Go) позволяет читать записи этих задач после `Wait`.
+Если другая горутина читает или меняет те же элементы во время работы, нужна отдельная синхронизация.
+
+| Элемент | Кто пишет | После `Wait` |
+|---|---|---|
+| `counts[0]` | задача chorsu | 40 |
+| `counts[1]` | задача oloy | 120 |
+| `counts[2]` | задача siyob | 5 |
+
+**Прогноз:** **A)** `[40 120 5]`, без предупреждений · **B)** числа в порядке завершения · **C)** гонка общего `append`
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Место выбирается индексом, а не порядком завершения. Общий заголовок не изменяется; B и C относятся к старому коду.
+
+</details>
+
+```console
+$ ./_video/race.sh 06-index go run -race .
+boshlandi: siyob
+boshlandi: oloy
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: oloy
+tayyor: siyob
+mahsulotlar: [40 120 5]
+jami: 1.000461175s
+(chiqish kodi: 0)
+```
+
+В этом запуске предупреждений о гонке нет. Один чистый запуск не доказывает отсутствие гонок на всех путях;
+главный аргумент здесь — отдельные элементы и `Wait` перед чтением.
+
+## Владелец каждой горутины
+
+В backend-коде может встретиться такой фрагмент. Это не самостоятельная программа, а решение внутри обработчика.
+`sendReceipt(o)` отправляет чек для нового заказа `o`. `writeJSON` записывает ответ.
+
+```go
+go sendReceipt(o)
+writeJSON(w, http.StatusCreated, o)
+```
+
+`w` записывает ответ, `http.StatusCreated` — `201`. Вызовы находятся внутри `createOrder` из GB-5.10 и GB-6.08.
+Обработчик записывает ответ и возвращается, даже если отправка чека ещё продолжается.
+
+**Вопрос:** кто ждёт эту горутину? **A)** сервер автоматически · **B)** никто · **C)** `main` автоматически
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Ожидание здесь не написано. Возврат обработчика сам по себе не останавливает отдельную горутину.
+Но завершение программы может оборвать доставку чека. Учёта количества задач тоже нет.
+A и C предполагают скрытое ожидание в сервере или `main`.
+
+</details>
+
+**Владелец** — код, отвечающий за запуск и ожидание завершения. Это правило проектирования, а не требование языка Go.
+Владелец может передать работу другому явно указанному управляющему коду; ответственность должна оставаться понятной.
+В задании `fetchAll` ждёт все запущенные им задачи и только затем возвращается.
+
+| Код | Запускает | Ждёт завершения | При возврате |
+|---|---|---|---|
+| обработчик с `go sendReceipt(o)` | да | нет | чек ещё может отправляться |
+| исправленный `fetchAll` | да | `wg.Wait` | его вызовы `fetch` завершены |
+
+Сигнал остановки через `context` будет в GB-7.03, упорядоченная остановка сервера — в GB-8.03,
+работа, переживающая перезапуск процесса, — в GB-9.01.
+
+## Глубже (необязательно): `recover` не защищает другую горутину
+
+В `main` есть `defer` и `recover`, но `panic` возникает в горутине, запущенной через `wg.Go`.
+
+```go filename="_video/07-panic/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("ushlandi:", r)
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Go(func() { panic("chorsu: javob buzuq") })
+	wg.Wait()
+	fmt.Println("tugadi")
+}
+```
+
+Строки 9–13: отложенная функция `main` сохраняет результат `recover()` в `r` и печатает его, если он не `nil`.
+Строка 15 вызывает panic в другой горутине. Строка 17 должна была вывести `tugadi` («завершено»), но до неё выполнение не доходит.
+
+**Прогноз:** **A)** появится `ushlandi` · **B)** программа завершится с panic · **C)** panic будет проигнорирован
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `recover` перехватывает panic только в своей горутине, при правильном вызове из отложенной функции.
+A распространяет защиту на другую горутину; C предполагает автоматическое исчезновение panic.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-panic go run -trimpath .
+panic: chorsu: javob buzuq [recovered, repanicked]
+
+goroutine 19 [running]:
+sync.(*WaitGroup).Go.func1.1()
+	sync/waitgroup.go:251 +0x45
+panic({0x5593a0?, 0x4a4a60?})
+	runtime/panic.go:859 +0x125
+main.main.func2()
+	github.com/abdurahmon27/bozor/main.go:15 +0x25
+sync.(*WaitGroup).Go.func1()
+	sync/waitgroup.go:258 +0x4a
+created by sync.(*WaitGroup).Go in goroutine 1
+	sync/waitgroup.go:238 +0x7d
+exit status 2
+(chiqish kodi: 1)
+```
+
+`ushlandi` — сообщение «перехвачено» — не появилось. `goroutine 19 [running]` указывает горутину с panic.
+`main.main.func2` — вторая анонимная функция внутри `main`; `main.go:15` — строка panic.
+Строки `sync` и `runtime` — стек вызовов: по нему panic поднят повторно.
+`exit status 2` — код программы при panic; `1` в строке скрипта снова относится к `go run`.
+
+`[recovered, repanicked]` означает, что реализация `wg.Go` в Go 1.27.4 перехватила panic и вызвала его снова.
+Она не вызывает `Done`: иначе `Wait` мог бы разблокироваться и программа завершилась бы до окончания сообщения panic.
+Обычный `defer wg.Done()` уменьшает счётчик и при раскрутке стека. Поэтому формы не полностью эквивалентны при panic.
+**Контракт:** функция `f`, переданная в `wg.Go`, не должна паниковать. Возврат и сбор ошибок — тема `errgroup` в GB-7.04.
+
+`recoverPanic` из GB-6.01 тоже защищает только горутину, выполняющую обработчик.
+Неперехваченный panic в отдельной горутине `sendReceipt` завершит серверный процесс.
+
+## Частые ошибки
+
+1. **Считать, что `go` гарантирует завершение.** В `02-go` ошибка прошла без сообщения. Исправление: учитывать задачи и вызывать `Wait` до возврата.
+2. **Принимать `Sleep` за гарантию ожидания.** Полсекунды в `03-sleep` не дождались результата. Исправление: ждать завершения работы, а не времени.
+3. **Считать, что `WaitGroup` защищает общий `append`.** В `05-append` показан настоящий отчёт о гонке. Исправление: заранее `make`, каждой задаче свой `counts[i]`.
+4. **Вызывать `Add(1)` внутри горутины.** `Wait` может вернуться до регистрации. Перенесите `Add` перед `go` или используйте `wg.Go`.
+5. **Полагаться на `recover` из другой горутины.** В `07-panic` программа завершилась с `exit status 2`. Соблюдайте контракт `f`; внешний `recover` не защищает её.
+
+Первые две ошибки не дают сообщения компилятора. Файлы, строки и исправления для гонки и panic разобраны выше.
+
+## Проверьте себя
+
+1. Что происходит с незавершёнными горутинами при возврате `main`?
+
+<details>
+<summary>Ответ</summary>
+
+Программа завершается, не ожидая их. Результат начатой работы может потеряться.
+
+</details>
+
+2. Почему `wg.Wait`, а не `time.Sleep`?
+
+<details>
+<summary>Ответ</summary>
+
+`Sleep` ориентируется на длительность; `Wait` — на завершение задач группы. Если поставщик ускорится, ожидание тоже сократится.
+
+</details>
+
+3. Что выведет `counts` в `06-index`, если siyob завершится первым?
+**A)** `[5 40 120]` · **B)** `[40 120 5]` · **C)** только `[5]`
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Siyob пишет в свой индекс 2. `Wait` ждёт все три задачи; порядок завершения не меняет индексы.
+
+</details>
+
+4. GB-6.06: зачем для чужого заказа возвращать `404` вместо `403`?
+
+<details>
+<summary>Ответ</summary>
+
+bozor делает ответ таким же, как для отсутствующего заказа. Клиент не различит существование заказа; отдельный `403` раскрыл бы его.
+
+</details>
+
+## Домашнее задание
+
+[Папка урока и TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti),
+[код ответа](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-01-goroutine-hayoti/solution/main.go).
+
+🟢 **Сделайте `fetchAll` конкурентным.** Функция в `main.go` принимает слайс поставщиков и `fetch func(string) int`.
+Второй параметр — функция, принимающая строку и возвращающая `int`. Сейчас тело последовательное; меняйте только места задания.
+Импортируйте `"sync"`, запускайте задачи через `wg.Go`, пишите в `counts[i]`, вызывайте `wg.Wait()` перед возвратом.
+Не меняйте `offers`, `fetch`, `main` и тесты.
+
+🟡 **Необязательно: `fetchAllAddDone`.** Реализуйте то же поведение через `wg.Add(1)`, `go func() { … }()` и `defer wg.Done()`.
+Не используйте здесь `wg.Go`. Пока функция не реализована, её тест получает `SKIP`, то есть пропускается.
+
+Тест даёт пять поставщиков с ожиданиями `150, 120, 90, 60, 30 ms`. Сумма — 450 мс, конкурентное время — около 150 мс.
+Он проверяет завершение, порядок `[40 120 5 17 64]` и скорость. Ответы в десять раз быстрее выявляют угадывание через `Sleep`.
+`sync/atomic` считает завершённые вызовы; `go/parser` проверяет исходный текст жёлтого задания. Это внутренности теста.
+
+**Прогноз:** тест стартового кода **A)** пройдёт · **B)** упадёт из-за последовательности · **C)** не скомпилируется
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Код корректен синтаксически, но задачи последовательны. Сообщение теста просит запускать их отдельно через `wg.Go`.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaFetchAll (0.45s)
+    tekshiruv_test.go:97: fetchAll 5 ta yetkazuvchini 452ms'da oʻqidi: ular ketma-ket ishlayapti (450ms atrofida). Bir vaqtda boʻlsa, eng sekini, ya'ni ~150ms atrofida tugaydi: har fetch'ni wg.Go bilan alohida goroutine'da boshlang
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.455s
+FAIL
+(chiqish kodi: 1)
+```
+
+`tekshiruv_test.go:97` — строка вызова проверки; `FAIL` означает неуспешный тест.
+Время около 450 мс указывает на последовательность. Примените подсказку и запускайте `go test .` до `ok`.
+Для проверки через `./...` есть `go test ./...`: команда берёт пакеты модуля и `solution`, пропуская папки `_video`.
+
+<details>
+<summary>Решение и объяснение</summary>
+
+Ниже полный файл ответа. `counts` выделяется заранее; `fetchAll` ждёт запущенные им задачи.
+Жёлтый вариант тоже вызывает `Add` до запуска работы. При пустом входе цикл не выполняется, `Wait` сразу возвращается.
+
+```go filename="solution/main.go" showLineNumbers
+// bozor import'ining birinchi qadami (GB-7.01): bir nechta yetkazib beruvchidan narx roʻyxatini
+// bir vaqtda oʻqish. Tarmoq oʻrniga time.Sleep: har yetkazuvchi bir soniyada javob beradi.
+// Toʻliq importer (cmd/import, bekor qilish, chegaralangan worker'lar) GB-7.07'da.
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// offers — har yetkazib beruvchining narx roʻyxatida nechta mahsulot bor (laboratoriya maʼlumoti).
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+// fetch — bitta yetkazuvchining roʻyxatini "oʻqiydi" va undagi mahsulotlar sonini qaytaradi.
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+// fetchAll har yetkazuvchi uchun fetch'ni chaqiradi va natijalarni xuddi suppliers tartibida qaytaradi:
+// counts[i] = fetch(suppliers[i]).
+//
+// Javob (TASK.md, 1-qadam): har fetch alohida goroutine'da (wg.Go), har goroutine oʻz counts[i]'iga yozadi
+// (har element alohida xotira joyi: data race yoʻq), fetchAll qaytishdan oldin hammasini kutadi (wg.Wait).
+// fetchAll — bu goroutine'larning egasi: u qaytganda ulardan birortasi ham ishlamayapti.
+func fetchAll(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	return counts
+}
+
+// fetchAllAddDone — 🟡 javob (TASK.md, 2-qadam): xuddi fetchAll, eski shaklda. wg.Add(1) go'dan OLDIN
+// (goroutine ichida emas: aks holda Wait hisob hali nol paytda qaytib ketishi mumkin), Done esa defer bilan.
+// wg.Go shu ikki qatorni oʻzi bajaradi, bitta farq bilan: f panic qilsa, wg.Go Done'ni chaqirmaydi va panic'ni
+// qayta tashlaydi, Wait ochilib, dastur panic tugashidan oldin chiqib ketmasin deb (src/sync/waitgroup.go).
+// Hujjat yangi kodda wg.Go'ni tavsiya qiladi (go doc sync.WaitGroup.Add).
+func fetchAllAddDone(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			counts[i] = fetch(name)
+		}()
+	}
+	wg.Wait()
+	return counts
+}
+
+func main() {
+	start := time.Now()
+	counts := fetchAll([]string{"chorsu", "oloy", "siyob"}, fetch)
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Новый `wg` в `fetchAll` локален; у каждого вызова своя группа. `return counts` выполняется только после ожидания.
+Лабораторный `fetch` не возвращает ошибку. Обработка сетевых ошибок и отмена добавляются в GB-7.03–7.04.
+
+Проверим ответ из той же папки; `./solution/` выбирает пакет ответа.
+
+```console
+$ CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4 go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	(cached)
+```
+
+Ответ также проверен с `-race` внутри Docker:
+
+```console
+$ ./_video/race.sh solution go test -race .
+ok  	github.com/abdurahmon27/bozor	1.347s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## Источники
+
+- [Go statements](https://go.dev/ref/spec#Go_statements), [Program execution](https://go.dev/ref/spec#Program_execution), [Variables](https://go.dev/ref/spec#Variables), [Appending to slices](https://go.dev/ref/spec#Appending_and_copying_slices), [Handling panics](https://go.dev/ref/spec#Handling_panics).
+- [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup), [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [WaitGroup.Add](https://pkg.go.dev/sync#WaitGroup.Add), [WaitGroup.Wait](https://pkg.go.dev/sync#WaitGroup.Wait), [исходный код Go 1.27.4](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/sync/waitgroup.go).
+- [Модель памяти Go](https://go.dev/ref/mem): конфликтующие обращения и синхронизация.
+- [Go 1.25](https://go.dev/doc/go1.25), [переменные цикла в Go 1.22](https://go.dev/doc/go1.22#language), [условие версии go.mod](https://go.dev/blog/loopvar-preview).
+- [Data Race Detector](https://go.dev/doc/articles/race_detector), [настройка exitcode](https://go.dev/doc/articles/race_detector#Options).
+- [time.Sleep](https://pkg.go.dev/time#Sleep), [time.Since](https://pkg.go.dev/time#Since), [net/http.Handler и panic](https://pkg.go.dev/net/http#Handler).
+- [Dave Cheney: заранее знайте, как завершится горутина](https://dave.cheney.net/2016/12/22/never-start-a-goroutine-without-knowing-how-it-will-stop).
+- [OWASP: проверка доступа к объекту](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/).
+
+Результаты: `go1.27.4 linux/amd64`, 2026-11-28. Обычные запуски — `CGO_ENABLED=0`; `-race` в Docker — `CGO_ENABLED=1`.
+Время, адреса памяти и идентификаторы горутин у вас будут другими.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+---
+
+← Предыдущий урок: [GB-6.08](/lab/youtube/gb/gb-6-08/ru) · Следующий урок: [GB-7.02](/lab/youtube/gb/gb-7-02/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

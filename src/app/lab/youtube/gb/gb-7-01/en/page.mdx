@@ -1,0 +1,913 @@
+---
+title: "Goroutines and their lifetime: who starts, who waits"
+date: "2026/11/28"
+description: "Start work with go, understand main returning, wait with WaitGroup, and collect results without a data race."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-01) · [Русский](/lab/youtube/gb/gb-7-01/ru) · **English**  
+Lesson GB-7.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+bozor reads price lists from three suppliers. If each response takes one second, why wait three seconds?
+How can we start all three together and know they have finished?
+
+**The one idea:** starting work in a new goroutine does not wait for it. The code that starts work should manage its completion too.
+In this lab, `sync.WaitGroup` waits for completion; `time.Sleep` only guesses a duration.
+
+By the end you will:
+
+- start a function with `go` and explain what happens when `main` returns;
+- start three tasks with `wg.Go` and wait for them with `wg.Wait`;
+- find the shared `append` bug and write results to separate indexes;
+- check who owns work started in a handler and complete the `fetchAll` task.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| goroutine | a function execution running concurrently with other code, managed by the Go runtime | goroutine |
+| WaitGroup | a `sync` type that counts started tasks and waits for them to finish | WaitGroup |
+| goroutine owner | code responsible for starting work and waiting for its completion | goroutine owner |
+
+## Before you start
+
+Start with [GB-6.08 · Protected bozor](/lab/youtube/gb/gb-6-08/en) and [GB-4.07 · Mutex and data races](/lab/youtube/gb/gb-4-07/en).
+Also needed: [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en), [GB-2.02 · Maps](/lab/youtube/gb/gb-2-02/en), [GB-2.09 · defer, panic, recover](/lab/youtube/gb/gb-2-09/en),
+[GB-5.05 · pgx and timing](/lab/youtube/gb/gb-5-05/en), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/en),
+[GB-6.06 · Order access](/lab/youtube/gb/gb-6-06/en), [GB-5.10 · Orders API](/lab/youtube/gb/gb-5-10/en), and [GB-4.02 · HTTP client](/lab/youtube/gb/gb-4-02/en).
+For basic syntax: [GB-1.01](/lab/youtube/gb/gb-1-01/en), [GB-1.02](/lab/youtube/gb/gb-1-02/en), [GB-1.06](/lab/youtube/gb/gb-1-06/en),
+[GB-1.07](/lab/youtube/gb/gb-1-07/en), [GB-1.08](/lab/youtube/gb/gb-1-08/en).
+
+The [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti) is a standalone module with `go 1.27` in `go.mod`.
+Open your terminal in `lessons/gb-7-01-goroutine-hayoti`. These runs used Go 1.27.4 and Docker; Postgres is unnecessary.
+Run every command from this folder. `./_video/run.sh STEP go run .` copies a step into a temporary folder and runs it.
+The script sets `CGO_ENABLED=0` and ends with `(chiqish kodi: N)`, meaning “exit code”.
+This Linux machine lacks a C compiler for `-race`: `race.sh` runs Docker with `CGO_ENABLED=1` and gcc.
+It also uses the Go 1.27.4 toolchain. Outputs below were re-run; video figures are identified separately.
+
+**Recall GB-6.08.** Why does an access test need two buyers?
+**A)** request someone else's order · **B)** limit attempts · **C)** check a password
+
+<details>
+<summary>Answer</summary>
+
+**A.** The second buyer requests the first buyer’s order. One buyer does not test access to another buyer’s order. B and C test other rules.
+
+</details>
+
+## Start with sequential execution
+
+`time.Sleep(time.Second)` stands in for the network: a supplier appears to respond after one second.
+`fetch` reads a list; `name` is the supplier’s name. For now, `fetch` returns no value.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | executable program package |
+| 3–6 | `import` | `fmt` prints text; `time` handles time |
+| 8 | `func fetch(name string)` | function with a string parameter; `{}` delimit the body |
+| 9 | `fmt.Println` | prints `boshlandi:` (“started”) and the name |
+| 10 | `time.Sleep(time.Second)` | pauses this goroutine for at least one second |
+| 11–12 | `fmt.Println`, `}` | prints `tayyor:` (“ready”) and finishes the function |
+| 14 | `func main()` | program entry function |
+| 15 | `start := time.Now()` | saves the starting time in variable `start` |
+| 16 | `for _, name := range []string{…}` | traverses a three-name slice; `_` discards the index |
+| 17–18 | `fetch(name)` | completes one call before moving to the next |
+| 19–20 | `time.Since(start)` | prints elapsed time with `jami:` (“total”); `main` returns |
+
+The dot selects a package member; `()` calls it; quotes delimit text. Blank lines do not execute.
+
+**Predict:** how long? **A)** ~1 s · **B)** ~3 s · **C)** almost 0 s
+
+<details>
+<summary>Answer</summary>
+
+**B.** Three one-second waits happen sequentially. A assumes overlapping waits; C assumes no waiting.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+boshlandi: chorsu
+tayyor: chorsu
+boshlandi: oloy
+tayyor: oloy
+boshlandi: siyob
+tayyor: siyob
+jami: 3.001382105s
+(chiqish kodi: 0)
+```
+
+| Stage | What `main` does | State |
+|---|---|---|
+| start | waits inside `fetch("chorsu")` | the others have not started |
+| next | waits inside `fetch("oloy")` | chorsu has finished |
+| end | waits for `fetch("siyob")` | then prints `jami` |
+
+The duration is the sum of three simulated waits. A hundred sequential one-second waits would take a hundred seconds in this model.
+
+## `go`: start without waiting
+
+Add one word: `go fetch(name)`. A **goroutine** is a separate function execution managed by the Go runtime.
+The runtime is Go’s supporting code that runs with the program. `main` also runs in a goroutine.
+`go` evaluates the function and arguments in the calling goroutine, then starts a new goroutine.
+It does not wait for the call to finish; returned values are discarded. [Official rule](https://go.dev/ref/spec#Go_statements).
+
+```go filename="_video/02-go/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Line 17 changed: `go` precedes `fetch(name)`. `main` starts three tasks and moves to `jami`.
+
+**Predict:** what appears? **A)** always three `tayyor` lines · **B)** `jami`, possibly `boshlandi` too · **C)** an unfinished-work error
+
+<details>
+<summary>Answer</summary>
+
+**B.** When `main` returns, the program exits without waiting for other goroutines. A assumes an implicit wait; C assumes a mandatory error; neither exists.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-go go run .
+boshlandi: chorsu
+jami: 4.094µs
+(chiqish kodi: 0)
+```
+
+`µs` means microseconds. A tiny `jami` does not mean the work finished: the program exited before the results.
+The [official rule](https://go.dev/ref/spec#Program_execution) says returning from `main` does not wait for other goroutines.
+This does not give them an orderly shutdown; do not rely on their deferred calls running either.
+
+| Event | `main` | Three tasks |
+|---|---|---|
+| `go fetch` | moves to the next line | ready to run or already running |
+| `main` returns | program exits | unfinished work cannot continue |
+
+`olchov.sh go` builds the program once and runs it 200 times. It groups runs by their numbers of `boshlandi` and `tayyor` lines.
+
+```console
+$ ./_video/olchov.sh go
+    110 boshlandi=0 tayyor=0
+     35 boshlandi=1 tayyor=0
+     28 boshlandi=2 tayyor=0
+     27 boshlandi=3 tayyor=0
+```
+
+The recorded video distribution was `110 / 32 / 37 / 21`; that is quoted, not a new run.
+Today’s distribution is `110 / 35 / 28 / 27`, shown above. Both had zero `tayyor` lines.
+The percentages are not a rule: the cause is missing completion waiting.
+
+## `Sleep`: elapsed time does not prove completion
+
+Add `time.Sleep(500 * time.Millisecond)` to `main`. `*` multiplies the duration by 500, giving half a second.
+
+```go filename="_video/03-sleep/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	time.Sleep(500 * time.Millisecond)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+**Predict:** `main` waits 0.5 s, `fetch` waits 1 s. **A)** three `tayyor` lines · **B)** usually three `boshlandi`, no `tayyor` · **C)** always only `jami`
+
+<details>
+<summary>Answer</summary>
+
+**B is the usual result.** Half a second allowed work to start, but not finish. A ignores the one-second wait; C excludes goroutines starting. Scheduling order is not guaranteed.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-sleep go run .
+boshlandi: siyob
+boshlandi: chorsu
+boshlandi: oloy
+jami: 500.059456ms
+(chiqish kodi: 0)
+```
+
+`Sleep` waits for at least the specified duration, not exactly that duration. Increasing it to two seconds adds unnecessary waiting here.
+If the supplier responds after three seconds, two seconds is insufficient. These numbers illustrate the guess; they are not separate measurements.
+
+| `main` waits | Work state | Outcome |
+|---|---|---|
+| 0.5 s | one-second work is unfinished | result is lost |
+| 2 s | one-second work has usually finished | unnecessary waiting |
+| 2 s | three-second work is unfinished | result is lost again |
+
+## `WaitGroup`: wait for work, not time
+
+We need to know whether started tasks have finished. **WaitGroup** counts those tasks.
+`var wg sync.WaitGroup` is ready at its zero value. `wg` is the variable name; `"sync"` was added to the imports.
+`wg.Go(func() { fetch(name) })` starts an anonymous function in a new goroutine and counts the task.
+When the function returns, the task is removed. `wg.Wait()` blocks its caller until the counter is zero.
+`wg.Go` was added in Go 1.25.
+
+```go filename="_video/04-wg/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+New lines: 5 imports `sync`, 17 declares `wg`, 19 starts a task, and 21 waits for all tasks.
+`func() { … }` is a function with no parameters or result; it executes `fetch(name)`.
+
+**Predict:** **A)** ~1 s and three `tayyor` lines · **B)** ~3 s and three `tayyor` lines · **C)** ~0 s, no `tayyor`
+
+<details>
+<summary>Answer</summary>
+
+**A.** The three waits overlap. B assumes sequential work; C ignores `Wait`.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-wg go run .
+boshlandi: chorsu
+boshlandi: siyob
+boshlandi: oloy
+tayyor: oloy
+tayyor: siyob
+tayyor: chorsu
+jami: 1.000144574s
+(chiqish kodi: 0)
+```
+
+| Event | Counter | `main` |
+|---|---|---|
+| tasks are registered | +1 per task | in the loop |
+| a task returns | −1 per task | may be waiting in `Wait` |
+| all tasks have returned | 0 | continues after `Wait` |
+
+Tasks can finish while others are still being registered; the counter need not first reach three.
+Calls to `wg.Go` starting from an empty group must precede `Wait`. Here they are in the loop; `Wait` follows it.
+
+| Version | Recorded video figures, not new runs | Today’s run |
+|---|---|---|
+| sequential | 3.002459679 s | 3.001382105 s |
+| `wg.Go` + `Wait` | 1.003058399 s | 1.000144574 s |
+
+The useful result is the roughly three-to-one ratio: the waits overlap. This is not a CPU computation benchmark.
+Start and completion order are not guaranteed.
+
+The [sync documentation](https://pkg.go.dev/sync#WaitGroup.Go) orders task writes before completion relative to reads after waiting.
+This guarantee covers tasks counted by this WaitGroup. It does not make conflicting writes between goroutines safe.
+
+## The older form: `Add`, `go`, `Done`
+
+You will also encounter this form at work. The documentation recommends `wg.Go` for new code.
+
+```go filename="_video/08-adddone/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fetch(name)
+		}()
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Line 19: `wg.Add(1)` counts the task **before go**. Lines 20–23: `go func() { … }()` starts an anonymous function.
+The final `()` calls it; `defer wg.Done()` decreases the counter on return or during panic unwinding.
+Line 25 waits for all tasks. Moving `Add` inside the goroutine can let `Wait` see zero and return too early.
+This bug can be silent; the compiler does not fix it.
+
+**Predict:** **A)** ~1 s · **B)** ~3 s · **C)** the counter never decreases
+
+<details>
+<summary>Answer</summary>
+
+**A.** Tasks run in separate goroutines and each calls `Done`. B assumes sequential work; C assumes `defer` never runs.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-adddone go run .
+boshlandi: oloy
+boshlandi: siyob
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: siyob
+tayyor: oloy
+jami: 1.000167093s
+(chiqish kodi: 0)
+```
+
+This form is not exactly equivalent to `wg.Go` during a panic; the optional section explains the difference.
+
+## Results: a data race in shared `append`
+
+The `offers` map now associates suppliers with product counts: `40`, `120`, `5`.
+`fetch(name string) int` returns that count with `return offers[name]`. The map is read without modification.
+`counts` holds product counts. `var counts []int` is an empty slice; each task assigns the result of `append` to this variable.
+
+```go filename="_video/05-append/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	var counts []int
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { counts = append(counts, fetch(name)) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+New lines: 9 defines `offers`; 11 and 15 add an `int` result and `return`; 21 declares `counts`; 23 shares reads and writes;
+26 prints the results. `mahsulotlar` means “products”, here a list of product counts.
+
+**Predict:** **A)** always `[40 120 5]` · **B)** a count may be lost · **C)** compilation error
+
+<details>
+<summary>Answer</summary>
+
+**B.** Several goroutines read and write shared `counts` without synchronization: a **data race**.
+`Wait` waits at the end but does not serialize the writers. A assumes ordering and safety; C mistakes a runtime bug for a compilation error.
+
+</details>
+
+The following command was **re-run in Docker**. `-race` checks conflicting memory accesses in executed code paths.
+`-trimpath` replaces filesystem paths with module paths. `2>&1` includes the error stream; `| sed -n` prints selected lines only.
+It selects the first 18 lines and the result summary; intermediate stack lines are omitted.
+
+```console
+$ ./_video/race.sh 05-append go run -trimpath -race . 2>&1 | sed -n '1,18p;/^mahsulotlar:/p;/^jami:/p;/^Found /p;/^exit status/p;/^(chiqish/p'
+boshlandi: oloy
+boshlandi: chorsu
+boshlandi: siyob
+tayyor: siyob
+tayyor: chorsu
+tayyor: oloy
+==================
+WARNING: DATA RACE
+Read at 0x00c000124030 by goroutine 8:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0x54
+
+Previous write at 0x00c000124030 by goroutine 10:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0xc9
+
+Goroutine 8 (running) created at:
+  sync.(*WaitGroup).Go()
+mahsulotlar: [5 40]
+jami: 1.001180388s
+Found 2 data race(s)
+exit status 66
+(chiqish kodi: 1)
+```
+
+`WARNING: DATA RACE` reports conflicting accesses. `Read at` identifies a read; `Previous write` identifies an earlier write.
+Goroutines `8` and `10` are execution identifiers. `main.main.func1` is the first anonymous function inside `main`.
+`main.go:23` identifies the faulty line; `+0x54` and `+0xc9` are machine-code offsets within the function.
+`Found 2 data race(s)` means two reports. This run lost `120`, leaving `[5 40]`.
+The video’s `[40 5]` also lost `120`; that is an older recorded result.
+
+`exit status 66` is the checked program’s default race exit code. The script’s `chiqish kodi: 1` is the `go run` command’s status.
+These are different levels of exit status.
+
+`append` reads the slice header, allocates an array if needed, and returns an updated header.
+`counts = …` writes it to the shared variable. The table shows one possible sequence that loses a value:
+
+| Step | A | B | Latest `counts` |
+|---|---|---|---|
+| read | obtained `[40]` | obtained `[40]` | `[40]` |
+| A writes | `[40 120]` | still holds the old value | `[40 120]` |
+| B writes | finished | `[40 5]` | `[40 5]`: `120` is lost |
+
+This is not an exhaustive list of allowed program results: do not rely on racy code.
+Loss is not visible on every run. The next measurement ran without `-race`, with each task still waiting one second.
+
+```console
+$ ./_video/olchov.sh append
+      3 sonlar=1
+      8 sonlar=2
+    189 sonlar=3
+```
+
+`sonlar=1/2/3` counts surviving values; the number on the left counts runs.
+The video’s older measurements lost values in 7 and 20 of 200 runs. Today’s distribution is shown above.
+The numbers change, but the bug remains: several writers modify one shared slice header.
+Order is not tied to supplier order either. Adding a lock alone would not establish the required index order.
+
+## Fix: each task writes its own element
+
+The result length is known in advance. `make([]int, len(suppliers))` allocates that many elements.
+The slice header stays unchanged; each goroutine writes only its own `counts[i]`.
+
+```go filename="_video/06-index/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	suppliers := []string{"chorsu", "oloy", "siyob"}
+	counts := make([]int, len(suppliers))
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Line 21 defines `suppliers`, a slice of names. Line 22 gives `counts` the same length: three.
+Line 23 supplies index `i` and name `name`. Line 24 writes one element; line 26 waits before reading.
+The `:=` in `for i, name := range` creates distinct variables per iteration when the module’s `go` version is at least 1.22.
+This module declares `go 1.27`. Assignment with `=` to previously declared variables does not have that rule.
+
+The [official rules](https://go.dev/ref/spec#Variables) treat each slice element as a separate variable.
+The [sync guarantee](https://pkg.go.dev/sync#WaitGroup.Go) lets us read these tasks’ writes after `Wait`.
+If another goroutine reads or writes those same elements during the work, it needs separate synchronization.
+
+| Element | Writer | After `Wait` |
+|---|---|---|
+| `counts[0]` | chorsu task | 40 |
+| `counts[1]` | oloy task | 120 |
+| `counts[2]` | siyob task | 5 |
+
+**Predict:** **A)** `[40 120 5]`, no warning · **B)** counts in completion order · **C)** the shared `append` race
+
+<details>
+<summary>Answer</summary>
+
+**A.** The index selects the destination, not completion order. There is no shared header write; B and C describe the old code.
+
+</details>
+
+```console
+$ ./_video/race.sh 06-index go run -race .
+boshlandi: siyob
+boshlandi: oloy
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: oloy
+tayyor: siyob
+mahsulotlar: [40 120 5]
+jami: 1.000461175s
+(chiqish kodi: 0)
+```
+
+This run produced no race warning. One clean run does not prove every path race-free;
+the main argument is separate elements and `Wait` before reading.
+
+## Every goroutine needs an owner
+
+You may encounter this fragment in a backend. It illustrates a handler decision rather than a complete runnable program.
+`sendReceipt(o)` sends a receipt for the new order `o`. `writeJSON` writes the response.
+
+```go
+go sendReceipt(o)
+writeJSON(w, http.StatusCreated, o)
+```
+
+`w` writes the response; `http.StatusCreated` is `201`. The calls belong inside `createOrder` from GB-5.10 and GB-6.08.
+The handler writes the response and returns even if receipt delivery is still running.
+
+**Question:** who waits for this goroutine? **A)** the server automatically · **B)** nobody · **C)** `main` automatically
+
+<details>
+<summary>Answer</summary>
+
+**B.** No wait is written here. Returning from the handler does not itself stop a separate goroutine.
+But program exit can interrupt receipt delivery. There is no task accounting either.
+A and C assume the server or `main` provides an implicit wait.
+
+</details>
+
+An **owner** is code responsible for starting work and waiting for completion. This is a design rule, not a Go language requirement.
+An owner can hand work to another explicit manager; responsibility should remain clear.
+The homework’s `fetchAll` waits for every task it starts before returning.
+
+| Code | Starts work | Waits for completion | On return |
+|---|---|---|---|
+| handler with `go sendReceipt(o)` | yes | no | receipt delivery may still be running |
+| fixed `fetchAll` | yes | `wg.Wait` | its `fetch` calls have finished |
+
+The stop signal through `context` comes in GB-7.03, orderly server shutdown in GB-8.03,
+and work that survives a process restart in GB-9.01.
+
+## Going deeper (optional): `recover` does not protect another goroutine
+
+`main` has `defer` and `recover`, but the panic occurs in the goroutine started by `wg.Go`.
+
+```go filename="_video/07-panic/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("ushlandi:", r)
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Go(func() { panic("chorsu: javob buzuq") })
+	wg.Wait()
+	fmt.Println("tugadi")
+}
+```
+
+Lines 9–13: `main`’s deferred function stores `recover()` in `r` and prints it if it is not `nil`.
+Line 15 panics in another goroutine. Line 17 would print `tugadi` (“finished”), but execution never reaches it.
+
+**Predict:** **A)** prints `ushlandi` · **B)** the program terminates with a panic · **C)** ignores the panic
+
+<details>
+<summary>Answer</summary>
+
+**B.** `recover` can catch a panic only in its own goroutine, when called correctly from a deferred function.
+A extends protection across goroutines; C assumes the panic disappears automatically.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-panic go run -trimpath .
+panic: chorsu: javob buzuq [recovered, repanicked]
+
+goroutine 19 [running]:
+sync.(*WaitGroup).Go.func1.1()
+	sync/waitgroup.go:251 +0x45
+panic({0x5593a0?, 0x4a4a60?})
+	runtime/panic.go:859 +0x125
+main.main.func2()
+	github.com/abdurahmon27/bozor/main.go:15 +0x25
+sync.(*WaitGroup).Go.func1()
+	sync/waitgroup.go:258 +0x4a
+created by sync.(*WaitGroup).Go in goroutine 1
+	sync/waitgroup.go:238 +0x7d
+exit status 2
+(chiqish kodi: 1)
+```
+
+`ushlandi`, meaning “caught”, was not printed. `goroutine 19 [running]` identifies the goroutine that panicked.
+`main.main.func2` is the second anonymous function in `main`; `main.go:15` is its panic line.
+The `sync` and `runtime` lines form the call stack through which the panic was raised again.
+`exit status 2` is the panicking program’s status; the script’s `1` again belongs to `go run`.
+
+`[recovered, repanicked]` means Go 1.27.4’s `wg.Go` implementation caught the panic and raised it again.
+It does not call `Done`: otherwise `Wait` could unblock and the program could exit before panic reporting finishes.
+An ordinary `defer wg.Done()` also decreases the counter during panic unwinding. The forms therefore differ during a panic.
+**Contract:** the function `f` passed to `wg.Go` must not panic. Returning and collecting errors comes with `errgroup` in GB-7.04.
+
+GB-6.01’s `recoverPanic` also protects only the goroutine running the handler.
+An unrecovered panic in a separate `sendReceipt` goroutine terminates the server process.
+
+## Common mistakes
+
+1. **Assuming `go` guarantees completion.** `02-go` failed silently. Fix: register tasks and call `Wait` before returning.
+2. **Treating `Sleep` as a completion guarantee.** Half a second in `03-sleep` did not wait for results. Fix: wait for work, not elapsed time.
+3. **Assuming `WaitGroup` protects shared `append`.** `05-append` shows a real race report. Fix: allocate with `make` and give each task its own `counts[i]`.
+4. **Calling `Add(1)` inside the goroutine.** `Wait` can return before registration. Move `Add` before `go` or use `wg.Go`.
+5. **Relying on `recover` in another goroutine.** `07-panic` terminated with `exit status 2`. Respect the contract for `f`; an outer `recover` does not protect it.
+
+The first two bugs produce no compiler message. The files, line numbers, and fixes for the race and panic are explained above.
+
+## Check yourself
+
+1. What happens to unfinished goroutines when `main` returns?
+
+<details>
+<summary>Answer</summary>
+
+The program exits without waiting for them. Started work can lose its result.
+
+</details>
+
+2. Why use `wg.Wait` rather than `time.Sleep`?
+
+<details>
+<summary>Answer</summary>
+
+`Sleep` follows a duration; `Wait` follows completion of the group’s tasks. Faster suppliers also shorten the wait.
+
+</details>
+
+3. What does `counts` contain in `06-index` if siyob finishes first?
+**A)** `[5 40 120]` · **B)** `[40 120 5]` · **C)** only `[5]`
+
+<details>
+<summary>Answer</summary>
+
+**B.** Siyob writes index 2. `Wait` waits for all three tasks; completion order does not change the indexes.
+
+</details>
+
+4. GB-6.06: why return `404` rather than `403` for another buyer’s order?
+
+<details>
+<summary>Answer</summary>
+
+bozor makes the response match an absent order. The client cannot distinguish existence; a separate `403` would reveal it.
+
+</details>
+
+## Homework
+
+The [lesson folder and TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti),
+and the [answer code](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-01-goroutine-hayoti/solution/main.go).
+
+🟢 **Make `fetchAll` concurrent.** The function in `main.go` receives a suppliers slice and `fetch func(string) int`.
+The second parameter is a function taking a string and returning an `int`. Its current body is sequential; change only the task locations.
+Import `"sync"`, start tasks with `wg.Go`, write `counts[i]`, and call `wg.Wait()` before returning.
+Keep `offers`, `fetch`, `main`, and the tests unchanged.
+
+🟡 **Optional: `fetchAllAddDone`.** Implement the same behavior using `wg.Add(1)`, `go func() { … }()`, and `defer wg.Done()`.
+Do not use `wg.Go` in this function. Until implemented, its test reports `SKIP`, meaning it is skipped.
+
+The test supplies five suppliers with waits of `150, 120, 90, 60, 30 ms`. Their sum is 450 ms; concurrent time is roughly 150 ms.
+It checks completion, the order `[40 120 5 17 64]`, and speed. Ten-times-faster responses detect duration guessing with `Sleep`.
+`sync/atomic` counts finished calls; `go/parser` checks source text for the yellow task. These are test internals.
+
+**Predict:** the starter test **A)** passes · **B)** fails because it is sequential · **C)** does not compile
+
+<details>
+<summary>Answer</summary>
+
+**B.** The code is valid but the work is sequential. The test message asks for separate tasks started with `wg.Go`.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaFetchAll (0.45s)
+    tekshiruv_test.go:97: fetchAll 5 ta yetkazuvchini 452ms'da oʻqidi: ular ketma-ket ishlayapti (450ms atrofida). Bir vaqtda boʻlsa, eng sekini, ya'ni ~150ms atrofida tugaydi: har fetch'ni wg.Go bilan alohida goroutine'da boshlang
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.455s
+FAIL
+(chiqish kodi: 1)
+```
+
+`tekshiruv_test.go:97` identifies the test call site; `FAIL` means the check failed.
+A duration near 450 ms reveals sequential execution. Apply the hint and run `go test .` until it reports `ok`.
+For a `./...` check, `go test ./...` includes the module’s packages and `solution`, while skipping `_video` folders.
+
+<details>
+<summary>Solution and explanation</summary>
+
+The complete answer file follows. `counts` is allocated in advance; `fetchAll` waits for the tasks it started.
+The yellow version also calls `Add` before starting work. With empty input the loop does nothing and `Wait` returns immediately.
+
+```go filename="solution/main.go" showLineNumbers
+// bozor import'ining birinchi qadami (GB-7.01): bir nechta yetkazib beruvchidan narx roʻyxatini
+// bir vaqtda oʻqish. Tarmoq oʻrniga time.Sleep: har yetkazuvchi bir soniyada javob beradi.
+// Toʻliq importer (cmd/import, bekor qilish, chegaralangan worker'lar) GB-7.07'da.
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// offers — har yetkazib beruvchining narx roʻyxatida nechta mahsulot bor (laboratoriya maʼlumoti).
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+// fetch — bitta yetkazuvchining roʻyxatini "oʻqiydi" va undagi mahsulotlar sonini qaytaradi.
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+// fetchAll har yetkazuvchi uchun fetch'ni chaqiradi va natijalarni xuddi suppliers tartibida qaytaradi:
+// counts[i] = fetch(suppliers[i]).
+//
+// Javob (TASK.md, 1-qadam): har fetch alohida goroutine'da (wg.Go), har goroutine oʻz counts[i]'iga yozadi
+// (har element alohida xotira joyi: data race yoʻq), fetchAll qaytishdan oldin hammasini kutadi (wg.Wait).
+// fetchAll — bu goroutine'larning egasi: u qaytganda ulardan birortasi ham ishlamayapti.
+func fetchAll(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	return counts
+}
+
+// fetchAllAddDone — 🟡 javob (TASK.md, 2-qadam): xuddi fetchAll, eski shaklda. wg.Add(1) go'dan OLDIN
+// (goroutine ichida emas: aks holda Wait hisob hali nol paytda qaytib ketishi mumkin), Done esa defer bilan.
+// wg.Go shu ikki qatorni oʻzi bajaradi, bitta farq bilan: f panic qilsa, wg.Go Done'ni chaqirmaydi va panic'ni
+// qayta tashlaydi, Wait ochilib, dastur panic tugashidan oldin chiqib ketmasin deb (src/sync/waitgroup.go).
+// Hujjat yangi kodda wg.Go'ni tavsiya qiladi (go doc sync.WaitGroup.Add).
+func fetchAllAddDone(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			counts[i] = fetch(name)
+		}()
+	}
+	wg.Wait()
+	return counts
+}
+
+func main() {
+	start := time.Now()
+	counts := fetchAll([]string{"chorsu", "oloy", "siyob"}, fetch)
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+The new `wg` in `fetchAll` is local; each call has its own group. `return counts` executes only after waiting.
+The lab’s `fetch` cannot return an error. Network-error handling and cancellation arrive in GB-7.03–7.04.
+
+Check the answer from the same folder; `./solution/` selects the answer package.
+
+```console
+$ CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4 go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	(cached)
+```
+
+The answer was also checked with `-race` inside Docker:
+
+```console
+$ ./_video/race.sh solution go test -race .
+ok  	github.com/abdurahmon27/bozor	1.347s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## Sources
+
+- [Go statements](https://go.dev/ref/spec#Go_statements), [Program execution](https://go.dev/ref/spec#Program_execution), [Variables](https://go.dev/ref/spec#Variables), [Appending to slices](https://go.dev/ref/spec#Appending_and_copying_slices), [Handling panics](https://go.dev/ref/spec#Handling_panics).
+- [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup), [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [WaitGroup.Add](https://pkg.go.dev/sync#WaitGroup.Add), [WaitGroup.Wait](https://pkg.go.dev/sync#WaitGroup.Wait), [Go 1.27.4 implementation](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/sync/waitgroup.go).
+- [The Go Memory Model](https://go.dev/ref/mem): conflicting accesses and synchronization.
+- [Go 1.25](https://go.dev/doc/go1.25), [Go 1.22 loop variables](https://go.dev/doc/go1.22#language), [the go.mod version condition](https://go.dev/blog/loopvar-preview).
+- [Data Race Detector](https://go.dev/doc/articles/race_detector), [exitcode option](https://go.dev/doc/articles/race_detector#Options).
+- [time.Sleep](https://pkg.go.dev/time#Sleep), [time.Since](https://pkg.go.dev/time#Since), [net/http.Handler and panic](https://pkg.go.dev/net/http#Handler).
+- [Dave Cheney: know how a goroutine will stop](https://dave.cheney.net/2016/12/22/never-start-a-goroutine-without-knowing-how-it-will-stop).
+- [OWASP: object-level authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/).
+
+Results: `go1.27.4 linux/amd64`, 2026-11-28. Ordinary runs used `CGO_ENABLED=0`; `-race` ran in Docker with `CGO_ENABLED=1`.
+Your timings, memory addresses, and goroutine identifiers will differ.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+---
+
+← Previous lesson: [GB-6.08](/lab/youtube/gb/gb-6-08/en) · Next lesson: [GB-7.02](/lab/youtube/gb/gb-7-02/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

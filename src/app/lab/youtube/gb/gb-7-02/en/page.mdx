@@ -1,0 +1,1056 @@
+---
+title: "Channels: passing results between goroutines"
+date: "2026/11/28"
+description: "Pass values, read deadlock reports, use close and range, and build a buffered channel and a pipeline with two senders."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-02/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-02"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-02/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-02/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-02"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-02) · [Русский](/lab/youtube/gb/gb-7-02/ru) · **English**  
+Lesson GB-7.02 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-02) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-02-channel)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The bozor importer reads two suppliers' price lists in two goroutines. How can it pass products to `main` without appending to a shared slice concurrently?
+
+**The one idea:** a **channel** combines passing a value with waiting. On an unbuffered channel, sender and receiver wait for each other; `close` signals that no more values will arrive.
+
+By the end, you will:
+
+- receive a goroutine's result and read `[chan send]` / `[chan receive]` reports;
+- signal the end of a stream with `close` and `range`;
+- determine how far a buffer postpones waiting;
+- build the `parse → inStock` pipeline and close its channel correctly with two senders.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| channel | a way to pass values and wait between goroutines | channel |
+| `close` and channel `range` | signal the end of a stream and read until it ends | close and range |
+| buffered channel | a channel with room for a limited number of queued values | buffered channel |
+
+A helper concept: a **directional channel type** permits only sending or only receiving inside a function. Stages connected by channels form a **pipeline**.
+
+## Before you start
+
+- [GB-7.01 · A goroutine and its lifetime](/lab/youtube/gb/gb-7-01/en): `go`, anonymous functions, `wg.Go`, `wg.Wait`, `counts[i]`.
+- [GB-4.07 · Mutex and data race](/lab/youtube/gb/gb-4-07/en): shared memory, mutex, runtime and deadlock.
+- [GB-3.01 · Files and bufio](/lab/youtube/gb/gb-3-01/en): `parseLine`, `ID;name;price;stock`, converting soʻm to tiyin.
+- [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en), [GB-2.02 · Maps](/lab/youtube/gb/gb-2-02/en), [GB-2.03 · Structs](/lab/youtube/gb/gb-2-03/en): `make`, `len`, `cap`, `append`, maps and `Product` fields.
+- [GB-2.09 · Defer and panic](/lab/youtube/gb/gb-2-09/en): deferred calls during function return or panic.
+- [GB-1.01 · First program](/lab/youtube/gb/gb-1-01/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.04 · Formatted output](/lab/youtube/gb/gb-1-04/en): program structure, `:=`, zero value and `go vet`.
+- [GB-1.05 · Conditions](/lab/youtube/gb/gb-1-05/en), [GB-1.06 · For](/lab/youtube/gb/gb-1-06/en), [GB-1.07 · Functions and error](/lab/youtube/gb/gb-1-07/en), [GB-1.08 · Tests](/lab/youtube/gb/gb-1-08/en): `if`, `range`, `continue`, `err != nil`, `go test`.
+- [GB-6.07 · Cookies, CSRF and CORS](/lab/youtube/gb/gb-6-07/en): the closing recall question.
+
+Run the code in the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-02-channel): `lessons/gb-7-02-channel`. This is a standalone module: its own `go.mod`, `go 1.27`, no external dependencies. `product.go` contains the earlier `Product` and `parseLine`. Open a terminal in this folder.
+
+`./_video/run.sh STEP go run .` copies the chosen step's `main.go` with `product.go`, `data.go` and `go.mod` into a temporary `bozor/` folder. Then `go run .` builds and runs that copy. The script uses `GOTOOLCHAIN=go1.27.4`, `CGO_ENABLED=0`. The `/tmp/tmp.…` paths in the output are real; yours will differ.
+
+The script ends with `(chiqish kodi: N)`, meaning the inner command's exit code. `exit status 2` is the program's code; `go run` itself returns `1`. The script can return `0` because its last command is `echo`; automation must not rely solely on its exit code.
+
+**Recall:** what happens to the remaining goroutines when `main` returns? **A)** `main` waits for them · **B)** they end with the program · **C)** they continue in the background.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The program does not wait for them. A requires `wg.Wait()`; C incorrectly assumes a separate process. Results now arrive through a channel instead of the earlier `counts[i]`.
+
+</details>
+
+## Channel: send and receive
+
+```go filename="_video/01-uzatish/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	counts := make(chan int)
+	go func() {
+		counts <- 40
+	}()
+	n := <-counts
+	fmt.Println(n)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | the executable program's package |
+| 3 | `import "fmt"` | imports the output package |
+| 5, 12 | `func main() { … }` | the main function and its boundaries |
+| 6 | `counts := make(chan int)` | creates an unbuffered channel for `int` values; `counts` holds that channel value |
+| 7, 9 | `go func() { … }()` | calls an anonymous function in a new goroutine; the final `()` invokes it |
+| 8 | `counts <- 40` | sends `40` into the channel; `<-` here denotes sending |
+| 10 | `n := <-counts` | `<-counts` receives a value; the result is stored in `n` |
+| 11 | `fmt.Println(n)` | prints the received number |
+
+Blank lines only aid reading. Here `counts` is a `chan int`, replacing the previous lesson's slice.
+
+| Event | Sender | `main` |
+|---|---|---|
+| `main` arrives first | has not sent yet | waits at `<-counts` |
+| sender arrives first | waits at `counts <- 40` | has not received yet |
+| both ready | value is transferred | `n == 40` |
+| after the transfer | can continue | can continue |
+
+What if `main` arrives first? **A)** `0` · **B)** waits, then `40` · **C)** immediate panic.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Receiving from an open, empty channel waits. A assumes an automatic zero value; C has no reason for a panic.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-uzatish go run .
+40
+(chiqish kodi: 0)
+```
+
+No `time.Sleep` was needed. The [Go memory model](https://go.dev/ref/mem#chan) guarantees that writes made by the sending goroutine before sending are visible after the corresponding receive completes. This transfer needs no separate mutex. Later writes to shared memory are not automatically protected.
+
+## Deadlock: which goroutine is waiting?
+
+```go filename="_video/02-deadlock/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	counts := make(chan int)
+	counts <- 40
+	n := <-counts
+	fmt.Println(n)
+}
+```
+
+The `go func` was removed. Line 7 now sends, and line 8 receives. One goroutine tries to execute both lines in sequence.
+
+Result? **A)** `40` · **B)** waits silently forever · **C)** a deadlock report.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Line 7 waits for a receiver and never reaches line 8. A ignores blocking. The runtime detects deadlock in this small program, so B is wrong.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-deadlock go run .
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan send]:
+main.main()
+	/tmp/tmp.2dqN2Sd4ye/bozor/main.go:7 +0x36
+exit status 2
+(chiqish kodi: 1)
+```
+
+`all goroutines are asleep` means no goroutine can continue execution. The runtime is Go code running inside the program.
+
+| Output | How to read it |
+|---|---|
+| `goroutine 1 [chan send]` | `main` is waiting to send |
+| `main.main()` | the waiting function |
+| `main.go:7` | the sending line; `/tmp/…` is the copy's path |
+| `+0x36` | a machine-code offset; unnecessary for finding this cause |
+| `exit status 2` | the program ended with an error |
+
+Fix: run the sender and receiver in separate goroutines, as in the first example.
+
+This message does not detect every hang. With a goroutine waiting for a timer or an external event, global deadlock may go unreported. A goroutine left unable to finish is a **goroutine leak**; see [GB-7.06](/lab/youtube/gb#gb-7-06).
+
+## A stream of lines: how does range know the end?
+
+```go filename="data.go" showLineNumbers
+package main
+
+// Ikki yetkazib beruvchining narx roʻyxati, GB-3.01'dagi katalog.txt formatida: «ID;nom;narx;qoldiq», narx soʻmda.
+// Haqiqiy importer ularni fayldan yoki HTTP'dan oʻqiydi (GB-7.07); bu darsda ular xotirada.
+var chorsu = []string{
+	"1;olma;12000;40",
+	"2;oʻrik;35000;0",
+	"3;non;4000;100",
+	"4;choy;25000;8",
+}
+
+var oloy = []string{
+	"3;non;4200;60",
+	"5;anor;18000;25",
+}
+```
+
+`chorsu` is a four-line slice, and `oloy` has two lines. Each line is `ID;name;price;stock`, with price in soʻm. `parseLine` converts the price to tiyin. `Product` has `ID`, `Name`, `Price`, `Stock`. ID `3` occurs in both lists. Product names: `olma` means apple, `oʻrik` apricot, `non` bread, `choy` tea, and `anor` pomegranate.
+
+First, read only `chorsu`:
+
+```go filename="_video/03-range/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func parse(lines []string, out chan<- Product) {
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+func main() {
+	products := make(chan Product)
+	go parse(chorsu, products)
+	for p := range products {
+		fmt.Println(p.Name, p.Stock)
+	}
+	fmt.Println("import tugadi")
+}
+```
+
+| Line | New or changed part |
+|---|---|
+| 5 | `parse(lines []string, out chan<- Product)` accepts a slice of lines and a send-only channel |
+| 6 | `for _, line := range lines` visits each line; `_` discards the index |
+| 7 | `p, err := parseLine(line)` turns a line into a product |
+| 8–10 | on `err != nil`, `continue` skips the line; returning errors is deferred to GB-7.04 |
+| 11–13 | `out <- p` sends the product; braces end the loop and function |
+| 16 | `products := make(chan Product)` creates the product channel |
+| 17 | `go parse(chorsu, products)` starts the parser separately |
+| 18–20 | `for p := range products` prints each received product's name and stock |
+| 21–22 | after the loop, `import tugadi` ("import finished") should print and `main` should end |
+
+`chan<- Product` permits sending only. The function receives the same channel value; no new channel is created.
+
+What happens after four products? **A)** the loop ends · **B)** empty `Product` values print forever · **C)** deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**C.** `parse` returned, but the channel remains open. `range` waits for another value. A confuses returning with closing; B describes repeated ordinary receives from a closed, empty channel.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-range go run .
+olma 40
+oʻrik 0
+non 100
+choy 8
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan receive]:
+main.main()
+	/tmp/tmp.g1IqkDO0WX/bozor/main.go:18 +0x199
+exit status 2
+(chiqish kodi: 1)
+```
+
+`[chan receive]` means `main` now waits to receive at line 18. `import tugadi` never printed.
+
+Fix: the sole sender closes the channel when done:
+
+```go filename="_video/04-close/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func parse(lines []string, out chan<- Product) {
+	defer close(out)
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+func main() {
+	products := make(chan Product)
+	go parse(chorsu, products)
+	for p := range products {
+		fmt.Println(p.Name, p.Stock)
+	}
+	fmt.Println("import tugadi")
+}
+```
+
+The new line 6 is `defer close(out)`. `defer` runs the call when `parse` returns or unwinds during panic. Closing tells `range` the stream has ended.
+
+Will `import tugadi` print now? **A)** yes · **B)** deadlock again · **C)** `close` deletes the last product.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Sent values are retained. Once the channel is closed and remaining values are received, `range` ends; B and C contradict that rule.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-close go run .
+olma 40
+oʻrik 0
+non 100
+choy 8
+import tugadi
+(chiqish kodi: 0)
+```
+
+| State | What does `range` do? |
+|---|---|
+| open channel, no available value | waits |
+| closed channel, buffered values remain | receives the remaining values |
+| closed and empty | ends the loop |
+
+Not every channel needs closing. Closing tells the receiver that the stream ended. The sending side controls closing; a receiver closing it independently can cause a send to panic.
+
+## Buffer: two slots, three sends
+
+```go filename="_video/05-buffer/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	counts := make(chan int, 2)
+	counts <- 40
+	counts <- 120
+	fmt.Println(len(counts), cap(counts))
+	counts <- 5
+}
+```
+
+The second argument, `2`, on line 6 gives the **buffer** two slots. Lines 7–8 proceed while space exists. On line 9, `len` counts queued values and `cap` gives capacity. What happens at the third send on line 10?
+
+**A)** `2 2`, then deadlock · **B)** `3 2` · **C)** `40` is discarded to store `5`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The buffer neither grows nor discards values. The third send waits for a receiver to free space; this program has no receiver.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-buffer go run .
+2 2
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan send]:
+main.main()
+	/tmp/tmp.F9Embx1zFE/bozor/main.go:10 +0xe6
+exit status 2
+(chiqish kodi: 1)
+```
+
+| Operation | Buffer | Result |
+|---|---|---|
+| creation | `[]`, capacity 2 | empty |
+| `counts <- 40` | `[40]` | continues |
+| `counts <- 120` | `[40, 120]` | continues |
+| `counts <- 5` | `[40, 120]` | waits |
+
+For an open buffered channel, sending waits when full and receiving waits when empty. A buffer lets the sender move N values ahead; it does not create a missing receiver.
+
+Now send `40` into the buffer and close the channel:
+
+```go filename="_video/06-quiz/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func main() {
+	counts := make(chan int, 2)
+	counts <- 40
+	close(counts)
+	fmt.Println(<-counts)
+	n, ok := <-counts
+	fmt.Println(n, ok)
+}
+```
+
+Line 9 receives the first value. On line 10, `n, ok := <-counts` receives the second and reports whether it came from a successful send. `ok == false` means closed and empty.
+
+What do the two calls print? **A)** panic · **B)** `40`, then `0 false` · **C)** `40`, then deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `close` keeps the buffered `40`. The next receive returns the zero value of `int` and `false`. A confuses sending with receiving; C ignores the closed-channel rule.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-quiz go run .
+40
+0 false
+(chiqish kodi: 0)
+```
+
+| Moment | Buffer | Receive |
+|---|---|---|
+| after `close` | `[40]` | a sent value remains |
+| first read | `[]` | `40`, with `ok == true` in the two-result form |
+| second read | `[]` | `0 false`, without waiting |
+
+A plain `0` does not mean the end: a sender can send a real `0`. Detect the end with `ok` or `range`.
+
+## Pipeline: parse → inStock
+
+```go filename="_video/07-pipeline/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func parse(lines []string, out chan<- Product) {
+	defer close(out)
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+func inStock(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	for p := range in {
+		if p.Stock > 0 {
+			out <- p
+		}
+	}
+}
+
+func main() {
+	raw := make(chan Product)
+	ready := make(chan Product)
+	go parse(chorsu, raw)
+	go inStock(raw, ready)
+	for p := range ready {
+		fmt.Println(p.Name, p.Stock)
+	}
+}
+```
+
+New lines 16–23 define `inStock`, a stage that passes products with positive stock. `in <-chan Product` permits receiving only; `out chan<- Product` permits sending only. Line 17 defers closing `out`. Line 18 drains the input, line 19 checks `p.Stock > 0`, and line 20 forwards the product. The remaining braces end the `if`, loop and function.
+
+On lines 26–27, `raw` carries raw products and `ready` carries ready products. Line 28 starts `parse`; line 29 starts `inStock`. On lines 30–32, `main` receives and prints ready products.
+
+| Stage | Before closing | After closing |
+|---|---|---|
+| `parse` | sends to `raw` | closes `raw` |
+| `inStock` | reads `raw`, sends to `ready` | finishes its input loop, closes `ready` |
+| `main` | reads `ready` | ends its loop |
+
+How many products print? **A)** 4 · **B)** 3 · **C)** 2.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `oʻrik` has stock `0`, so it is filtered out. A forgets the filter; C has no reason to drop another product.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-pipeline go run .
+olma 40
+non 100
+choy 8
+(chiqish kodi: 0)
+```
+
+This is a [pipeline](https://go.dev/blog/pipelines): stages run concurrently in separate goroutines and pass values through channels. Each stage reads its input to the end and closes its output at a safe point.
+
+## Two senders: one place closes
+
+```go filename="_video/08-ikki/main.go" showLineNumbers
+package main
+
+import "fmt"
+
+func parse(lines []string, out chan<- Product) {
+	defer close(out)
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+func inStock(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	for p := range in {
+		if p.Stock > 0 {
+			out <- p
+		}
+	}
+}
+
+func main() {
+	raw := make(chan Product)
+	ready := make(chan Product)
+	go parse(chorsu, raw)
+	go parse(oloy, raw)
+	go inStock(raw, ready)
+	for p := range ready {
+		fmt.Println(p.Name, p.Stock)
+	}
+}
+```
+
+The new line 29 is `go parse(oloy, raw)`. Both `parse` calls now send to the same `raw`, but each still has `defer close(out)` on line 6.
+
+Is the result guaranteed? **A)** always 5 products · **B)** panic or missing products are possible · **C)** always deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**B.** One sender can close the channel before the other finishes. A and C assume a guaranteed schedule. If `main` returns first, another goroutine may not finish; if sending continues, it panics.
+
+</details>
+
+The video's first output below is **quoted**, not reproduced for this page: `oloy` products were missing, but no error appeared.
+
+```text
+olma 40
+non 100
+choy 8
+```
+
+The run for this page produced a panic:
+
+```console
+$ ./_video/run.sh 08-ikki go run .
+olma 40
+non 100
+choy 8
+non 60
+panic: send on closed channel
+	panic: close of closed channel
+
+goroutine 20 [running]:
+main.parse({0x57a7a8?, 0x0?, 0x0?}, 0x1dc3ec396070)
+	/tmp/tmp.DDTNpVqO5f/bozor/main.go:12 +0xf6
+created by main.main in goroutine 1
+	/tmp/tmp.DDTNpVqO5f/bozor/main.go:29 +0x15c
+exit status 2
+(chiqish kodi: 1)
+```
+
+Line 12 in `main.parse` sent to a closed channel: `send on closed channel`. During panic, the deferred call on line 6 tried closing it again: `close of closed channel`. `created by` points to the goroutine's launch at line 29 in `main`. Goroutine numbers and memory addresses will differ on your machine.
+
+Fix: `parse` no longer closes the channel. One goroutine closes it after both senders finish.
+
+```go filename="_video/09-wg/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func parse(lines []string, out chan<- Product) {
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+func inStock(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	for p := range in {
+		if p.Stock > 0 {
+			out <- p
+		}
+	}
+}
+
+func main() {
+	raw := make(chan Product)
+	ready := make(chan Product)
+	var wg sync.WaitGroup
+	wg.Go(func() { parse(chorsu, raw) })
+	wg.Go(func() { parse(oloy, raw) })
+	go func() {
+		wg.Wait()
+		close(raw)
+	}()
+	go inStock(raw, ready)
+	for p := range ready {
+		fmt.Println(p.Name, p.Stock)
+	}
+}
+```
+
+| Line | Change |
+|---|---|
+| 3–6 | adds `sync` to the imports |
+| 8–16 | removes `defer close(out)` from `parse` |
+| 30 | `var wg sync.WaitGroup` tracks sender completion |
+| 31–32 | `wg.Go` starts each `parse` in a separate goroutine |
+| 33–36 | another goroutine waits for both with `wg.Wait()`, then calls `close(raw)` once |
+| 37–40 | `inStock` runs and `main` reads the results |
+
+Putting `wg.Wait()` directly in `main` here would prevent it from starting to read `ready`. `inStock` would block sending, followed by the parsers. That is why the waiter is a separate goroutine.
+
+**Predict:** **A)** 5 products, order may vary · **B)** 4 products, bread merges automatically · **C)** `parse` closes every channel.
+
+<details>
+<summary>Answer</summary>
+
+**A.** A channel does not merge products by ID. Both lists contain ID `3`: `non 100` and `non 60`. `parse` does not close the channel; C repeats the earlier bug.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-wg go run .
+non 60
+anor 25
+olma 40
+non 100
+choy 8
+(chiqish kodi: 0)
+```
+
+The video started with `olma 40`; this run starts with `non 60`. Both are correct: order between lists is not guaranteed. Values from one sender retain its order. The order need not change on every run.
+
+| State | What happens to `raw`? |
+|---|---|
+| one sender finished, the other still runs | remains open |
+| both finished | `wg.Wait()` returns, `raw` closes once |
+| `inStock` finishes its input | closes `ready` |
+| `main` receives everything | returns |
+
+I also reran `-race`. This machine lacks `gcc`: the script uses Go 1.27.4 with the C compiler in the `golang:1.26.8` Docker image. `CGO_ENABLED=1`; `-race` checks executed code for data races.
+
+```console
+$ ./_video/race.sh 09-wg go run -race .
+non 60
+anor 25
+olma 40
+non 100
+choy 8
+(chiqish kodi: 0)
+```
+
+No `WARNING: DATA RACE` appeared. This run found no race; it is not a proof for every possible execution order.
+
+## Going deeper (optional): nil and closed channels
+
+```go filename="_video/10-jadval/main.go" showLineNumbers
+package main
+
+// Chuqurroq: channel jadvali. Har holatni alohida ishga tushiring:
+//   ./_video/run.sh 10-jadval go run . nil-send | nil-recv | nil-close | closed-close | closed-send | closed-recv
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	var nilCh chan int64 // nol qiymati: nil channel
+	closed := make(chan int64)
+	close(closed)
+	switch os.Args[1] {
+	case "nil-send":
+		nilCh <- 1
+	case "nil-recv":
+		<-nilCh
+	case "nil-close":
+		close(nilCh)
+	case "closed-close":
+		close(closed)
+	case "closed-send":
+		closed <- 1
+	case "closed-recv":
+		v, ok := <-closed
+		fmt.Println(v, ok)
+	}
+}
+```
+
+`var nilCh chan int64` on line 11 does not create a channel: its zero value is `nil`. Lines 12–13 create and close another channel. `switch os.Args[1]` on line 14 selects the command argument; each `case` handles one state. Lines 16–27 send, receive or close.
+
+I checked each row by running `./_video/run.sh 10-jadval go run . STATE`. The table quotes significant lines from actual outputs; stack traces are shortened here.
+
+| STATE | Operation | Actual result |
+|---|---|---|
+| `nil-send` | `nilCh <- 1` | `fatal error: all goroutines are asleep - deadlock!`; `[chan send (nil chan)]` |
+| `nil-recv` | `<-nilCh` | `fatal error: all goroutines are asleep - deadlock!`; `[chan receive (nil chan)]` |
+| `nil-close` | `close(nilCh)` | `panic: close of nil channel` |
+| `closed-close` | `close(closed)` | `panic: close of closed channel` |
+| `closed-send` | `closed <- 1` | `panic: send on closed channel` |
+| `closed-recv` | `v, ok := <-closed` | `0 false` |
+
+Sending and receiving on `nil` block. This experiment has no other goroutines, so the runtime reports deadlock. Fix: use `make` before communication, matching senders and receivers, and one closer. Never close an already closed channel or send to it.
+
+You can also see a silent hang of the kind possible in a server:
+
+```go filename="_video/12-osilish/main.go" showLineNumbers
+package main
+
+// Boshqa goroutine tirik boʻlsa (masalan, server), runtime deadlock'ni aniqlamaydi: dastur abadiy osilib qoladi.
+//   timeout 3 ./_video/run.sh 12-osilish go run .
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	go func() {
+		for {
+			time.Sleep(time.Second) // tirik goroutine: masalan, ulanishlarni kutayotgan server
+		}
+	}()
+	prices := make(chan int64)
+	prices <- 12_000 // hech kim qabul qilmaydi
+	fmt.Println("bu qator hech qachon chiqmaydi")
+}
+```
+
+The goroutine on lines 11–15 repeatedly calls `time.Sleep(time.Second)`: timers remain active. Line 16 creates `prices`. Line 17 has no receiver; line 18 is unreachable. Will deadlock be reported? **A)** yes · **B)** silent hang · **C)** the price prints.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The timed goroutine prevents a global deadlock report. It does not create a receiver; `main` stays blocked sending. A overgeneralizes detection; C expects an unreachable line.
+
+</details>
+
+```console
+$ timeout 4 ./_video/run.sh 12-osilish go run .
+```
+
+There was no output. `timeout 4` stopped the command after four seconds; its outer exit code was `124`. Cancellation is covered in [GB-7.03 · select and context](/lab/youtube/gb/gb-7-03/en).
+
+## Common mistakes
+
+**1. Each of two senders closes the channel.** The two-sender section showed the actual panic. Fix: `parse` does not close; one place closes after `wg.Wait()`.
+
+**2. Expecting `range` to know when input ends.** `03-range` reported `[chan receive]`. The sole sender should use `defer close(out)`. Adding a buffer does not signal the end.
+
+**3. Closing a receive-only channel.** The complete broken file:
+
+```go filename="_video/11-yonalish/main.go" showLineNumbers
+package main
+
+// Yoʻnalishli channel turi: kompilyator xatosi (go vet / go build).
+func inStock(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	for p := range in {
+		if p.Stock > 0 {
+			out <- p
+		}
+	}
+	close(in)
+}
+
+func main() {}
+```
+
+Line 11 adds `close(in)`. `go vet .` checks this package; here it also reports a type error. Can this receiving side close the channel? **A)** yes · **B)** compile error · **C)** the value becomes `0`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `in` has type `<-chan Product`, which cannot be closed here. A ignores direction; C is unrelated to the channel type restriction.
+
+</details>
+
+```console
+$ ./_video/run.sh 11-yonalish go vet .
+# github.com/abdurahmon27/bozor
+# [github.com/abdurahmon27/bozor]
+vet: ./main.go:11:8: invalid operation: cannot close receive-only channel in (variable of type <-chan Product)
+(chiqish kodi: 1)
+```
+
+`./main.go:11:8` gives file, line and column. `cannot close receive-only channel` explains the forbidden operation. `variable of type` names the variable's type. Lines starting with `#` identify the package. Fix: remove line 11; keep `defer close(out)`.
+
+**4. Reading from a send-only channel.** Line 5 below contradicts its type:
+
+```go filename="_video/13-faqat-yuborish/main.go" showLineNumbers
+package main
+
+// chan<- Product: faqat yuborish uchun; undan oʻqish kompilyatsiya xatosi (go build).
+func parse(lines []string, out chan<- Product) {
+	p := <-out
+	_ = p
+}
+
+func main() {}
+```
+
+`go build .` builds the package. `_ = p` on line 6 only suppresses an unused-variable error; line 9 is an empty `main`. What happens at line 5? **A)** receives · **B)** blocks · **C)** compile error.
+
+<details>
+<summary>Answer</summary>
+
+**C.** `chan<- Product` permits sending only. The program never runs, ruling out A and B.
+
+</details>
+
+```console
+$ ./_video/run.sh 13-faqat-yuborish go build .
+# github.com/abdurahmon27/bozor
+./main.go:5:9: invalid operation: cannot receive from send-only channel chan<- Product out (variable of type chan<- Product)
+(chiqish kodi: 1)
+```
+
+`cannot receive from send-only channel` names the invalid receive. Replace line 5 with a send such as `out <- p` in the real `parse`, where `parseLine` supplies the product.
+
+## Check yourself
+
+**1.** When can an unbuffered send proceed?
+
+<details>
+<summary>Answer</summary>
+
+When a matching receiver is ready. Otherwise the sender blocks.
+
+</details>
+
+**2.** Who closes a channel? What if there are two senders?
+
+<details>
+<summary>Answer</summary>
+
+The sending side. With several senders, one place that knows all have finished; here, `close(raw)` after `wg.Wait()`.
+
+</details>
+
+**3.** Replace `40` with `0` in `06-quiz`. What would the first receive return in its two-result form? **A)** `0 false` · **B)** `0 true` · **C)** panic.
+
+<details>
+<summary>Answer</summary>
+
+**B.** This zero came from a send, so `ok == true`. The next receive returns `0 false`. A confuses a sent zero with the end; C has no cause.
+
+</details>
+
+**4.** From GB-6.07: why does CORS not protect the server-side operation?
+
+<details>
+<summary>Answer</summary>
+
+CORS controls browser permission to read a response. A simple request can still reach the server, which must check request origin and user permissions itself. For a request requiring preflight, the browser may withhold the actual request.
+
+</details>
+
+## Homework
+
+[Lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-02-channel), [`TASK.md`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-02-channel/TASK.md). Complete the two marked places in `main.go`. This is one required **🟢 Modify** task with two steps:
+
+1. `unique(in <-chan Product, out chan<- Product)` must read all input. Send only the first product for each ID, preserve order, and close `out` at the end. Use `map[int64]bool` for seen IDs.
+2. Add a `stocked` channel to `importAll`: `inStock → stocked → unique → ready`. Run `inStock` and `unique` in separate goroutines.
+
+Do not change `product.go`, `data.go`, `parse`, `inStock` or `tekshiruv_test.go`. There is no additional optional task.
+
+The starter's `unique` is empty. `importAll(a, b []string) []Product` starts two parsers and collects values from `ready` into a slice using `append`. `return products` returns it to the caller. `main` prints that slice. Insert the new stage between `inStock` and this collection loop.
+
+```go
+func unique(in <-chan Product, out chan<- Product) {
+	// VAZIFA 1 (TASK.md): har ID'ni faqat bir marta yuboring,
+	// oxirida out'ni yoping.
+}
+
+// importAll ikki roʻyxatni bir vaqtda oʻqiydi va qoldigʻi bor mahsulotlarni qaytaradi.
+func importAll(a, b []string) []Product {
+	raw := make(chan Product)
+	ready := make(chan Product)
+	var wg sync.WaitGroup
+	wg.Go(func() { parse(a, raw) })
+	wg.Go(func() { parse(b, raw) })
+	go func() {
+		wg.Wait()
+		close(raw)
+	}()
+	go inStock(raw, ready)
+	// VAZIFA 2 (TASK.md): inStock va natija orasiga unique bosqichini qoʻying.
+
+	var products []Product
+	for p := range ready {
+		products = append(products, p)
+	}
+	return products
+}
+```
+
+The starter check **should fail**. `go test .` runs this package's tests:
+
+```console
+$ go test .
+--- FAIL: TestVazifaUnique (2.00s)
+    tekshiruv_test.go:54: unique 2 soniyada tugamadi: out yopilmadi, shuning uchun `for p := range out` abadiy kutyapti.
+        	unique in'dagi hamma qiymatni oʻqishi (for p := range in) va oxirida out'ni yopishi kerak (defer close(out)).
+--- FAIL: TestVazifaImportAll (0.00s)
+    tekshiruv_test.go:101: importAll ichida unique bosqichi yoʻq: TASK.md 2-qadam, inStock → yangi channel → go unique(…, ready)
+    tekshiruv_test.go:120: importAll natijasida ID 3 2 marta (1-urinish), kutilgan 1 marta. Natija: [{3 non 420000 60} {5 anor 1800000 25} {1 olma 1200000 40} {3 non 400000 100} {4 choy 2500000 8}]
+        	TASK.md 2-qadam: inStock va natija orasiga unique bosqichini qoʻying.
+FAIL
+FAIL	github.com/abdurahmon27/bozor	2.003s
+FAIL
+```
+
+`TestVazifaUnique` reports that `out` did not close within two seconds. `TestVazifaImportAll` finds the missing stage call and two products with ID `3`. Structs inside `Natija` ("result") appear in field order: `ID`, `Name`, `Price` (tiyin), `Stock`. Product order may differ on your machine. `2.003s` is this run's duration; the video's check also uses a two-second deadline.
+
+The check also looks for a `unique` call inside `importAll`. Deduplicating in the final loop does not complete the task. The test's `select` and timeout are explained in GB-7.03.
+
+Answer: [`solution/main.go`](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-02-channel/solution/main.go).
+
+<details>
+<summary>Answer and explanation</summary>
+
+```go filename="solution/main.go" showLineNumbers
+// bozor importeri: ikki yetkazib beruvchining narx roʻyxatini channel'lar orqali bosqichma-bosqich oʻtkazadi (GB-7.02).
+//
+//	parse (chorsu) ─┐
+//	                ├─ raw ─ inStock ─ stocked ─ unique ─ ready ─ importAll
+//	parse (oloy)  ──┘
+//
+// Javob (TASK.md): unique bosqichi yozilgan va importAll'ga qoʻyilgan.
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// parse qatorlarni Product'ga aylantirib out'ga yuboradi. out'ni yopmaydi: unga bir nechta parse yozadi,
+// yopishni hammasini kutgan bitta goroutine qiladi (importAll).
+func parse(lines []string, out chan<- Product) {
+	for _, line := range lines {
+		p, err := parseLine(line)
+		if err != nil {
+			continue // xatoni qaytarish: GB-7.04
+		}
+		out <- p
+	}
+}
+
+// inStock faqat qoldigʻi bor mahsulotlarni oʻtkazadi; in yopilgach, out'ni yopadi.
+func inStock(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	for p := range in {
+		if p.Stock > 0 {
+			out <- p
+		}
+	}
+}
+
+// unique har ID'ni faqat birinchi marta oʻtkazadi; in yopilgach, out'ni yopadi.
+func unique(in <-chan Product, out chan<- Product) {
+	defer close(out)
+	seen := make(map[int64]bool)
+	for p := range in {
+		if seen[p.ID] {
+			continue
+		}
+		seen[p.ID] = true
+		out <- p
+	}
+}
+
+// importAll ikki roʻyxatni bir vaqtda oʻqiydi va qoldigʻi bor mahsulotlarni qaytaradi.
+func importAll(a, b []string) []Product {
+	raw := make(chan Product)
+	ready := make(chan Product)
+	var wg sync.WaitGroup
+	wg.Go(func() { parse(a, raw) })
+	wg.Go(func() { parse(b, raw) })
+	go func() {
+		wg.Wait()
+		close(raw)
+	}()
+	stocked := make(chan Product)
+	go inStock(raw, stocked)
+	go unique(stocked, ready)
+
+	var products []Product
+	for p := range ready {
+		products = append(products, p)
+	}
+	return products
+}
+
+func main() {
+	for _, p := range importAll(chorsu, oloy) {
+		fmt.Println(p.Name, p.Stock)
+	}
+}
+```
+
+`unique` starts with `defer close(out)`. `seen := make(map[int64]bool)` creates a map owned by this goroutine alone. A missing `seen[p.ID]` gives `false`; an existing entry triggers `continue`. For a first value, it sets `seen[p.ID] = true`, then sends `out <- p`.
+
+In `importAll`, `stocked := make(chan Product)` creates the new connection. `go inStock(raw, stocked)` writes to it; `go unique(stocked, ready)` reads from it. The collection loop still reads `ready`.
+
+The first ID to **arrive** is retained. Which supplier's price survives for a shared ID is not guaranteed. This task does not select the lowest price.
+
+Check the answer: `go test ./solution/` runs only the solution package.
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.003s
+```
+
+The solution's Docker race check; `-count=3` runs the tests three times:
+
+```console
+$ ./_video/race.sh solution go test -race -count=3 .
+ok  	github.com/abdurahmon27/bozor	1.017s
+(chiqish kodi: 0)
+```
+
+The recorded video run took `1.023s`; this run took `1.017s`, a ratio of about `0.994`. This is not a speed improvement; load and race-check overhead affect the time. What matters: both checks pass, IDs are unique, and channels close.
+
+</details>
+
+## Sources
+
+The official Go rules and this lesson's experiments:
+
+- [Channel types](https://go.dev/ref/spec#Channel_types), [make](https://go.dev/ref/spec#Making_slices_maps_and_channels).
+- [Send](https://go.dev/ref/spec#Send_statements), [receive](https://go.dev/ref/spec#Receive_operator).
+- [Range](https://go.dev/ref/spec#For_range), [close](https://go.dev/ref/spec#Close), [len and cap](https://go.dev/ref/spec#Length_and_capacity).
+- [Program execution](https://go.dev/ref/spec#Program_execution).
+- [Go memory model: channel communication](https://go.dev/ref/mem#chan).
+- [builtin.close](https://pkg.go.dev/builtin#close), [Effective Go: Channels](https://go.dev/doc/effective_go#channels).
+- [Pipelines and cancellation](https://go.dev/blog/pipelines), [sync.WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go).
+- [Runtime: checkdead](https://go.dev/src/runtime/proc.go).
+- [Course code and reproduction scripts](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-02-channel).
+
+Results: `go1.27.4 linux/amd64`, 2026-11-28; ordinary commands use `CGO_ENABLED=0`, race checks run in Docker with `CGO_ENABLED=1`. Only the explicitly quoted silent-loss output and `1.023s` timing come from the earlier recording.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-02-channel)
+
+---
+
+← Previous lesson: [GB-7.01](/lab/youtube/gb/gb-7-01/en) · Next lesson: [GB-7.03](/lab/youtube/gb/gb-7-03/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

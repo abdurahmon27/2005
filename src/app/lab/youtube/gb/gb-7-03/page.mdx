@@ -1,0 +1,906 @@
+---
+title: "select va context: ishni vaqtida toʻxtatish"
+date: "2026/11/28"
+description: "select, time.After, ctx.Done va r.Context bilan kutishni cheklang; mijoz ketganda handler qaytsin, report muddati tugasa 504 yozsin."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 53
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-03"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-03"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-7-03/ru) · [English](/lab/youtube/gb/gb-7-03/en)  
+Dars GB-7.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-03) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-03-select-context)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+`GET /stock` oʻrik qoldigʻini yetkazib beruvchidan soʻraydi. Javob 3 soniyada keladi, mijoz esa 1 soniyada ketadi. Handler nega yana 2 soniya kutishi kerak?
+
+**Bitta gʻoya:** kutayotgan goroutine uchun ikkinchi chiqish yoʻli boʻlsin. `select` natija yoki bekor qilish signalini kutadi; context shu signalni chaqiruvlar orasida uzatadi.
+
+Darsdan keyin siz:
+
+- `select` va `time.After` bilan kutish chegarasi qoʻyasiz;
+- `ctx.Done()` hamda `ctx.Err()`ni hurmat qiladigan `checkStock(ctx, id)` yozasiz;
+- mijoz ketganda handler kutishini `r.Context()` orqali tugatasiz;
+- `sumStock` va muddatli `/report` vazifasini testlar oʻtguncha yozasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| `select` | bir nechta kanal amalidan tayyor boʻlgan bittasini bajarish | select statement |
+| context bekor qilish | `Done` yopilishi orqali kutayotgan kodga toʻxtashni bildirish | context cancellation |
+| soʻrov contexti | HTTP soʻrovining muddati, bekor qilinishi va qiymatlari | request context |
+
+Yordamchi tushuncha **goroutine leak** — hech qachon tugamaydigan, keraksiz kutishda qolgan goroutine. `curl --max-time` esa mijoz qancha kutishini chegaralaydi.
+
+## Oldin bilish kerak
+
+Asos: [GB-7.02 · Kanal](/lab/youtube/gb/gb-7-02) — yuborish, qabul, bufer va yopish; [GB-5.05 · pgx va context muddati](/lab/youtube/gb/gb-5-05) — `WithTimeout`, `Background`, `defer cancel()`.
+
+Yana: [GB-7.01 · Goroutine hayoti](/lab/youtube/gb/gb-7-01), [GB-6.04 · Soʻrov contexti](/lab/youtube/gb/gb-6-04), [GB-6.08 · Himoyalangan bozor](/lab/youtube/gb/gb-6-08), [GB-4.07 · Race detector](/lab/youtube/gb/gb-4-07), [GB-4.05 · Route](/lab/youtube/gb/gb-4-05), [GB-4.03 · Handler](/lab/youtube/gb/gb-4-03), [GB-4.02 · time.Second](/lab/youtube/gb/gb-4-02), [GB-4.01 · HTTP va curl](/lab/youtube/gb/gb-4-01).
+
+Go yozuvlari: [GB-2.09 · defer](/lab/youtube/gb/gb-2-09), [GB-2.08 · errors.Is](/lab/youtube/gb/gb-2-08), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01), [GB-1.08 · Test](/lab/youtube/gb/gb-1-08), [GB-1.07 · Funksiya va error](/lab/youtube/gb/gb-1-07), [GB-1.06 · for](/lab/youtube/gb/gb-1-06), [GB-1.05 · if](/lab/youtube/gb/gb-1-05), [GB-1.03 · int64](/lab/youtube/gb/gb-1-03), [GB-1.02 · Oʻzgaruvchi](/lab/youtube/gb/gb-1-02), [GB-1.01 · go build](/lab/youtube/gb/gb-1-01).
+
+**Muhit.** `lessons/gb-7-03-select-context` — oʻz `go.mod`iga ega mustaqil laboratoriya. Bitta `package main`, tashqi bogʻliqlik yoʻq. Go 1.27.4, Bash va curl kerak. Docker faqat `-race` uchun kerak. Server tajribasini mahalliy terminalda bajaring.
+
+Dars papkasidan nusxa oling. Barcha oddiy buyruqlar shu nusxada bajariladi. `cp -a` papkani nusxalaydi; `cd` nusxaga oʻtadi. `GOTOOLCHAIN` versiyani tanlaydi; `CGO_ENABLED=0` C kompilyatorisiz quradi.
+
+```bash
+work=$(mktemp -d)
+cp -a . "$work/bozor"
+cd "$work/bozor"
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+`_video/` har bosqichning toʻliq kodini saqlaydi. `cp _video/.../*.go .` joriy nusxadagi Go fayllarini almashtiradi. `go run .` shu paketni qurib ishga tushiradi.
+
+**Eslash:** bufer yoʻq, hech kim qabul qilmaydi, serverning boshqa ishlari davom etmoqda. Yuboruvchiga nima boʻladi? **A)** darhol deadlock xatosi · **B)** kutishda qoladi · **C)** qiymat yoʻqoladi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bufer yoʻq kanalga yuborish qabul qiluvchini kutadi. Boshqa ish davom etayotgan serverda bitta osilgan goroutine avtomatik deadlock xabarini kafolatlamaydi. Qabul ham qiymat kelguncha kutishi mumkin.
+
+</details>
+
+## Yetkazib beruvchi va oddiy kutish
+
+`supplier` yetkazib beruvchini taqlid qiladi: `stocks` xaritasida ID → dona. ID 1 — olma, 40; ID 2 — non, 120; ID 3 — oʻrik, 5. `supplierDelay` — 3 soniya.
+
+```go filename="_video/01-kutish/supplier.go" showLineNumbers
+package main
+
+import "time"
+
+// stocks: yetkazib beruvchidagi qoldiqlar (ID → dona): olma 1, non 2, oʻrik 3.
+var stocks = map[int64]int{1: 40, 2: 120, 3: 5}
+
+// supplierDelay: yetkazib beruvchi shuncha vaqtda javob beradi.
+var supplierDelay = 3 * time.Second
+
+// supplier qoldiqni yetkazib beruvchidan soʻraydi: javob supplierDelay'dan keyin channel'ga keladi.
+func supplier(id int64) chan int {
+	ch := make(chan int, 1)
+	go func() {
+		time.Sleep(supplierDelay)
+		ch <- stocks[id]
+	}()
+	return ch
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1–3 | `package main`, `import "time"` | bajariladigan paket va vaqt paketi |
+| 5–6 | `stocks` | izoh va `map[int64]int` qiymati: ID → dona |
+| 8–9 | `supplierDelay` | izoh va `3 * time.Second`: 3 soniya |
+| 11–12 | `supplier(id int64) chan int` | izoh va funksiya imzosi: ID oladi, `int` kanali qaytaradi |
+| 13 | `make(chan int, 1)` | bitta qiymat sigʻadigan bufer yaratadi |
+| 14 | `go func() {` | yangi goroutine boshlaydi |
+| 15 | `time.Sleep(...)` | shu goroutine kutadi |
+| 16 | `ch <- stocks[id]` | qoldiqni kanalga yuboradi |
+| 17 | `}()` | nomsiz funksiyani chaqiradi |
+| 18–19 | `return ch`, `}` | natijani kutmasdan kanalni qaytaradi, funksiyani yopadi |
+
+Bufer nega bitta ekanini ixtiyoriy boʻlimda oʻlchaymiz. Avval `main`:
+
+```go filename="_video/01-kutish/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	start := time.Now()
+	n := <-supplier(3)
+	fmt.Println("qoldiq:", n, time.Since(start).Round(time.Second))
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1–6 | `main` paketi, `fmt` va `time` importlari |
+| 8–9 | `main` boshlanadi, `start := time.Now()` boshlanish vaqtini saqlaydi |
+| 10 | `supplier(3)` kanalini oladi; `<-` qiymat kelguncha kutib, uni `n`ga yozadi |
+| 11–12 | `fmt.Println` qoldiq va oʻtgan vaqtni chiqaradi; `Round(time.Second)` soniyaga yaxlitlaydi; `main` tugaydi |
+
+Nima chiqadi? **A)** `qoldiq: 5 3s` · **B)** `qoldiq: 0 0s` · **C)** `qoldiq: 5 1s`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** `supplier` kanalni darhol qaytaradi, lekin `<-` qiymatni kutadi. B: boʻsh kanal noldan qiymat yasamaydi. C: hali bir soniyalik chegara yoʻq.
+
+</details>
+
+```console
+$ cp _video/01-kutish/*.go .
+$ go run .
+qoldiq: 5 3s
+```
+
+## select: ikkita kutish, bitta tanlov
+
+Javob kelmasa, oddiy qabul kutishda qoladi. **`select`** bir nechta kanal amalini kuzatadi. `{}` ichidagi har `case` bitta yuborish yoki qabul amalini beradi; `:`dan keyin shu holat tanasidir.
+
+`time.After(time.Second)` kanal qaytaradi. Muddat oʻtgach unga hozirgi vaqt yuboriladi. Vaqt qiymati kerak emas: `case <-time.After(...)` chapida oʻzgaruvchi yoʻq.
+
+```go filename="_video/02-select/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	start := time.Now()
+	select {
+	case n := <-supplier(3):
+		fmt.Println("qoldiq:", n)
+	case <-time.After(time.Second):
+		fmt.Println("supplier javob bermadi")
+	}
+	fmt.Println(time.Since(start).Round(time.Second))
+}
+```
+
+Yangi qatorlar: 10 — `select`; 11–12 — qoldiq tayyor boʻlsa `n`ga olinadi va chiqariladi; 13–14 — taymer tayyor boʻlsa xabar chiqadi. 15 `select`ni yopadi, 16 umumiy vaqtni chiqaradi.
+
+| Vaqt | supplier kanali | After kanali | main |
+|---|---|---|---|
+| 0 s | boʻsh | taymer kutmoqda | `select` kutmoqda |
+| ≈1 s | hali boʻsh | qabul tayyor | faqat ikkinchi `case`, keyin chiqish |
+| ≈3 s | supplier qiymat yuborishi mumkin | tanlov tugagan | bu CLI allaqachon tugagan |
+
+Go qoidasi: tanlash paytida bir nechta amal tayyor boʻlsa, bittasi teng ehtimolli psevdotasodifiy tanlanadi. Yuqoridagi `case` ustun emas. `default` yoʻq va hech biri tayyor emas — `select` kutadi.
+
+Nima chiqadi? **A)** qoldiq, `3s` · **B)** javob bermadi, `1s` · **C)** javob bermadi, `3s`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bu tajribada taymer oldin tayyor boʻldi. A: kutishning ikkinchi chiqish yoʻlini hisobga olmadingiz. C: `main` uxlayotgan supplier goroutine tugashini kutmaydi, GB-7.01.
+
+</details>
+
+```console
+$ cp _video/02-select/*.go .
+$ go run .
+supplier javob bermadi
+1s
+```
+
+## context: muddatni chaqiruvga uzatish
+
+`After` bu yerda bitta `select`ga xizmat qildi. Handler qoldiq, baza va toʻlov funksiyalarini chaqirsa, ularga bitta bekor qilish signali kerak.
+
+**Context bekor qilish** shu signalni uzatadi. `checkStock` birinchi parametrda `ctx context.Context` oladi. Ikkinchi `case` `ctx.Done()`ni kutadi. Bu kanalga qiymat yuborilmaydi; bekor qilinganda yopiladi. Yopiq kanaldan qabul kutmaydi.
+
+`WithTimeout` GB-5.05dan tanish: quyidagi `main` bir soniyalik context muddati yaratadi.
+
+```go filename="_video/03-timeout/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	n, err := checkStock(ctx, 3)
+	fmt.Println(n, err, time.Since(start).Round(time.Second))
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 4 | `context` paketini import qiladi |
+| 9 | `checkStock(ctx, id)` qoldiq va xato qaytaradi |
+| 10–12 | supplier javobi tanlansa, `n, nil`: natija bor, xato yoʻq |
+| 13–14 | `Done` yopilsa, `0, ctx.Err()`: natija oʻrnida nol, sabab alohida |
+| 15–16 | `select` va funksiya yopiladi |
+| 19 | `Background()`dan muddatli context va `cancel` funksiyasini oladi |
+| 20 | `main` qaytganda `cancel()` resurslarni boʻshatadi |
+| 21–24 | vaqtni oladi, `ctx`ni uzatadi, natija, xato va vaqtni chiqaradi |
+
+Supplier 3 soniya, context 1 soniya. **A)** `5 <nil> 3s` · **B)** `0 context deadline exceeded 1s` · **C)** `0 context canceled 1s`?
+
+<details>
+<summary>Javob</summary>
+
+**B.** Muddat tugadi: `context deadline exceeded` — «context muddati oshib ketdi». A: uch soniyalik natijani kutish tugamadi. C: bu safar signal qoʻlda `cancel()`dan kelmadi.
+
+</details>
+
+```console
+$ cp _video/03-timeout/*.go .
+$ go run .
+0 context deadline exceeded 1s
+```
+
+| Context holati | Done | Err |
+|---|---|---|
+| hali faol | ochiq | `nil` |
+| muddat tugagan | yopiq | `context.DeadlineExceeded` |
+| boshqa sabab bilan bekor qilingan | yopiq | `context.Canceled` |
+
+`context.Background()` hech qachon bekor qilinmaydi; uning `Done()` natijasi `nil`. `nil` kanaldan qabul tayyor boʻlmaydi. Shuning uchun `Background()` berilgan `checkStock`da ikkinchi yoʻl ishlamaydi.
+
+`Err()` xato qiymatini beradi; `fmt.Println` uning matnini chiqaradi. Matnni solishtirmang: `errors.Is(err, context.DeadlineExceeded)` yoki `errors.Is(err, context.Canceled)` ishlating.
+
+## WithCancel: muddat tugashini kutmaslik
+
+`WithCancel` oʻz muddatini belgilamaydi. Uning contexti `cancel()` chaqirilganda yoki ota context bekor boʻlganda bekor qilinadi. Bu misolda ota `Background()`, shuning uchun signalni oʻzimiz beramiz.
+
+```go filename="_video/04-cancel/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func main() {
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(time.Second)
+		cancel()
+	}()
+	n, err := checkStock(ctx, 3)
+	fmt.Println(n, err, time.Since(start).Round(time.Second))
+}
+```
+
+Yangi qatorlar: 20 context va `cancel` oladi; 21 `defer cancel()`ni saqlaydi. 22–25dagi goroutine bir soniya uxlab, `cancel()` chaqiradi. 26 ayni `checkStock`ka `ctx` beradi.
+
+Nima chiqadi? **A)** `0 context canceled 1s` · **B)** `0 context deadline exceeded 1s` · **C)** `5 <nil> 3s`?
+
+<details>
+<summary>Javob</summary>
+
+**A.** `context canceled` — «context bekor qilindi». B: muddat belgilanmagan. C: natija kelishidan oldin `Done` yopiladi. `cancel()`ning keyingi chaqiruvlari hech narsa qilmaydi, shu sabab `defer cancel()` qoladi.
+
+</details>
+
+```console
+$ cp _video/04-cancel/*.go .
+$ go run .
+0 context canceled 1s
+```
+
+`cancel()` bir nechta goroutine tomonidan chaqirilishi mumkin. U ishlar tugashini kutmaydi: toʻxtash signalini beradi. Ishning oʻzi signalni kuzatishi kerak.
+
+Uch qoida: `ctx` birinchi parametr; contextni struct ichida saqlamang. Contextni yaratgan funksiya `cancel`ni ishlatishi kerak; bu misollarda `defer cancel()` qulay. Ota bekor qilinsa, undan yasalgan contextlar ham bekor boʻladi.
+
+**Oʻnta goroutine bir xil `ctx.Done()`ni kutmoqda. Bitta `cancel()`: nechtasi chiqishi mumkin? A)** bittasi · **B)** oʻntasi ham · **C)** hech biri.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Kanal yopildi: undan qabul har bir goroutine uchun tayyor. Bitta qiymat yuborilsa, faqat bitta qabul qiluvchi olardi. Yopilish esa barchasiga signal; ularning aynan bir vaqtda rejalashtirilishi kafolatlanmaydi.
+
+</details>
+
+## HTTP: Background bilan yoʻqolgan signal
+
+`GET /stock` shu laboratoriyadagi qisqa route. Toʻliq katalogda uning vazifasi `GET /products/{id}/stock`ga mos, GB-4.05.
+
+Quyidagi birinchi urinish xato: handler `r.Context()` oʻrniga `Background()` beradi. Soʻrov contexti bilan bogʻlanish uziladi.
+
+```go filename="_video/05-background/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+)
+
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func stockHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	n, err := checkStock(context.Background(), 3)
+	if err != nil {
+		fmt.Println("toʻxtadi:", err, time.Since(start).Round(time.Second))
+		return
+	}
+	fmt.Println("javob yozildi", time.Since(start).Round(time.Second))
+	fmt.Fprintln(w, "qoldiq:", n)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stock", stockHandler)
+	log.Fatal(http.ListenAndServe("localhost:8093", mux))
+}
+```
+
+Yangi qatorlar: 6–7 `log` va `net/http`ni oladi. 20–29 `stockHandler(w http.ResponseWriter, r *http.Request)` — javob yozuvchi va soʻrov pointeri bilan handler. 21 vaqtni saqlaydi; 22 qoldiqni `Background()` bilan kutadi.
+
+23–26: xato boʻlsa `toʻxtadi:` va sabab server terminaliga yoziladi, handler qaytadi. 27 — `javob yozildi` logi. 28 — `fmt.Fprintln(w, ...)` mijozga javob yozishga urinadi. Bu log mijoz javobni olganini tasdiqlamaydi.
+
+31–35: `main`, yangi mux, `GET /stock`ni handlerga ulash; `ListenAndServe` portni tinglaydi, xato boʻlsa `log.Fatal` chiqarib jarayonni tugatadi.
+
+Server `localhost:8093`ni ishlatadi. Tajribadan oldin port boʻshligini tekshirdim. Band boʻlsa, nusxadagi ikkala server fayli va curl manzilidagi portni bir xil boʻsh raqamga almashtiring.
+
+`go build; ./bozor &`: `;` ketma-ket bajaradi, `&` faqat binary'ni fonda qoldiradi. `kill %1` shu terminalning birinchi fon ishini toʻxtatadi. Boshqa fon ishi yoʻq alohida Bash terminalidan foydalaning.
+
+`curl -sS --max-time 1`: `-s` ortiqcha chiqishni yashiradi; `-S` xatoni koʻrsatadi; `--max-time 1` uzatish uchun bir soniyalik chegara qoʻyadi.
+
+Mijoz 1 soniyada ketadi. Server logi? **A)** `toʻxtadi: ... 1s` · **B)** `javob yozildi 3s` · **C)** hech narsa.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `Background()`ning `Done()` kanali `nil`; uni mijozning ketishi bekor qilmaydi. A: contextlar bir-biriga bogʻlanmagan. C: server hamon ishlamoqda va supplier javobidan keyin log yozadi.
+
+</details>
+
+```console
+$ cp _video/05-background/*.go .
+$ go build; ./bozor &
+$ curl -sS --max-time 1 localhost:8093/stock
+curl: (28) Operation timed out after 1000 milliseconds with 0 bytes received
+javob yozildi 3s
+```
+
+`go build` hech narsa chiqarmadi. Binary tinglashni boshlagach curlni yuboring. `(28)` — curlning timeout xatosi; 1000 millisekund — 1 soniya; javobdan 0 bayt olindi. Oxirgi qator curlniki emas, yana 2 soniyadan keyingi server logi.
+
+Chiqish haqiqiy qayta bajarishdan olingan. Shellning fon ish raqami va jarayon raqami koʻrsatilmagan. Ikki jarayon bitta terminalga yozadi; satrlar aralashishi, 1000 oʻrniga 1001 chiqishi mumkin.
+
+## r.Context: soʻrov bilan bogʻlangan kutish
+
+Tuzatish bitta argument: `checkStock(r.Context(), 3)`. Soʻrov contexti GB-6.04da qiymat tashigan edi; endi uning bekor qilinishidan foydalanamiz.
+
+`net/http` serveri kiruvchi soʻrov contextini mijoz ulanishi yopilganda, HTTP/2 soʻrovi bekor qilinganda yoki `ServeHTTP` qaytganda bekor qiladi.
+
+```go filename="_video/06-handler/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+)
+
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func stockHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	n, err := checkStock(r.Context(), 3)
+	if err != nil {
+		fmt.Println("toʻxtadi:", err, time.Since(start).Round(time.Second))
+		return
+	}
+	fmt.Println("javob yozildi", time.Since(start).Round(time.Second))
+	fmt.Fprintln(w, "qoldiq:", n)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stock", stockHandler)
+	log.Fatal(http.ListenAndServe("localhost:8093", mux))
+}
+```
+
+Faqat 22-qator oʻzgardi. Eski serverni toʻxtating, keyin yangi fayllarni nusxalab qayta quring.
+
+Xuddi shu curl: **A)** handler logi ≈1 soniyada `context canceled` · **B)** ≈3 soniyada javob · **C)** `context deadline exceeded`?
+
+<details>
+<summary>Javob</summary>
+
+**A.** Ulanish uzilishi contextni bekor qiladi. B: handler endi supplierni oxirigacha kutmaydi. C: serverda hali muddat qoʻyilmadi; curlning oʻz vaqti tugashi serverga mijoz ketishi sifatida koʻrinadi.
+
+</details>
+
+```console
+$ kill %1
+$ cp _video/06-handler/*.go .
+$ go build; ./bozor &
+$ curl -sS --max-time 1 localhost:8093/stock
+curl: (28) Operation timed out after 1000 milliseconds with 0 bytes received
+toʻxtadi: context canceled 1s
+$ kill %1
+```
+
+Bu Bash sessiyasida avvalgi ish tugagach keyingi server yana `%1` boʻldi. Sizda raqam boshqa boʻlsa, aynan oʻsha server ishini tanlang. Server tajribadan keyin toʻxtatilgan.
+
+| Bosqich | Soʻrov contexti | Handler | Supplier goroutine |
+|---|---|---|---|
+| 0 s | faol | kutmoqda | uxlamoqda |
+| ≈1 s: curl ketdi | bekor qilindi, `Done` yopildi | `ctx.Err()` bilan qaytdi | hali uxlamoqda |
+| ≈3 s | bekor | tugagan | buferga yuborib tugaydi, agar server tirik boʻlsa |
+
+**Faqat handler kutishi tugadi.** `supplier` `ctx` olmaydi; `time.Sleep`ni context uzmaydi. Haqiqiy baza yoki HTTP chaqiruvi contextni oʻzi qabul qilishi kerak.
+
+Handler oʻz muddatini ham belgilashi mumkin. Quyidagi parcha vazifadagi handlerga qoʻyiladi:
+
+```go
+ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+defer cancel()
+```
+
+Ota — `r.Context()`. Bola context 2 soniyada yoki ota bekor boʻlganda tugaydi; oldin sodir boʻlgani sabab boʻladi. `defer cancel()` handler oldin qaytsa ham resurslarni boʻshatadi.
+
+| Hodisa | Ota: r.Context() | Bola: WithTimeout |
+|---|---|---|
+| mijoz 1 s da ketdi | bekor | bekor, `context.Canceled` |
+| mijoz kutmoqda, 2 s oʻtdi | hali faol boʻlishi mumkin | muddati tugadi, `context.DeadlineExceeded` |
+| handler qaytdi | server bekor qiladi | `defer cancel()` ham chaqiriladi |
+
+Qayta oʻlchov: videoda oddiy qabul 3s, timeout 1s; `Background` handler 3s, `r.Context` handler 1s. Bu mashinada ham 3s/1s va 3s/1s chiqdi. Kutish taxminan uch baravar qisqardi, 2 soniya keraksiz handler kutishi yoʻqoldi. Bu hisoblash tezlashgani emas; chiqish vaqti boshqacha. `Round` va mashina yuki sabab aniq vaqt oʻzgaradi.
+
+## Chuqurroq (ixtiyoriy): bufer va goroutine leak
+
+Server CLI kabi tugamaydi. Handler qaytgach supplier hali yashashi mumkin. Natija kanali buferini olib tashlasak nima boʻladi? `07-leak` buni alohida jarayonda oʻlchaydi.
+
+```go filename="_video/07-leak/supplier.go" showLineNumbers
+package main
+
+import "time"
+
+// stocks: yetkazib beruvchidagi qoldiqlar (ID → dona): olma 1, non 2, oʻrik 3.
+var stocks = map[int64]int{1: 40, 2: 120, 3: 5}
+
+// supplierDelay: yetkazib beruvchi shuncha vaqtda javob beradi.
+var supplierDelay = 3 * time.Second
+
+// supplier qoldiqni yetkazib beruvchidan soʻraydi: javob supplierDelay'dan keyin channel'ga keladi.
+func supplier(id int64) chan int {
+	ch := make(chan int)
+	go func() {
+		time.Sleep(supplierDelay)
+		ch <- stocks[id]
+	}()
+	return ch
+}
+```
+
+13-qator endi `make(chan int)`: yuborish qabul qiluvchini kutadi. Qolgan kod bir xil.
+
+```go filename="_video/07-leak/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := checkStock(ctx, 3)
+	time.Sleep(4 * time.Second)
+	fmt.Println(err, "goroutine'lar:", runtime.NumGoroutine())
+}
+```
+
+6-qator `runtime`ni import qiladi. 20–21 bir soniyalik ctx va `defer cancel()`. 22 natijani `_` bilan tashlab, xatoni oladi. 23 yana 4 soniya kutadi. 24 `runtime.NumGoroutine()` bilan hozir tirik goroutine sonini chiqaradi.
+
+Bu yerda jami ≈5 soniyadan keyin sanaymiz: supplierning 3 soniyalik uyqusi tugagan. Nechta? **A)** 1 · **B)** 2 · **C)** 0.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `main` va `ch <- stocks[id]`da qolgan supplier. Qabul qiluvchi qaytib ketdi. A: bufer yoʻq; C: sanashni `main` bajarmoqda.
+
+</details>
+
+```console
+$ cp _video/07-leak/*.go .
+$ go run .
+context deadline exceeded goroutine'lar: 2
+```
+
+Endi bir oʻrinli buferli supplierni qaytaring; `main` oʻzgarmaydi. **A)** 1 · **B)** 2 · **C)** 3?
+
+<details>
+<summary>Javob</summary>
+
+**A.** Bir dona natija buferga sigʻadi, yuboruvchi tugaydi. B: endi qabul qiluvchi boʻlishi shart emas. C: bufer yangi goroutine yaratmaydi.
+
+</details>
+
+```console
+$ cp _video/01-kutish/supplier.go .
+$ go run .
+context deadline exceeded goroutine'lar: 1
+```
+
+| Kanal | Timeoutdan keyingi yuborish | 5 s dagi son |
+|---|---|---|
+| `make(chan int)` | qabul qiluvchisiz kutadi | 2 |
+| `make(chan int, 1)` | bitta qiymat sigʻadi, supplier tugaydi | 1 |
+
+Bu aynan bitta natija yuboradigan supplier uchun tuzatish. Cheksiz yuboruvchi uchun bir oʻrinli bufer yetmaydi; yuborishning oʻzi ham `ctx.Done()` bilan toʻxtash yoʻliga ega boʻlishi kerak.
+
+Go xotira modelida yuborish mos qabul tugashidan oldin sinxronlashadi. Kanal yopilishi ham yopilganlik tufayli tugagan qabuldan oldin sinxronlashadi. Bu yerda natija kanal orqali, bekor qilish esa `Done` yopilishi orqali uzatiladi.
+
+**Race tekshiruvi.** Bu mashinada gcc yoʻq. `_video/race.sh` Docker ichida gcc bor image bilan ayni Go toolchainni ishlatadi. Quyidagilar darsning asl papkasidan qayta bajarildi; chiqish iqtibos emas:
+
+```console
+$ ./_video/race.sh 04-cancel go run -race .
+0 context canceled 1s
+(chiqish kodi: 0)
+$ ./_video/race.sh solution go test -race -count=3 .
+ok  	github.com/abdurahmon27/bozor	3.873s
+(chiqish kodi: 0)
+```
+
+`-race` bajarilgan yoʻllarda data race qidiradi; `-count=3` testni uch marta bajaradi. `(chiqish kodi: 0)`ni yordamchi skript qoʻshadi: chiqish kodi 0, buyruq muvaffaqiyatli. DATA RACE hisoboti yoʻq. Bu barcha mumkin boʻlgan bajarilishlar uchun isbot emas.
+
+Videodagi test 3.876s, bu safar 3.873s; farq mashina yukiga bogʻliq. Muhim natija — tekshiruvlar oʻtdi va bekor qilish ≈1 soniyada kuzatildi.
+
+## Koʻp uchraydigan xatolar
+
+**1. Handler ichida `Background()`.** Yuqoridagi xato kod mijoz ketganidan keyin ham `javob yozildi 3s` chiqardi. Tuzatish: `r.Context()`ni pastga uzating; `sumStock` ichida ham yangisini yaratmang.
+
+**2. Natija kanalining buferini olib tashlash.** Ixtiyoriy boʻlimdagi `2` supplier yuborishda qolganini koʻrsatdi. Bu bir natijali misolda tuzatish `make(chan int, 1)`.
+
+**3. `cancel`ni tashlab yuborish.** Quyidagi toʻliq kichik dastur kurs papkasida yoʻq. Uni alohida `lostcancel.go` sifatida tekshirdim:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	ctx, _ := context.WithTimeout(context.Background(), time.Second)
+	fmt.Println(ctx.Err())
+}
+```
+
+1–7 — paket va importlar; 9–12 — `main`. 10-qator `cancel`ni `_` bilan tashlaydi; 11 `ctx.Err()`ni chiqaradi. `go vet` nima deydi? **A)** muammo yoʻq · **B)** cancel chaqirilishi kerak · **C)** ctx turi notoʻgʻri.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `_` kompilyatsiyani oʻtkazadi, lekin resurslarni boʻshatish majburiyati yoʻqolmaydi. C: tur toʻgʻri.
+
+</details>
+
+```console
+$ go vet lostcancel.go
+lostcancel.go:10:7: the cancel function returned by context.WithTimeout should be called, not discarded, to avoid a context leak
+```
+
+`lostcancel.go:10:7` — fayl, 10-qator, 7-ustun. Xabar: «WithTimeout qaytargan cancel funksiyasini tashlamang, chaqiring; context resurslari qolib ketmasin». Tuzatish — `_` oʻrniga `cancel`, keyingi qatorda `defer cancel()`.
+
+**4. `cancel()` hamma ishni majburan tugatadi deb oʻylash.** Supplier context olmaydi va uxlayveradi. Context berilgan kod ham signalni tekshirishi yoki uni qoʻllaydigan API chaqirishi kerak.
+
+**5. Cancel har doim natijadan ustun deb oʻylash.** Ikkala `case` tayyor boʻlsa, `select` tasodifiy tanlaydi. Hatto oldindan bekor ctx bilan ham `supplier(id)` tanlovdan oldin baholanib, goroutine boshlaydi. Bu laboratoriya soddalashtirishi: haqiqiy tashqi chaqiruvga ctx uzating.
+
+**6. `go run . &`ni `kill %1` bilan boshqarish.** Quruvchi jarayon toʻxtab, child server qolishi mumkin. Yuqoridagi kabi binaryni quring, `./bozor &` bilan boshlang va aynan shu ishni toʻxtating.
+
+## Oʻzingizni tekshiring
+
+**1. Ikkita `case` tanlash paytida tayyor. Birinchisi doim yutadimi?**
+
+<details>
+<summary>Javob</summary>
+
+Yoʻq. Tayyorlar orasidan teng ehtimolli psevdotasodifiy tanlov boʻladi. `ctx.Done()` uchun alohida ustunlik yoʻq.
+
+</details>
+
+**2. `context deadline exceeded` va `context canceled` farqi nima?**
+
+<details>
+<summary>Javob</summary>
+
+Birinchisi muddat tugaganini bildiradi. Ikkinchisi boshqa sabab: `cancel()` yoki bekor qilingan ota context, jumladan mijoz ketishi.
+
+</details>
+
+**3. Bashorat:** oʻnta goroutine bitta `Done`ni kutsa, bir marta cancel nechtasiga signal beradi? **A)** 1 · **B)** 10 · **C)** 0.
+
+<details>
+<summary>Javob</summary>
+
+**B: 10.** Kanal yopiladi. Har bir kutayotgan qabul tayyor boʻladi; qiymat bir kishiga yuborilmaydi.
+
+</details>
+
+**4. GB-6.08:** xaridor begona buyurtmani soʻrasa, status qaysi va nega?
+
+<details>
+<summary>Javob</summary>
+
+`404`, yoʻq buyurtma bilan bir xil javob. Buyurtma mavjudligini oshkor qilmaymiz.
+
+</details>
+
+**5. `r.Context()` handlerni qaytardi. Supplier ham toʻxtadimi?**
+
+<details>
+<summary>Javob</summary>
+
+Yoʻq. Bu supplier ctx olmaydi. U uyqudan keyin bitta natijani buferga yuboradi; server tirik boʻlsa goroutine shundan keyin tugaydi.
+
+</details>
+
+## Uy vazifasi
+
+[Kurs papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-03-select-context), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-03-select-context/TASK.md), [javob: solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-03-select-context/solution).
+
+Vazifani sahifa boshidagi bosqichlar almashtirilmagan asl starter nusxasida bajaring. `main.go`da faqat ikki funksiya oʻzgaradi:
+
+- 🟢 **1. `sumStock(ctx, ids)`.** Har ID uchun `checkStock(ctx, id)`ni ketma-ket chaqiring. Yigʻindi va `nil` qaytaring. Xato boʻlsa darhol `0, err`; ayni xatoni saqlang.
+- 🟡 **2. `reportHandler`.** `WithTimeout(r.Context(), reportTimeout)` va `defer cancel()`; `sumStock(ctx, reportIDs)`. `errors.Is(err, context.DeadlineExceeded)` boʻlsa `http.Error(w, "yetkazib beruvchi javob bermadi", http.StatusGatewayTimeout)` va `return`. Boshqa xatoda, jumladan `context.Canceled`, javob yozmasdan qayting. Muvaffaqiyatda mavjud `jami: N` qolsin.
+
+504 Gateway Timeout — server tashqi tizimdan zarur javobni vaqtida olmadi. Qolgan funksiyalar, `supplier.go` va `tekshiruv_test.go` oʻzgarmasin.
+
+Tekshiruv supplier vaqtini 100 ms qiladi. `sumStock` 40 + 120 + 5 = 165 qaytarishi kerak; muddat va mijozning ketishini alohida tekshiradi.
+
+Natijani oldindan ayting: starter **A)** oʻtadi · **B)** vazifa yozilmagani uchun yiqiladi · **C)** kompilyatsiya qilinmaydi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Starter ataylab `VAZIFA 1: sumStock hali yozilmagan` qaytaradi. Quyidagi blok toʻliq qayta bajarish, qisqartirilmagan.
+
+</details>
+
+```console
+$ go test -count=1 .
+--- FAIL: TestVazifa1SumStock (0.00s)
+    tekshiruv_test.go:28: sumStock(ctx, [1 2 3]) xato qaytardi: VAZIFA 1: sumStock hali yozilmagan
+        	Har id uchun checkStock(ctx, id) chaqirib, qoldiqlarni qoʻshing (VAZIFA 1).
+--- FAIL: TestVazifa1Muddat (0.00s)
+    tekshiruv_test.go:46: muddati 150ms boʻlgan ctx bilan sumStock xatosi «VAZIFA 1: sumStock hali yozilmagan», kutilgan context.DeadlineExceeded (got = 0).
+        	ctx'ni checkStock'ka uzating: checkStock(ctx, id), context.Background() emas; xatoni oʻzgartirmay qaytaring.
+--- FAIL: TestVazifa1Bekor (0.00s)
+    tekshiruv_test.go:63: bekor qilingan ctx bilan sumStock xatosi «VAZIFA 1: sumStock hali yozilmagan», kutilgan context.Canceled
+--- FAIL: TestVazifa2Report (0.00s)
+    tekshiruv_test.go:85: GET /report: status 500, tana «VAZIFA 1: sumStock hali yozilmagan»; kutilgan 200 va «jami: 165»
+--- FAIL: TestVazifa2Muddat (0.00s)
+    tekshiruv_test.go:95: reportTimeout 150ms, yetkazib beruvchi 3 × 100ms: status 500, kutilgan 504 Gateway Timeout.
+        	ctx, cancel := context.WithTimeout(r.Context(), reportTimeout); defer cancel(); errors.Is(err, context.DeadlineExceeded) boʻlsa http.StatusGatewayTimeout (VAZIFA 2).
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+```
+
+`-count=1` saqlangan test natijasini ishlatmaydi. `FAIL` — tekshiruv yiqildi; `tekshiruv_test.go:28` kabi joylar qaysi talab bajarilmaganini aytadi. 28 — yigʻindi; 46 — muddat; 63 — bekor qilish; 85 — javob; 95 — 504.
+
+Endi javobni ochishdan oldin yozib koʻring.
+
+<details>
+<summary>Javob</summary>
+
+```go filename="solution/main.go" showLineNumbers
+// bozor: yetkazib beruvchidan qoldiq soʻrash, select va context bilan vaqtida toʻxtatish (GB-7.03).
+// Javob (solution): sumStock va reportHandler yozilgan.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+)
+
+// checkStock yetkazib beruvchining javobini yoki ctx bekor qilinishini kutadi: qaysi biri oldin boʻlsa.
+func checkStock(ctx context.Context, id int64) (int, error) {
+	select {
+	case n := <-supplier(id):
+		return n, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// GET /stock: oʻrikning (ID 3) qoldigʻi. Mijoz ketsa, r.Context() bekor qilinadi va ish toʻxtaydi.
+func stockHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	n, err := checkStock(r.Context(), 3)
+	if err != nil {
+		fmt.Println("toʻxtadi:", err, time.Since(start).Round(time.Second))
+		return
+	}
+	fmt.Println("javob yozildi", time.Since(start).Round(time.Second))
+	fmt.Fprintln(w, "qoldiq:", n)
+}
+
+// reportIDs: hisobotdagi mahsulotlar; reportTimeout: GET /report shuncha vaqtdan koʻp kutmaydi.
+var (
+	reportIDs     = []int64{1, 2, 3}
+	reportTimeout = 5 * time.Second
+)
+
+// sumStock ids'dagi har mahsulot qoldigʻini checkStock bilan ketma-ket soʻrab, yigʻindisini qaytaradi.
+// ctx bekor qilinsa yoki muddati tugasa, darhol 0 va ctx'ning xatosini qaytaradi.
+func sumStock(ctx context.Context, ids []int64) (int, error) {
+	total := 0
+	for _, id := range ids {
+		n, err := checkStock(ctx, id)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// GET /report: reportIDs qoldiqlarining yigʻindisi, "jami: N".
+func reportHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), reportTimeout)
+	defer cancel()
+	total, err := sumStock(ctx, reportIDs)
+	if errors.Is(err, context.DeadlineExceeded) {
+		http.Error(w, "yetkazib beruvchi javob bermadi", http.StatusGatewayTimeout)
+		return
+	}
+	if err != nil {
+		return // mijoz ketdi (context.Canceled): javob yozishning ma'nosi yoʻq
+	}
+	fmt.Fprintln(w, "jami:", total)
+}
+
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stock", stockHandler)
+	mux.HandleFunc("GET /report", reportHandler)
+	return mux
+}
+
+func main() {
+	log.Fatal(http.ListenAndServe("localhost:8093", newMux()))
+}
+```
+
+44–54: `total` nol; `for _, id := range ids` indeksni tashlaydi, har ID uchun ayni ctx uzatiladi. Xatoda qisman yigʻindi emas, `0, err`; oxirida `total, nil`.
+
+57–69: soʻrovdan muddatli bola ctx olinadi, cancel kechiktiriladi. `DeadlineExceeded` alohida 504ga aylantiriladi; qolgan xatoda javob yozilmaydi. Muvaffaqiyatda yigʻindi yoziladi. 14–34 avvalgi `checkStock` va `stockHandler`. 36–40dagi `reportIDs` — `[]int64{1, 2, 3}`, `reportTimeout` — 5 soniya. 71–80dagi `newMux()` ikkala route ulangan muxni qaytaradi; `main` serverni boshlaydi. 1–12 — izohlar, paket va tanish importlar.
+
+Javob testdan oʻtadimi? **A)** ha · **B)** barcha soʻrovlar 504 · **C)** mijoz ketsa ham 9 soniya kutadi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Testlar muddatni boshqaradi. Yetarli vaqtda 165, muddat tugasa 504, mijoz ketsa javobsiz qaytish tekshiriladi. B va C contextni uzatish qoidasiga zid.
+
+</details>
+
+```console
+$ go test -count=1 ./solution/...
+ok  	github.com/abdurahmon27/bozor/solution	0.955s
+```
+
+Videoda 0.954s, qayta oʻlchov 0.955s. Aniqlik uchun testlar vaqtining tengligi emas, talablarning oʻtishi muhim. Oʻzingizning oʻzgartirgan starteringizda `go test -count=1 .` ham oʻtishi kerak.
+
+Ikkala paket uchun format va statik tekshiruv ham bajarildi:
+
+```console
+$ gofmt -l .
+$ go vet ./...
+```
+
+Ikkalasi ham hech narsa chiqarmadi. `gofmt -l` formatlanmagan fayllarni sanaydi; `go vet ./...` paketlar va ichki paketlarni tekshiradi. `_video` Go tomonidan chetlab oʻtiladi; uning bosqichlari yuqorida alohida ishga tushirildi.
+
+</details>
+
+Qoʻshimcha, tekshirilmaydi: javob serverida `/report`ni chaqiring. Uch mahsulot ketma-ket 3 × 3 = 9 soniya talab qiladi, `reportTimeout` esa 5 soniya. Shu sabab 504 kutiladi. Bu 9 soniya arifmetik hisob; bu sahifa uchun alohida curl oʻlchovi qilinmadi.
+
+Keyingi dars [GB-7.04 · Worker va errgroup](/lab/youtube/gb#gb-7-04) bir vaqtda nechta ish bajarilishini chegaralaydi.
+
+## Manbalar
+
+- Go rasmiy qoidalari: [select](https://go.dev/ref/spec#Select_statements), [qabul](https://go.dev/ref/spec#Receive_operator), [yuborish](https://go.dev/ref/spec#Send_statements), [kanal turlari](https://go.dev/ref/spec#Channel_types).
+- [Go xotira modeli](https://go.dev/ref/mem): kanal orqali sinxronlashish.
+- [context](https://pkg.go.dev/context), [Context.Done va Err](https://pkg.go.dev/context#Context), [WithCancel](https://pkg.go.dev/context#WithCancel), [WithTimeout](https://pkg.go.dev/context#WithTimeout), [CancelFunc](https://pkg.go.dev/context#CancelFunc).
+- [net/http Request.Context](https://pkg.go.dev/net/http#Request.Context): soʻrovning tugash shartlari.
+- [time.After](https://pkg.go.dev/time#After), [runtime.NumGoroutine](https://pkg.go.dev/runtime#NumGoroutine).
+- Go blog: [Context](https://go.dev/blog/context), [Pipelines and cancellation](https://go.dev/blog/pipelines).
+- [curl qoʻllanmasi](https://curl.se/docs/manpage.html), [--max-time](https://curl.se/docs/manpage.html#-m), [Go race detector talablari](https://go.dev/doc/articles/race_detector#Requirements).
+- RFC 9110: [504 Gateway Timeout](https://www.rfc-editor.org/rfc/rfc9110#name-504-gateway-timeout), [404 Not Found](https://www.rfc-editor.org/rfc/rfc9110#name-404-not-found).
+- [Kurs README va kod](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-03-select-context).
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, 2026-11-28. Race buyruqlari Docker orqali, `golang:1.26.8` image ichida Go 1.27.4 va `CGO_ENABLED=1` bilan qayta bajarildi. Videodagi sonlar matnda taqqoslash uchun aniq belgilangan.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-03-select-context)
+
+---
+
+← Oldingi dars: [GB-7.02](/lab/youtube/gb/gb-7-02) · Keyingi dars: [GB-7.04](/lab/youtube/gb#gb-7-04) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
