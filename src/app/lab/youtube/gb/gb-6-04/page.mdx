@@ -1,0 +1,1048 @@
+---
+title: "Login va bekor qilinadigan session'lar"
+date: "2026/11/28"
+description: "Go API uchun login, cookie, bazada token hashi, har soʻrovda muddat tekshiruvi va logout yozing; Postgres bilan sinang."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 46
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-04"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-04"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-6-04/ru) · [English](/lab/youtube/gb/gb-6-04/en)  
+Dars GB-6.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-04) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+bozor parolni tekshiradi. Keyingi `GET /me`ni kim yuborganini qanday biladi? Logout eski cookie nusxasini qanday bekor qiladi?
+
+**Bitta gʻoya:** session — serverdagi «shu token egasi shu foydalanuvchi, shu vaqtgacha» degan yozuv. Cookie tokenni olib yuradi; bazada faqat hash saqlanadi. Har himoyalangan soʻrov yozuvni tekshiradi.
+
+Dars oxirida siz:
+
+- tasodifiy token yaratib, faqat SHA-256 hashini saqlaysiz;
+- middleware orqali foydalanuvchini soʻrov contextiga qoʻyasiz;
+- muddat, qayta ishga tushirish va logoutni Postgres bilan tekshirasiz;
+- hamma qurilmadan chiqish endpointini testlar oʻtguncha yozasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| session | foydalanuvchi, token va muddatni bogʻlovchi yozuv | session |
+| session tokeni | kimlikni tasdiqlovchi tasodifiy sir | session token |
+| sessionni bekor qilish | keyingi tekshiruv tokenni rad etishi uchun yozuvni oʻchirish | session revocation |
+
+Ikki yordamchi: **cookie** — server `Set-Cookie` bilan beradigan, mijoz `Cookie` bilan qaytaradigan qiymat. **Soʻrov contexti** soʻrovga tegishli qiymatlarni handlerlar orasida olib yuradi.
+
+## Oldin bilish kerak
+
+Rejadagi asos: [GB-6.03 · argon2id](/lab/youtube/gb#gb-6-03), [GB-6.01 · middleware](/lab/youtube/gb/gb-6-01). Yana quyidagilar kerak:
+
+[GB-6.02 · problem details](/lab/youtube/gb/gb-6-02), [GB-5.10 · API/Postgres](/lab/youtube/gb/gb-5-10), [GB-5.08 · RowsAffected](/lab/youtube/gb/gb-5-08), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06), [GB-5.05 · pgx/context](/lab/youtube/gb/gb-5-05), [GB-5.04 · JOIN](/lab/youtube/gb/gb-5-04), [GB-5.03 · SQL](/lab/youtube/gb/gb-5-03), [GB-5.02 · Docker](/lab/youtube/gb/gb-5-02), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08), [GB-4.06 · JSON](/lab/youtube/gb/gb-4-06), [GB-4.05 · ServeMux](/lab/youtube/gb/gb-4-05), [GB-4.03 · Handler](/lab/youtube/gb/gb-4-03), [GB-4.01 · HTTP](/lab/youtube/gb/gb-4-01), [GB-2.09 · panic](/lab/youtube/gb/gb-2-09), [GB-2.08 · errors.Is/%w](/lab/youtube/gb/gb-2-08), [GB-2.07 · any](/lab/youtube/gb/gb-2-07), [GB-2.04 · &T\{\}](/lab/youtube/gb/gb-2-04), [GB-2.01 · []byte](/lab/youtube/gb/gb-2-01).
+
+**Ishga tushirish.** [Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session) ichida ishlang. Go Playground yetmaydi: Docker, Postgres, goose, curl va jq kerak. `5514` va `8765` portlari boʻsh boʻlsin. Foydalanuvchilar endi Postgresda; GB-6.03 da xotirada edi. Katalog va buyurtmalarni birlashtirish GB-6.08 da.
+
+Birinchi terminalda Bash ishlating. `CGO_ENABLED=0` C kompilyatorisiz quradi. `GOTOOLCHAIN` yozuvdagi versiyani tanlaydi. Goose oʻrnatilmagan boʻlsa:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`no_sqlite3` keraksiz SQLite drayverini chiqaradi. Go `bin` katalogidagi `goose` `PATH`da boʻlsin. Keyin:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5514/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+Ulanish satri laboratoriya konteyneridan olinadi, ekranga chiqmaydi. `-T` interaktiv terminal ajratmaydi. Migratsiyalar jadvallarni yaratadi. Seed ikki sinov foydalanuvchisini qoʻyadi:
+
+```console
+$ goose up 2>&1 | sed -E 's/^[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9:]{8} //'
+OK   00001_products.sql (10.82ms)
+OK   00002_orders.sql (12.95ms)
+OK   00003_orders_status.sql (2.82ms)
+OK   00004_users.sql (6.2ms)
+OK   00005_sessions.sql (6.76ms)
+goose: successfully migrated database to version: 5
+$ docker compose exec -T db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 2
+```
+
+`sed` faqat sana prefiksini olib tashlaydi. Takroriy `goose up` natijasi boshqacha. Seed mavjud foydalanuvchi va sessionlarni tozalaydi: faqat laboratoriyada ishlating. Server:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Ikkinchi terminalda ham shu papkani oching. Quyidagi `jq` filtrlari shaxsiy maydonlar va request IDʼni chiqarmaydi. Natijalar qayta bajarilgan; video sonlari alohida iqtibos deb belgilangan.
+
+**Eslash:** GB-6.03 dagi `Verify`? **A)** hashni ochadi · **B)** oʻsha salt va parametrlar bilan qayta hisoblaydi · **C)** yangi salt bilan satrlarni solishtiradi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Argon2id qayta hisoblanadi, natija doimiy vaqtda solishtiriladi. Hash shifrlangan parol emas; yangi salt boshqa natija beradi.
+
+</details>
+
+## Session va ikki tomondagi holat
+
+Har soʻrovda parol yuborish uni yana tarmoqdan oʻtkazadi va argon2id hisoblatadi. Login bir marta tekshiradi, keyin tasodifiy token ishlatiladi.
+
+`401 Unauthorized` — kimlik tasdiqlanmagan. Cookiesiz `/me`? **A)** `200` · **B)** `401` · **C)** `404`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Route mavjud, lekin kimlik dalili yoʻq. `404` — route yoʻq; `200` uchun session kerak.
+
+</details>
+
+```console
+$ curl -sS localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+| Qadam | Mijoz | Postgres |
+|---|---|---|
+| Logingacha | cookie yoʻq | qator yoʻq |
+| Login | tokenni `Set-Cookie`dan oladi | hash, user ID, muddat |
+| `/me` | tokenni `Cookie`da yuboradi | hash va muddat tekshiriladi |
+| Logout | nusxada token qolishi mumkin | qator yoʻq: keyingi tekshiruv `401` |
+
+`avval login qiling` mijozga avval kirishni aytadi.
+
+## Tasodifiy token, bazada faqat hash
+
+```go
+func newToken() string {
+	b := make([]byte, 32)
+	rand.Read(b) // Go 1.24+: xato qaytarmaydi
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// hashToken — bazaga yoziladigan va bazadan qidiriladigan qiymat: tokenning SHA-256 hash'i.
+func hashToken(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+```
+
+Bu `cmd/api/auth.go` parchasi; toʻliq fayl pastda. Parchani alohida ishga tushirmang.
+
+| Qator | Nima qiladi |
+|---|---|
+| 1 | `newToken` matn qaytaradi |
+| 2 | `make([]byte, 32)` 32 baytli slice yaratadi |
+| 3 | `crypto/rand.Read` kriptografik tasodif bilan toʻldiradi |
+| 4 | `RawURLEncoding` baytlarni URLga mos matnga aylantiradi; `=` toʻldiruvchisi yoʻq |
+| 5 | funksiya tugaydi |
+| 7–8 | izoh va `hashToken`: matn oladi, bayt qaytaradi |
+| 9 | `Sum256([]byte(token))` aynan token matnini hashlaydi: `[32]byte` |
+| 10–11 | `sum[:]` butun massivni slice qilib qaytaradi; funksiya tugaydi |
+
+32 tasodifiy bayt — 256 bit; base64url koʻrinishi 43 belgi. Alifbo: harf, raqam, `-`, `_`. Kodlash shifrlash emas. SHA-256 natijasi 32 bayt, hex koʻrinishi 64 belgi. Go 1.24 dan `rand.Read` toʻliq toʻldiradi va xato qaytarmaydi; tasodif manbasi ishlamasa dastur qaytmasdan toʻxtaydi.
+
+Inson paroli uchun argon2id kerak. Tasodifiy 256 bitli tokenga tez SHA-256 yetadi. Bazaning faqat oʻqish nusxasi sizsa, hashni cookie sifatida ishlatib boʻlmaydi. Bu oʻgʻirlangan cookie yoki bazaga yozish huquqidan himoya bermaydi. [OWASP saqlash tavsiyasi](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#server-side-session-token-storage) kamida 128 bit, yaxshisi 160 yoki koʻproq tasodifni soʻraydi.
+
+Foydalanuvchilar `00004_users.sql`da yaratiladi. `users_email_lower_idx` — `lower(email)` boʻyicha takrorni taqiqlovchi indeks. Login ham shu ifoda bilan qidiradi. Session jadvali:
+
+```sql filename="migrations/00005_sessions.sql"
+-- +goose Up
+CREATE TABLE sessions (
+    token_hash bytea       PRIMARY KEY,
+    user_id    bigint      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+-- "Hamma qurilmadan chiqish" (DELETE … WHERE user_id = $1) jadvalni oxirigacha oʻqimasin.
+CREATE INDEX sessions_user_id_idx ON sessions (user_id);
+
+-- +goose Down
+DROP TABLE sessions;
+```
+
+`Up` yaratadi, `Down` oʻchiradi. `bytea` baytlarni saqlaydi; primary key avtomatik unikal indeks yaratadi. `user_id` tashqi kalit; `ON DELETE CASCADE` foydalanuvchi bilan sessionlarini ham oʻchiradi. `timestamptz` UTC lahzasini saqlaydi, dastlabki vaqt mintaqasini emas. `sessions_user_id_idx` foydalanuvchi boʻyicha oʻchirishga yordam beradi.
+
+## Login: parol tekshiruvi va cookie
+
+```go
+type loginInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// login — POST /login: parol toʻgʻri boʻlsa yangi session ochadi va tokenni cookie'da qaytaradi.
+// Har login yangi token oladi, so'rovda eski session cookie'si bo'lsa, uning qatori o'chiriladi: OWASP
+// "Renew the Session ID After Any Privilege Level Change" — yangi ID, eskisi yo'q qilinsin (session fixation).
+func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	var in loginInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	u, err := a.checkPassword(r.Context(), in.Email, in.Password)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	token := newToken()
+	expires := time.Now().Add(sessionTTL)
+	err = a.st.CreateSession(r.Context(), hashToken(token), u.ID, expires)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	setSessionCookie(w, token, expires)
+	writeJSON(w, http.StatusOK, u)
+}
+```
+
+`loginInput` JSON teglari `Email` va `Password`ni bodyga bogʻlaydi. `a *api` storeʼga kirish beradi. `in` kirish qiymati; `&in` uning manzili. `!decodeJSON` — oʻqish muvaffaqiyatsiz: javob yozilgan, `return` kerak.
+
+`u, err :=` foydalanuvchi va xatoni oladi. `checkPassword` yangi metod: ichida GB-6.03 dagi `password.Verify`. Har `err != nil` tarmogʻi `writeError` va `return` bilan tugaydi.
+
+`endCurrentSession` soʻrovdagi eski cookiening yozuvini oʻchiradi. Keyin yangi token. `time.Now().Add(sessionTTL)` hozirga `24 * time.Hour` qoʻshadi. `err =` mavjud oʻzgaruvchiga qiymat beradi. `CreateSession` hash, user ID va muddatni `INSERT` qiladi. Faqat yozuv saqlangach cookie va `200` JSON yuboriladi. `User.PasswordHash`dagi `json:"-"` hashni javobdan chiqaradi.
+
+**Bashorat:** email bazada yoʻq. **A)** `404` · **B)** `401`, «email yoʻq» · **C)** notoʻgʻri paroldagi kabi umumiy `401`.
+
+<details>
+<summary>Javob</summary>
+
+**C.** A va B hisob mavjudligini tekshirish imkonini beradi. Ichki sabab logda qoladi.
+
+</details>
+
+Ikkinchi terminaldagi Bashda READMEʼdagi birinchi sinov foydalanuvchisining manzili va parolini kiriting. Faqat laboratoriya qiymatlari. `read -r` matnni oladi, `-s` parolni yashiradi. `jq -n --arg` JSON yaratadi. Buyruqlar natija chiqarmaydi:
+
+```bash
+read -r LAB_EMAIL
+read -r -s LAB_PASSWORD
+jq -n --arg email "$LAB_EMAIL" --arg password "$LAB_PASSWORD" '{email:$email,password:$password}' > login.json
+jq '.password += "-wrong"' login.json > wrong.json
+jq '.email = ("missing-" + .email)' login.json > missing.json
+```
+
+`--data-binary @file` faylni body qilib yuboradi. `-H` media turini qoʻyadi; body borligi `POST`ni tanlaydi. `-sS` progressni yashiradi, ulanish xatosini chiqaradi. `jq` uchta maydonni qoldiradi:
+
+```console
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @wrong.json | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "email yoki parol notoʻgʻri"
+}
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @missing.json | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "email yoki parol notoʻgʻri"
+}
+```
+
+`email yoki parol notoʻgʻri` ikki holatga umumiy javob.
+
+```go
+func setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+```
+
+`http.SetCookie` `&http.Cookie{...}`dan sarlavha yaratadi. `Name` — `session`; `Value` — token; `Path: "/"` shu hostning yoʻllari; `Expires` — mijozdagi saqlash muddati. `HttpOnly` sahifa skriptiga oʻqishni taqiqlaydi. `Secure` HTTPS talab qiladi; curl `http://localhost`ni istisno qiladi. `SameSite=Lax` cross-site POSTga cookie qoʻshmaydi. Toʻliq chegaralar [GB-6.07 · cookie va CSRF](/lab/youtube/gb#gb-6-07) da. `no-store` javobni keshda saqlamaslikni buyuradi.
+
+**Bashorat:** eski cookie yubormasdan ikkita login. **A)** bitta qator · **B)** nol · **C)** ikkita.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Har login yangi qator yaratadi. Eski cookie yuborilsa, aynan oʻsha qator oʻchadi. Telefon va noutbuk cookie saqlash joylari alohida.
+
+</details>
+
+```console
+$ curl -sS -D login.headers -o login.response -c jar.txt localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json
+$ sed -n -E '/^HTTP\/|^Cache-Control:|^Set-Cookie:/ { s/(session=)[^;]*/\1[redacted]/; p; }' login.headers
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Set-Cookie: session=[redacted]; Path=/; Expires=Sun, 29 Nov 2026 05:25:06 GMT; HttpOnly; Secure; SameSite=Lax
+$ jq '{id}' login.response
+{
+  "id": 1
+}
+$ curl -sS localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json | jq '{id}'
+{
+  "id": 1
+}
+```
+
+Birinchi buyruq jim: `-D` sarlavhalarni, `-o` bodyni saqlaydi; `-c` cookie faylini yozadi. `[redacted]`ni `sed` qoʻydi; haqiqiy token 43 belgi. Toʻliq tokenni ulashmang. Ikkinchi login `-b`siz: boshqa qurilma. Bazadan sirlarni chiqarmasdan shaklini koʻramiz:
+
+```console
+$ docker compose exec -T db psql -c "SELECT user_id, octet_length(token_hash) AS bytes, length(encode(token_hash, 'hex')) AS hex_chars, expires_at > now() AS valid FROM sessions ORDER BY expires_at"
+ user_id | bytes | hex_chars | valid 
+---------+-------+-----------+-------
+       1 |    32 |        64 | t
+       1 |    32 |        64 | t
+(2 rows)
+```
+
+`AS` nom beradi; `octet_length` baytlarni, `length(encode(..., 'hex'))` hex belgilarni sanaydi. `t` — true. Ikkala qator `user_id=1`; hashlar 32 bayt, 64 hex belgi. Cookie matni bazada yoʻq.
+
+## Har soʻrov: cookie → baza → context
+
+```go
+type userKey struct{}
+
+// requireUser — himoyalangan route'lar uchun middleware (GB-6.01 shakli): cookie'dagi token hash'i
+// boʻyicha session egasini topadi va uni soʻrov context'iga qoʻyadi. Topilmasa — 401, handler ishlamaydi.
+func (a *api) requireUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil {
+			writeError(w, err) // http.ErrNoCookie → 401
+			return
+		}
+		u, err := a.st.UserBySession(r.Context(), hashToken(c.Value))
+		if err != nil {
+			writeError(w, err) // store.ErrNoSession → 401
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store") // shaxsiy javob: keshda qolmasin (OWASP)
+		ctx := context.WithValue(r.Context(), userKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+`userKey struct{}` — maydonsiz oʻz kalit turi. Kalit taqqoslanadigan boʻlishi kerak. Go hujjati paketlar toʻqnashmasligi uchun ichki `string` oʻrniga oʻz turni tavsiya qiladi.
+
+`requireUser` handler olib, `http.HandlerFunc`ga aylantirilgan closure qaytaradi. `r.Cookie` nom boʻyicha oʻqiydi; yoʻq boʻlsa `http.ErrNoCookie` → `401` → `return`.
+
+`UserBySession` `hashToken(c.Value)` bilan qidiradi. Session yoʻq yoki eskirgan boʻlsa `ErrNoSession` → `401`. Baza nosozligi `500`. Muvaffaqiyatda `no-store` qoʻyiladi. `WithValue` eski contextdan yangi `ctx` yaratadi: `userKey{}` → `u`. `r.WithContext(ctx)` soʻrovning shu contextli sayoz nusxasini beradi. `next.ServeHTTP` handlerni bajaradi. Store:
+
+```go
+func (s *Store) UserBySession(ctx context.Context, tokenHash []byte) (User, error) {
+	var u User
+	err := s.pool.QueryRow(ctx, `
+		SELECT u.id, u.email
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1 AND s.expires_at > now()`,
+		tokenHash).Scan(&u.ID, &u.Email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, ErrNoSession
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("session oʻqilmadi: %w", err)
+	}
+	return u, nil
+}
+```
+
+`var u User` oluvchi qiymat. `QueryRow` bitta qator uchun; backtick SQLni oʻraydi. `s`, `u` jadval qisqa nomlari; `JOIN` foydalanuvchini ulaydi. `$1` hash parametri. `Scan(&u.ID, &u.Email)` maydonlarni yozadi. `pgx.ErrNoRows` session topilmaganiga aylantiriladi, boshqa xatolar `%w` bilan oʻraladi. `return u, nil` — muvaffaqiyat.
+
+`now()` — **joriy transaction boshlanish vaqti**. Bu alohida soʻrovda u tekshiruvga yaqin. Uzoq transactionda har SELECT bilan yangilanmaydi.
+
+```go
+func currentUser(r *http.Request) store.User {
+	u, ok := r.Context().Value(userKey{}).(store.User)
+	if !ok {
+		panic("currentUser: route requireUser bilan oʻralmagan")
+	}
+	return u
+}
+```
+
+`Value` qaytargan `any`ga `.(store.User)` type assertion qoʻllanadi. `u, ok :=` yoʻq qiymat yoki xato turni aniqlaydi. `!ok` dasturchi xatosi: route oʻralmagan. Ataylab `panic`, `recoverPanic`dan `500`. Oddiy holatda `return u`. Routeʼlar toʻliq:
+
+```go filename="cmd/api/handlers.go" showLineNumbers
+package main
+
+// Route'lar (GB-4.05). Ochiq: /health, POST /users (GB-6.03), POST /login, POST /logout. Himoyalangan
+// route'lar requireUser bilan oʻralgan (auth.go): cookie'dagi session tirik boʻlmasa, handler'gacha
+// yetib bormaydi — 401. POST body'li route'lar requireJSON bilan (GB-6.01, 415).
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// api — handler'lar bazani shu struct orqali koʻradi (GB-5.10).
+type api struct {
+	st *store.Store
+}
+
+// newMux — hamma route'lar shu yerda: main ham, testlar ham bir xil mux'ni ishlatadi.
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{st: st}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.Handle("POST /users", requireJSON(http.HandlerFunc(a.register))) // GB-6.03
+	mux.Handle("POST /login", requireJSON(http.HandlerFunc(a.login)))
+	mux.Handle("GET /me", a.requireUser(http.HandlerFunc(a.me)))
+	mux.HandleFunc("POST /logout", a.logout) // requireUser'siz: eskirgan cookie ham tozalansin
+	// VAZIFA (TASK.md, 2-qadam): POST /logout-all → a.logoutAll, requireUser bilan oʻralgan
+	return mux
+}
+
+// healthHandler — server tirikligini tekshirish: har soʻrovga «ok» (GB-4.03).
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "ok")
+}
+
+// me — GET /me: session egasi. requireUser uni context'ga qoʻygan.
+func (a *api) me(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, currentUser(r))
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1, 7–12 | `main` paketi; javob, HTTP, store importlari |
+| 15–17 | `api.st` store pointerini ushlaydi |
+| 20–22 | `api` va mux yaratadi |
+| 23–25 | health, register, login; body routeʼlari `requireJSON` bilan |
+| 26–27 | `/me` himoyalangan, logout ochiq |
+| 28–30 | vazifa joyi, muxni qaytarish, funksiya oxiri |
+| 33–35 | health `ok` chiqaradi |
+| 38–40 | contextdagi user → `200` JSON |
+
+`http.HandlerFunc(a.me)` funksiyani Handlerga aylantiradi; `Handle` tayyor Handler oladi. `me` bazaga qayta bormaydi. Izohlar va boʻsh qatorlar bajarilmaydi.
+
+| Bosqich | Context | Natija |
+|---|---|---|
+| Soʻrov kirishi | user yoʻq | cookie oʻqiladi |
+| Baza tekshiruvi | hali user yoʻq | `u` olindi |
+| `WithValue` + `WithContext` | `userKey{}` → `u` | yangi soʻrov nusxasi |
+| `currentUser` | `store.User` | `200` JSON |
+
+**Bashorat:** serverni Ctrl+C bilan toʻxtatib, oʻsha baza bilan qayta boshlang. `jar.txt` bilan `/me`? **A)** `200` · **B)** `401`, xotira yoʻqoldi · **C)** `500`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Cookie mijozda, qator Postgresda. Yangi jarayon uni oʻchirmaydi. Yana `go run ./cmd/api` bilan boshlang.
+
+</details>
+
+```console
+$ curl -sS -b jar.txt localhost:8765/me | jq '{id}'
+{
+  "id": 1
+}
+```
+
+`-b jar.txt` saqlangan cookieni yuboradi. **Bashorat:** bazadagi hex hash cookie sifatida? **A)** `200`, bazadagiga teng · **B)** `401` · **C)** `500`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Kelgan matn yana hashlanadi; bu asl token matni emas. `leaked` lokal oʻzgaruvchida qoladi; `psql -At` sarlavhasiz tekis natija beradi.
+
+</details>
+
+```console
+$ leaked=$(docker compose exec -T db psql -At -c "SELECT encode(token_hash, 'hex') FROM sessions ORDER BY expires_at LIMIT 1"); curl -sS -b "session=$leaked" localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+## Muddat shartini olib tashlasak
+
+Klassik jim xato — `UserBySession` SQLida faqat hash qolishi. Alohida laboratoriya nusxasida shartni quyidagiga almashtirib, serverni qayta boshlang:
+
+```sql
+SELECT u.id, u.email
+FROM sessions s JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1
+```
+
+**Bashorat:** ikkala qator muddati oʻtadi. Xato va toʻgʻri versiya? **A)** ikkalasi `401` · **B)** ikkalasi `200` · **C)** xato `200`, toʻgʻri `401`.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Postgres qatorni muddat oʻtganda oʻzi oʻchirmaydi. Cookie `Expires`i hali ertaga; server oʻz muddatini tekshirishi kerak.
+
+</details>
+
+```console
+$ docker compose exec -T db psql -c "UPDATE sessions SET expires_at = now() - interval '1 minute'"
+UPDATE 2
+$ curl -sS -b jar.txt localhost:8765/me | jq '{id}'
+{
+  "id": 1
+}
+```
+
+`interval '1 minute'` bir daqiqa; `UPDATE 2` ikki qator yangilanganini bildiradi. Xato versiya `200` berdi. `AND s.expires_at > now()`ni qaytarib, serverni yana boshlang:
+
+```console
+$ curl -sS -b jar.txt localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+Kompilyator xabari yoʻq: dastur ishlaydi, lekin eskirgan sessionni qabul qiladi. Tuzatish — serverdagi SQL tekshiruvi.
+
+## Logout: cookie va qator alohida
+
+```go
+func (a *api) endCurrentSession(r *http.Request) error {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil // cookie yoʻq: oʻchiradigan session ham yoʻq
+	}
+	return a.st.DeleteSession(r.Context(), hashToken(c.Value))
+}
+
+// logout — POST /logout: cookie'dagi session qatorini o'chiradi va brauzerga cookie'ni o'chirishni aytadi.
+// requireUser'siz: session allaqachon eskirgan yoki o'chirilgan bo'lsa ham javob 204 va cookie tozalanadi.
+func (a *api) logout(w http.ResponseWriter, r *http.Request) {
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+```go
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+```
+
+`endCurrentSession`da cookie yoʻq boʻlsa, oʻchiradigan narsa yoʻq: `nil`. Aks holda `DeleteSession` hash boʻyicha `DELETE FROM sessions WHERE token_hash = $1` qiladi. Qator yoʻq boʻlsa ham muvaffaqiyat.
+
+`if err := ...; err != nil` xatoni eʼlon qilib tekshiradi. Oʻchirish ishlamasa `writeError` va `return`. Aks holda `clearSessionCookie`, `204 No Content`, bodysiz javob.
+
+Tozalash oʻsha nom va `Path` bilan boʻsh qiymat beradi. Goʼda `MaxAge: -1` sarlavhada `Max-Age=0`. Qolgan atributlar login bilan bir xil. Sessionni bekor qiladigan amal — DELETE.
+
+Oldingi ikki yozuv eskirgan: qayta login kerak. **Bashorat:** login → nusxa → logout → eski nusxa bilan `/me`? **A)** `401` · **B)** `200`, Expires ertaga · **C)** `404`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Token nusxada bor, lekin qator oʻchgan. Mijoz muddati server tekshiruvini almashtirmaydi.
+
+</details>
+
+```console
+$ curl -sS -c jar.txt localhost:8765/login -H 'Content-Type: application/json' --data-binary @login.json | jq '{id}'
+{
+  "id": 1
+}
+$ cp jar.txt eski.txt
+$ curl -sS -D logout.headers -o /dev/null -X POST -b jar.txt -c jar.txt localhost:8765/logout
+$ sed -n -E '/^HTTP\/|^Set-Cookie:/p' logout.headers
+HTTP/1.1 204 No Content
+Set-Cookie: session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+$ curl -sS -b eski.txt localhost:8765/me | jq '{title,status,detail}'
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "avval login qiling"
+}
+```
+
+`cp` va logout buyruqlari natija chiqarmadi. `-X POST` bodysiz POST; `-b` yuboradi, `-c` jarni yangilaydi. `eski.txt` oʻzgarmaydi. **Bashorat:** cookiesiz logout? **A)** `401` · **B)** `204` · **C)** `500`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Logout `requireUser`siz. Takrorlash yakuniy holatni oʻzgartirmaydi: idempotent. `-o /dev/null` bodyni tashlaydi, `-w` status chiqaradi.
+
+</details>
+
+```console
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST localhost:8765/logout
+204
+```
+
+Bekor qilish keyingi tekshiruvga taʼsir qiladi. Allaqachon tekshiruvdan oʻtgan parallel handlerni DELETE orqaga qaytarmaydi.
+
+## Chuqurroq (ixtiyoriy): vaqt va himoya chegaralari
+
+`checkPassword` yoʻq emailga ham `dummyHash` bilan argon2id ishlatadi. Aks holda erta qaytish hisob mavjudligini vaqt orqali bildirishi mumkin. `dummyHash` dastur boshlanganda bir marta hisoblanadi. Saqlangan hash buzuq boʻlsa `500`. Muvaffaqiyatda `u.PasswordHash = ""`: keyingi kodga u kerak emas.
+
+`password.Verify` ichidagi solishtirish doimiy vaqtda. `WHERE token_hash = $1` esa **doimiy vaqt kafolatiga ega emas**. Yuqori entropiyali tokenni hashdan amaliy tiklab boʻlmaydi. Bu barcha vaqt kanallari xavfsiz degani emas. Split-token usulida ochiq identifikator va sir ajratiladi; sir hashi alohida doimiy vaqtda solishtiriladi.
+
+Har holatni besh marta oʻlchaymiz. `time_total` soniyada; `for` takrorlaydi, `-w` vaqtni chiqaradi:
+
+```console
+$ for i in 1 2 3 4 5; do curl -sS -o /dev/null -w '%{time_total}\n' localhost:8765/login -H 'Content-Type: application/json' --data-binary @wrong.json; done
+0.048716
+0.044513
+0.055996
+0.046747
+0.041252
+$ for i in 1 2 3 4 5; do curl -sS -o /dev/null -w '%{time_total}\n' localhost:8765/login -H 'Content-Type: application/json' --data-binary @missing.json; done
+0.041623
+0.034553
+0.047727
+0.053169
+0.048297
+```
+
+| Holat | Video, iqtibos | Qayta bajarish |
+|---|---|---|
+| Notoʻgʻri parol | 24.8–26.2 ms | 41.3–56.0 ms |
+| Yoʻq email | 25.1–31.0 ms | 34.6–53.2 ms |
+
+Video sonlari `_video/chiqishlar.txt`dan iqtibos. Yangi medianalar 46.747 va 47.727 ms; nisbat taxminan 1.02. Yuklama mutlaq vaqtni oʻzgartiradi. Muhim tekshiruv: yoʻq email argon2idni chetlab oʻtmasin. Besh oʻlchov teng vaqtni yoki hisobni aniqlab boʻlmasligini isbotlamaydi.
+
+24 soatlik TTL — laboratoriya tanlovi. Bu eng uzun umr — absolute timeout. Harakatsizlik muddati — idle timeout — hali yozilmagan. Uzaytiriladigan muddat va mutlaq chegara alohida saqlanishi kerak. Ilova `time.Now()` bilan yozadi, Postgres tekshiradi: soatlar mos boʻlsin.
+
+Har login yangi token oladi va taqdim etilgan eski sessionni oʻchiradi. Maʼlum eski tokenning login orqali saqlanishi — session fixation — cheklanadi. `SameSite` yakka CSRF himoyasi emas. Login urinishlarini cheklash GB-6.07 da; haqiqiy joylashtirishda HTTPS kerak.
+
+RFC 9110 `401`da `WWW-Authenticate` talab qiladi. Lab `Cookie realm="bozor"` yuboradi. Bu maxsus challenge; avtomatik kirishni belgilaydigan standart cookie auth-scheme emas.
+
+Quyidagi toʻliq fayl qolgan papka bilan `go run ./cmd/api` orqali ishlaydi:
+
+<details>
+<summary>Toʻliq auth.go</summary>
+
+```go filename="cmd/api/auth.go" showLineNumbers
+package main
+
+// Login va bekor qilinadigan session'lar (GB-6.04).
+//
+//	POST /login        parol toʻgʻri → yangi session: tokenning hash'i bazaga, tokenning oʻzi cookie'ga
+//	requireUser        cookie → hash → sessions qatori → foydalanuvchi context'ga; yoʻq yoki eski → 401
+//	POST /logout       cookie'dagi session qatorini oʻchiradi: shu token bilan keyingi soʻrov 401
+//	POST /logout-all   foydalanuvchining hamma session'larini oʻchiradi (VAZIFA, TASK.md)
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/password"
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// sessionCookie — cookie nomi. sessionTTL — session'ning eng uzun umri: login'dan 24 soat keyin u
+// baribir tugaydi (absolute timeout). 24 soat — bizning tanlov; OWASP Session Management Cheat Sheet'ning
+// misoli ish kuni ilovasi uchun 4–8 soat, harakatsizlik (idle) muddati esa alohida (README).
+const (
+	sessionCookie = "session"
+	sessionTTL    = 24 * time.Hour
+)
+
+// newToken — session tokeni: 32 tasodifiy bayt (256 bit), cookie'ga sigʻadigan matn qilib (43 belgi).
+func newToken() string {
+	b := make([]byte, 32)
+	rand.Read(b) // Go 1.24+: xato qaytarmaydi
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// hashToken — bazaga yoziladigan va bazadan qidiriladigan qiymat: tokenning SHA-256 hash'i.
+func hashToken(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+
+// loginInput — POST /login body'si.
+type loginInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// login — POST /login: parol toʻgʻri boʻlsa yangi session ochadi va tokenni cookie'da qaytaradi.
+// Har login yangi token oladi, so'rovda eski session cookie'si bo'lsa, uning qatori o'chiriladi: OWASP
+// "Renew the Session ID After Any Privilege Level Change" — yangi ID, eskisi yo'q qilinsin (session fixation).
+func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	var in loginInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	u, err := a.checkPassword(r.Context(), in.Email, in.Password)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	token := newToken()
+	expires := time.Now().Add(sessionTTL)
+	err = a.st.CreateSession(r.Context(), hashToken(token), u.ID, expires)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	setSessionCookie(w, token, expires)
+	writeJSON(w, http.StatusOK, u)
+}
+
+// setSessionCookie — tokenni cookie qilib yuboradi. Atributlar GB-6.07'da batafsil:
+// HttpOnly — sahifadagi skript cookie'ni oʻqiy olmaydi; Secure — brauzer uni faqat HTTPS orqali
+// yuboradi (brauzerlar va curl http://localhost'ni istisno qiladi, MDN: Set-Cookie); SameSite=Lax — boshqa
+// saytdan kelgan POST'ga qoʻshilmaydi. Cache-Control: no-store — session ID bor javob keshda qolmasin (OWASP).
+func setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// clearSessionCookie — brauzerga cookie'ni oʻchirishni aytadi (MaxAge: -1 → "Max-Age=0").
+// Bu faqat mijoz tomoni: session'ni bekor qiladigan narsa — bazadagi qatorni oʻchirish.
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// errBadLogin — email yoki parol notoʻgʻri (problemFor → 401, ikkalasiga bir xil matn).
+var errBadLogin = errors.New("email yoki parol notoʻgʻri")
+
+// dummyHash — yoʻq email uchun ham argon2id bir marta ishlaydi: javob vaqti email bazada bor-yoʻqligini
+// bildirmasin (OWASP Authentication Cheat Sheet, "Authentication Responses").
+var dummyHash = password.Hash("bozor: email topilmadi")
+
+// checkPassword — Verify (GB-6.03) ustidagi login tekshiruvi: email boʻyicha foydalanuvchi, keyin argon2id Verify.
+func (a *api) checkPassword(ctx context.Context, email, pw string) (store.User, error) {
+	u, err := a.st.UserByEmail(ctx, email)
+	if errors.Is(err, store.ErrUserNotFound) {
+		password.Verify(pw, dummyHash)
+		return store.User{}, fmt.Errorf("%w: %w", errBadLogin, err)
+	}
+	if err != nil {
+		return store.User{}, err
+	}
+	ok, err := password.Verify(pw, u.PasswordHash)
+	if err != nil {
+		return store.User{}, fmt.Errorf("foydalanuvchi %d: %w", u.ID, err)
+	}
+	if !ok {
+		return store.User{}, fmt.Errorf("%w: foydalanuvchi %d", errBadLogin, u.ID)
+	}
+	u.PasswordHash = "" // hash bundan keyin kerak emas: javobga yoki log'ga tasodifan chiqmasin
+	return u, nil
+}
+
+// userKey — context'dagi kalit turi. Oʻz turimiz: boshqa paketning kaliti bilan toʻqnashmaydi
+// (go doc context.WithValue: kalit string yoki boshqa ichki tur boʻlmasin).
+type userKey struct{}
+
+// requireUser — himoyalangan route'lar uchun middleware (GB-6.01 shakli): cookie'dagi token hash'i
+// boʻyicha session egasini topadi va uni soʻrov context'iga qoʻyadi. Topilmasa — 401, handler ishlamaydi.
+func (a *api) requireUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil {
+			writeError(w, err) // http.ErrNoCookie → 401
+			return
+		}
+		u, err := a.st.UserBySession(r.Context(), hashToken(c.Value))
+		if err != nil {
+			writeError(w, err) // store.ErrNoSession → 401
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store") // shaxsiy javob: keshda qolmasin (OWASP)
+		ctx := context.WithValue(r.Context(), userKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// currentUser — requireUser context'ga qoʻygan foydalanuvchi. Route requireUser bilan oʻralmagan
+// boʻlsa — bu dasturchi xatosi: panic, recoverPanic uni 500 qiladi (jim User{} qaytarishdan xavfsizroq).
+func currentUser(r *http.Request) store.User {
+	u, ok := r.Context().Value(userKey{}).(store.User)
+	if !ok {
+		panic("currentUser: route requireUser bilan oʻralmagan")
+	}
+	return u
+}
+
+// endCurrentSession — so'rovdagi session cookie'sining qatorini o'chiradi; cookie yo'q bo'lsa hech narsa
+// qilmaydi. logout va login (eski session'ni yo'q qilish) ishlatadi.
+func (a *api) endCurrentSession(r *http.Request) error {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil // cookie yoʻq: oʻchiradigan session ham yoʻq
+	}
+	return a.st.DeleteSession(r.Context(), hashToken(c.Value))
+}
+
+// logout — POST /logout: cookie'dagi session qatorini o'chiradi va brauzerga cookie'ni o'chirishni aytadi.
+// requireUser'siz: session allaqachon eskirgan yoki o'chirilgan bo'lsa ham javob 204 va cookie tozalanadi.
+func (a *api) logout(w http.ResponseWriter, r *http.Request) {
+	if err := a.endCurrentSession(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+`package main` bajariladigan paketni tanlaydi. Importlar context, tasodif, SHA, kodlash, xato, format, HTTP, vaqt, password va store paketlarini kiritadi. `const` nom va TTLni belgilaydi. Izohlar va boʻsh qatorlar bajarilmaydi. `errBadLogin` umumiy xato; ikkita `%w` asl sabablarni saqlaydi. `checkPassword`dagi `ok` parol mosligini, `err` hisoblash xatosini bildiradi.
+
+</details>
+
+## Koʻp uchraydigan xatolar
+
+1. **Faqat hashni tekshirish.** «Muddat shartini olib tashlasak» boʻlimida eskirgan qator `200` berdi. `AND s.expires_at > now()`ni qaytarish va serverni qayta boshlash uni `401`ga oʻzgartirdi.
+2. **Faqat cookieni oʻchirish.** Eski nusxa qator borligida ishlaydi. Logoutni `DeleteSession` muvaffaqiyatidan keyin yakunlang.
+3. **`currentUser`ni ochiq routeʼda chaqirish.** `panic("currentUser: route requireUser bilan oʻralmagan")` — dasturchi xatosi: route oʻralmagan. `recoverPanic` uni `500` qiladi. Tuzatish: `a.requireUser(http.HandlerFunc(a.me))`.
+4. **Oddiy logoutni `requireUser` bilan oʻrash.** Eskirgan session cookie tozalashgacha yetmaydi. Oddiy logout ochiq; logout-all joriy foydalanuvchi uchun himoyalangan.
+5. **`Expires`ni server muddati deb bilish.** Mijozdagi saqlash serverdagi qabul qilishdan alohida. Tozalash ham muddat tekshiruvini almashtirmaydi.
+
+Quyidagi test `500` holati toʻgʻri ushlanganini tekshiradi:
+
+```console
+$ go test ./cmd/api -run '^TestCurrentUserWithoutMiddleware$' -count=1
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.057s
+```
+
+## Oʻzingizni tekshiring
+
+1. Bazada nega tokenning oʻzi emas, hash?
+
+<details>
+<summary>Javob</summary>
+
+Bazaning faqat oʻqish nusxasi tayyor kirish tokenlarini bermasin. SHA-256 yuqori entropiyali token uchun yetadi; cookie oʻgʻirlanishini bartaraf etmaydi.
+
+</details>
+
+2. Natijani ayting: login → `cp jar.txt eski.txt` → logout → eski nusxa bilan `/me`. `200`, `401` yoki `404`?
+
+<details>
+<summary>Javob</summary>
+
+`401`: token bor, serverdagi qator yoʻq.
+
+</details>
+
+3. GB-6.01: middleware `next.ServeHTTP`ni chaqirmasa?
+
+<details>
+<summary>Javob</summary>
+
+Ichki handler ishlamaydi. `requireUser` `401`dan keyin shunday toʻxtaydi.
+
+</details>
+
+4. `DeleteExpiredSessions` boʻlsa, soʻrovda muddat sharti kerakmi?
+
+<details>
+<summary>Javob</summary>
+
+Ha. Tozalash kechikishi mumkin; tekshiruv eskirgan qatorni baribir rad etishi kerak.
+
+</details>
+
+## Uy vazifasi
+
+[Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-04-login-session/TASK.md), [javoblar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session/solution).
+
+🟢 **Asosiy: hamma qurilmadan chiqish.** `DeleteUserSessions(ctx, userID)`da `DELETE FROM sessions WHERE user_id = $1` bajaring. `RowsAffected()` va xatoni qaytaring; xatoga `%w` bilan maʼno qoʻshing. `logoutAll` user IDʼni `currentUser(r)`dan olsin. `POST /logout-all`ni `requireUser` bilan oʻrang. Muvaffaqiyatda cookieni tozalab, `204` qaytaring.
+
+Test bir foydalanuvchining ikkita sessioni `401`, boshqasiniki `200`, cookiesiz logout-all `401`ligini tekshiradi. Test fayllarini oʻzgartirmang.
+
+🟡 **Ixtiyoriy:** `DeleteExpiredSessions(ctx)` faqat `expires_at <= now()` qatorlarini oʻchirsin. `TestDeleteExpiredSessions` starterda SKIP: faqat shu ixtiyoriy qism, asosiy vazifa emas.
+
+**Bashorat:** starter `go test ./...`? **A)** hammasi oʻtadi · **B)** ikki asosiy test yiqiladi · **C)** Postgres kerak emas.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `TestLogoutAll` `404` oladi: route yoʻq. `TestDeleteUserSessions` hali yozilmagan. Haqiqiy Postgres kerak; har test oʻz sxemasida. Quyidagi buyruq request IDʼni filtrlaydi.
+
+</details>
+
+```console
+$ set -o pipefail
+$ go test ./... 2>&1 | sed -E 's/"request_id":"[^"]*"/"request_id":"[redacted]"/g'
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestLogoutAll (0.16s)
+    tekshiruv_test.go:18: POST /logout-all: status 404, kutilgan 204 (TASK.md, 2-qadam): {"type":"about:blank","title":"Not Found","status":404,"detail":"bunday yoʻl yoʻq","request_id":"[redacted]"}
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	1.230s
+ok  	github.com/abdurahmon27/bozor/internal/password	(cached)
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+--- FAIL: TestDeleteUserSessions (0.06s)
+    tekshiruv_test.go:27: DeleteUserSessions(1): DeleteUserSessions hali yozilmagan (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.338s
+FAIL
+```
+
+`tekshiruv_test.go:18` API testi fayli va qatori; `:27` store testi. `kutilgan` — kutilgan natija; `hali yozilmagan` — amalga oshirilmagan. Tuzatish testni oʻchirish emas, metod va routeni yozish. Javob:
+
+<details>
+<summary>Javob va sababi</summary>
+
+```go
+func (s *Store) DeleteUserSessions(ctx context.Context, userID int64) (int64, error) {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
+	if err != nil {
+		return 0, fmt.Errorf("foydalanuvchi %d session'lari oʻchirilmadi: %w", userID, err)
+	}
+	return tag.RowsAffected(), nil
+}
+```
+
+```go
+func (a *api) logoutAll(w http.ResponseWriter, r *http.Request) {
+	_, err := a.st.DeleteUserSessions(r.Context(), currentUser(r).ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+```go
+mux.Handle("POST /logout-all", a.requireUser(http.HandlerFunc(a.logoutAll)))
+```
+
+Birinchi parcha storeʼga, ikkinchisi auth.goʼga, oxirgisi `newMux`ga. `RowsAffected()` oʻchgan qatorlar soni. Handler sonni `_` bilan tashlaydi. `WHERE user_id` boshqa foydalanuvchini saqlaydi; uni olib tashlasangiz test yiqiladi. Ixtiyoriy tozalash ham shu `Exec` shaklida, sharti `WHERE expires_at <= now()`.
+
+</details>
+
+**Javob uchun bashorat:** Postgres ishlab turganda hamma paket oʻtadi. `cd` solution papkasiga oʻtadi; unda alohida `go.mod` bor:
+
+```console
+$ cd solution && go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	2.255s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.412s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.613s
+```
+
+Oʻz nusxangizda `go test ./...`ni asosiy testlar oʻtguncha ishlating. Format va statik tekshiruv:
+
+```console
+$ gofmt -l cmd internal migrate.go && go vet ./...
+```
+
+Natija chiqmadi. Tugagach serverni Ctrl+C bilan toʻxtating. Asosiy papkada konteyner va laboratoriya maʼlumotini oʻchiring:
+
+```bash
+docker compose down -v
+unset LAB_EMAIL LAB_PASSWORD DATABASE_URL GOOSE_DBSTRING
+```
+
+## Manbalar
+
+- [RFC 9110: 401 Unauthorized](https://www.rfc-editor.org/rfc/rfc9110#name-401-unauthorized)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [RFC 6265: HTTP State Management (cookies)](https://www.rfc-editor.org/rfc/rfc6265#section-3)
+- [Go crypto/rand: Read](https://pkg.go.dev/crypto/rand#Read)
+- [OWASP · Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+- [Go crypto/sha256: Sum256](https://pkg.go.dev/crypto/sha256#Sum256)
+- [PostgreSQL 18: Indexes on Expressions](https://www.postgresql.org/docs/18/indexes-expressional.html)
+- [PostgreSQL 18: Binary Data Types (bytea)](https://www.postgresql.org/docs/18/datatype-binary.html)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Authentication Responses](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#authentication-responses)
+- [Go time: Time.Add, Hour](https://pkg.go.dev/time#Time.Add)
+- [MDN: Set-Cookie (Secure, localhost)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)
+- [curl: --cookie-jar](https://curl.se/docs/manpage.html#-c)
+- [PostgreSQL 18: encode(bytea, 'hex')](https://www.postgresql.org/docs/18/functions-binarystring.html)
+- [Go net/http: Request.Cookie, ErrNoCookie](https://pkg.go.dev/net/http#Request.Cookie)
+- [Go context: WithValue (key type)](https://pkg.go.dev/context#WithValue)
+- [PostgreSQL 18: now() (current date/time)](https://www.postgresql.org/docs/18/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT)
+- [Go net/http: Request.WithContext](https://pkg.go.dev/net/http#Request.WithContext)
+- [Go net/http: ServeMux.Handle](https://pkg.go.dev/net/http#ServeMux.Handle)
+- [curl: --cookie](https://curl.se/docs/manpage.html#-b)
+- [OWASP: Session Expiration (server-side invalidation)](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#session-expiration)
+- [PostgreSQL 18: interval](https://www.postgresql.org/docs/18/datatype-datetime.html#DATATYPE-INTERVAL-INPUT)
+- [PostgreSQL 18: DELETE](https://www.postgresql.org/docs/18/sql-delete.html)
+- [OWASP: renew the session ID after login](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#renew-the-session-id-after-any-privilege-level-change)
+- [RFC 9110: 204 No Content](https://www.rfc-editor.org/rfc/rfc9110#name-204-no-content)
+- [Go net/http: Handler](https://pkg.go.dev/net/http#Handler)
+- [RFC 6265 · cookies](https://www.rfc-editor.org/rfc/rfc6265)
+- [RFC 9110 · WWW-Authenticate](https://www.rfc-editor.org/rfc/rfc9110#name-www-authenticate)
+- [Go · RawURLEncoding](https://pkg.go.dev/encoding/base64#pkg-variables)
+- [Go · Cookie](https://pkg.go.dev/net/http#Cookie)
+- [PostgreSQL 18 · timestamptz](https://www.postgresql.org/docs/18/datatype-datetime.html)
+- [PostgreSQL 18 · foreign key](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK)
+- [curl · manual](https://curl.se/docs/manpage.html)
+- [curl · HTTP Cookies](https://curl.se/docs/http-cookies.html)
+- [jq · manual](https://jqlang.org/manual/)
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, 2026-11-28; PostgreSQL 18.7 Dockerʼda, curl 8.22.0, goose v3.30.2. Videoning alohida keltirilgan vaqtlaridan boshqa natijalar qayta bajarilgan. Tokenlar, sanalar, request ID va test vaqtlari har ishga tushirishda oʻzgaradi.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-04-login-session)
+
+---
+
+← Oldingi dars: [GB-6.03](/lab/youtube/gb#gb-6-03) · Keyingi dars: [GB-6.05](/lab/youtube/gb#gb-6-05) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>

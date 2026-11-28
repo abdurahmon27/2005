@@ -1,0 +1,876 @@
+---
+title: "Bu buyurtma kimniki? Authorization va BOLA"
+date: "2026/11/28"
+description: "Login ruxsat emas: buyurtma egaligini SQL shartida tekshiring, begona buyurtmaga bir xil 404 qaytaring va admin yoʻlini rol bilan yoping."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 48
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-06"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-6-06/ru) · [English](/lab/youtube/gb/gb-6-06/en)  
+Dars GB-6.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-06) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Dilnoza login qildi va `GET /orders/41` bilan oʻz buyurtmasini oldi. Yoʻldagi `41`ni `42`ga almashtirsa, server kimning buyurtmasini qaytaradi?
+
+**Bitta gʻoya:** login faqat **kim** soʻrayotganini aytadi. **Ruxsat** alohida savol, va buyurtmaga tegadigan **har** soʻrov uni oʻzi berishi kerak. Obyekt darajasida javob SQL shartining oʻzida: `WHERE id = $1 AND user_id = $2`. `$1` mijozdan keladi (yoʻldagi ID), `$2` serverdan (session egasi). Funksiya darajasida javob — rol: `requireAdmin`.
+
+Dars oxirida siz:
+
+- login qilgan foydalanuvchi begona buyurtmani olishini qayta yaratib, yopasiz;
+- begona va mavjud boʻlmagan buyurtmaga bir xil `404` qaytarasiz, toʻliq sababni esa faqat server logiga yozdirasiz;
+- shu xatoni ushlaydigan testni eski kodda FAIL, yangi kodda ok qilib koʻrasiz;
+- `users.role` ustuni va `requireAdmin` middlewareʼi bilan admin yoʻlini yopasiz, `PATCH /orders/{id}`dagi shu xatoni oʻzingiz tuzatasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| avtorizatsiya | «shu amalga ruxsatingiz bormi?» tekshiruvi | authorization |
+| BOLA | aynan shu buyurtmaga (obyektga) ruxsat tekshirilmagan xato | Broken Object Level Authorization |
+| rol | foydalanuvchiga ochiq amallar guruhi (`xaridor`, `admin`) | role |
+
+Yordamchi soʻzlar shu yerning oʻzida izohlanadi: **autentifikatsiya** (authentication), **BFLA** (funksiya darajasidagi xato), **mass assignment**.
+
+## Oldin bilish kerak
+
+Bu dars [GB-6.05 · Session yoki JWT](/lab/youtube/gb#gb-6-05) va [GB-6.04 · Login va session'lar](/lab/youtube/gb/gb-6-04) ustiga quriladi: `requireUser`, `currentUser`, cookie va Dilnoza bilan Jasur shu yerdan. Yana kerak: [GB-6.03 · Parollar: argon2id](/lab/youtube/gb#gb-6-03), [GB-6.02 · Xato javoblari](/lab/youtube/gb/gb-6-02), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01), [GB-5.10 · bozor API Postgresʼda](/lab/youtube/gb/gb-5-10), [GB-5.08 · RowsAffected](/lab/youtube/gb/gb-5-08), [GB-5.06 · goose](/lab/youtube/gb/gb-5-06), [GB-5.05 · pgx va `$1`](/lab/youtube/gb/gb-5-05), [GB-4.08 · pathID](/lab/youtube/gb/gb-4-08), [GB-1.08 · go test](/lab/youtube/gb/gb-1-08).
+
+**Qayerda ishlaysiz.** Bu misol Go Playground uchun emas: haqiqiy Postgres kerak. [Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)dan vaqtinchalik nusxa oling: xato versiyalarni shu nusxada qoʻyasiz, dars papkasining oʻzi oʻzgarmaydi. Kerak: Go 1.27, Docker, curl, jq va goose v3.30.2. `5516` va `8765` portlari boʻsh boʻlsin. `cd` — «shu papkaga oʻtish» buyrugʻi.
+
+```bash
+work=$(mktemp -d)
+cp -a . "$work/bozor"
+cd "$work/bozor"
+cp cmd/api/handlers.go handlers.fixed
+cp internal/store/orders.go orders.fixed
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+go install -tags=no_sqlite3 github.com/pressly/goose/v3/cmd/goose@v3.30.2
+```
+
+`GOTOOLCHAIN` darsda ishlatilgan Go versiyasini tanlaydi, `CGO_ENABLED=0` C kompilyatorisiz quradi. `handlers.fixed` va `orders.fixed` — papkaning tuzatilgan fayllari nusxasi: xato versiyadan keyin shularni qaytarasiz. Goose oʻrnatilgan katalog `PATH`da boʻlsin. Endi baza:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL="$(docker compose exec -T db sh -c 'printf "postgres://%s:%s@localhost:5516/%s" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"')"
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$DATABASE_URL"
+```
+
+`up -d --wait` konteynerni fonda ishga tushirib, baza tayyor boʻlguncha kutadi. Ulanish satri konteynerdan olinadi va ekranga chiqmaydi. Keyin migratsiyalar va seed:
+
+```console
+$ goose up
+2026/11/28 11:15:20 OK   00001_products.sql (5.92ms)
+2026/11/28 11:15:20 OK   00002_orders.sql (8.61ms)
+2026/11/28 11:15:20 OK   00003_orders_status.sql (2.26ms)
+2026/11/28 11:15:20 OK   00004_users.sql (4.61ms)
+2026/11/28 11:15:20 OK   00005_sessions.sql (5.22ms)
+2026/11/28 11:15:20 OK   00006_orders_owner.sql (4.18ms)
+2026/11/28 11:15:20 OK   00007_users_role.sql (2.52ms)
+2026/11/28 11:15:20 goose: successfully migrated database to version: 7
+```
+
+```console
+$ docker compose exec db psql -f /lab/seed.sql
+TRUNCATE TABLE
+INSERT 0 3
+INSERT 0 4
+ALTER TABLE
+INSERT 0 2
+INSERT 0 4
+```
+
+Goose yetti migratsiyani qoʻlladi. `seed.sql` uch foydalanuvchi, toʻrt mahsulot va ikki buyurtma yozadi. Laboratoriya foydalanuvchilarining email va parollari dars papkasidagi README va test faylida; sahifada ular keltirilmaydi. Login maʼlumotlarini testdagi tayyor satrlardan fayllarga ajratamiz:
+
+```bash
+sed -n 's/^[[:space:]]*dilnozaLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > login.json
+sed -n 's/^[[:space:]]*adminLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > admin-login.json
+sed -n 's/^[[:space:]]*jasurLogin[[:space:]]*=[[:space:]]*`\(.*\)`$/\1/p' cmd/api/api_test.go > jasur-login.json
+```
+
+`sed -n '…/p'` faqat mos kelgan qatorni chiqaradi; teskari qoʻshtirnoq ichidagi JSON `login.json`ga tushadi. Birinchi terminalda serverni ishga tushiring; log ham faylga yozilsin (`2>&1` logni oddiy chiqishga qoʻshadi, `tee` ekranga ham, faylga ham yozadi):
+
+```bash
+go run ./cmd/api 2>&1 | tee server.log
+```
+
+Birinchi qator `bozor API: http://localhost:8765`. Kodni almashtirganda `Ctrl+C` bilan toʻxtatib, qayta ishga tushiring. Ikkinchi terminalda xuddi shu nusxa papkasiga kiring va Dilnoza sifatida login qiling:
+
+```console
+$ curl -s -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json > /dev/null
+```
+
+Buyruq hech narsa chiqarmaydi: `--data-binary @login.json` bodyʼni fayldan oladi, `-c jar.txt` cookieʼni `jar.txt`ga saqlaydi (`-b jar.txt` keyin uni yuboradi), `> /dev/null` esa javobni tashlaydi — javobda foydalanuvchining emaili bor.
+
+**Eslash, GB-6.05.** Foydalanuvchi JWT bilan kirgan va logout qilgan. Uning tokeni server uchun nima boʻladi? **A)** darhol `401` oladi · **B)** `exp`gacha yaroqli · **C)** server uni oʻchiradi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Serverda JWT yozuvi yoʻq, shuning uchun token `exp` (muddat) gacha yaroqli. Muddatdan oldin bekor qilish uchun alohida denylist kerak. bozor shu sababli sessionʼda qoldi: session serverda yozuv, uni oʻchirish bekor qiladi.
+
+</details>
+
+## Kimsiz? Va shu ishga ruxsatingiz bormi? — ikki savol
+
+Birinchi savol — **autentifikatsiya** (authentication): «siz kimsiz?». bozorda uni `requireUser` beradi: cookie → session → foydalanuvchi context'da. Javob topilmasa, `401 Unauthorized`.
+
+Ikkinchi savol — **avtorizatsiya** (authorization): «shu ishga ruxsatingiz bormi?». Ruxsat boʻlmasa, odatda `403 Forbidden`. Login qilgan foydalanuvchiga hamma narsa ruxsat degani emas. bozor ikkinchi savolni hozircha hech qayerda bermaydi.
+
+| Qadam | Savol | Yoʻq boʻlsa | Kim beradi |
+|---|---|---|---|
+| 1 | session yaroqlimi? (kim?) | `401` | `requireUser` (GB-6.04) |
+| 2 | bu buyurtma siznikimi? | `404` | SQL sharti, bugun yoziladi |
+| 3 | bu amal sizning rolingizga ochiqmi? | `403` | `requireAdmin`, bugun yoziladi |
+
+## Muammo: egasi bazada bor, soʻrovda yoʻq
+
+Har buyurtmaning egasi bazada allaqachon yozilgan: oltinchi migratsiya `orders` jadvaliga `user_id` ustunini qoʻshdi. Mana shu fayl (`--` bilan boshlanadigan qatorlar — izoh, `+goose Up` va `+goose Down` — goosening qoʻllash va qaytarish boʻlimlari):
+
+```sql filename="migrations/00006_orders_owner.sql" showLineNumbers
+-- +goose Up
+-- Har buyurtmaning egasi bor (GB-6.06): orders.user_id → users.id. Avvalgi customer matni kerak emas:
+-- buyurtma kimniki ekanini endi session aytadi, mijoz yozgan ism emas.
+-- NOT NULL default'siz qoʻshish faqat boʻsh jadvalda ishlaydi (laboratoriyada orders boʻsh, seed.sql keyin
+-- toʻldiradi). Qatorlari bor bazada: avval ustun NULL bilan, eski qatorlarga egasi yoziladi, keyin SET NOT NULL.
+ALTER TABLE orders
+    ADD COLUMN user_id bigint NOT NULL REFERENCES users (id),
+    DROP COLUMN customer;
+-- "Shu foydalanuvchining buyurtmalari" (WHERE user_id = …) jadvalni oxirigacha oʻqimasin.
+CREATE INDEX orders_user_id_idx ON orders (user_id);
+
+-- +goose Down
+DROP INDEX orders_user_id_idx;
+ALTER TABLE orders
+    ADD COLUMN customer text NOT NULL DEFAULT '',
+    DROP COLUMN user_id;
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 6–8 | bitta `ALTER TABLE`da vergul bilan ikki amal: `user_id` qoʻshadi (`NOT NULL`, `users.id`ga tashqi kalit — GB-5.04), eski `customer` matnini oʻchiradi: kim ekanini endi session aytadi |
+| 10 | `CREATE INDEX` `user_id` boʻyicha indeks yaratadi: bitta foydalanuvchining buyurtmalari jadvalni toʻliq oʻqimay topiladi |
+| 12–16 | `Down`: indeksni oʻchiradi, `customer`ni boʻsh matn bilan qaytaradi (eski matn tiklanmaydi) |
+
+`NOT NULL`ni `DEFAULT`siz qoʻshish faqat **boʻsh** jadvalda ishlaydi — GB-5.06dagi xato shu edi. Laboratoriyada `orders` boʻsh, `seed.sql` keyin toʻldiradi. Ishlab turgan bazada bu bir fayl emas, bir necha reliz: avval ustun `NULL` bilan va `NOT VALID` tashqi kalit bilan qoʻshiladi, keyin cheklov tasdiqlanadi; eski qatorlarga egasini biznes qarori bilan yozasiz (erkin `customer` matnini `users.id`ga avtomatik moslab boʻlmaydi); `SET NOT NULL` tasdiqlangan `CHECK` orqali; indeks `CREATE INDEX CONCURRENTLY` bilan; eski ustun keyingi relizda oʻchadi. Bosqichlar dars papkasining README faylida.
+
+Seeddan keyingi holat, `psql` bilan:
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders"
+ id | user_id |                note                 
+----+---------+-------------------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+ 42 |       2 | Yunusobod 4-kvartal, 17-uy, ertalab
+(2 rows)
+```
+
+41-buyurtma birinchi foydalanuvchiniki (Dilnoza), 42-buyurtma ikkinchisiniki (Jasur). Manzillar — oʻyin maʼlumoti. Endi serverni (`Ctrl+C`) toʻxtating, xato versiyani qoʻying va qayta ishga tushiring:
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+Ulangan route va handlerning boshi:
+
+```go
+	mux.Handle("GET /orders/{id}", a.requireUser(http.HandlerFunc(a.getOrder)))
+
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id)
+```
+
+Birinchi qator: `GET /orders/{id}` yoʻli `getOrder`ga ulangan, tashqi `requireUser` cookiesiz soʻrovni handlerga yetkazmaydi (GB-5.10). `pathID` yoʻldagi `{id}`ni songa aylantiradi, son boʻlmasa `400` (GB-4.08). Oxirgi qator storedan shu IDʼli buyurtmani oladi. Store soʻrovi:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+```
+
+Birinchi qator `user_id`, `status`, `note` ustunlarini tanlaydi; `note` — yetkazish izohi, odatda uy manzili. Ikkinchi qator shart: `id` `$1`ga teng. Soʻrovchi kimligi shartda yoʻq.
+
+Dilnoza login qilgan, uning ID'si 1. U `GET /orders/42` yuboradi; 42-buyurtma Jasurniki. Javob qanday? **A)** `401`: avval login qiling · **B)** `403`: ruxsat yoʻq · **C)** `200`: Jasurning buyurtmasi.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Cookie bor, session tirik, `requireUser` Dilnozani oʻtkazdi: `401` kimlik tekshiruvidan chiqardi, bu yerda kimlik toʻgʻri. `403` uchun kodda ruxsat tekshiruvi boʻlishi kerak edi — u yoʻq. Qator bazada bor, shartga mos, demak qaytadi.
+
+</details>
+
+Avval Dilnozaning oʻz buyurtmasi, keyin yoʻldagi son almashtirilgan soʻrov:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/41
+{"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy","items":[{"product_id":1,"quantity":2,"unit_price":1200000},{"product_id":2,"quantity":3,"unit_price":400000}],"total":3600000}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders/42
+{"id":42,"user_id":2,"status":"yangi","note":"Yunusobod 4-kvartal, 17-uy, ertalab","items":[{"product_id":4,"quantity":1,"unit_price":3500000},{"product_id":3,"quantity":1,"unit_price":2500000}],"total":6000000}
+```
+
+Ikkinchi javob — `200`: Jasurning buyurtmasi, uy manzili va jami summa (tiyinda) bilan. Bu xato. Har qadam nimani tekshirdi:
+
+| Qadam | Nima boʻldi | Tekshirilmadi |
+|---|---|---|
+| `requireUser` | cookie → session → Dilnoza context'ga | buyurtma kimniki |
+| `getOrder` | yoʻldagi `42` → store | soʻrovchining ID'si |
+| `WHERE id = $1` | 42 topildi → javob | 42 kimniki? |
+
+OWASP API Security Top 10 (2023) roʻyxatida bu **birinchi** band: **Broken Object Level Authorization**, qisqacha **BOLA**. OWASP Authorization Cheat Sheet uni Insecure Direct Object Reference (**IDOR**)ning bir koʻrinishi deydi. ID'lar ketma-ket: hujumchi 43, 44 va keyingilarini ham sinaydi. OWASP qoidasi: mijozdan kelgan ID bilan bazadagi yozuvga tegadigan **har** funksiya foydalanuvchining shu amalga ruxsatini tekshirsin, va buni testlar bilan mahkamlansin.
+
+## Tuzatish: egalik sharti SQLʼning oʻzida
+
+Serverni toʻxtating va saqlangan tuzatilgan fayllarni qaytaring:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+Tuzatish soʻrovning oʻzida, bitta yangi qator:
+
+```sql
+SELECT user_id, status, note FROM orders
+WHERE id = $1
+  AND user_id = $2
+```
+
+`AND` ikkala shart ham rost boʻlsagina qator topiladi. `$1` — mijoz yuborgan ID (yoʻldan), `$2` — soʻrovchining, ya'ni session egasining ID'si (serverdan). Mijoz `$2`ni tanlay olmaydi. Mana store metodi:
+
+```go
+func (s *Store) Order(ctx context.Context, id, userID int64) (Order, error) {
+	o := Order{ID: id, Items: []OrderItem{}}
+	var note *string // orders.note NULL boʻlishi mumkin: NULL → nil
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, status, note FROM orders
+		WHERE id = $1
+		  AND user_id = $2`,
+		id, userID).Scan(&o.UserID, &o.Status, &note)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	if err != nil {
+		return Order{}, err
+	}
+	if note != nil {
+		o.Note = *note
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY id", id)
+	if err != nil {
+		return Order{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPrice); err != nil {
+			return Order{}, err
+		}
+		o.Items = append(o.Items, it)
+		o.Total += it.UnitPrice * int64(it.Quantity)
+	}
+	if err := rows.Err(); err != nil {
+		return Order{}, err
+	}
+	return o, nil
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1 | metod `id` va `userID`ni oladi; `int64` ikkalasiga bir marta yozilgan (`id, userID int64`) |
+| 2 | `o` — qaytariladigan buyurtma |
+| 3 | `note` — `*string`: ustun `NULL` boʻlsa `nil` qoladi (GB-2.04) |
+| 4–8 | `QueryRow` soʻrovni bajaradi (GB-5.05): shart — yuqoridagi `WHERE id = $1 AND user_id = $2`; `$1` ← `id`, `$2` ← `userID`; `Scan` ustunlarni `o` va `note`ga yozadi |
+| 9–11 | qator topilmasa `pgx.ErrNoRows`; uni `ErrOrderNotFound`ga oʻraymiz (`%w`, GB-5.10). Begona buyurtmada ham xuddi shu: shart yolgʻon, qator yoʻq |
+| 12–14 | boshqa xato — oʻz holicha qaytadi |
+| 15–36 | oldingi darslardagidek: `note` bor boʻlsa koʻchiradi, buyurtma qatorlarini oʻqib jami summani hisoblaydi |
+
+Handler egani `currentUser`dan oladi (GB-6.04):
+
+```go
+func (a *api) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	o, err := a.st.Order(r.Context(), id, currentUser(r).ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+```
+
+6-qator oʻzgardi: `currentUser(r).ID` — session egasi. ID mijozdan keladi (2-qator, yoʻldan), ega esa sessiondan: mijoz uni tanlay olmaydi. Store endi egasiz chaqirilmaydi: imzo `userID`ni talab qiladi. Lekin ikkala parametr ham `int64`, ularning tartibini almashtirib yozish kompilyatsiya xatosi emas — tartibni test tekshiradi.
+
+Serverni qayta ishga tushiring. Dilnoza ikki soʻrov yuboradi: Jasurning 42-buyurtmasi va umuman yoʻq 999-buyurtma. Javoblar qanday farq qiladi? **A)** `42` → `403`, `999` → `404` · **B)** ikkalasi bir xil `404` · **C)** `42` → `404`, `999` → `400`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Ikkala soʻrovda ham shartga mos qator yoʻq, store ikkalasida `ErrOrderNotFound` qaytaradi. A javobni tanlasangiz, «bor, lekin sizniki emas» (`403`) deb oʻyladingiz — pastda nega bu xavfli ekani. C: `999` toʻgʻri son, `pathID` uni qabul qiladi, shuning uchun `400` emas.
+
+</details>
+
+`-i` bilan javob sarlavhalari ham chiqadi:
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/42
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: KNBI4DSAZOBX2A7LIZSPLVVBGK
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"KNBI4DSAZOBX2A7LIZSPLVVBGK"}
+```
+
+```console
+$ curl -i -b jar.txt localhost:8765/orders/999
+HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: BBSKMXA7MJX34EUFPSDY4XARRX
+Date: Sat, 28 Nov 2026 06:15:22 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Not Found","status":404,"detail":"bunday buyurtma yoʻq","request_id":"BBSKMXA7MJX34EUFPSDY4XARRX"}
+```
+
+Ikkalasi `404 Not Found`, bir xil matn «bunday buyurtma yoʻq»; farq faqat `request_id`da (har soʻrovga alohida beriladi, GB-6.01).
+
+**Nega `403` emas?** `403` «bu buyurtma bor, lekin sizniki emas» deydi. Shunda hujumchi ID'larni birma-bir sinab, qaysi buyurtmalar borligini bilib oladi. [RFC 9110 §15.5.4](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden) buni aniq aytadi: resurs borligini yashirmoqchi boʻlgan server `403` oʻrniga `404` qaytarishi mumkin («MAY»). Bu bozorning tanlovi, hamma API uchun majburiy qoida emas. Shuni ham bilib qoʻying: ketma-ket ID'lar buyurtmalar *sonini* baribir ochadi — `404` buni yashirmaydi (Chuqurroq boʻlimiga qarang).
+
+Tafsilot esa server logida (birinchi terminal): qaysi buyurtmani qaysi foydalanuvchi soʻraganini koʻrasiz. Bu GB-6.02dagi ikki yoʻl: mijozga xavfsiz matn, logga toʻliq xato. Faqat `xato` qatorlarini olamiz:
+
+```console
+$ grep ' xato ' server.log
+2026/11/28 11:15:22 KNBI4DSAZOBX2A7LIZSPLVVBGK xato 404: "buyurtma 42, foydalanuvchi 1: buyurtma topilmadi"
+2026/11/28 11:15:22 BBSKMXA7MJX34EUFPSDY4XARRX xato 404: "buyurtma 999, foydalanuvchi 1: buyurtma topilmadi"
+```
+
+`buyurtma` — order, `foydalanuvchi` — user, `topilmadi` — not found. Log «foydalanuvchi 1 buyurtma 42ni soʻradi» deydi; u begona buyurtma bilan yoʻq buyurtmani oʻzicha ajratmaydi, ikkala qator bir xil shaklda.
+
+## Test: eski kodda FAIL, yangi kodda ok
+
+OWASP buni testlar bilan mahkamlashni ham tavsiya qiladi («Write tests …»). Test `cmd/api/api_test.go`da:
+
+```go
+func TestOrderOwner(t *testing.T) {
+	h, _ := testAPI(t)
+	dilnoza := login(t, h, dilnozaLogin)
+	for id, want := range map[string]int{"41": 200, "42": 404, "999": 404} {
+		rec := send(h, "GET", "/orders/"+id, "", dilnoza.Value)
+		if rec.Code != want {
+			t.Errorf("Dilnoza GET /orders/%s: %d, kutilgan %d", id, rec.Code, want)
+		}
+	}
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1 | test funksiyasi (GB-1.08) |
+| 2 | `testAPI` yangi sxemali haqiqiy Postgres va seedʼni tayyorlaydi; `h` — tayyor handler |
+| 3 | `login` — `dilnozaLogin` JSONʼi bilan login qilib, cookie qaytaradi |
+| 4 | `map[string]int`: ID → kutilgan status; `range` uchala juftlikni aylanadi. Oʻziniki (`41`) — `200`, qolgani — `404` |
+| 5 | `send` soʻrovni handlerga beradi: metod, yoʻl, boʻsh body va cookie qiymati |
+| 6–8 | status kutilgandan boshqacha boʻlsa, `t.Errorf` testni yiqitadi: `%s` ID, `%d` ikkala status |
+
+Shu testni avval eski, tuzatilmagan kodda ishga tushiramiz. Uchta ID'dan qaysilari FAIL boʻladi? **A)** faqat `42` · **B)** `42` va `999` · **C)** hech biri: test oʻtadi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** `41` Dilnozaniki, eski kodda ham `200`. `999` eski kodda ham yoʻq buyurtma, ya'ni `404`. Faqat `42` eski kodda `404` oʻrniga `200` oladi. B ni tanlagan boʻlsangiz, «`999`ni eski kod ham xato qaytaradi» deb oʻyladingiz; u xato qaytarmaydi — bu yerda xato `42` uchun.
+
+</details>
+
+Eski bosqich fayllarini qoʻying, testni bajaring; keyin tuzatilganlarini qaytarib, takrorlang (`-run` faqat nomi mos testni ishga tushiradi):
+
+```bash
+cp _video/stages/v0-bola/handlers.go cmd/api/handlers.go
+cp _video/stages/v0-bola/orders.go internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+--- FAIL: TestOrderOwner (0.16s)
+    api_test.go:294: Dilnoza GET /orders/42: 200, kutilgan 404
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.214s
+FAIL
+```
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+cp orders.fixed internal/store/orders.go
+```
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.202s
+```
+
+`api_test.go:294` — tekshiruv yiqilgan fayl va qator; `kutilgan` — expected. Bu kompilyatsiya xatosi emas: kod ishladi, lekin begona buyurtmani berdi. Xuddi shu buyruqni oʻzgarishsiz qayta bajarsangiz, Go natijani keshdan oladi:
+
+```console
+$ go test -run TestOrderOwner ./cmd/api
+ok  	github.com/abdurahmon27/bozor/cmd/api	(cached)
+```
+
+Qayta bajarish uchun `-count=1` qoʻshing.
+
+Vaqtlar. Videoda aytilgan sonlar iqtibos (bu yozma darsda qayta bajarilmagan); oʻng ustun — bu yurishda shu kompyuterda oʻlchangani:
+
+| Natija | Videodagi son (iqtibos) | Bu yurish |
+|---|---|---|
+| eski kod | FAIL, `0.278s` | FAIL, `0.214s` |
+| tuzatilgan kod | ok, `0.283s` | ok, `0.202s` |
+
+Soniyalar kompyuter bandligiga bogʻliq; ularni taqqoslash maʼnosiz: bu soniyaga test uchun sxema yaratish, seed va login ham kiradi. Muhimi — natijaning oʻzi: begona buyurtmada FAIL, tuzatilgandan keyin ok. Uni bir marta koʻrgan test ertaga ham xatoni ushlaydi.
+
+Papkada yana testlar bor: `TestForeignOrderLooksMissing` (begona va yoʻq buyurtmaning javobi `request_id`dan boshqa hammasi bilan bir xil; Jasur ham 41ni koʻrmaydi), `TestCreateOrderOwner`, `TestAdminUsers`, `TestProductsAdminOnly`, `TestRequireAdminOutside`.
+
+## Rol: ruxsatning ikkinchi qavati
+
+Obyekt darajasi «bu buyurtma sizniki?»ni hal qildi. Ikkinchi qavat — funksiya darajasi: baʼzi amallar faqat admin uchun. Yettinchi migratsiya `users`ga `role` ustunini qoʻshadi:
+
+```sql filename="migrations/00007_users_role.sql" showLineNumbers
+-- +goose Up
+-- Rol (GB-6.06): oddiy xaridor yoki admin. Yangi foydalanuvchi har doim xaridor: eng kam huquq
+-- (OWASP Authorization Cheat Sheet, "Enforce Least Privileges"). Admin'ni faqat baza egasi tayinlaydi.
+ALTER TABLE users
+    ADD COLUMN role text NOT NULL
+    DEFAULT 'xaridor'
+    CHECK (role IN ('xaridor', 'admin'));
+
+-- +goose Down
+ALTER TABLE users DROP COLUMN role;
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 4–7 | `ALTER TABLE users` majburiy matn ustuni `role`ni qoʻshadi; `DEFAULT 'xaridor'` mavjud va yangi foydalanuvchiga `xaridor` beradi; `CHECK (role IN ('xaridor', 'admin'))` faqat shu ikki qiymatga ruxsat beradi |
+| 9–10 | `Down`: ustunni oʻchiradi |
+
+Yangi roʻyxatdan oʻtgan foydalanuvchi har doim `xaridor`: OWASP buni eng kam huquq (least privilege) deydi. Admin faqat bazada tayinlanadi. `store.User`da endi `Role` maydoni bor, `UserBySession` uni ham oʻqiydi. Yangi `cmd/api/authz.go`:
+
+```go filename="cmd/api/authz.go" showLineNumbers
+package main
+
+// Authorization — «nima qila olasiz» (GB-6.06). Authentication (requireUser, auth.go) faqat kim ekaningizni
+// aniqlaydi. Ruxsatning ikki qavati:
+//
+//	obyekt   «bu buyurtma sizniki?» — har store metodida, SQL shartida: WHERE id = $1 AND user_id = $2.
+//	         Begona buyurtma → 404, xuddi yoʻq buyurtma kabi (RFC 9110 §15.5.4: mavjudligini yashirish).
+//	funksiya «bu amal sizning rolingizga ochiq?» — requireAdmin middleware'i, /admin/… route'larida → 403.
+//
+// OWASP API Security Top 10 2023: API1 Broken Object Level Authorization, API5 Broken Function Level Authorization.
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+)
+
+// errForbidden — foydalanuvchi kim ekani maʼlum, lekin bu amal uning roliga ruxsat etilmagan (problemFor → 403).
+var errForbidden = errors.New("bu amal uchun ruxsat yoʻq")
+
+// requireAdmin — faqat admin rolidagi foydalanuvchini oʻtkazadi, qolganlarga 403.
+// requireUser'ning ICHIDA turishi shart: foydalanuvchini context'ga requireUser qoʻyadi.
+// Tashqarida tursa currentUser panic qiladi → 500 (GB-6.04): jim oʻtkazib yuborishdan xavfsizroq.
+func requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if currentUser(r).Role != store.RoleAdmin {
+			writeError(w, errForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| 1 | `package main` — `cmd/api`dagi boshqa fayllar bilan bir paket |
+| 3–10 | izoh: ruxsatning ikki qavati va OWASP bandlari |
+| 12–17 | importlar: `errors`, `net/http` va `store` paketi (rol konstantasi uchun) |
+| 19–20 | `errForbidden` — oddiy xato qiymati; `problemFor` (GB-6.02) uni `403 Forbidden`ga aylantiradi |
+| 22–24 | izoh: `requireAdmin` `requireUser`ning **ichida** turishi shart |
+| 25 | `requireAdmin` — GB-6.01dagi middleware shakli: handler oladi, handler qaytaradi |
+| 26 | qaytariladigan handler funksiyasi (closure) |
+| 27 | `currentUser(r).Role` admin emasmi? `store.RoleAdmin` qiymati `"admin"` |
+| 28–30 | admin emas: `errForbidden` yoziladi va `return` |
+| 31 | admin: `next.ServeHTTP` keyingi handlerni chaqiradi |
+| 32–33 | ikkala funksiya yopiladi |
+
+`403`ni tanlaymiz: admin boʻlimi borligi sir emas, foydalanuvchi esa kimligini biladi.
+
+Endi admin boʻlimi: `GET /admin/users` barcha foydalanuvchilar roʻyxatini qaytaradi (`listUsers` handleri). Serverni toʻxtating, `v1-admin-yoq` bosqichini qoʻying va qayta ishga tushiring. Hozirgi kodda route shunday ulangan:
+
+```bash
+cp _video/stages/v1-admin-yoq/handlers.go cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(http.HandlerFunc(a.listUsers)))
+```
+
+`requireAdmin` yozilgan, lekin bu qatorda yoʻq. Dilnoza oddiy xaridor. Shu route'ga soʻrov yuborsa, nima oladi? **A)** `401` · **B)** `403`: ruxsat yoʻq · **C)** `200`: hamma emaillar.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Route faqat `requireUser`: kimligi aniq, rolni hech kim tekshirmaydi. `requireAdmin` yozilgani uni avtomatik ulamaydi. B ni tanlagan boʻlsangiz, funksiya mavjudligini ulangan deb oʻyladingiz.
+
+</details>
+
+Haqiqiy javobda uchala foydalanuvchining emaili ham bor; sahifada `jq` bilan faqat `id` va `role`ni qoldiramiz (`-c` natijani bir qatorda chiqaradi, `map({id,role})` roʻyxatning har elementidan ikki maydonni oladi):
+
+```console
+$ curl -s -b jar.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+Dilnoza hamma foydalanuvchilar roʻyxatini oldi (3 — admin). Bu — **BFLA**, Broken Function Level Authorization, OWASP API5:2023: obyekt emas, **funksiya** (admin amali) himoyasiz. Bu koʻp uchraydigan xato. OWASP: «Don't assume that an API endpoint is regular or administrative only based on the URL path» — `/admin` nomining oʻzi hech narsani himoya qilmaydi.
+
+Tuzatish: `requireAdmin` `requireUser`ning ichida. Tuzatilgan fayllarni qaytaring, serverni qayta ishga tushiring:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+```go
+	mux.Handle("GET /admin/users", a.requireUser(requireAdmin(http.HandlerFunc(a.listUsers))))
+	mux.Handle("DELETE /products/{id}", a.requireUser(requireAdmin(http.HandlerFunc(a.deleteProduct))))
+```
+
+Tashqi qavat (`requireUser`) foydalanuvchini context'ga qoʻyadi, ichki qavat (`requireAdmin`) uning rolini tekshiradi. Mahsulotni oʻchiradigan `deleteProduct` (GB-5.10dagi `DELETE` route) ham shu ikki qavat bilan ulangan; `POST /products` ham. Rol har soʻrovda bazadan oʻqiladi: admin huquqi olib qoʻyilsa, keyingi soʻrovdayoq ishlaydi. Dilnozaning oʻsha soʻrovi, endi `-i` bilan:
+
+```console
+$ curl -i -b jar.txt localhost:8765/admin/users
+HTTP/1.1 403 Forbidden
+Cache-Control: no-store
+Content-Type: application/problem+json
+X-Request-Id: T3X6VTCETJ3752AI2JHD5KXA6M
+Date: Sat, 28 Nov 2026 06:15:24 GMT
+Content-Length: 136
+
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"bu amal uchun ruxsat yoʻq","request_id":"T3X6VTCETJ3752AI2JHD5KXA6M"}
+```
+
+Admin login qiladi (`-c admin.txt` cookieʼni alohida faylga yozadi), keyin `-b admin.txt` bilan roʻyxatni koʻradi:
+
+```console
+$ curl -s -c admin.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @admin-login.json > /dev/null
+```
+
+```console
+$ curl -s -b admin.txt localhost:8765/admin/users | jq -c 'map({id,role})'
+[{"id":1,"role":"xaridor"},{"id":2,"role":"xaridor"},{"id":3,"role":"admin"}]
+```
+
+**Tekshiramiz.** Tartibni almashtirsak: `requireAdmin` tashqarida, `requireUser` ichida. Admin oʻzi shu route'ga nima oladi? **A)** `200`: roʻyxat · **B)** `403` · **C)** `500`.
+
+```go
+	mux.Handle("GET /admin/users", requireAdmin(a.requireUser(http.HandlerFunc(a.listUsers))))
+```
+
+<details>
+<summary>Javob</summary>
+
+**C.** `requireAdmin` birinchi ishlaydi, context'da foydalanuvchi hali yoʻq: `currentUser` panic qiladi (GB-2.09), `recoverPanic` (GB-6.01) javobni `500` qiladi. Admin ham `500` oladi. A: admin faqat ichkariga yetib borsagina roʻyxatni oladi. B: `403` rol tekshirilgandan keyin chiqadi, tekshirish esa boshlanmadi.
+
+</details>
+
+```bash
+cp _video/stages/v2-teskari/handlers.go cmd/api/handlers.go
+```
+
+Serverni qayta ishga tushirgach:
+
+```console
+$ curl -i -b admin.txt localhost:8765/admin/users
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/problem+json
+X-Request-Id: WUCC4DHZMAADKTSKYACONOMYJU
+Date: Sat, 28 Nov 2026 06:15:25 GMT
+Content-Length: 110
+
+{"type":"about:blank","title":"Internal Server Error","status":500,"request_id":"WUCC4DHZMAADKTSKYACONOMYJU"}
+```
+
+Sababi server logida:
+
+```console
+$ grep ' panic: ' server.log
+2026/11/28 11:15:25 WUCC4DHZMAADKTSKYACONOMYJU panic: currentUser: route requireUser bilan oʻralmagan
+```
+
+`route requireUser bilan oʻralmagan` — route requireUser bilan oʻralmagan. Bu dasturchi xatosi, u jim oʻtib ketmaydi: birinchi soʻrovdayoq `500` va log. (`currentUser` jim boʻsh foydalanuvchi qaytarsa, tekshiruv notoʻgʻri ishlab, xato yashirin qolardi.) Tuzatilgan faylni qaytaring:
+
+```bash
+cp handlers.fixed cmd/api/handlers.go
+```
+
+## Chuqurroq (ixtiyoriy): body'dagi `user_id` va ketma-ket ID
+
+Dilnoza `POST /orders` bodyʼsiga `"user_id":2` qoʻshib, buyurtmani Jasur nomidan yozmoqchi. Nima boʻladi? **A)** buyurtma Jasurniki · **B)** buyurtma Dilnozaniki · **C)** `400`: nomaʼlum kalit.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Asosiy himoya: kirish struct'ida `user_id` maydoni yoʻq — egani yozadigan maydon umuman mavjud emas. `decodeJSON`dagi `DisallowUnknownFields` nomaʼlum kalitni jim tashlamay, ochiq `400` qiladi. Kalitsiz soʻrovda ega — session egasi, ya'ni Dilnoza.
+
+</details>
+
+```go
+type orderInput struct {
+	Items []itemInput `json:"items"`
+	Note  string      `json:"note"`
+}
+```
+
+`orderInput` — `POST /orders` bodyʼsi qabul qiladigan maydonlar; faqat `items` va `note`. Bu **mass assignment** himoyasi: mijoz oʻzi bermasligi kerak boʻlgan maydonni yuborishi (OWASP API3:2023, Broken Object Property Level Authorization; eski nomi *Mass Assignment*). Haqiqiy soʻrovlar:
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"user_id":2,"items":[{"product_id":3,"quantity":1}]}'
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"body bitta JSON obyekt boʻlsin, faqat maʼlum kalitlar bilan","request_id":"MDQKKJMQOKGIVIVYJKIIZFUEEP"}
+```
+
+```console
+$ curl -s -b jar.txt localhost:8765/orders -H "Content-Type: application/json" -d '{"items":[{"product_id":3,"quantity":1}]}'
+{"id":43,"user_id":1,"status":"yangi","items":[{"product_id":3,"quantity":1,"unit_price":2500000}],"total":2500000}
+```
+
+Ikkinchi javobda `"user_id":1` — Dilnoza, sessiondan. Yangi buyurtma `43` boʻldi. Bu 43 ta buyurtma borligini bildirmaydi: seed hisobni 41dan boshlaydi. Lekin ketma-ket ID umumiy hajmni baribir ochadi: ikki vaqtda ikkita buyurtma yaratgan hujumchi oraliqda nechta buyurtma boʻlganini hisoblaydi. OWASP tasodifiy, taxmin qilib boʻlmaydigan ID'ni (masalan UUID) qoʻshimcha qatlam sifatida tavsiya qiladi. Lekin Authorization Cheat Sheet aniq aytadi: bunday yashirish «generally not sufficient by itself» — tekshiruv har soʻrovda kerak.
+
+Yana ikki eslatma. Egalik — munosabatga asoslangan qoida («bu buyurtma shu foydalanuvchiniki»), rol esa RBAC (rolga asoslangan boshqaruv). OWASP murakkab tizimlar uchun atribut va munosabatga asoslangan modellarni (ABAC, ReBAC) afzal koʻradi. Keyingi qadam (GB-6.08): har admin route'ni alohida oʻrashni unutish mumkin; ishonchliroq shakl — `/admin/` uchun alohida `ServeMux`, u bir marta `requireUser(requireAdmin(…))` bilan ulanadi.
+
+## Koʻp uchraydigan xatolar
+
+**1. «Login yetarli».** Eng koʻp uchraydigan tasavvur: `requireUser` bor, demak xavfsiz. Lekin `WHERE id = $1` begona buyurtmani muvaffaqiyatli qaytaradi, kompilyator ham, server ham xato bermaydi — jim xato (yuqoridagi «Muammo» boʻlimi). Belgi: `200` va boshqa foydalanuvchining `user_id`si. Tuzatish: egani sessiondan olib, SQL shartiga qoʻying; oʻqishda ham, oʻzgartirishda ham.
+
+**2. Middleware yozilgan, lekin ulanmagan.** `requireAdmin` bor, route'da yoʻq: `/admin/users`ni xaridor oldi (yuqoridagi «Rol» boʻlimi). Tuzatish: har himoyalanishi kerak route'da `requireUser(requireAdmin(…))`.
+
+**3. Tartib teskari.** `requireAdmin(requireUser(…))` — admin ham `500` oladi; log: `panic: currentUser: route requireUser bilan oʻralmagan`. Tuzatish: tashqarida `requireUser` (kim?), ichkarida `requireAdmin` (admin'mi?).
+
+**4. Faqat `GET`ni tuzatish.** `PATCH`, `DELETE` va eksport route'lari ham yozuvga tegadi, har birida oʻz egalik tekshiruvi kerak. Starterdagi `PATCH /orders/{id}` hali xato — uy vazifasi shuni yopadi. Yarim tuzatish ham xato beradi: store imzosini oʻzgartirib handlerni unutsangiz, `go vet` darhol koʻrsatadi. Bu dars papkasida yoʻq qoʻshimcha tajriba: starter handler yangi imzoli `UpdateNote` bilan (funksiya uy vazifasi javobida toʻliq berilgan):
+
+```console
+$ go vet ./...
+# github.com/abdurahmon27/bozor/cmd/api
+# [github.com/abdurahmon27/bozor/cmd/api]
+vet: cmd/api/handlers.go:247:53: not enough arguments in call to a.st.UpdateNote
+	have (context.Context, int64, string)
+	want (context.Context, int64, int64, string)
+```
+
+`vet:` — vet xabari; `cmd/api/handlers.go:247:53` — fayl, qator, ustun; `not enough arguments` — argument yetmaydi, `have` — berilgan, `want` — kerak. Imzo egani berishga majbur qiladi: handlerga `currentUser(r).ID` qoʻshing.
+
+## Oʻzingizni tekshiring
+
+**1.** Autentifikatsiya va avtorizatsiya qaysi savollarga javob beradi?
+
+<details>
+<summary>Javob</summary>
+
+Autentifikatsiya — «siz kimsiz?» (bozorda `requireUser`, javob yoʻq boʻlsa `401`). Avtorizatsiya — «shu amalga ruxsatingiz bormi?» (obyekt: SQL sharti; funksiya: `requireAdmin`, javob yoʻq boʻlsa `403`).
+
+</details>
+
+**2.** Begona buyurtmaga nega `403` emas, `404`?
+
+<details>
+<summary>Javob</summary>
+
+`403` «bu buyurtma bor, lekin sizniki emas» deydi; hujumchi ID'larni sinab, qaysi buyurtmalar borligini bilib oladi. RFC 9110 §15.5.4 resurs borligini yashirish uchun `404`ni ruxsat etadi. Bu tekshiruvning oʻrnini bosmaydi: egalik sharti SQLʼda qoladi, `404` — uning javobi.
+
+</details>
+
+**3. Bashorat.** Dilnoza (ID 1) uchun `Order(ctx, id, 1)` ning `id` qiymatlari `41`, `42`, `999` boʻlsa, HTTP statuslar qanday? **A)** `200`, `404`, `404` · **B)** `200`, `403`, `404` · **C)** uchalasi `200`.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Faqat `41` ikkala shartga mos: `id = 41 AND user_id = 1`. `42` uchun `user_id` 2, shart yolgʻon; `999` umuman yoʻq. Ikkalasida qator yoʻq → `ErrOrderNotFound` → `404`. B — `403` ishlatmaymiz (savol 2). C — eski kodning natijasi emas, bu tuzatilgan kod.
+
+</details>
+
+**4. GB-6.03.** Parol nega SHA bilan emas, argon2id bilan saqlanadi?
+
+<details>
+<summary>Javob</summary>
+
+Argon2id ataylab sekin va xotira talab qiladi: har bir taxmin qimmatga tushadi. Tez hash (SHA) bunday toʻsiq bermaydi, hujumchi sekundiga juda koʻp taxmin qiladi.
+
+</details>
+
+## Uy vazifasi
+
+🟡 **`PATCH /orders/{id}` faqat oʻz buyurtmangizni oʻzgartirsin.** Papkada yana bir route bor: `PATCH /orders/{id}`. **PATCH** — resursning bir qismini oʻzgartiradigan HTTP metod (RFC 5789); bu yerda u buyurtmaning yetkazish izohini (`note`) oʻzgartiradi. Uning `UPDATE`ida bugungi xato: egasi tekshirilmaydi.
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $2 WHERE id = $1",
+		id, note)
+```
+
+Bu metodning boshi (`internal/store/orders.go`). Jasur Dilnozaning 41-buyurtmasiga oʻz manzilini yozib koʻradi (Jasur sifatida login qiling, `jasur-login.json` yuqorida yaratilgan):
+
+```console
+$ curl -s -c jasur.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @jasur-login.json > /dev/null
+```
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 204 No Content
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |       note        
+----+---------+-------------------
+ 41 |       1 | Jasurning manzili
+(1 row)
+```
+
+`-X PATCH` HTTP metodni tanlaydi, `-d` bodyʼni beradi, `| head -1` javobning faqat birinchi qatorini (statusni) qoldiradi. `204 No Content` — oʻzgardi, javob bodysiz; baza Dilnozaning buyurtmasida Jasurning matnini saqlab qoʻydi. Vazifa:
+
+1. **Store.** `UpdateNote(ctx context.Context, id, userID int64, note string) error` qiling va egasini SQL shartiga qoʻying: `UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2`. Raqamlar argument tartibiga mos: `$1` ← `id`, `$2` ← `userID`, `$3` ← `note`. Begona yoki yoʻq buyurtmada hech qator oʻzgarmaydi (`tag.RowsAffected() == 0`) → `ErrOrderNotFound` (`%w` bilan, hozirgidek).
+2. **Handler.** `cmd/api/handlers.go`dagi `updateNote`da store'ga `currentUser(r).ID`ni bering. Egani bodyʼdan yoki yoʻldan olmang.
+3. `cmd/api/tekshiruv_test.go`ni oʻzgartirmang. Test uch narsani tekshiradi: Jasur → `404` va izoh oʻzgarmaydi; Dilnoza oʻz buyurtmasiga → `204` va izoh oʻzgaradi; yoʻq `999` → `404`.
+
+Vazifa [dars papkasidagi TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/TASK.md)da. Boshlangʻich nusxada, papkaning ildizida (Postgres ishlab tursin):
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+--- FAIL: TestUpdateNoteOwner (0.15s)
+    tekshiruv_test.go:28: Jasur PATCH /orders/41 (Dilnozaniki): status 204, kutilgan 404 — begona buyurtma yoʻq buyurtma kabi (TASK.md, 1–2-qadam)
+    tekshiruv_test.go:31: Jasur Dilnozaning 41-buyurtmasini oʻzgartirdi: izoh «Jasurning manzili», kutilgan «Chilonzor 9-kvartal, 12-uy» — UPDATE'da egasi tekshirilmayapti (TASK.md, 1-qadam: WHERE id = $1 AND user_id = $2)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	2.581s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.282s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.728s
+FAIL
+```
+
+`--- FAIL: TestUpdateNoteOwner` — yiqilgan test; ikkala xabar nima yoʻqligini aytadi (404 oʻrniga 204; izoh oʻzgargan). `FAIL` bilan boshlangan qator paket, `ok` — oʻtgan paketlar, `[no test files]` — testi yoʻq paket. Maslahat: `store.Order`ga qarang — shakl oʻsha, faqat `QueryRow` oʻrniga `Exec` va `RowsAffected()` (GB-5.08). Yechim — [solution/ papkasida](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki/solution).
+
+<details>
+<summary>Javob: izoh</summary>
+
+Store:
+
+```go
+func (s *Store) UpdateNote(ctx context.Context, id, userID int64, note string) error {
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE orders SET note = $3 WHERE id = $1 AND user_id = $2",
+		id, userID, note)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("buyurtma %d, foydalanuvchi %d: %w", id, userID, ErrOrderNotFound)
+	}
+	return nil
+}
+```
+
+Handlerda bitta qator oʻzgaradi: `a.st.UpdateNote(r.Context(), id, currentUser(r).ID, *in.Note)`. `solution/`da shu ikki fayl tuzatilgan. Sinash uchun avval seedni qayta bajaring (u 41-buyurtmani asl holiga qaytaradi va sessionlarni tozalaydi), `solution/` fayllarini qoʻying, serverni qayta ishga tushiring va Jasur sifatida qayta login qiling:
+
+```bash
+docker compose exec -T db psql -f /lab/seed.sql > /dev/null
+cp solution/internal/store/orders.go internal/store/orders.go
+cp solution/cmd/api/handlers.go cmd/api/handlers.go
+```
+
+Jasurning oʻsha soʻrovi va baza:
+
+```console
+$ curl -s -i -X PATCH -b jasur.txt localhost:8765/orders/41 -H "Content-Type: application/json" -d '{"note":"Jasurning manzili"}' | head -1
+HTTP/1.1 404 Not Found
+```
+
+```console
+$ docker compose exec db psql -c "SELECT id, user_id, note FROM orders WHERE id = 41"
+ id | user_id |            note            
+----+---------+----------------------------
+ 41 |       1 | Chilonzor 9-kvartal, 12-uy
+(1 row)
+```
+
+Begona buyurtma yoʻq buyurtma kabi `404` oladi va izoh oʻzgarmaydi. Test izoh oʻzgarmaganini bazadan ham tekshiradi: faqat statusni qaytarish yetmaydi. Javob papkasining testlari:
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	3.010s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.360s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.888s
+```
+
+Format va statik tekshiruv hech narsa chiqarmaydi:
+
+```console
+$ gofmt -l cmd internal && go vet ./...
+```
+
+</details>
+
+Tajribadan keyin serverni `Ctrl+C` bilan toʻxtating. Quyidagi buyruq aynan shu laboratoriya bazasi va uning volumeʼini oʻchiradi:
+
+```bash
+docker compose down -v
+```
+
+## Manbalar
+
+- OWASP API Security Top 10 2023: [API1 · BOLA](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/), [API3 · BOPLA](https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/), [API5 · BFLA](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/)
+- [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) · [lookup ID'lar](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#ensure-lookup-ids-are-not-accessible-even-when-guessed-or-cannot-be-tampered-with) · [eng kam huquq](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#enforce-least-privileges) · [logging](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html#implement-appropriate-logging)
+- [RFC 9110 §15.5.4 · 403 Forbidden](https://www.rfc-editor.org/rfc/rfc9110#name-403-forbidden), [RFC 5789 · PATCH](https://www.rfc-editor.org/rfc/rfc5789)
+- [PostgreSQL 18 · ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html), [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html), [SELECT · WHERE](https://www.postgresql.org/docs/18/sql-select.html#SQL-WHERE)
+- [Go · net/http ServeMux](https://pkg.go.dev/net/http#ServeMux), [Go · testing flags](https://pkg.go.dev/cmd/go#hdr-Testing_flags), [Go · funksiya turlari](https://go.dev/ref/spec#Function_types)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [GB-6.05 dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, goose v3.30.2, PostgreSQL 18 (`postgres:18-alpine`), Docker; 2026-11-28. Videodagi vaqtlar iqtibos sifatida belgilangan. Soʻrov ID'lari va sanalar har yurishda boshqacha. Keyingi dars: [GB-6.07 · Cookie, CSRF, CORS va rate limit](/lab/youtube/gb#gb-6-07).
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-06-buyurtma-kimniki)
+
+---
+
+← Oldingi dars: [GB-6.05](/lab/youtube/gb#gb-6-05) · Keyingi dars: [GB-6.07](/lab/youtube/gb#gb-6-07) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
