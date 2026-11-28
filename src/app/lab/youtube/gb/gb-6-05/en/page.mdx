@@ -1,0 +1,907 @@
+---
+title: "Session or JWT: an honest comparison"
+date: "2026/11/28"
+description: "Build a JWT by hand, verify it with golang-jwt under four rules, and compare it with a session after logout to justify the choice for bozor."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-05"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-05) · [Русский](/lab/youtube/gb/gb-6-05/ru) · **English**  
+Lesson GB-6.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-05) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+In GB-6.04, bozor ("market", the course project) looks up a session record on every protected request. A common alternative is the JWT: a token that is verified without touching the database. Which one is right? Today we try both on the same requests.
+
+**One idea:** a JWT is three parts joined by dots, `header.payload.signature`. The signature is a keyed HMAC-SHA256 of the first two parts. The server recomputes it to verify, so it stores nothing. For the same reason logout has nothing to delete: a stolen JWT works until `exp`, while a session dies as soon as its record is deleted. Revoking a JWT (a denylist or a refresh token) brings server state back.
+
+By the end of the lesson you will:
+
+- build a JWT without a library and read its payload without the key;
+- verify a token with `golang-jwt/jwt/v5` under four rules and see what a rule-less `Parse` lets through;
+- see on your own screen that after logout the old cookie gives `401` while the same JWT gives `200`;
+- name the price of revocation, justify the choice for bozor, and write a `jti` denylist until `go test` passes.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| JWT | three parts joined by dots: header, payload, signature | JSON Web Token |
+| signature | the HMAC of the first two parts, computed with a key | signature |
+| token revocation | a mark kept on the server so a token is rejected before it expires | token revocation |
+
+Two helpers: **base64url** turns bytes into text made of letters, digits, `-` and `_`; **HMAC** is a hash computed with a key, so it cannot be computed without the key. Both appear in the code below. A **claim** is a field in the payload: it says who and what the token is about.
+
+## Before you start
+
+The planned base is [GB-6.04 · login and sessions](/lab/youtube/gb/gb-6-04/en). You also need: [GB-6.03 · argon2id](/lab/youtube/gb/gb-6-03/en), [GB-6.02 · uniform API errors](/lab/youtube/gb/gb-6-02/en), [GB-6.01 · middleware](/lab/youtube/gb/gb-6-01/en), [GB-5.05 · time and pgx](/lab/youtube/gb/gb-5-05/en), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08/en), [GB-4.07 · mutex](/lab/youtube/gb/gb-4-07/en), [GB-4.01 · HTTP as text](/lab/youtube/gb/gb-4-01/en), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/en), [GB-2.09 · function literals](/lab/youtube/gb/gb-2-09/en), [GB-2.08 · `%w`](/lab/youtube/gb/gb-2-08/en), [GB-2.07 · `[]byte` and `any`](/lab/youtube/gb/gb-2-07/en), [GB-2.06 · `go get`](/lab/youtube/gb/gb-2-06/en), [GB-2.04 · `&T{}`](/lab/youtube/gb/gb-2-04/en), [GB-2.02 · map and comma-ok](/lab/youtube/gb/gb-2-02/en), [GB-1.08 · `go test`](/lab/youtube/gb/gb-1-08/en), [GB-1.04 · `Sprintf`](/lab/youtube/gb/gb-1-04/en).
+
+**How to run.** Work inside the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt). Go Playground is not enough: you need the server, `curl`, `jq` and `basenc` (GNU coreutils). Docker and Postgres are not needed: the store is in memory. Port `8765` must be free. `CGO_ENABLED=0` builds without a C compiler; `GOTOOLCHAIN` selects the version from the record:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+The results were re-run on this machine. Token values are different every time: the key is new on each start. So your `header` will match, while your `payload` and signature will differ.
+
+**Recall:** in GB-6.04 the cookie file was copied to `eski.txt` ("old") after login, and then we logged out. What does `/me` return with the old copy? **A)** `200` · **B)** `401` · **C)** `500`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Logout deleted the session record. The cookie stayed in the copy, but the server has no row: the very next request gives `401`. Today we compare this property with the JWT.
+
+</details>
+
+## The lab: two ways on one server
+
+The lesson folder starts from the final state of GB-6.04. The differences: the store is in memory instead of Postgres (`map` and a mutex), and the `internal/token` package and two small programs were added.
+
+| Place | Purpose |
+|---|---|
+| `internal/token/qolda.go` | building a JWT without a library (`SignHS256`) |
+| `internal/token/token.go` | issuing (`Issue`) and verifying (`Parse`) with `golang-jwt/jwt/v5` |
+| `cmd/qolda` ("by hand") | prints the three parts of a hand-built token |
+| `cmd/tekshir` ("check") | runs a token and its damaged copies through `Parse` |
+| `cmd/api/auth.go` | login, `authenticate`, logout |
+| `internal/store` | users, sessions and (the task) the denylist, in memory |
+
+The store is in memory because the lesson is about the difference between two approaches, not about the database itself. The session rule is the same as in GB-6.04: record deleted, token dead. When the server restarts, the in-memory sessions and the JWT key are both lost: old cookies and old JWTs stop working.
+
+For comparison, `POST /login` gives both: the session token in a cookie and the JWT in the response body (the `token` field). `GET /me` accepts both. In real work you pick one; the choice is in the last sections.
+
+## What is inside a JWT
+
+A **JWT** (JSON Web Token, [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519)) is three parts joined by dots. Each part is base64url text.
+
+```text
+header . payload . signature
+```
+
+| Part | Inside | Purpose |
+|---|---|---|
+| header | `{"alg":"HS256","typ":"JWT"}` | `alg` is the signing algorithm (`HS256` is HMAC with SHA-256), `typ` is the token type |
+| payload | claims | who and what the token is about |
+| signature | an HMAC result | binds the first two parts to a key |
+
+The payload in this lesson has four claims:
+
+| Claim | English | Meaning | In bozor |
+|---|---|---|---|
+| `sub` | subject | who the token is about | user ID: `1` |
+| `iss` | issuer | who issued it | `bozor` |
+| `aud` | audience | who it is for | `bozor-api` |
+| `exp` | expiration time | from this moment the token is not accepted | now + 15 minutes |
+
+`exp` is written in Unix time: the number of seconds since 1970-01-01 00:00:00 UTC ([RFC 7519 §2, NumericDate](https://www.rfc-editor.org/rfc/rfc7519#section-2)). The library adds two more claims: `iat` (issued at, the time of issue) and `jti` (JWT ID, a unique ID of the token).
+
+RFC 7519 describes a JWT in two forms: signed (JWS, three parts) and encrypted (JWE, [five parts](https://www.rfc-editor.org/rfc/rfc7516#section-3.1)). This lesson covers only the signed JWT; bozor issues that one.
+
+## Building a JWT by hand
+
+First we build one without a library, so every byte is visible. `cmd/qolda/main.go` builds a token and prints its three parts on separate lines.
+
+```go filename="cmd/qolda/main.go" showLineNumbers
+// qolda — HS256 imzoli JWT'ni kutubxonasiz yasaydi va uch qismini alohida qatorda chiqaradi (GB-6.05).
+// Token: header.payload.imzo — uchala qism nuqta bilan ulanadi. Kalit har ishga tushishda yangi.
+//
+//	go run ./cmd/qolda
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/token"
+)
+
+func main() {
+	key := token.NewKey()
+	exp := time.Now().Add(15 * time.Minute).Unix() // Unix vaqt: 1970-01-01 UTC'dan beri soniyalar (RFC 7519 §2: NumericDate)
+	header := `{"alg":"HS256","typ":"JWT"}`
+	payload := fmt.Sprintf(`{"sub":"1","iss":"bozor","aud":"bozor-api","exp":%d}`, exp)
+	t := token.SignHS256(header, payload, key)
+
+	parts := strings.Split(t, ".")
+	fmt.Println("header: ", parts[0])
+	fmt.Println("payload:", parts[1])
+	fmt.Println("imzo:   ", parts[2])
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1–4 | `//` comments | say what the program does and how to run it; the compiler does not read them |
+| 5–13 | `package main`, `import` | this is a runnable program; the packages it needs: `fmt`, `strings`, `time` and our `internal/token` |
+| 16 | `key := token.NewKey()` | `NewKey` from `internal/token` returns 32 random bytes. Anyone who knows the key can issue tokens, so the key is a secret. For HS256 the key must be at least 32 bytes ([RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518#section-3.2)) |
+| 17 | `exp := time.Now().Add(15 * time.Minute).Unix()` | `Now()` is the current moment, `Add` adds 15 minutes, `Unix()` converts the moment to Unix-time seconds |
+| 18 | ``header := `\{"alg":"HS256","typ":"JWT"\}` `` | text in backticks is ready-made JSON (GB-3.02); the quotes inside need no `\` escape |
+| 19 | `payload := fmt.Sprintf(…, exp)` | `Sprintf` puts the number `exp` in place of `%d` and builds the text (GB-1.04) |
+| 20 | `t := token.SignHS256(header, payload, key)` | builds the token from those three values |
+| 22 | `parts := strings.Split(t, ".")` | splits the token at the dots into three texts: `parts[0]`, `parts[1]`, `parts[2]` |
+| 23–25 | `fmt.Println(…)` | prints each part on its own line |
+
+Now inside `SignHS256`. It lives in `internal/token/qolda.go`. First the helper `b64`: it turns bytes into base64url text.
+
+```go filename="internal/token/qolda.go" showLineNumbers
+// Package token — bozor'ning JWT'lari (GB-6.05).
+//
+// qolda.go: HS256 imzoli JWT'ni kutubxonasiz, qoʻlda yasash — har bayti koʻrinsin deb (RFC 7519, RFC 7515).
+// token.go: ishdagi yoʻl — golang-jwt/jwt/v5 bilan yasash va qatʼiy tekshirish (RFC 8725).
+package token
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+)
+
+// b64 — base64url, "="siz (RFC 7515 §2: Base64url Encoding, padding yoʻq).
+// Alifbo: A–Z a–z 0–9 - _ ; oddiy base64'dagi + va / oʻrniga - va _, shuning uchun URL va sarlavhada xavfsiz.
+func b64(b []byte) string {
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// SignHS256 — JWT'ni qoʻlda yasaydi: base64url(header) . base64url(payload) . base64url(imzo).
+// Imzo — nuqtagacha boʻlgan matnning HMAC-SHA256'i, kalit bilan (RFC 7518 §3.2).
+// header va payload — tayyor JSON matnlar; ular shifrlanmaydi, faqat imzolanadi.
+func SignHS256(header, payload string, key []byte) string {
+	input := b64([]byte(header)) + "." + b64([]byte(payload))
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(input))
+	return input + "." + b64(mac.Sum(nil))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 5 | `package token` | the `internal/token` folder is a package with this name (GB-2.06) |
+| 7–11 | `import` | `crypto/hmac` and `crypto/sha256` are for the signature; `encoding/base64` is for the text |
+| 15–17 | `func b64(b []byte) string` | takes bytes, returns text. `RawURLEncoding` is the URL alphabet (`A–Z a–z 0–9 - _`) with no `=` at the end; so the token survives both a URL and a header. `EncodeToString` returns the result as a `string` |
+| 22 | `func SignHS256(header, payload string, key []byte) string` | takes two texts and the key bytes, returns the token text |
+| 23 | `input := b64([]byte(header)) + "." + b64([]byte(payload))` | `[]byte(…)` turns text into bytes (GB-2.07); `b64` encodes; `+` joins with a dot. This is the text that gets signed |
+| 24 | `mac := hmac.New(sha256.New, key)` | a keyed hash calculator. `sha256.New` has no parentheses: the function itself is passed, and `hmac` calls it when needed |
+| 25 | `mac.Write([]byte(input))` | feeds the text to be signed into the calculator |
+| 26 | `return input + "." + b64(mac.Sum(nil))` | `Sum(nil)` returns the result, 32 bytes, in a new slice. `b64` turns it into text: this is the third part |
+
+This is how the token is computed:
+
+| Step | What | Value |
+|---|---|---|
+| 1 | `b64(header)` | `eyJhbGci…` |
+| 2 | `b64(payload)` | the base64url form of the payload JSON text |
+| 3 | `input` | 1 + `.` + 2 |
+| 4 | `HMAC-SHA256(key, input)` | 32 bytes |
+| 5 | `b64(32 bytes)` | 43 characters: this is the signature |
+| 6 | token | `input` + `.` + signature |
+
+Run it:
+
+```console
+$ go run ./cmd/qolda
+header:  eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+payload: eyJzdWIiOiIxIiwiaXNzIjoiYm96b3IiLCJhdWQiOiJib3pvci1hcGkiLCJleHAiOjE3OTU4NTg0OTh9
+imzo:    C1q-jEJddLMip5WA-QKKdF8byGpmxhY4SR4JpBQ51TY
+```
+
+Three lines: on screen `header`, `payload` and `imzo` (the signature) are separate, while in the token they are joined with dots. The signature is 43 characters: the base64url form of 32 bytes. Your `payload` and signature will differ: `exp` and the key are different.
+
+A JWT usually starts with `eyJ`. The reason: the header JSON text starts with `{"alg"…`. Its base64url form is `eyJhbGci…`. `eyJ` is `{"` plus the start of the next letter. If a space follows the `{`, the beginning is different. You can see this with `basenc`, a GNU coreutils command; with `--base64url` it encodes. `printf` prints the text without a trailing newline:
+
+```console
+$ printf '{"alg"' | basenc --base64url
+eyJhbGci
+$ printf '{ "alg"' | basenc --base64url
+eyAiYWxnIg==
+```
+
+`basenc` added `=` padding at the end (`==`). A JWT drops it: that is exactly what `RawURLEncoding` does. `basenc` does not print a newline, so in your terminal the next prompt may start on the same line.
+
+## The payload is not encrypted
+
+Can someone who does not know the key read the payload line? **A)** no: it is encrypted · **B)** yes: it is only base64url · **C)** only if there is a signature too.
+
+<details>
+<summary>Answer</summary>
+
+**B.** base64url encoding is not encryption: it reverses without a key. If you chose **A**, you mixed up encoding with encryption. In **C**, the signature does not hide the payload; it only helps check that it has not changed.
+
+</details>
+
+`echo` prints the line, `|` passes it to the next command, and `basenc --base64url -d` decodes with `-d`:
+
+```console
+$ echo eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 | basenc --base64url -d
+{"alg":"HS256","typ":"JWT"}
+$ echo eyJzdWIiOiIxIiwiaXNzIjoiYm96b3IiLCJhdWQiOiJib3pvci1hcGkiLCJleHAiOjE3OTU4NTg0OTh9 | basenc --base64url -d
+{"sub":"1","iss":"bozor","aud":"bozor-api","exp":1795858498}
+```
+
+No key was needed: the claims are plain text. So you never put secrets in a JWT: no passwords, no personal data. The signature guarantees only this: someone who knows the key wrote the text, and it has not changed. OWASP: an HS256 signature proves only that the token was produced by some holder of the shared secret ([OWASP JWT Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)).
+
+## The server recomputes the signature
+
+To verify, the server repeats the computation from `SignHS256`:
+
+```text
+token  =  header . payload . signature
+          \_______  _______/    |
+                  \/            |
+     HMAC-SHA256(server key)     |
+                  |              |
+        computed signature  ==  signature in the token ?
+                  |
+     yes → trust the payload, no database visit
+     no  → the token is rejected
+```
+
+Change one letter and the HMAC comes out completely different. The server looks nothing up: the token itself and the key on the server are enough. The library compares with `hmac.Equal`, in constant time ([golang-jwt/jwt v5.3.1 source](https://github.com/golang-jwt/jwt/blob/v5.3.1/hmac.go)).
+
+## The library and the four rules
+
+At work you do not write verification by hand. [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725), JWT best current practices, lists the usual mistakes: trusting the `alg` in the header, and not checking `iss` and `aud`. We take [golang-jwt/jwt](https://github.com/golang-jwt/jwt/releases), version 5: it is actively maintained. `go get` works as in GB-2.06, with the version written exactly:
+
+```console
+$ go get github.com/golang-jwt/jwt/v5@v5.3.1
+go: added github.com/golang-jwt/jwt/v5 v5.3.1
+```
+
+This output was taken in a new, empty module. In the lesson folder the line is already there, so a repeated `go get` prints nothing. The line in `go.mod`:
+
+```console
+$ grep jwt go.mod
+	github.com/golang-jwt/jwt/v5 v5.3.1
+```
+
+Verification is in the `Parse` function in `internal/token/token.go`:
+
+```go
+func Parse(s string, key []byte) (Claims, error) {
+	rc := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(s, rc, func(*jwt.Token) (any, error) {
+		return key, nil
+	},
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithIssuer(Issuer),
+		jwt.WithAudience(Audience),
+		jwt.WithExpirationRequired(),
+	)
+	if err != nil {
+		return Claims{}, err
+	}
+	id, err := strconv.ParseInt(rc.Subject, 10, 64)
+	if err != nil {
+		return Claims{}, fmt.Errorf("token: sub son emas: %w", err)
+	}
+	c := Claims{UserID: id, JTI: rc.ID}
+	if rc.ExpiresAt != nil { // WithExpirationRequired bilan doim bor; nil'ga baribir tayanmaymiz
+		c.Expires = rc.ExpiresAt.Time
+	}
+	return c, nil
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `Parse` takes the token text `s` and the key; it returns `Claims` and an `error` |
+| 2 | `jwt.RegisteredClaims` is a struct from the library: it has fields for the standard claims (`sub`, `iss`, `aud`, `exp`…). `&…{}` gives its address (GB-2.04) |
+| 3–5 | `jwt.ParseWithClaims` splits the token, reads the payload into `rc` and verifies the signature. The third argument is an anonymous function: the library asks it for the key, and we hand over that same `key` (GB-2.09). Its parameter `*jwt.Token` is not needed, so it has no name. `any` is any type (GB-2.07) |
+| 6–9 | the four rules: each is an option whose name starts with `With`. A table follows |
+| 11–13 | if verification returned an error, an empty `Claims{}` and the error are returned |
+| 14–17 | `strconv.ParseInt(rc.Subject, 10, 64)` turns the `sub` text into an `int64` number; if it is not a number, it is an error (wrapped with `%w`, GB-2.08) |
+| 18–22 | our `Claims`: `UserID` (`sub`), `JTI`, `Expires` (`exp`, if present) and `return c, nil` |
+
+`Claims` is our struct, at the top of `token.go`:
+
+```go
+type Claims struct {
+	UserID  int64     // sub
+	JTI     string    // jti: shu tokenning noyob ID'si (RFC 7519 §4.1.7) — denylist kaliti
+	Expires time.Time // exp
+}
+```
+
+The four rules:
+
+| Option | What it rejects | Why |
+|---|---|---|
+| `WithValidMethods([]string{"HS256"})` | another `alg` in the header: `none`, `HS512`… | the server chooses the algorithm, not the token ([RFC 8725 §3.1](https://www.rfc-editor.org/rfc/rfc8725#section-3.1)) |
+| `WithIssuer(Issuer)` | `iss` is not `bozor` | checks who issued the token ([§3.8](https://www.rfc-editor.org/rfc/rfc8725#section-3.8)); `Issuer` is a package constant |
+| `WithAudience(Audience)` | `bozor-api` is not in `aud` | a token issued for another service must not fit this API ([§3.9](https://www.rfc-editor.org/rfc/rfc8725#section-3.9)) |
+| `WithExpirationRequired()` | no `exp` | a token without `exp` never dies; in the library `exp` is optional by default |
+
+If `exp` is present, the library always checks it: by [RFC 7519 §4.1.4](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.4) the token is not accepted after that moment. **Requiring** `exp` is our own rule.
+
+`cmd/tekshir` runs the hand-built token through `Parse`, then tries seven cases. The list of cases:
+
+```go
+	cases := []struct{ name, tok string }{
+		{"qoʻlda yasalgan", good},
+		// payload'da sub 1 → 2, imzo eski: header va imzo oʻsha, faqat oʻrtadagi qism yangi.
+		{"sub 1 → 2, imzo eski", parts[0] + "." + b64([]byte(claims("2", "bozor-api", exp))) + "." + parts[2]},
+		// alg "none": imzo boʻsh (RFC 7519 §6: unsecured JWT).
+		{"alg none, imzo yoʻq", b64([]byte(`{"alg":"none","typ":"JWT"}`)) + "." + parts[1] + "."},
+		{"exp yoʻq", token.SignHS256(hs256, claims("1", "bozor-api", 0), key)},
+		{"aud boshqa xizmat", token.SignHS256(hs256, claims("1", "hisobot-api", exp), key)},
+		{"muddati oʻtgan", token.SignHS256(hs256, claims("1", "bozor-api", time.Now().Add(-time.Minute).Unix()), key)},
+		// alg HS512, imzo shu kalit bilan TOʻGʻRI hisoblangan: algoritmni token emas, server tanlaydi.
+		{"alg HS512, imzo toʻgʻri", signHS512(claims("1", "bozor-api", exp), key)},
+	}
+```
+
+Each case is a name and a token text. The first is the whole token. The second is a copy: `parts[0]` and `parts[2]` (header and signature) are old, the middle payload is new: `sub` is two instead of one. The `alg none` token has an empty signature ([RFC 7519 §6](https://www.rfc-editor.org/rfc/rfc7519#section-6): an unsecured JWT). The last one is signed with `HS512`, and the signature was computed correctly with the same key.
+
+Two questions, then we run it.
+
+**Prediction 1:** in the copy `sub` is 2 instead of 1, with the old header and signature. `Parse`? **A)** `ok, sub=2` · **B)** rejected: the signature is wrong · **C)** rejected: the payload cannot be opened.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The server computes the HMAC of the changed payload, and the result does not match the old signature. If you chose **A**, you thought the signature is not checked. In **C**, opening the payload does not depend on the key: it was plain text.
+
+</details>
+
+**Prediction 2:** `alg` is `HS512`, and the signature is correct for the same key. `Parse`? **A)** ok: the signature is correct · **B)** rejected: this algorithm is not allowed · **C)** rejected: the key is short.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `WithValidMethods` allows only `HS256`. Even with a correct signature, the server chooses the algorithm, not the token. **C** is wrong: the key is 32 bytes, which is accepted for `HS512` too.
+
+</details>
+
+```console
+$ go run ./cmd/tekshir
+qoʻlda yasalgan:         ok, sub=1
+sub 1 → 2, imzo eski:    token signature is invalid: signature is invalid
+alg none, imzo yoʻq:     token signature is invalid: signing method none is invalid
+exp yoʻq:                token has invalid claims: token is missing required claim: exp claim is required
+aud boshqa xizmat:       token has invalid claims: token has invalid audience
+muddati oʻtgan:          token has invalid claims: token is expired
+alg HS512, imzo toʻgʻri: token signature is invalid: signing method HS512 is invalid
+```
+
+Read the result. The library error has two layers: first the kind of error, and after the colon the reason (wrapping with `%w`, GB-2.08).
+
+| Case | Result | Who rejected it |
+|---|---|---|
+| built by hand | `ok, sub=1` | same format, correct signature |
+| `sub` 1 → 2, old signature | `signature is invalid` | the HMAC did not match |
+| `alg none` | `signing method none is invalid` | `WithValidMethods` |
+| no `exp` | `missing required claim: exp claim is required` | `WithExpirationRequired` |
+| `aud` of another service | `token has invalid audience` | `WithAudience` |
+| expired | `token is expired` | the `exp` check |
+| `alg HS512`, correct signature | `signing method HS512 is invalid` | `WithValidMethods` |
+
+`iss` does not appear in this table. `TestParseRadEtadi` in `internal/token/token_test.go` checks it: it tries another `iss`, another key, `HS384`, a non-numeric `sub` and other cases.
+
+## The classic mistake: Parse without rules
+
+The most common mistake: calling `Parse` without the four options. For an experiment, we temporarily remove the four option lines. I tried it with the ready copy in the lesson folder: `_video/stages/token-qoidasiz.go`, the rule-less variant of `internal/token/token.go`. In your own copy, comment out the option lines, try it, and then put them back:
+
+```go
+	rc := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(s, rc, func(*jwt.Token) (any, error) {
+		return key, nil
+	})
+```
+
+**Prediction:** which tokens get through a rule-less `Parse`? **A)** none: a signature is required · **B)** no `exp`, another `aud`, `HS512` · **C)** only `alg none`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The signature is still checked, so **A** is partly right: a token with a broken signature does not pass. But in the library's default settings `exp` is optional, `aud` is not checked and the algorithm comes from the header. **C** is wrong: the library rejects `none` itself.
+
+</details>
+
+```console
+$ go run ./cmd/tekshir
+qoʻlda yasalgan:         ok, sub=1
+sub 1 → 2, imzo eski:    token signature is invalid: signature is invalid
+alg none, imzo yoʻq:     token signature is invalid: token is unverifiable: 'none' signature type is not allowed
+exp yoʻq:                ok, sub=1
+aud boshqa xizmat:       ok, sub=1
+muddati oʻtgan:          token has invalid claims: token is expired
+alg HS512, imzo toʻgʻri: ok, sub=1
+```
+
+- The library rejected `alg none` itself: `token is unverifiable: 'none' signature type is not allowed`. v5 accepts `none` only with the key `jwt.UnsafeAllowNoneSignatureType`.
+- The expired token was rejected too: if `exp` is present, it is always checked.
+- **The token without `exp` passed:** it never dies.
+- **The token issued for another service passed:** `aud` was not checked.
+- **`HS512` passed:** the token chooses the algorithm.
+
+The fix: put the four options back. With a single HMAC key, `HS512` passing is not yet an attack. But with public-key algorithms it turns into "alg confusion" (below, in the "Going deeper" section).
+
+## The server: authenticate with two paths
+
+`requireUser` from GB-6.04 now calls `authenticate`. It has two paths: if the `Authorization: Bearer <token>` header is present, it is a JWT; otherwise a cookie.
+
+```go
+func (a *api) authenticate(r *http.Request) (store.User, error) {
+	if s, ok := bearer(r); ok {
+		c, err := token.Parse(s, a.jwtKey)
+		if err != nil {
+			return store.User{}, fmt.Errorf("%w: %w", errBadToken, err)
+		}
+		// VAZIFA (TASK.md, 3-qadam): c.JTI denylist'da boʻlsa (a.st.TokenRevoked) — errBadToken.
+		return store.User{ID: c.UserID}, nil
+	}
+	// aks holda: session cookie'si (GB-6.04)
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return store.User{}, err // http.ErrNoCookie → 401
+	}
+	return a.st.UserBySession(r.Context(), hashToken(cookie.Value))
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `authenticate` takes the request and returns a `store.User` or an error |
+| 2 | `bearer(r)` extracts the token after the word `Bearer` from the `Authorization` header. If a token is present, `ok` is `true` (the comma-ok form from GB-2.02) |
+| 3–6 | `token.Parse` verifies the token with the server key `a.jwtKey`. On error we wrap it in `errBadToken` (`%w` twice, GB-6.02); `problemFor` turns that into `401` |
+| 7 | a comment: in the task, the denylist check is added here |
+| 8 | the user ID comes from the token's `sub`. **There is no store access** |
+| 10–15 | if there is no Bearer, the GB-6.04 path: `r.Cookie` gets the cookie (if missing, an error, `401`), `hashToken` hashes it, `UserBySession` looks it up in the store |
+
+A **Bearer** token is one that any party in possession of it can use ([RFC 6750 §1.2](https://www.rfc-editor.org/rfc/rfc6750#section-1.2)). The header looks like `Authorization: Bearer <token>`. The `bearer` function parses that header:
+
+```go
+func bearer(r *http.Request) (string, bool) {
+	scheme, rest, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	t := strings.TrimLeft(rest, " ")
+	return t, t != ""
+}
+```
+
+`strings.Cut` splits the text at the first space into two parts: the scheme name and the rest. `EqualFold` compares the scheme name ignoring case ([RFC 9110 §11.1](https://www.rfc-editor.org/rfc/rfc9110#section-11.1)). `TrimLeft` removes extra spaces before the token.
+
+## The same requests: login, /me, logout
+
+In the first terminal we start the server. It occupies that terminal, so we send requests from the second.
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+In the second terminal, open the lesson folder too. In the video the login credentials are typed in the command. So they stay off this page, put the email and password of the first test user from the README into variables. `read -r` takes the text, `-s` keeps the password off the screen, `jq -n --arg` builds the JSON. The commands print nothing:
+
+```bash
+read -r LAB_EMAIL
+read -r -s LAB_PASSWORD
+jq -n --arg email "$LAB_EMAIL" --arg password "$LAB_PASSWORD" '{email:$email,password:$password}' > cred.json
+```
+
+Login. `-s` hides the progress meter, `-c jar.txt` writes the cookie to the file `jar.txt`, `-H` sets the content type, `--data-binary @cred.json` sends the file as the body. We write the response to `login.json`. `jq -c keys` shows the field names: the response body now has a `token` too, and that is the JWT:
+
+```console
+$ curl -s -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @cred.json > login.json
+$ jq -c keys login.json
+["email","id","token"]
+```
+
+`jq -r .token` takes the token without quotes; `$(…)` stores the result in a shell variable called `T`. `cut -c1-36` shows the first 36 characters: this is the header part, which is the same in every token of this server:
+
+```console
+$ T=$(jq -r .token login.json)
+$ echo "$T" | cut -c1-36
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+```
+
+Let us open the payload. `cut -d. -f2` splits the token at the dots and takes the second part:
+
+```console
+$ echo "$T" | cut -d. -f2 | basenc --base64url -d
+{"iss":"bozor","sub":"1","aud":["bozor-api"],"exp":1795858747,"iat":1795857847,"jti":"QRMH66VP3WITY52K3JFBCJSPGV"}
+```
+
+We knew four claims; the library added two new ones: `iat` (the time of issue) and `jti` (the token's unique ID). `aud` is a list here: in a JWT, `aud` can be a single string or a list of strings ([RFC 7519 §4.1.3](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.3)). `exp − iat` = 900 seconds = 15 minutes.
+
+Now we call `/me` both ways. `-b jar.txt` sends the cookie; `-H "Authorization: Bearer $T"` sends the JWT:
+
+```console
+$ curl -s -b jar.txt localhost:8765/me | jq -c keys
+["email","id"]
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+```
+
+The cookie path takes the user from the store: `id` and `email`. The JWT path knows only what is in the token: `id`. If you need the email, you read it from the database: anyone can read the payload.
+
+Now let us model theft. We copy the cookie file to `eski.txt`: this is the "stolen" copy. Then we log out. Logout revokes each credential separately, so we send both the cookie and the same `$T`. `-i` also shows the response headers, `-X POST` sets the method:
+
+```console
+$ cp jar.txt eski.txt
+$ curl -s -i -X POST -b jar.txt -c jar.txt -H "Authorization: Bearer $T" localhost:8765/logout
+HTTP/1.1 204 No Content
+Set-Cookie: session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+X-Request-Id: LBKKRHY6FBOB7S2XRM7BIP6KRV
+Date: Sat, 28 Nov 2026 09:24:07 GMT
+```
+
+`204 No Content` means success, with no body. `Set-Cookie: session=; … Max-Age=0` tells the browser to delete the cookie, as in GB-6.04. We cover the `HttpOnly; Secure; SameSite=Lax` attributes in GB-6.07.
+
+**Prediction:** logout is done. `/me` with the old cookie copy and `/me` with the same `$T`. What happens with the JWT? **A)** `401`: logout worked · **B)** `200`: the token is still valid · **C)** `500`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** With the old cookie it is `401`, as in GB-6.04. But with the JWT it is `200`: the server has no record of the JWT, and logout found nothing to delete. If you chose **A**, you thought logout kills every credential.
+
+</details>
+
+```console
+$ curl -s -b eski.txt localhost:8765/me
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"4TPO4P23THH64ILRCGUDXACD2Y"}
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+```
+
+The server log appears in the first terminal. The reason for the `401` (`session yoʻq yoki muddati oʻtgan`, "no session or it has expired") is not visible to the client: it is only in the log, under the same `request_id` as in the response (GB-6.02). The last line is `/me` with the JWT after logout, `200`:
+
+```text
+2026/11/28 14:24:07 SAQ37BTFTXRWNMEQG6DNNUXROO POST "/login" 200 433.789326ms
+2026/11/28 14:24:07 XT7WJKHHB5NOKLW6HVXKUX3ATO GET "/me" 200 462.78µs
+2026/11/28 14:24:07 Z3ONVJSPVM5AYFVHY3YGIG6V2N GET "/me" 200 768.897µs
+2026/11/28 14:24:07 LBKKRHY6FBOB7S2XRM7BIP6KRV POST "/logout" 204 150.893µs
+2026/11/28 14:24:07 4TPO4P23THH64ILRCGUDXACD2Y xato 401: "session yoʻq yoki muddati oʻtgan"
+2026/11/28 14:24:07 4TPO4P23THH64ILRCGUDXACD2Y GET "/me" 401 737.287µs
+2026/11/28 14:24:07 DTM5YDLPYMKTLWVDOTJ3IDEMAT GET "/me" 200 363.503µs
+```
+
+## Why the JWT keeps working after logout
+
+| | session | JWT |
+|---|---|---|
+| what the server holds | token hash → user, expiry | only the key |
+| what logout does | deletes the row | nothing to delete |
+| next request | lookup: no row → `401` | signature valid, `exp` not passed → `200` |
+| a stolen copy | dies at once | works until `exp`: 15 minutes for us |
+
+The proof is in the token itself: with a valid signature and an `exp` that has not passed, it is valid. For the server to "forget" it, something about it would have had to be stored. With a stolen token, an attacker uses it until `exp`.
+
+## The price of revocation
+
+There are two usual fixes. Each one brings state back to the server.
+
+1. **A denylist** is a list of revoked `jti` values. It must be checked on every request, which is again a lookup. OWASP writes: with a denylist, user sessions are no longer fully **stateless** (the server keeps no state), so you may consider a plain session system ([OWASP JWT Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)).
+2. **A short `exp` + a refresh token.** The access token lives a few minutes, and a new one is obtained with a **refresh token**. The refresh token is stored on the server and revoked there, which is again a session.
+3. **Changing the key** is a way without a database, but it kills everyone's tokens.
+
+**Size.** A JWT travels with every request and grows with every claim. `printf %s` prints the token without a trailing newline, `wc -c` counts bytes. We take the cookie value from the `jar.txt` format: a cookie file has tab-separated columns, and the seventh is the value (`cut -f7`); `tr -d` removes the newline:
+
+```console
+$ printf %s "$T" | wc -c
+233
+$ grep session eski.txt | cut -f7 | tr -d '\n' | wc -c
+43
+```
+
+The JWT is 233 characters, the session token is 43. This is a lab value: every added claim makes the token bigger.
+
+## The choice for bozor
+
+- **bozor: session.** One API and one Postgres: requests go to the database anyway, and the session lookup is a single `SELECT` by primary key (GB-6.04). It is usually cheap; it was not measured in this lesson. Logout and blocking must take effect at once.
+- **A JWT fits between services:** one service gives another a short-lived token, and the service that accepts the token does not connect to the database.
+
+This is a choice for bozor's conditions, not a general rule. If the conditions change, the choice changes: what matters is knowing the price of both paths. At work tomorrow: when you see a JWT, check the four rules and what logout does.
+
+## Going deeper (optional): each credential separately, alg confusion and the 401 header
+
+**Logout revokes each credential separately.** `POST /login` gives both, so in the video both the cookie and `$T` were sent to logout. Logout with only the cookie does not touch the JWT; `/logout-all` also deletes only session rows. Tests check both:
+
+```console
+$ go test -count=1 -run "TestLogoutHarBiriAlohida|TestUsersVaLogoutAll" -v ./cmd/api
+=== RUN   TestUsersVaLogoutAll
+--- PASS: TestUsersVaLogoutAll (0.16s)
+=== RUN   TestLogoutHarBiriAlohida
+--- PASS: TestLogoutHarBiriAlohida (0.03s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.290s
+```
+
+To kill JWTs "on all devices" you need a record per user ("tokens issued before this moment are invalid"): server state again.
+
+**An invalid Bearer.** The token here is the plain word `salom` ("hello"). For an invalid token the response is `401` with a `WWW-Authenticate: Bearer error="invalid_token"` header ([RFC 6750 §3](https://www.rfc-editor.org/rfc/rfc6750#section-3)). If a Bearer is present but invalid, `authenticate` does not fall back to the cookie: the client chose a method.
+
+```console
+$ curl -s -i -H "Authorization: Bearer salom" localhost:8765/me
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+Www-Authenticate: Bearer error="invalid_token"
+X-Request-Id: PNKR2JIJZAWHYTB6O5ZWTW5WMX
+Date: Sat, 28 Nov 2026 09:24:07 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"PNKR2JIJZAWHYTB6O5ZWTW5WMX"}
+```
+
+The `X-Request-Id` header is from GB-6.01; `Content-Type: application/problem+json` is from GB-6.02. The reason, `token is malformed`, is only in the log:
+
+```text
+2026/11/28 14:24:07 PNKR2JIJZAWHYTB6O5ZWTW5WMX xato 401: "JWT yaroqsiz: token is malformed: token contains an invalid number of segments"
+2026/11/28 14:24:07 PNKR2JIJZAWHYTB6O5ZWTW5WMX GET "/me" 401 340.984µs
+```
+
+**Alg confusion** (not re-run here; a paraphrase of [RFC 8725 §2.1](https://www.rfc-editor.org/rfc/rfc8725#section-2.1)). In a system that signs with a public-key algorithm (for example `RS256`), an attacker changes the header's `alg` to `HS256` and uses the publicly known public key as the HMAC secret. The defence is for the server to set the allowed algorithms, that is, `WithValidMethods`. In our system with a single HMAC key this attack does not exist; so it is mentioned here only as a rule.
+
+## Common mistakes
+
+**1. `Parse` without rules.** There is no error message: the token simply passes. A token without `exp` lives forever, a token for another service is accepted, and the token still chooses the algorithm. The full analysis is in the "The classic mistake: Parse without rules" section above. The fix: the four options.
+
+**2. Secrets in a JWT.** We read the payload without a key using `basenc` (the "The payload is not encrypted" section above). Do not put a password or personal data in a claim. If you need the email, read it from the database by `sub`; that is why `/me` on the JWT path returned only `id`.
+
+**3. Believing that "logout kills the JWT too".** Logout deletes the session row; for a JWT there is nothing to delete (the "The same requests" section: old cookie `401`, JWT `200`). The fix: a denylist (the task) or accepting a short `exp`.
+
+## Check yourself
+
+1. What do the three parts of a JWT and the signature guarantee?
+
+<details>
+<summary>Answer</summary>
+
+The parts are `header`, `payload` and the signature. The signature guarantees that someone who knows the key wrote the text and that it has not changed. It does not hide the payload: it keeps no secrets.
+
+</details>
+
+2. Why does the JWT keep working after logout?
+
+<details>
+<summary>Answer</summary>
+
+The server has no record of the JWT that could be deleted. With a valid signature and an `exp` that has not passed, the token is valid until `exp`.
+
+</details>
+
+3. From GB-6.02: the `detail` of today's `401` responses is the same. Where is the real reason?
+
+<details>
+<summary>Answer</summary>
+
+In the server log, under the same request ID. The internal reason is not shown to the client.
+
+</details>
+
+4. Prediction: `Parse` with four options, the token's signature is valid, but the payload has no `exp`. The result?
+
+<details>
+<summary>Answer</summary>
+
+Rejected: `token has invalid claims: token is missing required claim: exp claim is required`. That is exactly what `WithExpirationRequired` demands; a rule-less `Parse` would have accepted such a token.
+
+</details>
+
+5. Prediction: the token's `aud` is `hisobot-api` ("reports API"), and the signature is valid. `Parse` with four options?
+
+<details>
+<summary>Answer</summary>
+
+Rejected: `token has invalid claims: token has invalid audience`. `WithAudience(Audience)` accepts only a token issued for `bozor-api`.
+
+</details>
+
+## Homework
+
+[Lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-05-session-jwt/TASK.md), [answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt/solution).
+
+🟢 **Main: logout also revokes the JWT (a `jti` denylist).** Three steps:
+
+1. `internal/store/store.go`: `RevokeToken(ctx, jti, expires)` writes `s.revoked[jti] = expires` and returns `nil`; `TokenRevoked(ctx, jti)` reads the map with comma-ok and returns `ok, nil`. Both start with `s.mu.Lock()` and `defer s.mu.Unlock()` (GB-4.07).
+2. `cmd/api/auth.go`, `logout`: if the request came with a `Bearer`, open the token with `token.Parse`. If there is no error, call `RevokeToken(r.Context(), c.JTI, c.Expires)`; if it returns an error, call `writeError` and `return`. If `Parse` returns an error, do nothing: such a token cannot get in anyway, and logout returns `204`.
+3. `cmd/api/auth.go`, `authenticate`: on the JWT path, after `Parse`, if `TokenRevoked` returns `true`, return an error wrapped in `errBadToken`.
+
+🟡 **Optional:** `PurgeRevoked(ctx, now)` deletes the entries whose `exp` is before `now` and returns how many it deleted. An expired token does not pass `Parse` anyway, so its entry is useless; without cleaning, the map keeps growing. If you do not write it, that test is skipped (`SKIP`).
+
+Do not change the `tekshiruv_test.go` files.
+
+**Prediction:** `go test ./...` on the starter? **A)** everything passes · **B)** two main tests fail · **C)** a compile error.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The code compiles, but `RevokeToken` is not written yet and `logout` does not revoke the JWT. In **A** you forgot that the tests check the task; in **C** the code is written correctly: only the content is missing.
+
+</details>
+
+```console
+$ go test ./...
+--- FAIL: TestLogoutJWTniBekorQiladi (0.04s)
+    tekshiruv_test.go:19: logout'dan keyin oʻsha JWT bilan /me: status 200, kutilgan 401 — jti denylist'ga tushmadi yoki authenticate uni tekshirmayapti (TASK.md, 2–3-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.741s
+?   	github.com/abdurahmon27/bozor/cmd/qolda	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/tekshir	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.484s
+--- FAIL: TestRevokeToken (0.00s)
+    tekshiruv_test.go:15: RevokeToken: vazifa: RevokeToken hali yozilmagan (TASK.md) — TASK.md, 1-qadam: s.revoked'ga yozing va nil qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.004s
+ok  	github.com/abdurahmon27/bozor/internal/token	0.012s
+FAIL
+```
+
+Read the result. `FAIL` means a test failed. `tekshiruv_test.go:19` is the file and line; the text after it says what was expected (`kutilgan 401`, "expected 401", but it is `200` now). In `internal/store`, the message `RevokeToken hali yozilmagan` ("RevokeToken is not written yet") points to step 1. `?  …  [no test files]` means this package has no tests. The fix is not to delete the test but to write the code.
+
+<details>
+<summary>Answer and explanation</summary>
+
+```go
+func (s *Store) RevokeToken(ctx context.Context, jti string, expires time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revoked[jti] = expires
+	return nil
+}
+
+// TokenRevoked jti denylist'da bormi? Bu — JWT'ni bekor qilishning narxi: har soʻrovda yana bitta qidiruv.
+func (s *Store) TokenRevoked(ctx context.Context, jti string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.revoked[jti]
+	return ok, nil
+}
+```
+
+Into `logout` (the JWT first, then the session) and into `authenticate`:
+
+```go
+	if s, ok := bearer(r); ok {
+		if c, err := token.Parse(s, a.jwtKey); err == nil {
+			if err := a.st.RevokeToken(r.Context(), c.JTI, c.Expires); err != nil {
+				writeError(w, err)
+				return
+			}
+		}
+	}
+```
+
+```go
+		revoked, err := a.st.TokenRevoked(r.Context(), c.JTI)
+		if err != nil {
+			return store.User{}, err
+		}
+		if revoked {
+			return store.User{}, fmt.Errorf("%w: jti %s bekor qilingan", errBadToken, c.JTI)
+		}
+```
+
+The first fragment goes into the store, the second into `logout`, the third into `authenticate` after `Parse`. The optional `PurgeRevoked` walks the map and deletes the entries whose `exp` is before `now`:
+
+```go
+func (s *Store) PurgeRevoked(ctx context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for jti, exp := range s.revoked {
+		if exp.Before(now) {
+			delete(s.revoked, jti)
+			n++
+		}
+	}
+	return n, nil
+}
+```
+
+The rest: the `revoked` map holds `jti` → `exp`: after `exp` the token is rejected anyway, so the entry can be cleaned (the optional part). If `Parse` returns an error, `logout` revokes nothing: an invalid token cannot get in. The order is the JWT first, then the session. If writing to the denylist fails, the session stays in place and logout can be repeated.
+
+</details>
+
+**Prediction for the solution:** `go test ./...` in the `solution` folder. `cd` moves into the solution folder; it has its own `go.mod`:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.704s
+?   	github.com/abdurahmon27/bozor/cmd/qolda	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/tekshir	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.414s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.005s
+ok  	github.com/abdurahmon27/bozor/internal/token	0.005s
+```
+
+Start the same server from `solution` and try the JWT after logout by hand. In the first terminal `cd solution && go run ./cmd/api`, in the second the login from above and `T=$(jq -r .token login.json)`, then:
+
+```console
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $T" localhost:8765/logout
+204
+```
+
+Here `-o /dev/null` discards the response body and `-w '%{http_code}\n'` prints only the status code. The last request uses the same token:
+
+```console
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"3KI6N4F622SNZQNQVFNBUVW7TB"}
+```
+
+Now it is `401`. In the server log, the reason: the `jti` is revoked.
+
+```text
+2026/11/28 14:24:46 LJSWE4HDPBQKF7MGYGZKTMR52C POST "/logout" 204 130.945µs
+2026/11/28 14:24:46 3KI6N4F622SNZQNQVFNBUVW7TB xato 401: "JWT yaroqsiz: jti O2BZPFBFFHJDBB4PCKXKAVGYFC bekor qilingan"
+2026/11/28 14:24:46 3KI6N4F622SNZQNQVFNBUVW7TB GET "/me" 401 366.966µs
+```
+
+Here is the price: every JWT request does one lookup in the store, just like a session. What is left of the JWT compared with a session? Signature verification and a "who is this" answer without the database; killing a stolen token at once still depends on server state.
+
+Format and static check:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+There is no output: formatting and `vet` are clean. When you finish, stop the server with Ctrl+C and delete the lab files:
+
+```bash
+rm -f cred.json login.json jar.txt eski.txt
+unset LAB_EMAIL LAB_PASSWORD T
+```
+
+## Sources
+
+- [RFC 7519: JSON Web Token (JWT)](https://www.rfc-editor.org/rfc/rfc7519) — structure (§3), claims (§4.1), unsecured JWT (§6)
+- [RFC 7516: JSON Web Encryption (JWE)](https://www.rfc-editor.org/rfc/rfc7516)
+- [RFC 7515: JSON Web Signature (JWS)](https://www.rfc-editor.org/rfc/rfc7515) — base64url (§2)
+- [RFC 7518 §3.2: HMAC with SHA-2](https://www.rfc-editor.org/rfc/rfc7518#section-3.2)
+- [RFC 8725: JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725)
+- [RFC 6750: Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750)
+- [RFC 9110: HTTP Semantics (authentication scheme, §11.1)](https://www.rfc-editor.org/rfc/rfc9110#section-11.1)
+- [OWASP JSON Web Token Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)
+- [golang-jwt/jwt/v5: ParseWithClaims, parser options](https://pkg.go.dev/github.com/golang-jwt/jwt/v5)
+- [golang-jwt/jwt: releases](https://github.com/golang-jwt/jwt/releases)
+- [Go crypto/hmac: New](https://pkg.go.dev/crypto/hmac#New)
+- [Go encoding/base64: RawURLEncoding](https://pkg.go.dev/encoding/base64#pkg-variables)
+- [GNU coreutils: basenc](https://www.gnu.org/software/coreutils/manual/html_node/basenc-invocation.html)
+
+Results are from `go1.27.4 linux/amd64` (`CGO_ENABLED=0`), curl 8.22.0, jq 1.8.2, GNU coreutils 9.11, `golang-jwt/jwt/v5 v5.3.1`, 2026-11-28. The `exp`, `iat`, `jti`, signature and request ID values in the video are different: they change on every run; the token size (233 and 43 characters) matches the video.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+---
+
+← Previous lesson: [GB-6.04](/lab/youtube/gb/gb-6-04/en) · Next lesson: [GB-6.06](/lab/youtube/gb/gb-6-06/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

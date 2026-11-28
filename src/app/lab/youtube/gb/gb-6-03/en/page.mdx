@@ -1,0 +1,1067 @@
+---
+title: "Passwords: argon2id, salt and never plain text"
+date: "2026/11/28"
+description: "You store a password with argon2id and a salt, verify it from the stored string, and measure on your own machine what an offline attack on a leaked table costs."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-03/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-03"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-03/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-03/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-03"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-03) · [Русский](/lab/youtube/gb/gb-6-03/ru) · **English**  
+Lesson GB-6.03 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-03) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Users are joining bozor with an email and a password. If a copy of the `users` table leaks one day, how quickly will an attacker find the passwords?
+
+**One idea:** a password goes into the database as a string you can check but cannot reverse, and every guess against it is expensive. Argon2id fills 19 MiB of memory on every computation and makes two passes over it. Each user gets a new random salt. The result is one string that holds everything needed to verify. The attacker can only guess too, and each guess costs them a lot.
+
+By the end of this lesson you will:
+
+- measure an offline attack on a leaked table on your own machine: against a fast hash and against argon2id;
+- write `Hash` and `Verify` in the `internal/password` package: random salt, argon2id, one string;
+- see `Verify` read the salt and parameters from the stored string and compare the keys in constant time;
+- add `POST /users` (registration) to bozor: the database receives only the argon2id string.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| offline attack | the attacker opens a copy of the table on their own computer and tests password guesses; the server notices nothing | offline attack |
+| argon2id and salt | a password hash that makes every computation deliberately expensive; salt is new random bytes for each user | argon2id, salt |
+| constant-time comparison | comparing two byte strings so that the time does not depend on how many bytes match | constant-time comparison |
+
+The other terms (OWASP, PHC string, `fmt.Sscanf`) get one sentence where they first appear.
+
+## Before you start
+
+- [GB-6.02 · One error shape for the API](/lab/youtube/gb/gb-6-02/en): `problemFor`, `fieldErrors`, `writeError(w, err)`, the 409 and 422 responses.
+- [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/en): `crypto/rand`, `X-Request-Id` and the log line `ID METHOD "path" status duration`.
+- [GB-5.10 · Checkpoint: orders API](/lab/youtube/gb/gb-5-10/en): the closing review question comes from this lesson.
+- [GB-4.06 · JSON in and out](/lab/youtube/gb/gb-4-06/en), [GB-4.08 · Checkpoint: catalog API](/lab/youtube/gb/gb-4-08/en), [GB-4.03 · Handler](/lab/youtube/gb/gb-4-03/en), [GB-4.01 · An HTTP request](/lab/youtube/gb/gb-4-01/en): `decodeJSON`, handlers, `curl`, the 201 response.
+- [GB-3.02 · JSON and struct tags](/lab/youtube/gb/gb-3-02/en), [GB-3.01 · Files and `bufio`](/lab/youtube/gb/gb-3-01/en): the struct tag and `strings.Split`.
+- [GB-2.10 · UTF-8: byte, rune](/lab/youtube/gb/gb-2-10/en), [GB-2.08 · Errors in depth](/lab/youtube/gb/gb-2-08/en), [GB-2.06 · Packages](/lab/youtube/gb/gb-2-06/en), [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04/en), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03/en), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01/en): the types in the code below and `go get`.
+- [GB-1.08 · First test](/lab/youtube/gb/gb-1-08/en), [GB-1.07 · Function and the first error](/lab/youtube/gb/gb-1-07/en), [GB-1.05 · Decisions: if and switch](/lab/youtube/gb/gb-1-05/en), [GB-1.04 · Text and formatted output](/lab/youtube/gb/gb-1-04/en): `go test`, multiple results, `||`, `Sprintf`.
+
+The [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar) has its own `go.mod` (`go 1.27`). It starts from the GB-6.02 solution and already contains the `golang.org/x/crypto` module. In this lesson users live in memory: the topic is password storage, not Postgres. The Go Playground cannot reproduce this lesson: it needs a module, files and a server.
+
+In your shell set `CGO_ENABLED=0` and `GOTOOLCHAIN=go1.27.4`. Run the commands in the lesson folder. The server needs two terminals: the first runs the server, the second sends requests with `curl`. The server uses port 8765; if it is busy, stop the other server with Ctrl+C first.
+
+Recall: how does `problemFor` send an unknown error to the client?
+
+**A)** 500 and the `err.Error()` text · **B)** 500 without `detail` · **C)** 400 and a generic text
+
+<details>
+<summary>Answer</summary>
+
+**B.** The client gets a 500 with no `detail` field; the full text goes only to the log ([GB-6.02](/lab/youtube/gb/gb-6-02/en)). A leaks internal text to the client, and C presents the server's own error as the client's mistake. Today's rule is stricter: a password is not written to the database even as plain text.
+
+</details>
+
+## The leaked table: plain password and fast hash
+
+The `sizdi/` folder (Uzbek for "leaked") holds one `users` table in three forms. The emails and passwords are made up; the `.test` domain is reserved for testing only ([RFC 2606](https://www.rfc-editor.org/rfc/rfc2606#section-2)). The first form: the password itself.
+
+```console
+$ cat sizdi/ochiq.txt
+dilnoza@bozor.test choy2024
+jasur@bozor.test choy2024
+malika@bozor.test tarvuz-osmon-qalam-ariq-27
+```
+
+`cat` prints the file to the terminal. Each line has the email and the password itself: the attacker has nothing left to do.
+
+The second form: the password is hashed with sha256. A **hash** is a function that computes a fixed-length byte string from text. SHA-256 is one-way: you cannot compute the password back from the result. Storing passwords with sha256 does happen in practice, and OWASP warns against it. **OWASP** is an open project about web security; its Password Storage Cheat Sheet collects the rules for storing passwords.
+
+```console
+$ cat sizdi/sha256.txt
+dilnoza@bozor.test 385426486641a520e865c4e6b24d379c8f8afa1eb5de2f932ba90f0622f06289
+jasur@bozor.test 385426486641a520e865c4e6b24d379c8f8afa1eb5de2f932ba90f0622f06289
+malika@bozor.test f8fe182b2bef6749451694c3042b04e5cd5f5aa6aeecbfb0c2744dfbac6549a5
+```
+
+Each line has a 64-character hex string: 32 bytes, two hex characters per byte ([GB-2.10](/lab/youtube/gb/gb-2-10/en)). Compare two lines:
+
+| User | Hash | What we see |
+|---|---|---|
+| dilnoza | `38542648…f06289` | — |
+| jasur | `38542648…f06289` | the same as dilnoza: so the password is the same |
+| malika | `f8fe182b…6549a5` | different: a different password |
+
+Looking at the table, the attacker learns that two people share a password. Find one password and both open. The reason: no **salt** was added to the password. A salt is new random bytes for each user; it is added to the password before hashing. Without a salt, the same password always gives the same hash.
+
+## Offline attack: millions of guesses per second against sha256
+
+The attacker does not reverse the hash. They **guess**: they take each candidate from a list of popular passwords, hash it the same way and compare it with the hash from the table.
+
+```text
+candidate ("olma")  →  sha256(candidate)  →  same as the hash in the table?
+                                               ├─ yes: password found
+                                               └─ no:  next candidate
+```
+
+This is an **offline attack**: the copy of the table sits on the attacker's computer and the server knows nothing about it. Only the attacker's computer limits the speed.
+
+The `cmd/taxmin` program in the folder (`taxmin` means "guess") measures exactly this. `nomzodlar.txt` ("candidates") has 1000 made-up candidates (not a real leaked list). For a sha256 line the program computes sha256; for an argon2id line it calls bozor's own `password.Verify`, which we meet later. The program's code is in the folder as `cmd/taxmin/main.go`; read it after the lesson.
+
+Guess: how many candidates per second does one processor core check with sha256?
+
+**A)** ~100,000 · **B)** ~1,000,000 · **C)** ~10,000,000
+
+<details>
+<summary>Answer</summary>
+
+**C.** The measurement in the video: 8,229,029 guesses per second, so one hash takes ≈ 0.12 microseconds (1,000,000 ÷ 8,229,029). If you chose A or B, you estimated a hash in milliseconds: sha256 is fast on purpose, and computing over 32 bytes is very cheap.
+
+</details>
+
+Run the program against the sha256 table. Dilnoza's and Jasur's password is `choy2024`; Malika's is a long phrase:
+
+```console
+$ go run ./cmd/taxmin sizdi/sha256.txt
+sizdi/sha256.txt: 3 qator · nomzodlar.txt: 1000 parol
+dilnoza@bozor.test  topildi: choy2024 (71-nomzod) · 11µs
+jasur@bozor.test    topildi: choy2024 (71-nomzod) · 10µs
+malika@bozor.test   topilmadi · 123µs
+1142 taxmin · 157µs · sekundiga 7 279 728 · har taxmin 0 B xotira
+```
+
+Read the output:
+
+| Line | Meaning |
+|---|---|
+| 1 | 3 lines (accounts in the table), 1000 candidates |
+| 2–3 | `choy2024` is candidate number 71 in the list: dilnoza and jasur were found (`topildi` means "found"); `µs` is a microsecond, a millionth of a second |
+| 4 | Malika's long phrase is not in the list: `topilmadi` (not found) |
+| 5 | 1142 guesses in total, the total time, guesses per second and the memory allocated per guess |
+
+`0 B` in the last line means: in this measurement no extra memory was allocated per guess (measured with `runtime.MemStats.TotalAlloc`). Remember this: computing sha256 needs almost no memory.
+
+**The numbers depend on the computer.** The video's output and my run side by side:
+
+| Measurement | Video's measurement | My run (machine busy) |
+|---|---|---|
+| sha256, guesses per second | 8,229,029 | 5.7–7.3 million (three runs) |
+| finding `choy2024` | 9 µs, 8 µs | 9–20 µs |
+
+While I was writing this page the machine was busy (load average ≈ 13–17, the computer has 12 logical processors), so the absolute number is lower. What matters is the order of magnitude: sha256 gives **millions** of guesses per second.
+
+## argon2id: a hash where every computation is expensive
+
+For a password, every hash computation must be expensive on purpose. **Argon2id** fills a given amount of memory, for example 19 mebibytes, and makes several passes over it. The output is a 32-byte key. (A **kibibyte** KiB is 1024 bytes, a **mebibyte** MiB is 1024 KiB.) Argon2 won the Password Hashing Competition in 2015; OWASP recommends argon2id first for storing passwords.
+
+```text
+password + salt  →  19 MiB of memory is filled  →  several passes over the memory  →  32-byte key (this goes to the database)
+```
+
+Argon2id is tuned with three parameters:
+
+| Parameter | Meaning | Ours |
+|---|---|---|
+| `m` | memory, in kibibytes | 19456 (19 MiB) |
+| `t` | number of passes over the memory | 2 |
+| `p` | number of parallel lanes | 1 |
+
+The OWASP table gives five minimum settings. They give the same level of defense: less memory means more passes.
+
+| `m` | `t` | `p` |
+|---|---|---|
+| 47104 (46 MiB) | 1 | 1 |
+| **19456 (19 MiB)** | **2** | **1** |
+| 12288 (12 MiB) | 3 | 1 |
+| 9216 (9 MiB) | 4 | 1 |
+| 7168 (7 MiB) | 5 | 1 |
+
+We take the second row. These are **minimum** values: OWASP advises tuning them by measuring on the production server.
+
+The salt is new random bytes for each user. It is not a secret: its job is to stop the attacker from sharing work between users.
+
+Argon2 is not in the standard library: it is in the Go team's `golang.org/x/crypto` module ([GB-2.06](/lab/youtube/gb/gb-2-06/en)). In an empty project you add the module with `go get`:
+
+```console
+$ go get golang.org/x/crypto/argon2
+go: downloading golang.org/x/crypto v0.59.0
+go: downloading golang.org/x/sys v0.50.0
+go: added golang.org/x/crypto v0.59.0
+go: added golang.org/x/sys v0.50.0
+```
+
+`go get` downloads the module and records it in `go.mod`. The second module, `golang.org/x/sys`, is needed by `x/crypto`: it depends on it. In the lesson folder this is already done (`go.mod`, `go.sum`), so you do not have to run the command. The output above was taken in a copy of the GB-6.02 solution with an empty module cache, which is why the `downloading` lines appear.
+
+## Hash: salt, argon2id and one string
+
+A new package, `internal/password`. At the top of the file the parameters sit in a `const` block:
+
+```go
+const (
+	memory  = 19 * 1024 // m: xotira, KiB
+	passes  = 2         // t: xotira ustidan necha marta oʻtiladi
+	threads = 1         // p: parallel yoʻlaklar soni
+	keyLen  = 32        // hosil boʻladigan kalit, bayt
+	saltLen = 16        // salt, bayt
+)
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `const (` | start of the constant block ([GB-2.03](/lab/youtube/gb/gb-2-03/en)) |
+| 2 | `memory  = 19 * 1024` | `m`: 19 times 1024 = 19456 KiB = 19 MiB. `*` is multiplication, `//` starts a comment |
+| 3 | `passes  = 2` | `t`: how many passes over the memory |
+| 4 | `threads = 1` | `p`: number of parallel lanes |
+| 5 | `keyLen  = 32` | length of the resulting key, in bytes |
+| 6 | `saltLen = 16` | salt length, in bytes |
+
+Now the start of the `Hash` function:
+
+```go
+func Hash(pw string) string {
+	salt := make([]byte, saltLen)
+	rand.Read(salt) // Go 1.24'dan beri xato qaytarmaydi
+	key := argon2.IDKey([]byte(pw), salt, passes, memory, threads, keyLen)
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func Hash(pw string) string {` | `pw` is the password; the function returns a string ([GB-1.07](/lab/youtube/gb/gb-1-07/en)) |
+| 2 | `salt := make([]byte, saltLen)` | creates a 16-byte slice ([GB-2.01](/lab/youtube/gb/gb-2-01/en)) |
+| 3 | `rand.Read(salt)` | the `crypto/rand` package ([GB-6.01](/lab/youtube/gb/gb-6-01/en)) fills the slice with **cryptographically** random bytes, that is, bytes that cannot be predicted. Since Go 1.24, `Read` does not return an error |
+| 4 | `key := argon2.IDKey(…)` | creates a 32-byte `key` from the password bytes, the salt, `passes`, `memory`, `threads` and the key length |
+
+What is left is putting the result into a string. The complete `Hash`:
+
+```go
+var b64 = base64.RawStdEncoding
+
+// Hash parolni argon2id bilan hash qiladi va bazaga yoziladigan satrni qaytaradi:
+//
+//	$argon2id$v=19$m=19456,t=2,p=1$<salt>$<kalit>
+//
+// Har chaqiruvda yangi tasodifiy salt: bir xil parol ham har safar boshqa satr beradi.
+func Hash(pw string) string {
+	salt := make([]byte, saltLen)
+	rand.Read(salt) // Go 1.24'dan beri xato qaytarmaydi
+	key := argon2.IDKey([]byte(pw), salt, passes, memory, threads, keyLen)
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version,
+		memory, passes, threads, b64.EncodeToString(salt), b64.EncodeToString(key))
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `var b64 = base64.RawStdEncoding` | a way to write bytes as text (explained below); used in two places: when writing and when reading |
+| 3–7 | comment | the shape of the string: `$argon2id$v=19$m=…,t=…,p=…$salt$key` |
+| 12 | `return fmt.Sprintf(…)` | [GB-1.04](/lab/youtube/gb/gb-1-04/en): the values replace `%d` and `%s` in the template |
+| 12–13 | `argon2.Version`, `memory, passes, threads` | the version (19), then `m`, `t`, `p` |
+| 13 | `b64.EncodeToString(salt)`, `b64.EncodeToString(key)` | writes the salt and key bytes as text |
+
+**Base64** turns every 3 bytes into 4 characters. A 16-byte salt becomes 22 characters, a 32-byte key becomes 43. `RawStdEncoding` does not add the `=` padding at the end; `StdEncoding` does. The difference matters below, in "Common mistakes".
+
+The result is a **PHC string**: a format agreed in the Password Hashing Competition, with parts separated by `$`. Let us split one string:
+
+```text
+$argon2id$v=19$m=19456,t=2,p=1$fd+QrkyR3ap9uAJkzw4Ocw$1tRXqM9ibZAPh1bCRLKEoQtHxfvyHk/HuicsoJA/CsQ
+```
+
+| Part | Value | Meaning |
+|---|---|---|
+| 0 | (empty) | the string starts with `$`, so the first part is empty |
+| 1 | `argon2id` | the algorithm |
+| 2 | `v=19` | the version (`argon2.Version` = 0x13 = 19) |
+| 3 | `m=19456,t=2,p=1` | the parameters |
+| 4 | `fd+QrkyR3ap9uAJkzw4Ocw` | the salt, 22 characters |
+| 5 | `1tRXqM9ibZAPh1bCRLKEoQtHxfvyHk/HuicsoJA/CsQ` | the key, 43 characters |
+
+This string has everything needed to verify: the algorithm, the parameters and the salt. That is why the database stores only this string.
+
+First, predict. `sizdi/argon2id.txt` was made by this very `Hash`. Dilnoza and Jasur have the same password (`choy2024`). Which part of the two lines is the same?
+
+**A)** no part · **B)** the salt · **C)** the start: algorithm and parameters
+
+<details>
+<summary>Answer</summary>
+
+**C.** `$argon2id$v=19$m=19456,t=2,p=1$` is built from constants, so it is the same on every line. B is wrong: the salt is new and random on every call. A is wrong too: the start is the same. The key is computed together with the salt, so it is completely different.
+
+</details>
+
+```console
+$ cat sizdi/argon2id.txt
+dilnoza@bozor.test $argon2id$v=19$m=19456,t=2,p=1$fd+QrkyR3ap9uAJkzw4Ocw$1tRXqM9ibZAPh1bCRLKEoQtHxfvyHk/HuicsoJA/CsQ
+jasur@bozor.test $argon2id$v=19$m=19456,t=2,p=1$rUPhzHtvN8st9ZvrLtD39A$QDmgSweLTZ3B4crIK4E1dj13e/GF9VEcFyNE49sErHY
+malika@bozor.test $argon2id$v=19$m=19456,t=2,p=1$GX6RH2ZGTsRb4K5+L5A5Ew$nsERR+E5HtqLtBfmTmTOsYGRpK9blc8HIdMX/k2/SRY
+```
+
+The start is the same: algorithm, version, parameters. The salt differs, and the key is completely different too. Now you cannot tell equal passwords from the table.
+
+## Verify: parameters from the string, comparison in constant time
+
+At login, that is, when the user signs in, the server hashes the password again with the salt **from the stored string** and compares the result with the stored key.
+
+```go
+var ErrBadHash = errors.New("hash satri notoʻgʻri")
+
+// Verify parol saqlangan satrga mos kelishini tekshiradi. Parametrlar va salt satrdan olinadi,
+// kalit qaytadan hisoblanadi va saqlangani bilan doimiy vaqtda solishtiriladi.
+// Parol notoʻgʻri boʻlsa — false, nil; satrning oʻzi buzuq boʻlsa — xato (ErrBadHash).
+func Verify(pw, encoded string) (bool, error) {
+	p, err := decode(encoded)
+	if err != nil {
+		return false, err
+	}
+	key := argon2.IDKey([]byte(pw), p.salt, p.passes, p.memory, p.threads, uint32(len(p.key)))
+	return subtle.ConstantTimeCompare(key, p.key) == 1, nil
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `var ErrBadHash = errors.New(…)` | a sentinel error for a malformed string ([GB-2.08](/lab/youtube/gb/gb-2-08/en)) |
+| 3 | `func Verify(pw, encoded string) (bool, error)` | `pw` and `encoded` are both `string`: the type is written once. The results: did it match, and an error |
+| 4 | `p, err := decode(encoded)` | gets `params` from the string; `decode` is below |
+| 5–7 | `if err != nil { return false, err }` | if the string is malformed, `false` and the error |
+| 8 | `key := argon2.IDKey(…)` | computes the key again with the salt and parameters **from the string**. `len` returns an `int`, but `IDKey` expects a non-negative `uint32`, so `uint32(len(p.key))` |
+| 9 | `subtle.ConstantTimeCompare(key, p.key) == 1` | returns `1` when the keys are equal, and `== 1` gives `true` |
+
+The result of `decode` is a `params` struct:
+
+```go
+type params struct {
+	memory, passes uint32
+	threads        uint8
+	salt, key      []byte
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 2 | `memory, passes uint32` | two numbers; fields of the same type go on one line, separated by a comma |
+| 3 | `threads uint8` | one byte: this is the type `IDKey` expects |
+| 4 | `salt, key []byte` | the salt and key bytes |
+
+`decode` splits the string into parts:
+
+```go
+func decode(encoded string) (params, error) {
+	var p params
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return p, ErrBadHash
+	}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func decode(encoded string) (params, error)` | takes the string, returns `params` and an error |
+| 2 | `var p params` | `p` is a variable of this type, its fields at their zero values |
+| 3 | `strings.Split(encoded, "$")` | splits the string on `$` into 6 parts; the first is empty. The result is `parts` |
+| 4–6 | `if len(parts) != 6 \|\| …` | if the number of parts, the algorithm or the version is different, `ErrBadHash` is returned |
+
+Next: the parameters, the salt and the key.
+
+```go
+	_, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.passes, &p.threads)
+	if err != nil || p.passes < 1 || p.threads < 1 {
+		return p, fmt.Errorf("%w: parametrlar %q", ErrBadHash, parts[3])
+	}
+	if p.salt, err = b64.DecodeString(parts[4]); err != nil {
+		return p, fmt.Errorf("%w: salt: %w", ErrBadHash, err)
+	}
+	if p.key, err = b64.DecodeString(parts[5]); err != nil {
+		return p, fmt.Errorf("%w: kalit: %w", ErrBadHash, err)
+	}
+	if len(p.key) < 16 { // boʻsh kalit har qanday parolga «mos» kelardi
+		return p, fmt.Errorf("%w: kalit %d bayt", ErrBadHash, len(p.key))
+	}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", …)` | the reverse of `Sprintf`: reads by a template and writes the numbers into the fields through pointers (`&p.memory`, [GB-2.04](/lab/youtube/gb/gb-2-04/en)). `_` is the number of fields read, which we do not need |
+| 2–4 | `if err != nil \|\| p.passes < 1 \|\| p.threads < 1` | if `t` or `p` is zero, `IDKey` would panic; we wrap that in `ErrBadHash` (`%w`) |
+| 5–7 | `b64.DecodeString(parts[4])` | turns the salt text back into bytes; on error `ErrBadHash` wraps it |
+| 8–10 | `b64.DecodeString(parts[5])` | the same for the key |
+| 11–13 | `if len(p.key) < 16` | a short key is also an error. `Verify` takes the key length from the stored key (`uint32(len(p.key))`): with an empty key, `IDKey` would also compute an empty key, the two empty strings would be equal, and any password would "match" |
+
+At the end `p` and `nil` are returned. There is one more check that the video does not show; it is in "Going deeper". `NeedsRehash` still always returns `false`: you write it in the homework.
+
+<details>
+<summary>Full internal/password/password.go</summary>
+
+```go filename="internal/password/password.go" showLineNumbers
+// Package password — parollarni argon2id bilan saqlash va tekshirish (GB-6.03).
+//
+// Bazaga parolning oʻzi ham, tez hash'i (sha256) ham yozilmaydi: faqat Hash qaytargan satr.
+// Satrda hamma narsa bor: algoritm, versiya, parametrlar, salt va hosil boʻlgan kalit —
+// shuning uchun Verify parametrlarni satrdan oʻqiydi va parametrlar keyin oʻzgarsa ham eski satrlar tekshiriladi.
+package password
+
+import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+
+	"golang.org/x/crypto/argon2"
+)
+
+// argon2id parametrlari — OWASP Password Storage Cheat Sheet'ning minimal sozlamasi:
+// m=19456 KiB (19 MiB), t=2, p=1. Bitta Hash shu kompyuterda ≈ 20 ms va 19 MiB xotira oladi.
+const (
+	memory  = 19 * 1024 // m: xotira, KiB
+	passes  = 2         // t: xotira ustidan necha marta oʻtiladi
+	threads = 1         // p: parallel yoʻlaklar soni
+	keyLen  = 32        // hosil boʻladigan kalit, bayt
+	saltLen = 16        // salt, bayt
+)
+
+// b64 — PHC satr formatidagi base64: standart alifbo, oxirida «=» toʻldiruvchisiz.
+var b64 = base64.RawStdEncoding
+
+// Hash parolni argon2id bilan hash qiladi va bazaga yoziladigan satrni qaytaradi:
+//
+//	$argon2id$v=19$m=19456,t=2,p=1$<salt>$<kalit>
+//
+// Har chaqiruvda yangi tasodifiy salt: bir xil parol ham har safar boshqa satr beradi.
+func Hash(pw string) string {
+	salt := make([]byte, saltLen)
+	rand.Read(salt) // Go 1.24'dan beri xato qaytarmaydi
+	key := argon2.IDKey([]byte(pw), salt, passes, memory, threads, keyLen)
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version,
+		memory, passes, threads, b64.EncodeToString(salt), b64.EncodeToString(key))
+}
+
+// ErrBadHash — saqlangan satr argon2id formatida emas (buzilgan yoki boshqa algoritm).
+var ErrBadHash = errors.New("hash satri notoʻgʻri")
+
+// Verify parol saqlangan satrga mos kelishini tekshiradi. Parametrlar va salt satrdan olinadi,
+// kalit qaytadan hisoblanadi va saqlangani bilan doimiy vaqtda solishtiriladi.
+// Parol notoʻgʻri boʻlsa — false, nil; satrning oʻzi buzuq boʻlsa — xato (ErrBadHash).
+func Verify(pw, encoded string) (bool, error) {
+	p, err := decode(encoded)
+	if err != nil {
+		return false, err
+	}
+	key := argon2.IDKey([]byte(pw), p.salt, p.passes, p.memory, p.threads, uint32(len(p.key)))
+	return subtle.ConstantTimeCompare(key, p.key) == 1, nil
+}
+
+// NeedsRehash — saqlangan satr hozirgi parametrlardan boshqasi bilan yasalganmi.
+// Login paytida parol toʻgʻri chiqsa va bu true boʻlsa, parolni qaytadan Hash qilib saqlash kerak.
+func NeedsRehash(encoded string) (bool, error) {
+	// VAZIFA (TASK.md, 2-qadam): satrni decode bilan oʻqing va memory, passes, threads yoki
+	// kalit uzunligi hozirgi konstantalardan farq qilsa true qaytaring.
+	return false, nil
+}
+
+// Satrdan oʻqiladigan parametrlarning yuqori chegarasi (OWASP jadvalining eng katta qatoridan ancha yuqori).
+const (
+	maxMemory = 256 * 1024 // KiB: 256 MiB
+	maxPasses = 16
+)
+
+// params — satrdan oʻqilgan qismlar.
+type params struct {
+	memory, passes uint32
+	threads        uint8
+	salt, key      []byte
+}
+
+// decode satrni «$» boʻyicha olti qismga ajratadi: "", "argon2id", "v=19", "m=…,t=…,p=…", salt, kalit.
+func decode(encoded string) (params, error) {
+	var p params
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return p, ErrBadHash
+	}
+	_, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.passes, &p.threads)
+	if err != nil || p.passes < 1 || p.threads < 1 {
+		return p, fmt.Errorf("%w: parametrlar %q", ErrBadHash, parts[3])
+	}
+	if p.salt, err = b64.DecodeString(parts[4]); err != nil {
+		return p, fmt.Errorf("%w: salt: %w", ErrBadHash, err)
+	}
+	if p.key, err = b64.DecodeString(parts[5]); err != nil {
+		return p, fmt.Errorf("%w: kalit: %w", ErrBadHash, err)
+	}
+	if len(p.key) < 16 { // boʻsh kalit har qanday parolga «mos» kelardi
+		return p, fmt.Errorf("%w: kalit %d bayt", ErrBadHash, len(p.key))
+	}
+	// Parametrlar qatorida ortiqcha belgi yoʻq ("p=1abc") va qiymatlar chegarada: buzilgan satrdagi
+	// m=4294967295 jarayonni «out of memory» bilan oʻldirardi (buni recover ham ushlay olmaydi).
+	if fmt.Sprintf("m=%d,t=%d,p=%d", p.memory, p.passes, p.threads) != parts[3] ||
+		p.memory > maxMemory || p.passes > maxPasses {
+		return p, fmt.Errorf("%w: parametrlar %q", ErrBadHash, parts[3])
+	}
+	return p, nil
+}
+```
+
+</details>
+
+### Why constant time
+
+An ordinary comparison stops at the first byte that differs. The response time reveals how many bytes matched. `subtle.ConstantTimeCompare` looks at every byte: the time does not depend on the content ([crypto/subtle](https://pkg.go.dev/crypto/subtle#ConstantTimeCompare)).
+
+| Comparison | When it stops | What the time reveals |
+|---|---|---|
+| ordinary | at the first differing byte | how many bytes matched |
+| `ConstantTimeCompare` | after looking at all bytes | not the content (only the length) |
+
+In `Verify` this is an extra precaution: the key is computed from the attacker's own password. Where a secret is compared directly, it is required: that place is the session tokens of the next lesson ([GB-6.04](/lab/youtube/gb/gb-6-04/en)).
+
+### Hash and Verify together
+
+The next example is **not** in the lesson folder; create it yourself as `cmd/hashdemo/main.go` (it must sit inside the module, because `internal/password` is open only to that module):
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/abdurahmon27/bozor/internal/password"
+)
+
+func main() {
+	a := password.Hash("choy2024")
+	b := password.Hash("choy2024")
+	fmt.Println(a)
+	fmt.Println(b)
+	fmt.Println(a == b)
+
+	ok, err := password.Verify("choy2024", a)
+	fmt.Println(ok, err)
+	ok, err = password.Verify("choy2025", a)
+	fmt.Println(ok, err)
+	ok, err = password.Verify("choy2024", "385426486641a520e865c4e6b24d379c8f8afa1eb5de2f932ba90f0622f06289")
+	fmt.Println(ok, err)
+}
+```
+
+Guess: what does `password.Verify("choy2025", a)` return? (The real password is `choy2024`.)
+
+**A)** `true`, `nil` · **B)** `false`, `nil` · **C)** `false` and `ErrBadHash`
+
+<details>
+<summary>Answer</summary>
+
+**B.** A wrong password is not an error: the string is fine, the key just came out different. An error (`ErrBadHash`) is returned only when the string itself is malformed, as in the third `Verify`: a sha256 hex is not an argon2id string. A happens only for the right password, and C would need a malformed string, but the string is fine.
+
+</details>
+
+```console
+$ go run ./cmd/hashdemo
+$argon2id$v=19$m=19456,t=2,p=1$4wDZmEKt2VGbKRDlq9DIFQ$W1vg3B4aMXWroyrjTznr1lW4QgA6XdDDbtFXd4uIsDQ
+$argon2id$v=19$m=19456,t=2,p=1$Pu4NEKxdT29DETs8+ZoigQ$TqzyXHUoV9wuyFjU+ZU6BF+lluvSKGx1LQVyvDKuvDk
+false
+true <nil>
+false <nil>
+false hash satri notoʻgʻri
+```
+
+The same `choy2024` gave two different strings (`false`: the strings are not equal), but both pass `Verify`. The salt and key parts will differ from yours: they are random on every run.
+
+A mid-lesson question. If we raise `memory` to 46 MiB (47104 KiB), does the old string (`m=19456`) still pass `Verify`?
+
+**A)** no: the parameter differs · **B)** yes: the parameters come from the string · **C)** only after a new `Hash`
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Verify` takes both the salt and the parameters from the string, not from the constants. The old string is still verified. Moving it to the new parameters is the homework: `NeedsRehash`.
+
+</details>
+
+## The same attack on argon2id strings
+
+Now the attacker has the `argon2id.txt` file. For each candidate they call our `Verify`. Will `choy2024` be found?
+
+**A)** no: it cannot be broken · **B)** yes, but much slower · **C)** yes, as fast as sha256
+
+<details>
+<summary>Answer</summary>
+
+**B.** Argon2id does not make a password unbreakable: if the candidate is in the list it is found, because `Verify` answers `true` for the right password and that is exactly what the attacker waits for (A is wrong). Argon2id makes every guess expensive, so C is wrong too.
+
+</details>
+
+```console
+$ go run ./cmd/taxmin sizdi/argon2id.txt
+sizdi/argon2id.txt: 3 qator · nomzodlar.txt: 1000 parol
+dilnoza@bozor.test  topildi: choy2024 (71-nomzod) · 2.7s
+jasur@bozor.test    topildi: choy2024 (71-nomzod) · 2.4s
+malika@bozor.test   topilmadi · 38.6s
+1142 taxmin · 43.7s · sekundiga 26 · har taxmin 19.0 MiB xotira
+```
+
+The password is still number 71 in the list, but now it took seconds. For Jasur the work started from scratch: his salt is different, so the guess found for Dilnoza does not help. The last line: guesses per second and 19.0 MiB of memory per guess.
+
+| Measurement | Video's measurement | My run (machine busy) |
+|---|---|---|
+| sha256, guesses per second | 8,229,029 | 5.7–7.3 million |
+| argon2id, guesses per second | 51 | 23–26 |
+| memory per argon2id guess | 19.0 MiB | 19.0 MiB |
+| ratio (sha256 ÷ argon2id) | ≈ 161,000 | ≈ 220,000–280,000 |
+| finding `choy2024` | 1.3 s | 2.4–3.6 s |
+| Malika (not found) | 19.7 s | 38.6–43.3 s |
+
+The absolute speed depends on the computer and how busy it is: mine was busy, so argon2id is slower. Two things do not change: every guess takes 19.0 MiB, and the gap is more than a hundred thousand times. Here is that gap (the video's measurement, on a logarithmic axis; each block is one power of ten, approximate):
+
+```text
+guesses per second, one core (log10 axis)
+sha256    ███████  8,229,029
+argon2id  ██       51
+```
+
+One billion candidates on one core, **for one user**:
+
+| | Video's measurement | My run |
+|---|---|---|
+| sha256 | 1,000,000,000 ÷ 8,229,029 ≈ 122 s ≈ 2 minutes | ≈ 137 s (output above: 7,279,728/s) |
+| argon2id | 1,000,000,000 ÷ 51 ≈ 19.6 million s ≈ 227 days | ≈ 445 days (output above: 26/s) |
+
+Every salt is different, so three users mean three times the work: each is computed separately.
+
+**Why the memory cost matters.** The attacker guesses on a graphics card, on thousands of cores at once. Sha256 needs no memory, so all the cores work. Each argon2id guess takes 19 MiB: a card with 24 GiB of memory holds no more than 24,576 ÷ 19 ≈ 1293 guesses at once. This is arithmetic, not a benchmark: the card's memory is needed for other things too, so the real number is lower. [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106#section-1) calls argon2 a *memory-hard* function, built for this: to raise the cost of password guessing on special hardware (GPU, ASIC).
+
+One more thing: `choy2024` was found anyway. Argon2id only slowed it down: the guess rate fell about 160,000 times (the video's measurement), but it did not protect the password. That is why a password length rule is needed too. It is in the next section.
+
+## Registration: POST /users
+
+Registration goes in order: read the request, validate, hash the password, store, respond **without** the hash. Users are in memory for now, in `store.Users`; in Postgres the same string will go into the `password_hash` column of the `users` table, and the code will not change.
+
+The request body:
+
+```go
+type userInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+```
+
+`in` is the body that was read (in the next code). The length rule:
+
+```go
+const (
+	minPassword = 15
+	maxPassword = 64
+)
+```
+
+By OWASP and the US standards institute NIST (SP 800-63B): without a second factor a password is at least 15 characters. The upper limit must be **at least** 64; bozor takes exactly 64. There are no composition rules ("one capital letter…"): NIST does not recommend them.
+
+```go
+func validateUser(in userInput) fieldErrors {
+	f := fieldErrors{}
+	if !strings.Contains(in.Email, "@") {
+		f["email"] = "email manzil boʻlsin"
+	}
+	if n := utf8.RuneCountInString(in.Password); n < minPassword || n > maxPassword {
+		f["password"] = fmt.Sprintf("%d–%d belgi boʻlsin", minPassword, maxPassword)
+	}
+	return f
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func validateUser(in userInput) fieldErrors` | `in` is the body that was read; the result is the field errors ([GB-6.02](/lab/youtube/gb/gb-6-02/en)) |
+| 2 | `f := fieldErrors{}` | an empty `f`: field name → message |
+| 3 | `strings.Contains(in.Email, "@")` | the email must contain `@`; this is a minimal check |
+| 6 | `utf8.RuneCountInString(in.Password)` | `n` is the number of characters. It is counted in runes, not bytes ([GB-2.10](/lab/youtube/gb/gb-2-10/en)) |
+| 6–7 | `n < minPassword \|\| n > maxPassword` | fewer than 15 or more than 64: a message in `f["password"]` |
+
+Now the `register` handler:
+
+```go
+func (a *api) register(w http.ResponseWriter, r *http.Request) {
+	var in userInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateUser(in); len(f) > 0 {
+		writeError(w, f)
+		return
+	}
+	hash := password.Hash(in.Password) // parolning oʻzi bundan keyin ishlatilmaydi
+	u, err := a.users.Add(in.Email, hash)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, u)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `func (a *api) register(w, r)` | the handler: `a` is the `api` struct, and its new `users` field stores the users ([GB-4.08](/lab/youtube/gb/gb-4-08/en)) |
+| 2 | `var in userInput` | the body is read into this variable |
+| 3–5 | `if !decodeJSON(w, r, &in) { return }` | reads the body into `in` ([GB-4.06](/lab/youtube/gb/gb-4-06/en)) |
+| 6–9 | `if f := validateUser(in); len(f) > 0` | on an error, 422 ([GB-6.02](/lab/youtube/gb/gb-6-02/en)) |
+| 10 | `hash := password.Hash(in.Password)` | the password itself is not used anywhere after this; the result is the argon2id string |
+| 11 | `u, err := a.users.Add(in.Email, hash)` | `Add` stores the string and gives the new `User` to `u` |
+| 12–15 | `if err != nil { writeError(w, err); return }` | if the email is taken, `ErrEmailTaken`; in `problemFor` it is a 409 |
+| 16 | `writeJSON(w, http.StatusCreated, u)` | 201 and `u` |
+
+That the hash never reaches the response is set in the `User` struct (`internal/store/users.go`):
+
+```go
+type User struct {
+	ID           int64  `json:"id"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"-"`
+}
+```
+
+The `PasswordHash` field has the tag `json:"-"`: `encoding/json` never writes this field ([pkg.go.dev](https://pkg.go.dev/encoding/json#Marshal)).
+
+<details>
+<summary>Full cmd/api/users.go</summary>
+
+```go filename="cmd/api/users.go" showLineNumbers
+package main
+
+// Roʻyxatdan oʻtish (GB-6.03): POST /users. Parol faqat password.Hash'ga kiradi va undan
+// keyin hech qayerda qolmaydi: storega satr, mijozga esa faqat id va email.
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/abdurahmon27/bozor/internal/password"
+)
+
+// userInput — POST /users body'si.
+type userInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// Parol uzunligi (OWASP Authentication Cheat Sheet, NIST SP 800-63B): ikkinchi omil (MFA) yoʻq
+// boʻlsa — kamida 15 belgi; uzun iboralar uchun kamida 64 belgigacha ruxsat.
+const (
+	minPassword = 15
+	maxPassword = 64
+)
+
+// validateUser — 422 uchun maydon xatolari (GB-6.02'dagi fieldErrors). Belgilar baytda emas,
+// rune'da sanaladi (GB-2.10): «oʻ» bitta belgi.
+func validateUser(in userInput) fieldErrors {
+	f := fieldErrors{}
+	if !strings.Contains(in.Email, "@") {
+		f["email"] = "email manzil boʻlsin"
+	}
+	if n := utf8.RuneCountInString(in.Password); n < minPassword || n > maxPassword {
+		f["password"] = fmt.Sprintf("%d–%d belgi boʻlsin", minPassword, maxPassword)
+	}
+	return f
+}
+
+// register — POST /users: decodeJSON → validateUser (422) → password.Hash → users.Add (409) → 201.
+func (a *api) register(w http.ResponseWriter, r *http.Request) {
+	var in userInput
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if f := validateUser(in); len(f) > 0 {
+		writeError(w, f)
+		return
+	}
+	hash := password.Hash(in.Password) // parolning oʻzi bundan keyin ishlatilmaydi
+	u, err := a.users.Add(in.Email, hash)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, u)
+}
+```
+
+</details>
+
+Start the server in the first terminal, and from the second register Dilnoza with `curl` (`-s` turns off the progress meter, `-i` prints the response headers):
+
+```console
+$ curl -s -i localhost:8765/users -H "Content-Type: application/json" -d '{"email":"dilnoza@bozor.test","password":"tarvuz-osmon-qalam-ariq-27"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+X-Request-Id: EKQQCWNPYVEFQFW4SCSB6C65UX
+Date: Sat, 28 Nov 2026 09:14:29 GMT
+Content-Length: 38
+
+{"id":1,"email":"dilnoza@bozor.test"}
+```
+
+201 Created; the body has only `id` and `email`. Guess: what status do we get if we send the same email with a capital first letter (`Dilnoza@bozor.test`) and a different password?
+
+**A)** 201 Created · **B)** 409 Conflict · **C)** 422 validation
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Add` compares emails ignoring case (`strings.EqualFold`), so it finds that "Dilnoza" already exists and returns `ErrEmailTaken`; `problemFor` turns it into a 409. A would happen for a new email. C would happen for a wrong field value, but here both the email and the password follow the rules.
+
+</details>
+
+```console
+$ curl -s localhost:8765/users -H "Content-Type: application/json" -d '{"email":"Dilnoza@bozor.test","password":"boshqa-uzun-ibora-2025"}'
+{"type":"about:blank","title":"Conflict","status":409,"detail":"bu email bilan foydalanuvchi bor","request_id":"SYFYV4PKBF2GQY2GQBJBNRWBYP"}
+```
+
+Now Jasur tries his password `choy2024`:
+
+```console
+$ curl -s localhost:8765/users -H "Content-Type: application/json" -d '{"email":"jasur@bozor.test","password":"choy2024"}'
+{"type":"/problems/validation","title":"Qiymatlar notoʻgʻri","status":422,"errors":{"password":"15–64 belgi boʻlsin"},"request_id":"SHBDWZPI7BFXCMA3PQWW2KF565"}
+```
+
+422: the password must be 15–64 characters. The server log in the first terminal:
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+2026/11/28 14:14:29 EKQQCWNPYVEFQFW4SCSB6C65UX POST "/users" 201 68.665676ms
+2026/11/28 14:14:29 SYFYV4PKBF2GQY2GQBJBNRWBYP xato 409: "bu email bilan foydalanuvchi bor"
+2026/11/28 14:14:29 SYFYV4PKBF2GQY2GQBJBNRWBYP POST "/users" 409 81.888045ms
+2026/11/28 14:14:29 SHBDWZPI7BFXCMA3PQWW2KF565 xato 422: "validatsiya: 1 ta maydon notoʻgʻri"
+2026/11/28 14:14:29 SHBDWZPI7BFXCMA3PQWW2KF565 POST "/users" 422 154.231µs
+```
+
+The `POST "/users" 201` line takes ~69 ms, almost all of it argon2id. In the video this line showed 29.97 ms; my machine was busy. The 409 takes as long: `Hash` is computed before `Add`. The 422 takes a hundred microseconds: it never reaches `Hash`.
+
+## Going deeper (optional): checks the video does not show, and production notes
+
+**A malformed string must not kill the server.** At the end of `decode` there is a check that is not in the video. Here are the relevant parts:
+
+```go
+// Satrdan oʻqiladigan parametrlarning yuqori chegarasi (OWASP jadvalining eng katta qatoridan ancha yuqori).
+const (
+	maxMemory = 256 * 1024 // KiB: 256 MiB
+	maxPasses = 16
+)
+```
+
+```go
+	// Parametrlar qatorida ortiqcha belgi yoʻq ("p=1abc") va qiymatlar chegarada: buzilgan satrdagi
+	// m=4294967295 jarayonni «out of memory» bilan oʻldirardi (buni recover ham ushlay olmaydi).
+	if fmt.Sprintf("m=%d,t=%d,p=%d", p.memory, p.passes, p.threads) != parts[3] ||
+		p.memory > maxMemory || p.passes > maxPasses {
+		return p, fmt.Errorf("%w: parametrlar %q", ErrBadHash, parts[3])
+	}
+	return p, nil
+```
+
+The first reason: `m=4294967295` in a string kills the process with `fatal error: out of memory`, and `recover` cannot catch it. That is why `m` is at most 256 MiB and `t` at most 16. The second reason: `Sscanf` accepts extra characters such as `p=1abc`; rebuilding the text with `Sprintf` and comparing rejects them. `TestVerifyBadHash` in `internal/password/password_test.go` checks this (`m juda katta`, `t juda katta`, `ortiqcha belgi`).
+
+**In production** (notes from the [README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar#readme)):
+
+- Measure the parameters on your own server: the OWASP table gives minimums; one `Hash` here takes ≈ 20–45 ms, depending on load.
+- The Unicode form of a password is not normalized (NFC/NFKC): two forms that look the same give different hashes. bozor does not do this yet.
+- The 409 response tells who is registered. The full fix is a confirmation message sent by email; bozor makes do with a plain 409 for now.
+- Every `POST /users` takes ~20 ms of CPU and 19 MiB of memory: registration and login need a rate limit ([GB-6.07](/lab/youtube/gb/gb-6-07/en)).
+- The password itself must never be written to the log. A JSON syntax error from `decodeJSON` can quote one character of the body, so a malformed character in the password field can reach the log.
+
+## Common mistakes
+
+**1. "A hash is one-way, so the password is safe."** No. A one-way function does not recover the password from the result, but the attacker does not recover it, they guess: above, sha256 gave 8 million guesses per second, and `choy2024` was found in microseconds. The rule: for a password use not a fast hash but argon2id, a new salt for every user and a length rule (the "Offline attack" section above).
+
+**2. `RawStdEncoding` when writing, `StdEncoding` when reading.** `Hash` writes the salt without `=`, and `decode` reads it with `StdEncoding`:
+
+```go
+	if p.salt, err = base64.StdEncoding.DecodeString(parts[4]); err != nil {
+		return p, fmt.Errorf("%w: salt: %w", ErrBadHash, err)
+	}
+```
+
+Guess: what does `Verify` return with the right password in this copy?
+
+**A)** `true`, `nil` · **B)** `false`, `nil` · **C)** `false` and `ErrBadHash`
+
+<details>
+<summary>Answer</summary>
+
+**C.** The salt text is not valid for `StdEncoding`: it expects the `=` padding, `decode` returns an error wrapped in `ErrBadHash`, and `Verify` gives `false` and that error. Even the right password does not pass.
+
+</details>
+
+The broken copy is in the lesson folder: `_video/xato/password.go.txt`. Put it in a copy of the folder in place of `internal/password/password.go` and run the test:
+
+```console
+$ go test ./internal/password
+--- FAIL: TestHashFormat (0.06s)
+    password_test.go:17: decode(Hash(…)): hash satri notoʻgʻri: salt: illegal base64 data at input byte 20
+--- FAIL: TestVerify (0.04s)
+    password_test.go:39: toʻgʻri parol: Verify = false, hash satri notoʻgʻri: salt: illegal base64 data at input byte 20; kutilgan true, nil
+    password_test.go:42: notoʻgʻri parol: Verify = false, hash satri notoʻgʻri: salt: illegal base64 data at input byte 20; kutilgan false, nil
+--- FAIL: TestVazifaParams (0.03s)
+    tekshiruv_test.go:20: decode(Hash(…)): hash satri notoʻgʻri: salt: illegal base64 data at input byte 20
+--- FAIL: TestVazifaOldStillVerifies (0.00s)
+    tekshiruv_test.go:31: eski satr (m=19456,t=2) bilan Verify = false, hash satri notoʻgʻri: salt: illegal base64 data at input byte 20; kutilgan true, nil. Verify parametrlarni konstantalardan emas, satrdan olishi kerak
+--- FAIL: TestVazifaNeedsRehash (0.04s)
+    tekshiruv_test.go:38: NeedsRehash(eski satr m=19456,t=2) = false, <nil>; kutilgan true, nil. decode bilan oʻqing va parametrlarni konstantalar bilan solishtiring (TASK.md, 2-qadam)
+    tekshiruv_test.go:45: NeedsRehash(sha256 hex) xatosi <nil>; kutilgan ErrBadHash: buzuq satrda decode'ning xatosini qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/password	0.309s
+FAIL
+```
+
+How to read it: `--- FAIL: TestVerify` is the test; `password_test.go:39` is the file and line; then the message (`toʻgʻri parol` means "correct password"). `hash satri notoʻgʻri: salt: illegal base64 data at input byte 20` is the text of `ErrBadHash` ("the hash string is wrong"), then `: salt: ` and the base64 error (`illegal base64 data at input byte 20`). `kutilgan true, nil` says what the test expected. Other tests failed too because they also call `decode`; in the video the extra lines are shortened to `…`.
+
+The cause: a 16-byte salt is 22 characters. `StdEncoding` reads blocks of 4 characters: 20 characters are 5 full blocks, and the remaining 2 characters are not a full block, they need `==`. The fix: one `b64` (`RawStdEncoding`) for both writing and reading, as in the lesson code.
+
+**3. `Verify` takes the parameters from the constants.** This mistake is silent: after the constants change, `IDKey` computes the key with the stored salt under different parameters, and no existing user can sign in (`false`). The rule: the parameters come from the string (the mid-lesson question above). A new `Hash` builds its string from the constants; changing them does not touch old strings. `TestVazifaOldStillVerifies` checks this.
+
+## Check yourself
+
+**1.** Why is sha256 not suitable for storing passwords?
+
+<details>
+<summary>Answer</summary>
+
+It is too fast: millions of guesses per second on one core (8,229,029 on this machine) with almost no memory. Without a salt, the same password gives the same hash.
+
+</details>
+
+**2.** How does a salt get in the attacker's way?
+
+<details>
+<summary>Answer</summary>
+
+The same password gives a different string for each user, so you cannot tell equal passwords from the table. Each user is guessed separately: work done on one candidate does not help with another user.
+
+</details>
+
+**3.** ([GB-5.10](/lab/youtube/gb/gb-5-10/en)) Why does each integration test run in its own schema?
+
+<details>
+<summary>Answer</summary>
+
+`go test` runs packages in parallel. In a shared schema, tests break each other's tables; a separate schema makes each test independent.
+
+</details>
+
+**4.** What does `Verify("x", "$argon2id$v=19$m=19456,t=0,p=1$" + salt + "$" + key)` return (the salt and key are valid base64 of enough length)?
+
+<details>
+<summary>Answer</summary>
+
+`false` and an error wrapped in `ErrBadHash`. `decode` rejects `t < 1` before `IDKey`, because `IDKey` panics when `t` or `p` is zero. This case is in `TestVerifyBadHash` under the name `t=0`.
+
+</details>
+
+## Homework
+
+The task is in the lesson folder in [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-03-parollar/TASK.md); the check is in `internal/password/tekshiruv_test.go`, which you must not change. The folder: [gb-6-03-parollar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar). TASK.md gives no levels; the levels on this page are mine.
+
+The situation: the server has plenty of memory, so we move to the **first row** of the OWASP table (`m=47104`, `t=1`, `p=1`). The old strings in the database (`m=19456`, `t=2`) do not disappear: they are still verified, and at login they must be saved again with the new parameters.
+
+- 🟢 **Step 1.** In the `const` block set `memory` to `46 * 1024` (47104 KiB) and `passes` to `1`. `threads`, `keyLen` and `saltLen` stay the same.
+- 🟡 **Step 2.** `NeedsRehash(encoded string) (bool, error)`: read the string with `decode`. On an error return `false` and that same error. Otherwise, if `memory`, `passes`, `threads` or the key length (`len(p.key)`) **differ** from the current constants return `true`; if all are the same return `false`.
+
+Before you start, `go test ./...` fails like this (the homework tests):
+
+```console
+$ go test -count=1 ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.234s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.054s
+?   	github.com/abdurahmon27/bozor/cmd/taxmin	[no test files]
+--- FAIL: TestVazifaParams (0.04s)
+    tekshiruv_test.go:23: Hash hozir m=19456,t=2,p=1 bilan yasayapti, kutilgan m=47104,t=1,p=1 (OWASP'ning birinchi qatori, 46 MiB). password.go'dagi memory va passes konstantalarini oʻzgartiring (TASK.md, 1-qadam)
+--- FAIL: TestVazifaNeedsRehash (0.04s)
+    tekshiruv_test.go:38: NeedsRehash(eski satr m=19456,t=2) = false, <nil>; kutilgan true, nil. decode bilan oʻqing va parametrlarni konstantalar bilan solishtiring (TASK.md, 2-qadam)
+    tekshiruv_test.go:45: NeedsRehash(sha256 hex) xatosi <nil>; kutilgan ErrBadHash: buzuq satrda decode'ning xatosini qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/password	0.557s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.247s
+FAIL
+```
+
+To see only the homework tests: `go test ./internal/password -run TestVazifa -v`. If you do only step 1, `TestVazifaNeedsRehash` keeps failing. If you do only step 2, the old string equals the current parameters and `NeedsRehash` returns `false`. The login itself (right password and `NeedsRehash` is `true`: save a new `Hash`) is in [GB-6.04](/lab/youtube/gb/gb-6-04/en).
+
+Try it yourself first, then open the answer:
+
+<details>
+<summary>Answer and explanation</summary>
+
+The answer is in the folder: [solution/internal/password/password.go](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-03-parollar/solution/internal/password/password.go). What changed:
+
+```go
+const (
+	memory  = 46 * 1024 // m: xotira, KiB
+	passes  = 1         // t: xotira ustidan necha marta oʻtiladi
+	threads = 1         // p: parallel yoʻlaklar soni
+	keyLen  = 32        // hosil boʻladigan kalit, bayt
+	saltLen = 16        // salt, bayt
+)
+```
+
+```go
+func NeedsRehash(encoded string) (bool, error) {
+	p, err := decode(encoded)
+	if err != nil {
+		return false, err
+	}
+	return p.memory != memory || p.passes != passes || p.threads != threads || len(p.key) != keyLen, nil
+}
+```
+
+`decode` reads the string and, on an error, returns it unchanged: it wraps `ErrBadHash`, so `errors.Is(err, ErrBadHash)` works. Then one expression with `||` checks four differences: `p.memory != memory`, `p.passes != passes`, `p.threads != threads`, `len(p.key) != keyLen`. If all the inequalities are false, the string was made with the current parameters and `NeedsRehash` returns `false`. In the old string, `m=19456` and `t=2` do not match the constants, so the result is `true`. `Verify` does not change: it reads the parameters from the string, so the old string still passes.
+
+The tests in the `solution/` folder:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.302s
+ok  	github.com/abdurahmon27/bozor/cmd/bozor	0.078s
+?   	github.com/abdurahmon27/bozor/cmd/taxmin	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.700s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.230s
+```
+
+</details>
+
+## Sources
+
+- [OWASP · Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html): argon2id parameters, salt, "Fast hashing algorithms such as SHA-256 are not suitable for password storage", upgrading the work factor
+- [OWASP · Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html): password length, NIST SP 800-63B
+- [OWASP · Error Handling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html): the recall question
+- [RFC 9106 · Argon2](https://www.rfc-editor.org/rfc/rfc9106): memory-hard function, parameters, salt and key lengths
+- [PHC string format](https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md): `$id$v=…$params$salt$hash`, base64 without padding
+- [RFC 2606 · the .test domain](https://www.rfc-editor.org/rfc/rfc2606)
+- [Go · golang.org/x/crypto/argon2](https://pkg.go.dev/golang.org/x/crypto/argon2): `IDKey`, `Version`
+- [Go · crypto/rand.Read](https://pkg.go.dev/crypto/rand#Read): returns no error since Go 1.24
+- [Go · crypto/subtle.ConstantTimeCompare](https://pkg.go.dev/crypto/subtle#ConstantTimeCompare)
+- [Go · encoding/base64](https://pkg.go.dev/encoding/base64): `RawStdEncoding`
+- [Go · fmt.Sscanf](https://pkg.go.dev/fmt)
+- [Go · encoding/json, `json:"-"`](https://pkg.go.dev/encoding/json#Marshal)
+- [RFC 9110 · 409 Conflict](https://www.rfc-editor.org/rfc/rfc9110#name-409-conflict)
+- [bozor · lesson folder (code, TASK.md, answer)](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar)
+
+Results are from `go1.27.4 linux/amd64` (`CGO_ENABLED=0`), 2026-11-28. The video's numbers (8,229,029 and 51 per second) come from the measurement in the video; the outputs on this page were re-run the same day on a busy machine.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-03-parollar)
+
+---
+
+← Previous lesson: [GB-6.02](/lab/youtube/gb/gb-6-02/en) · Next lesson: [GB-6.04](/lab/youtube/gb/gb-6-04/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

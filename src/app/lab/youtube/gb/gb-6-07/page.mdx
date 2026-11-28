@@ -1,0 +1,1113 @@
+---
+title: "Cookie, CSRF, CORS va rate limit: brauzer tomondan himoya"
+date: "2026/11/28"
+description: "Cookie atributlari, boshqa saytdan kelgan soxta POSTni http.CrossOriginProtection bilan yopish, CORS allow-list va login'ga token bucket limit."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 49
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-6-07/ru) · [English](/lab/youtube/gb/gb-6-07/en)  
+Dars GB-6.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-07) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Dilnoza bozor'ga login qildi. Keyin boshqa portdagi begona sahifada «Sovgʻani olish» tugmasini bosdi. Shu bosish bozor'dagi 41-buyurtmani bekor qildi, holbuki session cookie'si `SameSite=Lax` edi. Himoya nega ishlamadi?
+
+**Bitta gʻoya:** brauzer cookie'ni soʻrovga **oʻzi** qoʻshadi, soʻrovni qaysi sahifa boshlaganidan qatʼi nazar. Cookie atributlari faqat «qachon qoʻshilsin»ni boshqaradi, `SameSite` esa *site*'ga qaraydi: port va subdomen site'ni oʻzgartirmaydi. Shuning uchun holatni oʻzgartiradigan soʻrovda server soʻrov **qayerdan** kelganini oʻzi tekshiradi. CORS faqat javobni **oʻqish**ni boshqaradi: soʻrov baribir bajariladi. Login esa urinishlar soni bilan cheklanadi.
+
+Dars oxirida siz:
+
+- `Set-Cookie`ning har atributi (`__Host-`, `Max-Age`, `HttpOnly`, `Secure`, `SameSite`) brauzerda nima qilishini haqiqiy Chrome'da koʻrasiz;
+- boshqa sahifadagi oddiy HTML forma Dilnozaning buyurtmasini bekor qilishini qayta yaratib, `http.CrossOriginProtection` bilan `403`ga aylantirasiz;
+- CORS'ni allow-list va `Vary: Origin` bilan sozlaysiz, `Origin`ni tekshirmay qaytarish xatosini oʻz koʻzingiz bilan koʻrasiz;
+- `POST /login`ga IP boʻyicha token bucket limit qoʻyasiz (`429` va `Retry-After`), email boʻyicha ikkinchisini esa uy vazifasida oʻzingiz yozasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| `SameSite` | cookie'ni boshqa **site**'dan boshlangan soʻrovga qoʻshish-qoʻshmaslikni aytuvchi atribut | SameSite |
+| CSRF | boshqa saytdagi sahifa foydalanuvchining brauzeri orqali, uning cookie'si bilan soʻrov yuboradi | cross-site request forgery |
+| token bucket | har kalit (IP, email) uchun cheklangan token zaxirasi: har urinish bittasini oladi | token bucket |
+
+Ikki yordamchi: `Sec-Fetch-Site` va `Origin` sarlavhalari (soʻrovni kim boshlagani) hamda **CORS** (brauzerning oʻqish qoidasi). Qolgan soʻzlar birinchi uchragan joyda izohlanadi.
+
+## Oldin bilish kerak
+
+Bu dars [GB-6.06 · Bu buyurtma kimniki?](/lab/youtube/gb/gb-6-06) va [GB-6.04 · Login va session'lar](/lab/youtube/gb/gb-6-04) ustiga quriladi: `requireUser`, `currentUser`, cookie, `jar.txt`, buyurtmalar 41 va 42 shu yerdan. Yana kerak: [GB-6.03 · Parollar: argon2id](/lab/youtube/gb/gb-6-03), [GB-6.02 · Xato javoblari](/lab/youtube/gb/gb-6-02), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08), [GB-4.07 · mutex](/lab/youtube/gb/gb-4-07), [GB-1.08 · go test](/lab/youtube/gb/gb-1-08).
+
+**Qayerda ishlaysiz.** Bu misol Go Playground uchun emas: bir nechta jarayon va haqiqiy brauzer kerak. Postgres va Docker kerak emas: bu darsda store xotirada (map va mutex), metodlari GB-6.04 va GB-6.06'dagi bilan bir xil. [Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)ni oling. Kerak: Go 1.27, curl, jq va Google Chrome. `8765` va `9090` portlari boʻsh boʻlsin. Chrome yoʻq boʻlsa, uchta brauzer buyrugʻining chiqishlarini sahifadan oʻqing: ular mening yurgizishimdan.
+
+Papkaning ichida ishlamaymiz: har tajriba uchun alohida nusxa olamiz. Quyidagi blokni **har terminalda** bajaring, ikkita oʻzgaruvchini oʻz yoʻlingizga moslang:
+
+```bash
+lab=$PWD                 # dars papkasi
+work=/tmp/gb-6-07        # nusxalar shu yerda turadi
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+mask() { sed -E 's/[A-Za-z0-9._-]+@[A-Za-z0-9.-]+/[email]/g; s/(__Host-session[=[:space:]]+)[^;[:space:]]+/\1[redacted]/g'; }
+prepare() {              # prepare NOM [bosqich]
+	rm -rf "$work/$1" && cp -a "$lab" "$work/$1"
+	[ -n "${2:-}" ] && cp "$lab/_video/stages/$2/"*.go "$work/$1/cmd/api/"
+	sed -n 's/^const dilnozaLogin = `\(.*\)`$/\1/p' "$work/$1/cmd/api/api_test.go" > "$work/$1/login.json"
+	jq '.password = "taxmin-1"' "$work/$1/login.json" > "$work/$1/wrong.json"
+}
+mkdir -p "$work"
+prepare final; prepare himoyasiz himoyasiz; prepare none none; prepare aks aks
+```
+
+`GOTOOLCHAIN` darsda ishlatilgan Go versiyasini tanlaydi, `CGO_ENABLED=0` C kompilyatorisiz quradi. `prepare` nusxa yasaydi: `final` — darsning yakuniy kodi; `himoyasiz` — dars boshidagi bozor (CSRF va CORS himoyasi yoʻq, login'da limit yoʻq); `none` — shu holat va `SameSite=None`; `aks` — CORS xatosi bilan. Bosqich fayllari `_video/stages/` papkasida. `[ -n "${2:-}" ] && cp …` qatori ikkinchi argument (bosqich nomi) berilgan boʻlsa, bosqich fayllarini nusxadagi `cmd/api/`ga ustidan yozadi. `login.json` — Dilnozaning login body'si: uni test faylidan `sed` olib beradi, shuning uchun email va parol bu sahifada yozilmaydi. `wrong.json` — xuddi shu body, parol notoʻgʻri. `mask` laboratoriya foydalanuvchisining emailini va session tokenini sahifadagi chiqishdan yashiradi; oʻz kompyuteringizda u shart emas, lekin ekranni boshqalarga koʻrsatsangiz, foydali.
+
+Laboratoriya shunday tuzilgan:
+
+```text
+ bozor API :8765  <----  Chrome (headless)  ---->  begona sayt :9090
+ (store xotirada)              ^                  (cmd/begona: forma va oʻqish sahifasi)
+                               |
+                  _video/brauzer (Go + chromedp)
+```
+
+Tajriba shunday boradi: bitta terminalda server (`cd "$work/himoyasiz" && go run ./cmd/api 2>&1 | tee server.log`), ikkinchisida curl (`cd "$work/himoyasiz"`), uchinchisida begona sayt (`cd "$lab" && go run ./cmd/begona`), toʻrtinchisida brauzer dasturi (`cd "$lab/_video/brauzer"`). `tee server.log` logni ekranga ham, faylga ham yozadi. Boshqa tajribaga oʻtishdan oldin serverni `Ctrl+C` bilan toʻxtating va papka nomini (`himoyasiz`, `none`, `aks`, `final`) almashtiring. Brauzer dasturining birinchi ishga tushishi chromedp kutubxonasini yuklaydi.
+
+**Eslash, GB-6.06.** `POST /orders/{id}/cancel` route'i ham buyurtma egaligini tekshiradi. Shunga qaramay begona sahifaning soxta soʻrovi buyurtmani bekor qildi. Egalik tekshiruvi nega uni toʻxtatmadi? **A)** `404` qaytardi, lekin buyurtma baribir bekor boʻldi · **B)** soʻrov Dilnozaning oʻz cookie'si bilan keldi · **C)** begona sayt `user_id`ni almashtirib yubordi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Soʻrovni Dilnozaning brauzeri yubordi va bozor'ning cookie'sini oʻzi qoʻshdi. Server cookie'dan `currentUser(r).ID`ni oladi, SQL sharti `AND user_id = $2` esa shu ID bilan solishtiradi. Server uchun bu Dilnozaning oʻzi: shart oʻtadi. A notoʻgʻri: `404` faqat begona buyurtmada chiqadi, bunda esa buyurtma Dilnozaniki. C notoʻgʻri: `user_id` mijozdan umuman kelmaydi, uni server session'dan oladi (GB-6.06).
+
+</details>
+
+Bu hujum **CSRF** deyiladi (cross-site request forgery): boshqa sayt soʻrovni foydalanuvchining oʻz brauzeri orqali qalbakilashtiradi. Bugun uni qayta yaratamiz va yopamiz. Reja: cookie atributlari, soʻrov qayerdan kelganini serverda tekshirish, CORS nima emasligi va login'ga rate limit, ya'ni urinishlar soniga cheklov.
+
+## Cookie atributlari: brauzer uchun qoidalar
+
+Cookie'ni saqlash va uni qaysi soʻrovga qoʻshishni brauzer hal qiladi. Server faqat `Set-Cookie` sarlavhasidagi **atributlar** bilan unga qoida beradi. Login javobini toʻliq koʻramiz (`-i` javob sarlavhalarini ham chiqaradi, `-c jar.txt` cookie'ni faylga saqlaydi). Serverni `final` papkasidan ishga tushiring, curl'ni shu papkada yurgizing:
+
+```console
+$ curl -s -i -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax
+Vary: Origin
+X-Request-Id: GLYOPBEPBDRKAICL3Q3V6FD3N7
+Date: Sat, 28 Nov 2026 09:24:10 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+Soʻrov ID'si, sana va token har yurishda boshqa. Token oʻrniga `[redacted]` turibdi: uni `mask` almashtirdi. `Cache-Control: no-store` GB-6.04'dan tanish; `Content-Type`, `Content-Length`, `Date` — oddiy HTTP sarlavhalari (GB-4.01). `Vary: Origin` shu darsda qoʻshildi, CORS boʻlimida tushuntiraman. Diqqat `Set-Cookie` qatorida. GB-6.04'dagi bilan solishtirsangiz, ikki joy oʻzgargan: nom oldiga `__Host-` prefiksi qoʻshildi va `Expires` oʻrniga `Max-Age` keldi. Qolgan atributlar oʻsha.
+
+| Qism | Brauzer nima qiladi |
+|---|---|
+| `__Host-session` | `__Host-` bilan boshlangan nomli cookie'ni brauzer faqat uchta shart bajarilsa qabul qiladi (pastga qarang) |
+| `Path=/` | cookie saytning hamma yoʻllariga qoʻshiladi |
+| `Max-Age=86400` | brauzer cookie'ni 86400 soniya, ya'ni 24 soat saqlaydi |
+| `HttpOnly` | sahifadagi skript cookie'ni `document.cookie` orqali oʻqiy olmaydi |
+| `Secure` | cookie faqat HTTPS orqali yuboriladi; `http://localhost` — istisno |
+| `SameSite=Lax` | boshqa site'dan boshlangan soʻrovga cookie qoʻshilishi cheklanadi (keyingi boʻlimlarda) |
+
+Bu atributlar `setSessionCookie`da qanday yoziladi:
+
+```go
+func setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+```
+
+| Kod | Nima qiladi |
+|---|---|
+| `Name: sessionCookie` | cookie nomi; bu konstantaning qiymati `"__Host-session"` |
+| `MaxAge: int(sessionTTL.Seconds())` | `sessionTTL` — `24 * time.Hour`; `Seconds()` uni soniyaga (`86400`) aylantiradi, `int` butun son qiladi |
+| `HttpOnly: true`, `Secure: true` | mos atributlarni yozadi |
+| `SameSite: http.SameSiteLaxMode` | `SameSite=Lax` yozadi; GB-6.04'da u faqat nomlangan edi |
+| `w.Header().Set("Cache-Control", "no-store")` | javob keshda qolmasin (GB-6.04) |
+
+**`Max-Age`** — soniyalarda *nisbiy* muddat: brauzer uni oʻzining hozirgi vaqtiga qoʻshib hisoblaydi. `Expires` esa aniq sana, uni brauzer oʻz soati bilan solishtiradi, soat xato boʻlsa muddat ham siljiydi. Ikkalasi berilsa, `Max-Age` ustun (RFC 6265bis §4.1.2.2). Brauzer muddatni qisqartirishi ham mumkin, shuning uchun serverdagi session muddati (`sessionTTL`, GB-6.04) asosiy qoladi.
+
+**`__Host-` prefiksi** brauzerga shart qoʻyadi: cookie `Secure` boʻlsin, `Path=/` boʻlsin va `Domain` atributi boʻlmasin. `Domain`siz cookie *host-only* boʻladi: u faqat oʻzi berilgan host'ga qaytadi, subdomenlarga emas. Natija: `blog.bozor.uz` bozor'ning `__Host-session` cookie'sini ustidan yozib qoʻya olmaydi. Cheklov host'ga tegishli, portga emas: RFC 6265bis aytadi, portlar `__Host-` cookie'lar eʼtiborsiz qoldiradigan yagona qism.
+
+Curl bu cookie'ni qanday saqladi? `jar.txt`ning oxirgi qatori:
+
+```console
+$ tail -1 jar.txt | mask
+#HttpOnly_localhost	FALSE	/	TRUE	1795944250	__Host-session	[redacted]
+```
+
+Qator tab bilan ajratilgan yetti ustun: domen (`#HttpOnly_` belgisi — cookie `HttpOnly`), subdomenlar ham qabul qiladimi (`FALSE` — yoʻq, `Domain` yoʻq edi), yoʻl, `Secure` (`TRUE`), tugash vaqti (epoch soniyalarda: curl `Max-Age`ni mutlaq vaqtga aylantirdi), nom, qiymat. Curl `http://localhost` uchun `Secure` cookie'ni ham saqlaydi va qaytaradi: localhost istisno (MDN, Set-Cookie).
+
+### HttpOnly: haqiqiy brauzerda
+
+`HttpOnly`ni curl bilan koʻrsatib boʻlmaydi: curl'da sahifa skripti yoʻq. Shuning uchun haqiqiy Chrome kerak. U oynasiz (**headless**) ishlaydi va uni `_video/brauzer`dagi Go dasturi **chromedp** kutubxonasi orqali boshqaradi. Bu dastur darsning mavzusi emas: u brauzerni boshqaradi va natijani chop etadi. `httponly` buyrugʻi bozor sahifasida Dilnoza sifatida login qiladi (brauzer cookie'ni oʻzi saqlaydi), keyin sahifa skripti bilan ikki narsa qiladi. Serverni `final`dan ishga tushirib, brauzer papkasida:
+
+```console
+$ go run . httponly | mask
+login: 200 {"id":1,"email":"[email]"}
+document.cookie: ""
+fetch /me: 200 {"id":1,"email":"[email]"}
+```
+
+1. `login: 200 …` — login ishladi, brauzerda cookie bor.
+2. `document.cookie: ""` — skript cookie'larni `document.cookie` bilan oʻqiydi va boʻsh qatorni oladi: `HttpOnly` shuni qiladi.
+3. `fetch /me: 200 …` — `fetch` brauzerning soʻrov funksiyasi. U `/me`ga soʻrov yuboradi va brauzer cookie'ni oʻzi qoʻshadi: javob `200`.
+
+Xulosa: sahifaga tushgan zararli skript tokenni **oʻgʻirlay olmaydi**, lekin sahifa ochiq turganda Dilnoza nomidan soʻrov yubora oladi. `HttpOnly` birinchisidan himoya qiladi, ikkinchisidan emas.
+
+## Origin va site: cookie qachon «boshqa joydan» deb hisoblanadi
+
+`SameSite` ishlashi uchun «boshqa joydan» nima ekanini aniq bilish kerak. Ikkita tushuncha bor.
+
+**Origin** — sxema, host va port birgalikda: `http://localhost:8765`. Bittasi farq qilsa, origin boshqa.
+
+**Site** — sxema va *roʻyxatdan oʻtgan domen* (registrable domain): Public Suffix List'dagi yozuv va undan oldingi bitta qism, masalan `bozor.uz`. **Port hisobga olinmaydi.** `localhost` va IP manzil kabi hostlarda roʻyxatdan oʻtgan domen yoʻq: ularda butun host teng boʻlishi kerak (HTML Standard, «same site»). Sxema ham qaraladi: cookie qoidalarida `http://` va `https://` turli site (MDN, Site).
+
+| Bir sahifa | Boshqa sahifa | Origin | Site |
+|---|---|---|---|
+| `http://localhost:8765` | `http://localhost:8765/me` | bir xil | bir xil |
+| `http://localhost:8765` | `http://localhost:9090` | **boshqa** (port) | **bir xil** (port hisobga olinmaydi) |
+| `https://app.bozor.uz` | `https://blog.bozor.uz` | boshqa (host) | **bir xil** (`bozor.uz`) |
+| `http://localhost:8765` | `http://127.0.0.1:9090` | boshqa | **boshqa** (host boshqa) |
+| `http://localhost` | `https://localhost` | boshqa | boshqa (sxema boshqa) |
+
+Laboratoriyadagi begona sayt bitta serverdan ikki nom bilan ochiladi: `http://localhost:9090` (bozor bilan **bir site**, boshqa origin) va `http://127.0.0.1:9090` (**boshqa site**). Birinchisi tarmoq ichidagi qoʻshni xizmatni modellaydi (qoʻshni port yoki subdomen), ikkinchisi — oddiy begona saytni.
+
+## SameSite: cookie qachon qoʻshiladi
+
+`SameSite` cookie'ni **boshqa site'dan boshlangan** soʻrovga qoʻshish-qoʻshmaslikni aytadi. Uch qiymat bor. Bir site ichida soʻrovning turidan qatʼi nazar cookie uchalasida ham ketadi.
+
+| Boshqa site'dan boshlangan soʻrov | `Strict` | `Lax` | `None` (`Secure` shart) |
+|---|---|---|---|
+| havola bosilib ochilgan sahifa (yuqori darajadagi navigatsiya, `GET`) | ketmaydi | **ketadi** | ketadi |
+| forma bilan `POST` | ketmaydi | ketmaydi | ketadi |
+| `iframe` (sahifa ichidagi sahifa) yoki `fetch` | ketmaydi | ketmaydi | ketadi |
+
+`Lax` — shu dars cookie'sining qiymati. Uning qoidasi: boshqa site'dan faqat yuqori darajadagi navigatsiyada xavfsiz metod (`GET`) bilan ketadi (RFC 6265bis §4.1.2.7). Shu jadvalga qarab bashorat qiling: begona sahifa boshqa site'da boʻlsa, `POST` forma nima oladi?
+
+## CSRF: begona sahifadagi forma
+
+Hujum sahifasi `cmd/begona`dagi `formaPage` konstantasida: oddiy HTML forma, skript yoʻq.
+
+```html
+<form method="post" action="http://localhost:8765/orders/41/cancel">
+  <button>Sovgʻani olish</button>
+</form>
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| `<form method="post" action="…">` | forma yuborilganda brauzer `POST` soʻrov yuboradi; `action` — qayerga: bozor'ning bekor qilish yoʻli |
+| `<button>Sovgʻani olish</button>` | tugma; bosilsa brauzer formani yuboradi |
+| `</form>` | forma tugadi |
+
+Brauzer formani yuborganda bozor'ning cookie'larini, `SameSite` ruxsat bersa, **oʻzi** qoʻshadi. Bu route'da body yoʻq, shuning uchun `requireJSON` ham yoʻq (GB-6.01): oddiy forma ham unga yetib keladi. Bu — `cancelOrder` route'i:
+
+```go
+	mux.Handle("POST /orders/{id}/cancel", a.requireUser(http.HandlerFunc(a.cancelOrder)))
+```
+
+| Qadam | Kim | Nima |
+|---|---|---|
+| 1 | Dilnoza | bozor'ga login qiladi; brauzer cookie'ni saqlaydi |
+| 2 | Dilnoza | begona sahifani ochadi |
+| 3 | Dilnoza | «Sovgʻani olish»ni bosadi |
+| 4 | brauzer | formani `POST /orders/41/cancel` qilib yuboradi, cookie'ni (ruxsat boʻlsa) oʻzi qoʻshadi |
+| 5 | bozor | cookie toʻgʻri, egalik toʻgʻri: buyurtma bekor |
+
+### Server logiga ikki yangi maydon
+
+Soʻrovni kim boshlaganini koʻrish uchun `logRequests`ga ikki maydon qoʻshildi:
+
+```go
+		_, err := r.Cookie(sessionCookie)
+		log.Printf("%s %s %q %d %s site=%q cookie=%t", w.Header().Get("X-Request-Id"),
+			r.Method, r.URL.Path, rec.status, time.Since(start), r.Header.Get("Sec-Fetch-Site"), err == nil)
+```
+
+`site=` — `Sec-Fetch-Site` sarlavhasi: brauzer uni HTTPS yoki localhost manzillariga har soʻrovda oʻzi qoʻshadi va unda soʻrovni qaysi sahifa boshlagani yoziladi. Qiymatlari: `same-origin`, `same-site`, `cross-site`, `none` (manzil qatoriga yozilgan yoki xatchoʻpdan ochilgan). `cookie=` — session cookie keldimi (`true`/`false`). `r.Header.Get` sarlavhani oʻqiydi, `err == nil` cookie borligini bildiradi (GB-6.04).
+
+### Bashorat: boshqa site'dan forma
+
+Begona sahifani endi `127.0.0.1` orqali, ya'ni **boshqa site**'da ochamiz. Cookie `SameSite=Lax`. «Sovgʻani olish» bosilsa, nima boʻladi? **A)** `200`, buyurtma bekor boʻldi · **B)** `401`, cookie kelmadi · **C)** `403`, ruxsat yoʻq.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `Lax` boshqa site'dan kelgan forma `POST`ida cookie'ni qoʻshmaydi (jadvalning ikkinchi qatori). Cookie yoʻq: `requireUser` `401` beradi (GB-6.04). A — buyurtma bekor boʻlishi uchun cookie kerak edi. C — `403` GB-6.06'da rolga ruxsat boʻlmaganda chiqadi, bu yerda esa server Dilnozani umuman tanimadi.
+
+</details>
+
+Bu dastur darsdan oldingi bozor (`himoyasiz` nusxasi): CSRF tekshiruvi hali yoʻq. Server `himoyasiz`dan, begona sayt `go run ./cmd/begona` bilan ishlasin. Brauzer dasturining `csrf` buyrugʻi sahifani ochadi, tugmani bosadi va javobni chop etadi:
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"ACVH6PKV4N4FAPNLU3FZIDAK5C"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+Javob `401`, buyurtma 41 hamon `yangi`. Server logi (`grep` login, health va favicon shovqinini olib tashlaydi):
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C xato 401: "http: named cookie not present"
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C POST "/orders/41/cancel" 401 44.065µs site="cross-site" cookie=false
+2026/11/28 14:24:15 OM23C5KFFSB7OQLTCEPDHLLBRF GET "/orders/41" 200 125.151µs site="none" cookie=true
+```
+
+Soʻrov qatoridagi vaqt (`44.065µs`) yuklamaga bogʻliq: videoda xuddi shu soʻrov `164.447µs` edi. Muhimi — vaqt emas, `site=` va `cookie=` maydonlari. Birinchi qator — serverning ishga tushish xabari. `xato 401: "http: named cookie not present"` — `requireUser` cookie topmadi (`ErrNoCookie`, GB-6.04). Keyingi qatorda `site="cross-site"`: brauzer soʻrov boshqa site'dan kelganini oʻzi yozdi, `cookie=false`: cookie qoʻshilmadi. Oxirgi qator — brauzer dasturining holatni tekshirish uchun yuborgan `GET /orders/41` soʻrovi: manzil qatoriga yozilgan, shuning uchun `site="none"`.
+
+### Hujum baribir ishlaydi: begona sahifa qoʻshni portda
+
+Endi darsning boshidagi hujum: begona sahifa `http://localhost:9090`da, ya'ni bozor bilan **bir site**'da. Server yana `himoyasiz`dan:
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:12 EAB3D6NLO5XWZPSATRJ64CSIBV POST "/orders/41/cancel" 200 47.942µs site="same-site" cookie=true
+2026/11/28 14:24:13 PYKFJVQKYKGXLZXBOCEEHVAMNU GET "/orders/41" 200 64.841µs site="none" cookie=true
+```
+
+`site="same-site"`, `cookie=true`: bir site ichida `Lax` cookie'ni brauzer formaga ham qoʻshdi (videodagi vaqt `53.587µs`, mening yurishimda `47.942µs`: ikkalasi mikrosekund). `200`: buyurtma bekor boʻldi. Bu `Lax`ning buzilishi emas: qoida «boshqa **site**'dan» deydi, `localhost:9090` esa bozor bilan bir site. Port va subdomen site'ni oʻzgartirmaydi.
+
+### Bashorat: SameSite=None
+
+Cookie'ni `SameSite=None` qildik (`none` nusxasi; kodda faqat shu qator: `SameSite: http.SameSiteNoneMode`). `127.0.0.1:9090`dagi sahifa endi nima oladi? **A)** `401`, cookie kelmaydi · **B)** `200`, buyurtma bekor boʻladi · **C)** `400`, `Secure` yoʻq.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `None` cookie'ni boshqa site'dan boshlangan soʻrovga ham qoʻshadi. `Secure` allaqachon yoqilgan edi va Chrome `Secure` cookie'ni `http://127.0.0.1` ga ham yubordi (tajriba shuni koʻrsatdi: ishonchli manzillar uchun `Secure` istisnosi bor). A — bu `Lax`ning natijasi edi. C — bozor'da bunday tekshiruv yoʻq: cookie atributlarini brauzer hal qiladi, server emas.
+
+</details>
+
+Cookie sarlavhasi va natija:
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | grep Set-Cookie | mask
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=None
+```
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:16 UGJMHRV2FH6I7W57PIWUYIGFWU POST "/orders/41/cancel" 200 100.054µs site="cross-site" cookie=true
+2026/11/28 14:24:17 IHC74EO7MAZQAHXL4Z5Q2WQARL GET "/orders/41" 200 76.7µs site="none" cookie=true
+```
+
+`site="cross-site"`, lekin `cookie=true` va `200`. Jami uch holat:
+
+| Begona sahifa | Cookie | Natija (himoyasiz) | Logdagi maydonlar |
+|---|---|---|---|
+| `http://localhost:9090` (bir site) | `Lax` | **`200`, buyurtma bekor** | `same-site`, `cookie=true` |
+| `http://127.0.0.1:9090` (boshqa site) | `Lax` | `401` | `cross-site`, `cookie=false` |
+| `http://127.0.0.1:9090` | `None` | **`200`, buyurtma bekor** | `cross-site`, `cookie=true` |
+
+Xulosa: `SameSite` — foydali qoʻshimcha qatlam, lekin asosiy CSRF himoyasi emas. OWASP shunday yozadi: u roʻyxatdan oʻtgan domenga qaraydi, origin'ga emas, shuning uchun qoʻshni port yoki subdomen uni chetlab oʻtadi. Asosiy himoya serverda boʻlishi kerak.
+
+## Server himoyasi: http.CrossOriginProtection
+
+Server holatni oʻzgartiradigan soʻrovning **qayerdan** kelganini oʻzi tekshiradi. Go 1.25'dan beri buning uchun standart kutubxonada `http.CrossOriginProtection` bor; OWASP CSRF Prevention Cheat Sheet uni nomlab koʻrsatadi. U brauzer yuboradigan ikki sarlavhaga tayanadi: `Sec-Fetch-Site` (yuqorida koʻrdik) va `Origin` (soʻrovni boshlagan sahifaning origin'i; brauzer uni `POST`da qoʻshadi).
+
+```go
+var allowedOrigins = []string{"http://localhost:3000"}
+
+// errCrossOrigin — soʻrov boshqa origin'dagi sahifadan kelgan (problemFor → 403).
+var errCrossOrigin = errors.New("boshqa saytdan kelgan soʻrov")
+
+// protectCSRF — Go 1.25'dan beri standart kutubxonadagi http.CrossOriginProtection bilan:
+//   - GET, HEAD, OPTIONS — har doim oʻtadi (ular holatni oʻzgartirmasligi kerak);
+//   - Sec-Fetch-Site: same-origin yoki none (manzil qatoriga yozilgan) — oʻtadi; boshqa qiymat — rad;
+//   - Sec-Fetch-Site yoʻq, Origin bor — Origin'ning host'i Host sarlavhasiga teng boʻlsa oʻtadi;
+//   - ikkalasi ham yoʻq — Go buni brauzer emas deb hisoblaydi (curl, mobil ilova, boshqa server): oʻtadi (fail-open);
+//   - AddTrustedOrigin'dagi origin'lar — oʻtadi.
+//
+// Origin ↔ Host solishtiruvida sxema (http/https) koʻrilmaydi: production'da HTTPS + HSTS (GB-8.06).
+//
+// Brauzer bo'lmagan mijozda begona cookie yoʻq: CSRF — aynan brauzer cookie'ni oʻzi qoʻshgani uchun xavf.
+// Rad sababi (Check'ning xatosi) log'ga, mijozga — bizning matn (GB-6.02).
+func protectCSRF(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	for _, o := range allowedOrigins {
+		if err := cop.AddTrustedOrigin(o); err != nil {
+			panic(err) // roʻyxat kodimizda: notoʻgʻri yozilgan boʻlsa server ishga tushmasin
+		}
+	}
+```
+
+| Kod | Nima qiladi |
+|---|---|
+| `var allowedOrigins = []string{…}` | ruxsat berilgan origin'lar roʻyxati: bozor'ning oʻz veb ilovasi, `http://localhost:3000` |
+| `func protectCSRF(next http.Handler) http.Handler` | middleware (GB-6.01 shakli) |
+| `cop := http.NewCrossOriginProtection()` | tekshiradigan obyekt yasaydi |
+| `for _, o := range allowedOrigins` | roʻyxatdagi har origin uchun |
+| `cop.AddTrustedOrigin(o)` | uni **ishonchli** origin'larga qoʻshadi; yozilishi notoʻgʻri boʻlsa (sxema yoʻq, yoʻl bor) xato qaytaradi |
+| `panic(err)` | roʻyxat bizning kodimizda: xato boʻlsa server ishga tushmasin (GB-2.09) |
+
+Asosiy qism — qaytarilgan handler:
+
+```go
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := cop.Check(r); err != nil {
+			writeError(w, fmt.Errorf("%w: %w", errCrossOrigin, err))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Kod | Nima qiladi |
+|---|---|
+| `cop.Check(r)` | soʻrovni tekshiradi; rad etilsa xato qaytaradi |
+| `fmt.Errorf("%w: %w", errCrossOrigin, err)` | ikki xatoni birlashtiradi: bizning matn va `Check`ning sababi (GB-6.02) |
+| `writeError(w, …)` | `403` problem javobi yozadi: mijozga bizning matn, sabab esa logga |
+| `next.ServeHTTP(w, r)` | tekshiruv oʻtdi, handler ishlaydi |
+
+`Check` qoidalari (Go 1.27.4 manbasi, `net/http/csrf.go`):
+
+1. `GET`, `HEAD`, `OPTIONS` — **doim oʻtadi**: bu metodlar holatni oʻzgartirmasligi kerak. Shuning uchun GET'da holat oʻzgartirmang.
+2. `Sec-Fetch-Site: same-origin` yoki `none` — oʻtadi. Boshqa qiymat (`same-site`, `cross-site`) — **rad**, agar `Origin` ishonchli roʻyxatda boʻlmasa yoki yoʻl `AddInsecureBypassPattern` bilan istisno qilinmagan boʻlsa.
+3. `Sec-Fetch-Site` yoʻq, `Origin` bor — `Origin`ning host'i (port bilan) `Host` sarlavhasiga teng boʻlsa oʻtadi, aks holda rad. Sxema solishtirilmaydi.
+4. Ikkalasi ham yoʻq — soʻrov brauzerdan emas yoki bir origin'dan deb hisoblanadi va **oʻtadi**.
+
+Zanjirdagi oʻrni: `requestID → logRequests → recoverPanic → cors → protectCSRF → muxErrors → mux` (`cmd/api/middleware.go`, `newHandler`).
+
+### Bashorat: sahifa va curl
+
+Yangi server (`final`). Begona sahifa `localhost:9090`da, terminaldagi curl esa Dilnozaning `jar.txt` cookie'si bilan: ikkalasi bir xil `POST /orders/41/cancel`, bir xil cookie yuboradi. Natija? **A)** ikkalasi `403` · **B)** sahifa `403`, curl `200` · **C)** sahifa `200`, curl `403`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Sahifa soʻrovida brauzer `Sec-Fetch-Site: same-site` yozadi: 2-qoida rad etadi. Curl esa bu sarlavhalarni yubormaydi: 4-qoida oʻtkazadi. A notoʻgʻri: curl'da tekshiriladigan hech narsa yoʻq. C — teskari: rad etish sarlavhaga bogʻliq.
+
+</details>
+
+Brauzer dasturi, begona sahifa `localhost:9090`da (server `final`):
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"2UQK2DTO7A4VA7DUD44YMHEUGR"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR POST "/orders/41/cancel" 403 115.527µs site="same-site" cookie=true
+2026/11/28 14:25:18 S3W4NBVELWNTMKWLRE73DBIZ3N GET "/orders/41" 200 119.195µs site="none" cookie=true
+```
+
+`403`, javobda bizning matn; buyurtma `yangi` qoldi. Logda `xato 403` qatorida `Check`ning sababi (`cross-origin request detected from Sec-Fetch-Site header`), keyingi qatorda `site="same-site" cookie=true`: cookie **keldi**, lekin handler ishlamadi. Boshqa site'dan ham xuddi shunday (yangi server, `127.0.0.1:9090`):
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"A5ALNFEBTDWMJ4HK5OHQ6DE2UA"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+Endi terminaldan curl. Birinchisi brauzer sarlavhalarisiz (`-X POST` metodni tanlaydi), ikkinchisida brauzerning sarlavhalarini qoʻlda yozamiz (`-H` sarlavha qoʻshadi):
+
+```console
+$ curl -s -X POST -b jar.txt localhost:8765/orders/41/cancel | mask
+{"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: same-site' -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"PQ6NJNCEWIUPZEO4MWFH2U6AD2"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: cross-site' -H 'Origin: http://localhost:3000' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"FEWF6V7VVNHDXV7TN3U7MS32RC"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"EJO3ZNELQYCCILIPSVKSAUCGSW"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:8765' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"PBFVLOUUFURXMUXZ3LUYOAGPGE"}
+```
+
+Birinchi curl `200`: buyurtma bekor boʻldi. Bu xavfsiz: curl'ga cookie'ni oʻzimiz berdik, begona sayt birovning curl'iga cookie qoʻsha olmaydi. CSRF xavfi aynan brauzer cookie'ni **oʻzi** qoʻshgani uchun bor. Ikkinchi curl: brauzer sarlavhalari bilan u ham `403` oladi.
+
+Yuqoridagi chiqishda yana uchta curl bor: ularni videoda koʻrmaysiz, men `Check` qoidalarini tekshirish uchun qoʻshdim (papkada ular yoʻq, buyruqlar sahifada toʻliq). Uchinchisida `Sec-Fetch-Site: cross-site`, lekin `Origin: http://localhost:3000` — `allowedOrigins`dagi ishonchli origin: `403` emas, `409` keldi (buyurtma yuqorida bekor qilingan edi). Demak, `CrossOriginProtection` tekshiruvdan oʻtkazdi va soʻrov handler'ga yetdi. Toʻrtinchisida faqat `Origin: http://localhost:9090` bor, `Sec-Fetch-Site` yoʻq (3-qoida): `Origin`ning host'i `Host`dan farq qiladi, `403`. Beshinchisida `Origin: http://localhost:8765` — `Host` bilan teng, oʻtadi, yana `409`. Rad sabablari logda:
+
+```console
+$ grep 'xato 40' server.log
+2026/11/28 14:25:21 PQ6NJNCEWIUPZEO4MWFH2U6AD2 xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:21 FEWF6V7VVNHDXV7TN3U7MS32RC xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+2026/11/28 14:25:21 EJO3ZNELQYCCILIPSVKSAUCGSW xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host"
+2026/11/28 14:25:21 PBFVLOUUFURXMUXZ3LUYOAGPGE xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+```
+
+Eslatma: `409` — «Conflict», buyurtma allaqachon bekor qilingan (`store.ErrAlreadyCancelled`); bu yerda uning ma'nosi faqat shu: soʻrov `CrossOriginProtection`dan oʻtgan.
+
+## CORS: javobni oʻqish qoidasi
+
+**CORS** (cross-origin resource sharing) — brauzerning **oʻqish** qoidasi. Boshqa origin'dagi sahifa serverga soʻrov yubora oladi, lekin javobni oʻqishi uchun server `Access-Control-Allow-Origin` sarlavhasida aynan shu origin'ni aytishi kerak. Aytmasa, brauzer javobni sahifaga bermaydi. Cookie bilan soʻrovda yana `Access-Control-Allow-Credentials: true` kerak. Bu qoida serverni himoya **qilmaydi**: soʻrov baribir bajariladi. Quyidagi tajriba buni koʻrsatadi.
+
+`cmd/begona`dagi `oqishPage` — skriptli sahifa:
+
+```html
+<pre id="natija">kutilmoqda…</pre>
+<script>
+fetch("http://localhost:8765/me", {credentials: "include"})
+  .then(r => r.text())
+  .then(t => { natija.textContent = "oʻqildi: " + t })
+  .catch(e => { natija.textContent = "oʻqib boʻlmadi: " + e })
+</script>
+```
+
+| Qator | Nima qiladi |
+|---|---|
+| `<pre id="natija">kutilmoqda…</pre>` | natija yoziladigan joy |
+| `fetch("http://localhost:8765/me", {credentials: "include"})` | bozor'ning `/me`sini soʻraydi; `credentials: "include"` cookie'ni ham yuboradi |
+| `.then(r => r.text())` | javob kelsa, uning matnini oladi |
+| `.then(t => { natija.textContent = "oʻqildi: " + t })` | matnni sahifaga yozadi |
+| `.catch(e => { … "oʻqib boʻlmadi: " + e })` | oʻqish rad etilsa, xatoni yozadi |
+
+Server `final`, begona sayt `localhost:9090`da. Brauzer dasturi sahifani ochadi va natija matnini kutadi:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqib boʻlmadi: TypeError: Failed to fetch
+```
+
+Sahifa javobni oʻqiy olmadi: `fetch` `TypeError: Failed to fetch` bilan tugadi. Brauzer skriptga sababni ataylab aytmaydi (tafsilot faqat brauzerning konsolida). Lekin server logiga qarang:
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:22 YU6V7AC7JE45YS2SINT4X25D6E GET "/me" 200 40.408µs site="same-site" cookie=true
+```
+
+`GET "/me" 200`, `cookie=true`: soʻrov **bajarildi**. Bu `GET` boʻlgani uchun u `CrossOriginProtection`dan ham oʻtdi (1-qoida). CORS faqat javobni sahifaga bermadi. Demak, CORS server himoyasi emas: holat oʻzgartiradigan soʻrovni CSRF tekshiruvi toʻxtatadi.
+
+### Tez-tez uchraydigan xato: Origin'ni qaytarish
+
+Dasturchilar ruxsat bermoqchi boʻladi va roʻyxat oʻrniga soʻrovdagi `Origin`ning oʻzini qaytaradi, `Allow-Credentials: true` bilan. Bu `aks` nusxasidagi kod:
+
+```go
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// XATO (video): roʻyxat oʻrniga soʻrovdagi Origin'ni oʻzini qaytarish — har qanday sahifa javobni oʻqiydi.
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+`r.Header.Get("Origin")` soʻrovdagi `Origin`ni oʻqiydi, `Set` uni javobga yozadi: har qanday sahifaga «sizga ruxsat» deydi. `Allow-Credentials: true` bilan esa — cookie'li javobni ham oʻqishga. `Origin` hech narsa bilan tekshirilmaydi.
+
+**Bashorat.** Shu kod bilan begona sahifaning oʻqish yoʻli (`localhost:9090/oqish`) yana ishga tushadi. Natija? **A)** sahifa Dilnozaning email'ini oʻqiydi · **B)** `TypeError: Failed to fetch` · **C)** `403`, `protectCSRF` toʻxtatadi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Server `Allow-Origin`da sahifaning oʻz origin'ini qaytaradi va `Allow-Credentials: true` deydi: brauzer javobni sahifaga beradi. B — oldingi (toʻgʻri) versiyaning natijasi edi. C — `protectCSRF` bu yerda yordam bermaydi: u `GET`ni doim oʻtkazadi.
+
+</details>
+
+Server `aks` nusxasidan:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqildi: {"id":1,"email":"[email]"}
+```
+
+Sahifa Dilnozaning maʼlumotini oʻqidi (email `mask` bilan yashirilgan: haqiqiy chiqishda u turadi). Curl bilan istalgan `Origin` yozamiz:
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: https://istalgan-sayt.example' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: https://istalgan-sayt.example
+Cache-Control: no-store
+Content-Type: application/json
+X-Request-Id: XMSGQRD5CIJJQNP4E75VWIAW7S
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+Server aynan oʻsha `Origin`ni qaytardi. Natija: bir site'dagi **har qanday** sahifa shu bilan Dilnoza ma'lumotini oʻqiy oladi; cookie `SameSite=None` boʻlsa — har qanday sayt.
+
+### Toʻgʻrisi: allow-list
+
+Ruxsat etilgan origin'lar roʻyxati (**allow-list**) — `protectCSRF` ishlatadigan oʻsha `allowedOrigins`. Bu `cors` middleware (yakuniy kod):
+
+```go
+func cors(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		origin := r.Header.Get("Origin")
+		if !allowed[origin] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		// Preflight: brauzer haqiqiy soʻrovdan oldin OPTIONS bilan ruxsat soʻraydi (JSON body, PATCH, DELETE…).
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, PATCH, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600") // brauzer javobni 10 daqiqa eslab qoladi
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Kod | Nima qiladi |
+|---|---|
+| `allowed := map[string]bool{}` va `for … allowed[o] = true` | roʻyxatni `map`ga aylantiradi: tez tekshirish uchun |
+| `w.Header().Add("Vary", "Origin")` | keshga: «javob `Origin`ga qarab farq qiladi» (`Add` sarlavhaga qiymat **qoʻshadi**, `Set` almashtiradi) |
+| `if !allowed[origin] { next.ServeHTTP(w, r); return }` | origin roʻyxatda boʻlmasa, CORS sarlavhalari **qoʻshilmaydi**; soʻrov oddiy bajariladi |
+| `Access-Control-Allow-Origin` = `origin` | roʻyxatdagi origin boʻlsa, aynan shuni qaytaradi |
+| `Access-Control-Allow-Credentials: true` | cookie'li javobni oʻqishga ruxsat |
+| `if r.Method == http.MethodOptions && …` | preflight shoxi (pastda) |
+
+Ruxsatli origin (`localhost:3000`) va ruxsatsiz origin (`localhost:9090`) bilan `/me`:
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:3000' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: http://localhost:3000
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: YH3O7WIH5AQ6Q6LW2BG64WRDW6
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: B6W4MDQ3BEQVLDYSWTS76SGUDO
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+Ruxsatlida `Allow-Origin` aynan shu origin, `Allow-Credentials: true` va `Vary: Origin` bor. Ruxsatsizda faqat `Vary: Origin`: javob `200`, soʻrov bajarilgan, lekin brauzer uni begona sahifaga bermaydi. `Vary: Origin` kesh (brauzer yoki oraliq server) bir origin uchun mos kelgan javobni boshqasiga bermasligi uchun kerak.
+
+### Preflight
+
+Oddiy boʻlmagan soʻrovdan oldin (JSON body, `PATCH`, `DELETE`, maxsus sarlavha) brauzer avval `OPTIONS` soʻrov yuboradi va unda ruxsat soʻraydi: `Access-Control-Request-Method` va `Access-Control-Request-Headers`ga nima kerakligini yozadi. Bu **preflight**. Javob ruxsat bermasa, brauzer haqiqiy soʻrovni **umuman yubormaydi**. Ruxsatli origin bilan preflight:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 204 No Content
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Allow-Methods: POST, PATCH, DELETE
+Access-Control-Allow-Origin: http://localhost:3000
+Access-Control-Max-Age: 600
+Vary: Origin
+X-Request-Id: CBSBM7HLJMTKV7ANIJRZFYZSPA
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+```
+
+`cors` oʻzi `204 No Content` bilan ruxsat etilgan metod va sarlavhalarni yozdi (`Max-Age: 600` — brauzer javobni 10 daqiqa eslab qoladi). Begona origin bilan:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:9090' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 405 Method Not Allowed
+Allow: POST
+Content-Type: application/problem+json
+Vary: Origin
+X-Content-Type-Options: nosniff
+X-Request-Id: 462CYTNM7RMK7HCEVU5MWHYCUK
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 152
+
+{"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"462CYTNM7RMK7HCEVU5MWHYCUK"}
+```
+
+`cors` bu origin'ga hech narsa qoʻshmadi, soʻrov `protectCSRF`dan (`OPTIONS` xavfsiz metod: oʻtadi) mux'ga yetdi. `/login` uchun `OPTIONS` route'i yoʻq: `405 Method Not Allowed` va `Allow: POST`. Javobda `Access-Control-Allow-*` yoʻq: preflight muvaffaqiyatsiz, brauzer haqiqiy `POST`ni yubormaydi.
+
+## Login'ga rate limit: token bucket
+
+Har login urinishi argon2id hisoblaydi: GB-6.03'da koʻrdik, har urinish 46 MiB xotira va sezilarli CPU vaqti. Mening yurishimda logdagi bitta `POST "/login"` qatori `82.523656ms` koʻrsatdi. Cheklov boʻlmasa, `POST /login` parol taxmin qilish uchun ochiq va serverni band qilishning arzon yoʻli. Darsdan oldingi bozor (`himoyasiz`): bitta IP'dan ketma-ket sakkizta notoʻgʻri login. `for i in $(seq 8)` bash sikli buyruqni sakkiz marta takrorlaydi; curl'da `-o /dev/null` body'ni tashlaydi, `-w "%{http_code} "` faqat status kodini chiqaradi, `echo` qatorni yakunlaydi:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Sakkizta `401`: taxminlar cheksiz. Yechim — **token bucket** («tokenli chelak»). Har kalit uchun (hozir IP) chelak bor: ichida eng koʻpi 5 token, bosh holatda toʻla. Har urinish bitta token oladi. Chelakka har 12 soniyada bitta token qaytadi. Token qolmasa — `429 Too Many Requests` va `Retry-After`: necha soniyadan keyin yana urinish mumkin.
+
+| Urinish | Chelakda oldin | Natija | Chelakda keyin |
+|---|---|---|---|
+| 1 | 5 | `401` (parol xato, lekin urinish ruxsat) | 4 |
+| 2 | 4 | `401` | 3 |
+| 3 | 3 | `401` | 2 |
+| 4 | 2 | `401` | 1 |
+| 5 | 1 | `401` | 0 |
+| 6, 7, 8 | 0 | `429`, `Retry-After` | 0 (token olinmaydi) |
+| 12 soniyadan keyin | 0 → 1 | keyingi urinish `401` | 0 |
+
+Kod `golang.org/x/time/rate` paketida: Go jamoasining token bucket'i (`go get golang.org/x/time/rate` bilan qoʻshilgan, GB-2.06; `go.mod`da `v0.16.0`). Toʻliq `cmd/api/ratelimit.go`:
+
+```go filename="cmd/api/ratelimit.go" showLineNumbers
+package main
+
+// Login'ga rate limit (GB-6.07). Har login urinishi argon2id hisoblaydi (GB-6.03: 46 MiB xotira):
+// cheklovsiz POST /login — parol taxmin qilish uchun ochiq eshik va serverni band qilishning arzon yoʻli.
+//
+// golang.org/x/time/rate — Go jamoasining token bucket'i: chelakda eng koʻpi `burst` ta token,
+// har `every` vaqtda bittadan toʻladi; har soʻrov bitta token oladi; token yoʻq — 429 Too Many Requests
+// (RFC 6585 §4) va Retry-After: necha soniyadan keyin qayta urinish mumkin (RFC 9110 §10.2.3).
+
+import (
+	"math"
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// limiters — har kalit (IP yoki email) uchun alohida chelak. Map bir vaqtda koʻp soʻrovdan
+// ishlatiladi, shuning uchun mutex (GB-4.07). Kalitlar oʻchirilmaydi: uzoq ishlaydigan serverda
+// map oʻsib boradi — tozalash 🟡 ixtiyoriy vazifada (TASK.md, sweep).
+type limiters struct {
+	mu    sync.Mutex
+	m     map[string]*rate.Limiter
+	every rate.Limit
+	burst int
+}
+
+// newLimiters — har kalitga: boshida burst ta urinish, keyin har every'da bittadan.
+func newLimiters(every time.Duration, burst int) *limiters {
+	return &limiters{m: map[string]*rate.Limiter{}, every: rate.Every(every), burst: burst}
+}
+
+// get — kalitning chelagi; birinchi murojaatda yangisi (toʻla) yaratiladi.
+func (l *limiters) get(key string) *rate.Limiter {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.m[key]
+	if !ok {
+		lim = rate.NewLimiter(l.every, l.burst)
+		l.m[key] = lim
+	}
+	return lim
+}
+
+// wait — 0: urinish mumkin (token olindi). Aks holda — keyingi token qancha vaqtdan keyin.
+// Reserve navbat oladi, Delay — shu navbatgacha kutish; biz kutmaymiz: Cancel tokenni qaytaradi.
+func (l *limiters) wait(key string) time.Duration {
+	res := l.get(key).Reserve()
+	d := res.Delay()
+	if d > 0 {
+		res.Cancel()
+	}
+	return d
+}
+
+// limitByIP — middleware (GB-6.01 shakli): kalit — mijozning IP manzili. r.RemoteAddr — TCP ulanishning
+// manzili («IP:port»), uni mijoz soxtalashtira olmaydi. X-Forwarded-For sarlavhasiga ishonmaymiz: uni
+// har kim yozadi. Server proksi (Caddy, GB-8.06) ortida boʻlsa, RemoteAddr — proksining manzili: hamma mijoz bitta
+// chelakka tushadi. U holda IP'ni faqat ishonchli proksi yozgan sarlavhadan olish kerak (GB-8.06).
+// net/http serveri RemoteAddr'ni doim «IP:port» qiladi, shuning uchun SplitHostPort xatosi bu yerda kutilmaydi.
+// Eslatma: IPv6'da bitta foydalanuvchida odatda butun /64 tarmoq boʻladi — production'da kalitni /64 boʻyicha olish mumkin.
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tooManyRequests — 429 problem va Retry-After butun soniyalarda, yuqoriga yaxlitlangan.
+func tooManyRequests(w http.ResponseWriter, d time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
+	writeProblem(w, newProblem(http.StatusTooManyRequests, "urinishlar koʻp: keyinroq qayta urinib koʻring"))
+}
+```
+
+| Qatorlar | Nima qiladi |
+|---|---|
+| 10–19 | `import`lar; `rate` — `golang.org/x/time/rate` |
+| 24–29 | `limiters`: `m` — kalit (IP yoki email) → bitta chelak (`*rate.Limiter`); `mu` — mutex, chunki `map`ni koʻp soʻrov bir vaqtda ishlatadi (GB-4.07); `every` — token oraligʻi (`rate.Limit` turi), `burst` — chelak hajmi |
+| 32–34 | `newLimiters`: `rate.Every(every)` «har `every`da bitta token» tezligini yasaydi |
+| 37–46 | `get`: kalitning chelagi; yangi kalitga `rate.NewLimiter` toʻla chelak yasaydi |
+| 50–57 | `wait`: `Reserve` navbat oladi (token olinadi), `Delay` — shu navbatgacha kutish vaqti (`time.Duration`). Kutmaymiz: `d > 0` boʻlsa `Cancel` tokenni qaytaradi. Funksiya `0` (mumkin) yoki kutish vaqtini qaytaradi |
+| 65–74 | `limitByIP`: middleware (GB-6.01 shakli). `r.RemoteAddr` — TCP ulanish manzili, `"IP:port"`; `net.SplitHostPort` IP'ni ajratadi, port va xato `_`ga tashlanadi. `wait(ip) > 0` boʻlsa — `429`, `return` |
+| 77–80 | `tooManyRequests`: `Retry-After`ni butun soniyada yozadi: `math.Ceil` yuqoriga yaxlitlaydi (`11.9` → `12`), `strconv.Itoa` butun sonni matnga aylantiradi. Javob — GB-6.02'dagi problem JSON |
+
+`Cancel` nega kerak? `Reserve` token yetmasa ham navbat oladi (kelajakdagi tokenni «qarzga» oladi). Rad etilgan urinish chelakni yana boʻshatmasligi uchun `Cancel` uning taʼsirini qaytaradi (paket hujjati: «iloji boricha»). Aks holda har rad etilgan urinish keyingi ruxsatni kechiktirardi.
+
+`limitByIP` route'ga `requireJSON`ni oʻrab qoʻyiladi, shuning uchun argon2id'dan **oldin** ishlaydi:
+
+```go
+	mux.Handle("POST /login", a.loginIP.limitByIP(requireJSON(http.HandlerFunc(a.login))))
+```
+
+`api.loginIP` esa `newMux`da yaratiladi: `newLimiters(12*time.Second, 5)` — besh urinish, keyin har 12 soniyada bittadan (`handlers.go`, `loginIP: newLimiters(12*time.Second, 5)`).
+
+**Bashorat.** Yangi server (`final`), xuddi oʻsha sikl: bitta IP'dan ketma-ket sakkizta notoʻgʻri login. Nima chiqadi? **A)** sakkiz marta `401` · **B)** besh marta `401`, keyin uch marta `429` · **C)** bir marta `401`, keyin yetti marta `429`.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Chelak 5 token bilan boshlanadi: besh urinish oʻtadi (parol notoʻgʻri, shuning uchun `401`), qolgan uchtasiga token yetmaydi. A — bu limitsiz bozorning natijasi edi (yuqorida). C — chelak boʻsh boshlanmaydi: yangi kalitga toʻla chelak beriladi.
+
+</details>
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+Toʻqqizinchi urinishni `-i` bilan koʻramiz (sarlavhalar ham chiqadi):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | mask
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/problem+json
+Retry-After: 12
+Vary: Origin
+X-Request-Id: K7V3HIQQB55VIDP4I42XHAMIXC
+Date: Sat, 28 Nov 2026 09:24:26 GMT
+Content-Length: 166
+
+{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"urinishlar koʻp: keyinroq qayta urinib koʻring","request_id":"K7V3HIQQB55VIDP4I42XHAMIXC"}
+```
+
+`Retry-After: 12`, `Content-Type: application/problem+json`: GB-6.02'dagi javob shakli. Muhim: `12` — bu **qolgan** vaqt, doimiy son emas. Men toʻqqizinchidan besh soniya keyin yana bir soʻrov yubordim: qiymat kamaydi (bu qoʻshimcha tajriba, videoda yoʻq):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | grep Retry-After
+Retry-After: 7
+```
+
+Yana sakkiz soniya kutgach chelakka token qaytdi: urinish yana ruxsat etildi (parol xato, `401`):
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json
+401
+```
+
+Limit **hamma** urinishni sanaydi, toʻgʻri parolli loginni ham (yana qoʻshimcha tajriba; `login.json` — toʻgʻri parol): oltinchi urinish `429` oladi.
+
+```console
+$ for i in $(seq 6); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json; done; echo
+200 200 200 200 200 429
+```
+
+Kalit — `r.RemoteAddr`dagi IP, ya'ni TCP ulanishning manzili: uni mijoz soxtalashtira olmaydi. `X-Forwarded-For` sarlavhasiga ishonmaymiz: uni mijozning oʻzi yozadi. Server proksi ortida boʻlsa, `RemoteAddr` — proksining manzili va hamma mijoz bitta chelakka tushadi; haqiqiy IP'ni olishni [GB-8.06](/lab/youtube/gb#gb-8-06)da hal qilamiz.
+
+**Ishda ertaga:** `Origin`ni tekshirmay qaytarmang; holat oʻzgartiradigan soʻrovda soʻrov qayerdan kelganini tekshiring; login'ni IP va hisob boʻyicha cheklang.
+
+## Chuqurroq (ixtiyoriy): chegaralar
+
+- **Sarlavhasiz soʻrov oʻtadi (fail-open).** `Check` 4-qoidasi tufayli `Sec-Fetch-Site` ham, `Origin` ham yoʻq soʻrov oʻtadi: curl va mobil ilovalar ishlashi uchun. OWASP sezgir endpoint'larda teskarisini (fail-safe: sarlavha yoʻq — rad) tavsiya qiladi. Zamonaviy brauzerlar `Sec-Fetch-Site`ni 2023-yildan beri yuboradi (OWASP), shuning uchun bu qaror brauzer uchun xavfli emas.
+- **`Origin` va `Host` solishtirilganda sxema koʻrilmaydi.** HTTP'dan HTTPS'ga boʻlgan origin'lararo soʻrovni 3-qoida ajrata olmaydi. Go manbasidagi izoh yechimni aytadi: HTTPS va HSTS (GB-8.06).
+- **Fetch Metadata faqat ishonchli manzillarga** yuboriladi: `https`, `wss`, `file`, `localhost` va `127.0.0.0/8` (OWASP). Production'da HTTPS shart; oddiy HTTP'da faqat `Origin` tekshiruvi qoladi.
+- **`SameSite`siz cookie.** RFC 6265bis: atribut yoʻq yoki notanish boʻlsa, odatiy rejim `Lax`ga teng. Brauzer (`MAY`) yaqinda yaratilgan cookie uchun `Lax-allowing-unsafe` rejimini ham qoʻllashi mumkin: boshqa site'dan yuqori darajadagi `POST`ga yuboradi; RFC cookie yoshi 2 daqiqa yoki kamroq boʻlishini tavsiya etadi. Shuning uchun atributni har doim aniq yozing.
+- **CSRF token** (synchronizer yoki signed double-submit) — klassik yoʻl. OWASP `Sec-Fetch-Site`ni Fetch Metadata siyosatining asosiy signali deydi, sarlavha topilmasa esa `Origin` tekshiruvi va kerak boʻlsa token bilan tekshirishni aytadi.
+- **XSS hamma CSRF himoyasini yengadi** (OWASP): sahifaga tushgan skript soʻrovni bir origin'dan yuboradi. `HttpOnly` faqat tokenni oʻgʻirlashni toʻxtatadi.
+- **Limitlar xotirada** va bitta jarayonga tegishli. Bir nechta server nusxasi boʻlsa, umumiy hisob kerak (masalan Redis). Kalitlar mijozdan keladi (IP, email), `map` oʻchirilmasa oʻsib boradi: uy vazifasidagi `sweep` shuni tozalaydi.
+- **IP kaliti chegaralari.** Bitta NAT ortidagi koʻp foydalanuvchi bitta chelakni boʻlishadi. IPv6'da bitta mijozda odatda butun `/64` tarmoq boʻladi (production'da kalitni `/64` boʻyicha olish mumkin).
+- **Lockout orqali DoS.** Email limiti hujumchiga Dilnozani bloklash imkonini ham beradi (OWASP, «Account Lockout»). Shuning uchun email limiti IP limitidan yumshoqroq: 10 urinish, keyin daqiqada bitta.
+
+## Koʻp uchraydigan xatolar
+
+**1. «`SameSite=Lax` qoʻydim, CSRF yopildi».** Yuqorida koʻrdik: `Lax` boshqa **site**'dan kelgan `POST`ni toʻxtatadi, lekin bir site ichidagi qoʻshni port yoki subdomenni emas. `None`da esa cookie hamma joydan ketadi. Natija: `200`, buyurtma bekor (jadval, uch qator). Toʻgʻrisi: `Lax`ni qoldiring **va** serverda `protectCSRF` (`CrossOriginProtection`) ishlating.
+
+**2. CORS'ni server himoyasi deb bilish.** Real chiqish: begona sahifa `TypeError: Failed to fetch` oldi, lekin logda `GET "/me" 200 … cookie=true` bor edi: soʻrov bajarilgan. Xato koʻrinishi brauzerda, server esa ishlagan. Toʻgʻrisi: holat oʻzgartiradigan soʻrovni `protectCSRF` toʻxtatadi, ma'lumot oʻqishni esa autentifikatsiya (`requireUser`) va egalik tekshiruvi (GB-6.06).
+
+**3. `Origin`ni tekshirmay qaytarish.** Real chiqish: sahifa Dilnozaning maʼlumotini oʻqidi (`oʻqildi: {"id":1,…}`). Sababi: `Allow-Origin` soʻrovdagi `Origin`dan olingan va `Allow-Credentials: true` qoʻshilgan. Toʻgʻrisi: `allowedOrigins` roʻyxati, `cors` kodidagi `if !allowed[origin]`, har javobda `Vary: Origin`. `Allow-Origin: *` bilan `Allow-Credentials` ishlatib boʻlmaydi: brauzer bunday javobni rad etadi (OWASP).
+
+**4. IP kaliti sifatida `X-Forwarded-For`.** Bu papkada yoʻq, mening qoʻshimcha tajribam: `limitByIP`ga quyidagi uch qator qoʻshildi (vaqtinchalik nusxada; papkadagi kod oʻzgarmagan).
+
+```go
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			ip = xff // XATO: sarlavhani mijoz yozadi
+		}
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+Hujumchi har soʻrovda sarlavhani almashtiradi (`-H "X-Forwarded-For: 203.0.113.$i"`):
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Sakkiz marta `401`: limit ishlamadi, har sarlavha qiymatiga yangi toʻla chelak berildi. Haqiqiy kodda (kalit — `RemoteAddr`) xuddi shu buyruq limitga uriladi:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+## Oʻzingizni tekshiring
+
+**1.** `localhost:9090`dagi sahifa nega `Lax` cookie'ni oldi? Cookie `Lax` boʻlsa ham.
+
+<details>
+<summary>Javob</summary>
+
+Port site'ni oʻzgartirmaydi: `localhost:9090` bozor (`localhost:8765`) bilan **bir site**. `SameSite` faqat boshqa site'dan boshlangan soʻrovni cheklaydi, bir site ichida cookie hamma soʻrovda ketadi. Shuning uchun serverda `Sec-Fetch-Site` va `Origin`ni tekshirish kerak: `Sec-Fetch-Site: same-site` `CrossOriginProtection`da rad etiladi.
+
+</details>
+
+**2.** CORS nega server himoyasi emas?
+
+<details>
+<summary>Javob</summary>
+
+CORS faqat javobni **oʻqish**ni boshqaradi. Soʻrov serverga yetib boradi va bajariladi: logda `GET "/me" 200 … cookie=true` bor edi, sahifa esa baribir `Failed to fetch` oldi. Holat oʻzgartiradigan soʻrovni `protectCSRF` toʻxtatadi.
+
+</details>
+
+**3. GB-6.04.** Logout'dan keyin cookie'ning eski nusxasi nega `401` oladi?
+
+<details>
+<summary>Javob</summary>
+
+Logout serverdagi session yozuvini oʻchirgan. Server har soʻrovda cookie'dagi token hash'i boʻyicha yozuvni qidiradi va topmaydi: `requireUser` `401` beradi. Cookie'ning oʻzi (brauzerda yoki `jar.txt`da) hech narsa isbotlamaydi.
+
+</details>
+
+**4. Bashorat.** `final` serverda Dilnoza **toʻgʻri** parol bilan bitta IP'dan ketma-ket 6 marta login qiladi. Statuslar qanday?
+
+<details>
+<summary>Javob</summary>
+
+`200 200 200 200 200 429`. Limit urinishni sanaydi, parol toʻgʻriligini emas: `limitByIP` route'da `login`dan oldin turadi. Oltinchi urinishga token yetmaydi. Yuqoridagi «Limit hamma urinishni sanaydi» chiqishi shuni koʻrsatadi.
+
+</details>
+
+**5. Bashorat.** `curl -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel` (`Sec-Fetch-Site`siz): natija?
+
+<details>
+<summary>Javob</summary>
+
+`403`. `Sec-Fetch-Site` yoʻq, shuning uchun 3-qoida: `Origin`ning host'i (`localhost:9090`) `Host` sarlavhasidan (`localhost:8765`) farq qiladi, rad. Logdagi sabab: `cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host`.
+
+</details>
+
+## Uy vazifasi
+
+🟢 **Email boʻyicha ikkinchi limit.** Videodagi IP limiti bitta IP'ni cheklaydi. Hujumchi IP'ni almashtirsa (proksilar, botnet, IPv6), har yangi IP'ning chelagi toʻla: Dilnozaning paroliga taxminlar cheksiz davom etadi. OWASP Authentication Cheat Sheet: urinishlar hisoblagichi **hisobning oʻziga** bogʻlansin, manba IP'ga emas.
+
+Spetsifikatsiya (papkadagi [TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/TASK.md)dan):
+
+- bitta email'ga: 10 urinish, keyin har daqiqada bittadan (`newLimiters(time.Minute, 10)`);
+- email harf kattaligisiz: `Dilnoza@…` va `DILNOZA@…` bitta chelak;
+- 11-urinish (har safar boshqa IP'dan) → `429` va `Retry-After`; boshqa email'ga oddiy `401`;
+- tekshiruv argon2id'dan **oldin**: limitdan oshgan urinish serverni band qilmasin.
+
+Nima qilish kerak: `cmd/api/handlers.go`dagi `api` struct'iga `loginEmail *limiters` maydoni va `newMux`da `newLimiters(time.Minute, 10)`; `cmd/api/auth.go`dagi `login`da `decodeJSON`dan keyin, `checkPassword`dan oldin email'ni `strings.ToLower` bilan kichik harfga oʻtkazing, `a.loginEmail.wait(…)`ni chaqiring, natija `0`dan katta boʻlsa `tooManyRequests(w, d)` va `return`. Shakl `limitByIP` bilan bir xil, kalit boshqa. `*_test.go` fayllarini oʻzgartirmang. Papkaning ildizida (bu yerda nusxa shart emas, papkaning oʻzida ishlang):
+
+```console
+$ go test ./... 2>&1 | mask
+--- FAIL: TestLoginEmailLimit (0.68s)
+    tekshiruv_test.go:26: 11-urinish ([email], yangi IP 10.0.0.11): status 401, kutilgan 429 (TASK.md: email boʻyicha limit — 10 ta urinish, harf kattaligi farq qilmaydi)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	1.629s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.470s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+FAIL
+```
+
+`--- FAIL: TestLoginEmailLimit` — yiqilgan test; xabar nima kutilganini aytadi: 11-urinishda `429`, hozir `401`. `[email]` — `mask` yashirgan laboratoriya email'i. Test har urinishni boshqa IP'dan yuboradi: IP limiti ishlamaydi, faqat sizning limitingiz. `FAIL` bilan boshlangan qator paket, `ok` — oʻtgan paketlar, `[no test files]` — testi yoʻq paket.
+
+🟡 **Ixtiyoriy: `sweep`.** `cmd/api/ratelimit.go`da `func (l *limiters) sweep(now time.Time) int`: chelagi **toʻla** (uzoq urinmagan) kalitlarni `map`dan oʻchiradi va nechtasi oʻchganini qaytaradi. Yordam: `lim.TokensAt(now) >= float64(l.burst)`. `TestSweep` testi `sweep` yozilmaguncha `SKIP` beradi:
+
+```console
+$ go test -v -run "Sweep" ./cmd/api
+=== RUN   TestSweep
+    tekshiruv_test.go:43: 🟡 ixtiyoriy: (*limiters).sweep(now time.Time) int hali yozilmagan (TASK.md, 3-qadam)
+--- SKIP: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.095s
+```
+
+Yechim — [solution/ papkasida](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/solution).
+
+<details>
+<summary>Javob: izoh</summary>
+
+`handlers.go`da maydon va yaratilishi:
+
+```go
+type api struct {
+	st         *store.Store
+	loginIP    *limiters // GB-6.07: bitta IP'dan login urinishlari
+	loginEmail *limiters // vazifa: bitta email'ga login urinishlari (IP'lar almashsa ham)
+}
+
+// newMux — hamma route'lar shu yerda: main ham, testlar ham bir xil mux'ni ishlatadi.
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{
+		st:         st,
+		loginIP:    newLimiters(12*time.Second, 5), // 5 ta urinish, keyin har 12 soniyada bittadan
+		loginEmail: newLimiters(time.Minute, 10),   // 10 ta urinish, keyin har daqiqada bittadan
+	}
+```
+
+`auth.go`dagi `login`da `decodeJSON`dan keyin, `checkPassword`dan oldin (importga `"strings"` qoʻshiladi):
+
+```go
+	// Vazifa: email boʻyicha limit — argon2id'dan oldin, harf kattaligisiz (users_email_lower_idx, GB-6.04).
+	// OWASP Authentication Cheat Sheet: hujumchi IP'larni almashtirsa ham, bitta hisobga urinishlar cheklansin.
+	if d := a.loginEmail.wait(strings.ToLower(in.Email)); d > 0 {
+		tooManyRequests(w, d)
+		return
+	}
+```
+
+Kalit — kichik harfga oʻtkazilgan email: `Dilnoza@…` va `DILNOZA@…` bitta chelakka tushadi. Tekshiruv `checkPassword`dan oldin: argon2id hisoblanmaydi. IP limiti route'da email limitidan oldin turadi: avval IP, keyin email.
+
+`sweep` (🟡):
+
+```go
+func (l *limiters) sweep(now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for key, lim := range l.m {
+		if lim.TokensAt(now) >= float64(l.burst) {
+			delete(l.m, key) // range ichida delete mumkin (Go spec: For statements with range clause)
+			n++
+		}
+	}
+	return n
+}
+```
+
+`sweep` `mu`ni ushlaydi (map'ni boshqa soʻrovlar bir vaqtda ishlatadi), har kalitning chelagida `TokensAt(now)` toʻla chelakni koʻrsatsa — kalitni `delete` bilan oʻchiradi (`range` ichida `delete` mumkin). Toʻla chelakni oʻchirish xavfsiz: yangi chelak baribir toʻla yaratiladi. Serverda uni vaqti-vaqti bilan chaqirish kerak (`time.Ticker` bilan goroutine'da, GB-7.01).
+
+Javob papkasining testlari:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.153s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.291s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+```
+
+Ikkala test ham oʻtganini `-v` bilan koʻrish:
+
+```console
+$ cd solution && go test -v -run "LoginEmailLimit|Sweep" ./cmd/api
+=== RUN   TestLoginEmailLimit
+--- PASS: TestLoginEmailLimit (0.64s)
+=== RUN   TestSweep
+--- PASS: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.730s
+```
+
+Format va statik tekshiruv hech narsa chiqarmaydi (papkaning ildizida):
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+</details>
+
+Tajribadan keyin serverlarni `Ctrl+C` bilan toʻxtating va nusxalarni oʻchiring: `rm -rf /tmp/gb-6-07`.
+
+## Manbalar
+
+- [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) · [SameSite](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#samesite-cookie-attribute) · [Origin tekshiruvi](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#verifying-origin-with-standard-headers)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#login-throttling): login throttling va account lockout
+- Go: [net/http · CrossOriginProtection](https://pkg.go.dev/net/http#CrossOriginProtection) · [Go 1.25 release notes](https://go.dev/doc/go1.25#nethttppkgnethttp) · [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) · [Request.RemoteAddr](https://pkg.go.dev/net/http#Request)
+- [RFC 6265bis · cookie'lar](https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis) (draft-22): `__Host-` prefiksi, `Max-Age`, `SameSite`
+- MDN: [Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie) · [Site](https://developer.mozilla.org/en-US/docs/Glossary/Site) · [Sec-Fetch-Site](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site) · [Document.cookie](https://developer.mozilla.org/en-US/docs/Web/API/Document/cookie) · [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS) · [CSRF](https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF)
+- [HTML Standard · same site](https://html.spec.whatwg.org/multipage/browsers.html#same-site) · [Fetch Standard · CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol) · [CORS-preflight request](https://fetch.spec.whatwg.org/#cors-preflight-request)
+- [RFC 6585 §4 · 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585#section-4) · [RFC 9110 §10.2.3 · Retry-After](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)
+- [PortSwigger Web Security Academy · CORS](https://portswigger.net/web-security/cors) · [chromedp](https://github.com/chromedp/chromedp) (faqat brauzer dasturi uchun)
+
+Natijalar: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, jq 1.8.2, Google Chrome 155.0.8059.39 (headless, chromedp bilan), 2026-11-28. Barcha chiqishlar shu mashinada qayta yurgizilgan; videodagi chiqishlar bilan mazmuni bir xil, farq faqat soʻrov ID'larida, tokenlarda, sanalarda va vaqtlarda (videoda masalan `164.447µs`, `53.587µs`). Qoʻshimcha tajribalar (`Check` qoidalari, `Retry-After` kamayishi, toʻgʻri parolli loginlar, `X-Forwarded-For`) papkada yoʻq: men ularni yurgizdim, buyruqlari sahifada toʻliq. Keyingi dars: [GB-6.08 · Nazorat nuqtasi: himoyalangan bozor](/lab/youtube/gb#gb-6-08).
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+---
+
+← Oldingi dars: [GB-6.06](/lab/youtube/gb/gb-6-06) · Keyingi dars: [GB-6.08](/lab/youtube/gb#gb-6-08) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
