@@ -1,0 +1,1113 @@
+---
+title: "Cookie, CSRF, CORS and rate limit: browser-side protection"
+date: "2026/11/28"
+description: "Cookie attributes, blocking a forged cross-site POST with http.CrossOriginProtection, a CORS allow-list, and a token bucket limit on login."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-07) · [Русский](/lab/youtube/gb/gb-6-07/ru) · **English**  
+Lesson GB-6.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-07) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Dilnoza logged in to bozor. Then, on a foreign page on another port, she clicked the button «Sovgʻani olish» ("Get the gift"). That click cancelled order 41 in bozor, although the session cookie was `SameSite=Lax`. Why did the protection not work?
+
+**One idea:** the browser adds the cookie to the request **by itself**, no matter which page started the request. Cookie attributes only control "when to add it", and `SameSite` looks at the *site*: a port or a subdomain does not change the site. So for a request that changes state, the server itself checks **where** the request came from. CORS only controls whether a page can **read** the response: the request still runs. And login is limited by the number of attempts.
+
+By the end of the lesson you will:
+
+- see in a real Chrome what each `Set-Cookie` attribute does (`__Host-`, `Max-Age`, `HttpOnly`, `Secure`, `SameSite`);
+- recreate the cancellation of Dilnoza's order by a plain HTML form on another page, and turn it into a `403` with `http.CrossOriginProtection`;
+- set up CORS with an allow-list and `Vary: Origin`, and see with your own eyes the mistake of returning `Origin` without checking it;
+- put a token bucket limit per IP on `POST /login` (`429` and `Retry-After`), and write the second one, per email, yourself in the homework.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| `SameSite` | an attribute: whether to add the cookie to a request started from **another site** | SameSite |
+| CSRF | a page on a foreign site sends a request through the user's browser, with the user's cookie | cross-site request forgery |
+| token bucket | a limited stock of tokens for each key (IP, email): every attempt takes one | token bucket |
+
+Two helpers: the `Sec-Fetch-Site` and `Origin` headers (who started the request) and **CORS** (the browser's read rule). Other words are explained where they first appear.
+
+## Before you start
+
+This lesson builds on [GB-6.06 · Whose order is this?](/lab/youtube/gb/gb-6-06/en) and [GB-6.04 · Login and sessions](/lab/youtube/gb/gb-6-04/en): `requireUser`, `currentUser`, the cookie, `jar.txt`, orders 41 and 42 come from there. You also need [GB-6.03 · Passwords: argon2id](/lab/youtube/gb/gb-6-03/en), [GB-6.02 · Error responses](/lab/youtube/gb/gb-6-02/en), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/en), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08/en), [GB-4.07 · mutex](/lab/youtube/gb/gb-4-07/en), and [GB-1.08 · go test](/lab/youtube/gb/gb-1-08/en).
+
+**Where to work.** This example is not for the Go Playground: it needs several processes and a real browser. You do not need Postgres or Docker: in this lesson the store is in memory (a map and a mutex), and its methods are the same as in GB-6.04 and GB-6.06. Get the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors). You need Go 1.27, curl, jq and Google Chrome. Ports `8765` and `9090` must be free. If you have no Chrome, read the outputs of the three browser commands on this page: they come from my run.
+
+We do not work inside the folder itself: each experiment gets its own copy. Run this block **in every terminal**, and set the two variables to your own paths:
+
+```bash
+lab=$PWD                 # the lesson folder
+work=/tmp/gb-6-07        # the copies live here
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+mask() { sed -E 's/[A-Za-z0-9._-]+@[A-Za-z0-9.-]+/[email]/g; s/(__Host-session[=[:space:]]+)[^;[:space:]]+/\1[redacted]/g'; }
+prepare() {              # prepare NAME [stage]
+	rm -rf "$work/$1" && cp -a "$lab" "$work/$1"
+	[ -n "${2:-}" ] && cp "$lab/_video/stages/$2/"*.go "$work/$1/cmd/api/"
+	sed -n 's/^const dilnozaLogin = `\(.*\)`$/\1/p' "$work/$1/cmd/api/api_test.go" > "$work/$1/login.json"
+	jq '.password = "taxmin-1"' "$work/$1/login.json" > "$work/$1/wrong.json"
+}
+mkdir -p "$work"
+prepare final; prepare himoyasiz himoyasiz; prepare none none; prepare aks aks
+```
+
+`GOTOOLCHAIN` selects the Go version used in the lesson, and `CGO_ENABLED=0` builds without a C compiler. `prepare` makes a copy: `final` is the final code of the lesson; `himoyasiz` ("unprotected") is bozor at the start of the lesson (no CSRF and CORS protection, no limit on login); `none` is that state plus `SameSite=None`; `aks` has the CORS mistake. The stage files are in `_video/stages/`. The line `[ -n "${2:-}" ] && cp …` copies the stage files over `cmd/api/` in the copy when a second argument (the stage name) is given. `login.json` is Dilnoza's login body: `sed` takes it from the test file, so the email and the password are not written on this page. `wrong.json` is the same body with a wrong password. `mask` hides the lab user's email and the session token in the output shown on this page; on your own computer it is not needed, but it helps if you share your screen.
+
+The lab is built like this:
+
+```text
+ bozor API :8765  <----  Chrome (headless)  ---->  foreign site :9090
+ (store in memory)             ^                  (cmd/begona: form and read page)
+                               |
+                  _video/brauzer (Go + chromedp)
+```
+
+The experiments go like this: the server in one terminal (`cd "$work/himoyasiz" && go run ./cmd/api 2>&1 | tee server.log`), curl in the second (`cd "$work/himoyasiz"`), the foreign site in the third (`cd "$lab" && go run ./cmd/begona`), the browser program in the fourth (`cd "$lab/_video/brauzer"`). `tee server.log` writes the log both to the screen and to a file. Before the next experiment, stop the server with `Ctrl+C` and change the folder name (`himoyasiz`, `none`, `aks`, `final`). The first run of the browser program downloads the chromedp library.
+
+**Recall, GB-6.06.** The route `POST /orders/{id}/cancel` also checks order ownership. Still, the forged request from a foreign page cancelled the order. Why did the ownership check not stop it? **A)** it returned `404`, but the order was cancelled anyway · **B)** the request came with Dilnoza's own cookie · **C)** the foreign site replaced `user_id`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Dilnoza's browser sent the request and added bozor's cookie by itself. The server takes `currentUser(r).ID` from the cookie, and the SQL condition `AND user_id = $2` compares against that ID. For the server this is Dilnoza herself: the condition passes. A is wrong: `404` appears only for someone else's order, and here the order is Dilnoza's. C is wrong: `user_id` never comes from the client at all, the server takes it from the session (GB-6.06).
+
+</details>
+
+This attack is called **CSRF** (cross-site request forgery): a foreign site forges a request through the user's own browser. Today we recreate it and close it. The plan: cookie attributes, checking on the server where a request came from, what CORS is not, and a rate limit on login, that is, a cap on the number of attempts.
+
+## Cookie attributes: rules for the browser
+
+The browser decides how to store a cookie and which request to add it to. The server gives it rules only through the **attributes** in the `Set-Cookie` header. Let us look at the whole login response (`-i` also prints the response headers, `-c jar.txt` saves the cookie to a file). Start the server from the `final` folder and run curl in the same folder:
+
+```console
+$ curl -s -i -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax
+Vary: Origin
+X-Request-Id: GLYOPBEPBDRKAICL3Q3V6FD3N7
+Date: Sat, 28 Nov 2026 09:24:10 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+The request ID, the date and the token are different on every run. The token is replaced by `[redacted]`: `mask` did that. `Cache-Control: no-store` is familiar from GB-6.04; `Content-Type`, `Content-Length` and `Date` are ordinary HTTP headers (GB-4.01). `Vary: Origin` was added in this lesson, and I explain it in the CORS section. Look at the `Set-Cookie` line. Compared with GB-6.04, two things changed: the `__Host-` prefix was added before the name, and `Max-Age` replaced `Expires`. The other attributes are the same.
+
+| Part | What the browser does |
+|---|---|
+| `__Host-session` | the browser accepts a cookie whose name starts with `__Host-` only if three conditions hold (see below) |
+| `Path=/` | the cookie is added to all paths of the site |
+| `Max-Age=86400` | the browser keeps the cookie for 86400 seconds, that is, 24 hours |
+| `HttpOnly` | a script on the page cannot read the cookie through `document.cookie` |
+| `Secure` | the cookie is sent only over HTTPS; `http://localhost` is an exception |
+| `SameSite=Lax` | limits adding the cookie to requests started from another site (next sections) |
+
+Here is how these attributes are written in `setSessionCookie`:
+
+```go
+func setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+```
+
+| Code | What it does |
+|---|---|
+| `Name: sessionCookie` | the cookie name; this constant's value is `"__Host-session"` |
+| `MaxAge: int(sessionTTL.Seconds())` | `sessionTTL` is `24 * time.Hour`; `Seconds()` converts it to seconds (`86400`), `int` makes a whole number |
+| `HttpOnly: true`, `Secure: true` | write the matching attributes |
+| `SameSite: http.SameSiteLaxMode` | writes `SameSite=Lax`; in GB-6.04 it was only named |
+| `w.Header().Set("Cache-Control", "no-store")` | the response must not stay in a cache (GB-6.04) |
+
+**`Max-Age`** is a *relative* lifetime in seconds: the browser adds it to its own current time. `Expires` is an exact date that the browser compares with its own clock, so a wrong clock shifts the lifetime. If both are given, `Max-Age` wins (RFC 6265bis §4.1.2.2). A browser may also shorten the lifetime, so the session lifetime on the server (`sessionTTL`, GB-6.04) stays the main one.
+
+**The `__Host-` prefix** sets a condition for the browser: the cookie must be `Secure`, must have `Path=/`, and must not have a `Domain` attribute. A cookie without `Domain` is *host-only*: it returns only to the host that issued it, not to subdomains. The result: `blog.bozor.uz` cannot overwrite bozor's `__Host-session` cookie. The restriction is about the host, not the port: RFC 6265bis says that ports are the only part of the origin model that `__Host-` cookies still ignore.
+
+How did curl store this cookie? The last line of `jar.txt`:
+
+```console
+$ tail -1 jar.txt | mask
+#HttpOnly_localhost	FALSE	/	TRUE	1795944250	__Host-session	[redacted]
+```
+
+The line has seven tab-separated columns: the domain (the `#HttpOnly_` mark means the cookie is `HttpOnly`), whether subdomains accept it too (`FALSE` means no, there was no `Domain`), the path, `Secure` (`TRUE`), the expiry time (in epoch seconds: curl turned `Max-Age` into an absolute time), the name, the value. Curl stores and returns a `Secure` cookie for `http://localhost`: localhost is an exception (MDN, Set-Cookie).
+
+### HttpOnly: in a real browser
+
+You cannot show `HttpOnly` with curl: curl has no page script. That is why a real Chrome is needed. It runs without a window (**headless**), and a Go program in `_video/brauzer` drives it through the **chromedp** library. The program itself is not the topic of the lesson: it drives the browser and prints the result. The `httponly` command logs in to bozor as Dilnoza on a bozor page (the browser stores the cookie by itself), then does two things with a page script. The server runs from `final`, the command runs in the browser folder:
+
+```console
+$ go run . httponly | mask
+login: 200 {"id":1,"email":"[email]"}
+document.cookie: ""
+fetch /me: 200 {"id":1,"email":"[email]"}
+```
+
+1. `login: 200 …`: the login worked, the browser has the cookie.
+2. `document.cookie: ""`: the script reads cookies through `document.cookie` and gets an empty string. That is what `HttpOnly` does.
+3. `fetch /me: 200 …`: `fetch` is the browser's function for requests. It sends a request to `/me`, and the browser adds the cookie by itself: the response is `200`.
+
+Conclusion: a malicious script on the page **cannot steal** the token, but while the page is open it can send requests on Dilnoza's behalf. `HttpOnly` protects against the first, not the second.
+
+## Origin and site: when a cookie counts as "coming from elsewhere"
+
+To understand `SameSite` you must know exactly what "elsewhere" means. There are two notions.
+
+**Origin** is the scheme, host and port together: `http://localhost:8765`. If any one differs, the origin is different.
+
+**Site** is the scheme and the *registrable domain*: an entry from the Public Suffix List plus one part before it, for example `bozor.uz`. **The port is not counted.** Hosts such as `localhost` and IP addresses have no registrable domain: the whole host must be equal (HTML Standard, "same site"). The scheme is also checked: in cookie rules `http://` and `https://` are different sites (MDN, Site).
+
+| One page | Another page | Origin | Site |
+|---|---|---|---|
+| `http://localhost:8765` | `http://localhost:8765/me` | same | same |
+| `http://localhost:8765` | `http://localhost:9090` | **different** (port) | **same** (the port is not counted) |
+| `https://app.bozor.uz` | `https://blog.bozor.uz` | different (host) | **same** (`bozor.uz`) |
+| `http://localhost:8765` | `http://127.0.0.1:9090` | different | **different** (different host) |
+| `http://localhost` | `https://localhost` | different | different (different scheme) |
+
+In the lab the foreign site opens from one server under two names: `http://localhost:9090` (the **same site** as bozor, but a different origin) and `http://127.0.0.1:9090` (a **different site**). The first models a neighbouring service inside the network (a neighbour port or a subdomain), the second a plain foreign site.
+
+## SameSite: when the cookie is added
+
+`SameSite` decides whether to add the cookie to a request **started from another site**. There are three values. Inside one site the cookie is sent in all three cases, whatever the request type.
+
+| Request started from another site | `Strict` | `Lax` | `None` (needs `Secure`) |
+|---|---|---|---|
+| a page opened by a link (top-level navigation, `GET`) | not sent | **sent** | sent |
+| `POST` by a form | not sent | not sent | sent |
+| `iframe` (a page inside a page) or `fetch` | not sent | not sent | sent |
+
+`Lax` is the value of this lesson's cookie. Its rule: from another site it is sent only on a top-level navigation with a safe method (`GET`) (RFC 6265bis §4.1.2.7). Use this table to predict: if the foreign page is on another site, what does a `POST` form get?
+
+## CSRF: a form on a foreign page
+
+The attack page is in the `formaPage` constant in `cmd/begona`: a plain HTML form, no script.
+
+```html
+<form method="post" action="http://localhost:8765/orders/41/cancel">
+  <button>Sovgʻani olish</button>
+</form>
+```
+
+| Line | What it does |
+|---|---|
+| `<form method="post" action="…">` | when the form is submitted, the browser sends a `POST` request; `action` is where: bozor's cancel path |
+| `<button>Sovgʻani olish</button>` | a button; when pressed, the browser submits the form |
+| `</form>` | the form ends |
+
+When the browser submits the form, it adds bozor's cookies **by itself**, if `SameSite` allows. This route has no body, so there is no `requireJSON` either (GB-6.01): a plain form can reach it too. This is the `cancelOrder` route:
+
+```go
+	mux.Handle("POST /orders/{id}/cancel", a.requireUser(http.HandlerFunc(a.cancelOrder)))
+```
+
+| Step | Who | What |
+|---|---|---|
+| 1 | Dilnoza | logs in to bozor; the browser stores the cookie |
+| 2 | Dilnoza | opens the foreign page |
+| 3 | Dilnoza | clicks «Sovgʻani olish» |
+| 4 | browser | submits the form as `POST /orders/41/cancel` and, if allowed, adds the cookie by itself |
+| 5 | bozor | the cookie is valid, the owner is valid: the order is cancelled |
+
+### Two new fields in the server log
+
+To see who started a request, two fields were added to `logRequests`:
+
+```go
+		_, err := r.Cookie(sessionCookie)
+		log.Printf("%s %s %q %d %s site=%q cookie=%t", w.Header().Get("X-Request-Id"),
+			r.Method, r.URL.Path, rec.status, time.Since(start), r.Header.Get("Sec-Fetch-Site"), err == nil)
+```
+
+`site=` is the `Sec-Fetch-Site` header: the browser adds it by itself to every request to HTTPS or localhost addresses, and it records which page started the request. Its values are `same-origin`, `same-site`, `cross-site`, `none` (typed into the address bar or opened from a bookmark). `cookie=` tells whether the session cookie arrived (`true`/`false`). `r.Header.Get` reads the header, and `err == nil` means the cookie is present (GB-6.04).
+
+### Predict: a form from another site
+
+Now we open the foreign page through `127.0.0.1`, that is, on a **different site**. The cookie is `SameSite=Lax`. What happens when «Sovgʻani olish» is clicked? **A)** `200`, the order is cancelled · **B)** `401`, the cookie did not arrive · **C)** `403`, no permission.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Lax` does not add the cookie to a form `POST` that came from another site (the second row of the table). There is no cookie, so `requireUser` returns `401` (GB-6.04). A: for the order to be cancelled the cookie is needed. C: in GB-6.06 `403` appears when a role has no permission, and here the server did not recognise Dilnoza at all.
+
+</details>
+
+This is bozor before the lesson (the `himoyasiz` copy): there is no CSRF check yet. The server runs from `himoyasiz`, the foreign site runs with `go run ./cmd/begona`. The `csrf` command of the browser program opens the page, clicks the button and prints the response:
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"ACVH6PKV4N4FAPNLU3FZIDAK5C"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+The response is `401`, and order 41 is still `yangi` ("new"). The server log (`grep` removes the noise from login, health and favicon):
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C xato 401: "http: named cookie not present"
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C POST "/orders/41/cancel" 401 44.065µs site="cross-site" cookie=false
+2026/11/28 14:24:15 OM23C5KFFSB7OQLTCEPDHLLBRF GET "/orders/41" 200 125.151µs site="none" cookie=true
+```
+
+The time in the request line (`44.065µs`) depends on the load: in the video the same request took `164.447µs`. What matters is not the time but the `site=` and `cookie=` fields. The first line is the server start message. `xato 401: "http: named cookie not present"`: `requireUser` did not find the cookie (`ErrNoCookie`, GB-6.04). In the next line `site="cross-site"`: the browser itself recorded that the request came from another site, and `cookie=false`: the cookie was not added. The last line is the `GET /orders/41` request that the browser program sent to check the state: its address was typed in, so `site="none"`.
+
+### The attack still works: a foreign page on a neighbour port
+
+Now the attack from the start of the lesson: the foreign page is at `http://localhost:9090`, that is, on the **same site** as bozor. The server is again from `himoyasiz`:
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:12 EAB3D6NLO5XWZPSATRJ64CSIBV POST "/orders/41/cancel" 200 47.942µs site="same-site" cookie=true
+2026/11/28 14:24:13 PYKFJVQKYKGXLZXBOCEEHVAMNU GET "/orders/41" 200 64.841µs site="none" cookie=true
+```
+
+`site="same-site"`, `cookie=true`: inside one site the browser added the `Lax` cookie to the form too (the video shows `53.587µs`, my run `47.942µs`: both are microseconds). `200`: the order was cancelled. This is not a bypass of `Lax`: the rule says "from **another site**", and `localhost:9090` and bozor are one site. A port or a subdomain does not change the site.
+
+### Predict: SameSite=None
+
+We made the cookie `SameSite=None` (the `none` copy; only this line changes in the code: `SameSite: http.SameSiteNoneMode`). What does the page on `127.0.0.1:9090` get now? **A)** `401`, the cookie does not arrive · **B)** `200`, the order is cancelled · **C)** `400`, no `Secure`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `None` adds the cookie to requests started from another site too. `Secure` was already on, and Chrome sent the `Secure` cookie to `http://127.0.0.1` as well (the experiment showed it: there is a `Secure` exception for trustworthy addresses). A was the result of `Lax`. C: bozor has no such check: the browser decides about cookie attributes, not the server.
+
+</details>
+
+The cookie header and the result:
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | grep Set-Cookie | mask
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=None
+```
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:16 UGJMHRV2FH6I7W57PIWUYIGFWU POST "/orders/41/cancel" 200 100.054µs site="cross-site" cookie=true
+2026/11/28 14:24:17 IHC74EO7MAZQAHXL4Z5Q2WQARL GET "/orders/41" 200 76.7µs site="none" cookie=true
+```
+
+`site="cross-site"`, but `cookie=true` and `200`. In total there are three cases:
+
+| Foreign page | Cookie | Result (unprotected) | Log fields |
+|---|---|---|---|
+| `http://localhost:9090` (same site) | `Lax` | **`200`, order cancelled** | `same-site`, `cookie=true` |
+| `http://127.0.0.1:9090` (different site) | `Lax` | `401` | `cross-site`, `cookie=false` |
+| `http://127.0.0.1:9090` | `None` | **`200`, order cancelled** | `cross-site`, `cookie=true` |
+
+Conclusion: `SameSite` is a useful extra layer, but not the main CSRF protection. OWASP writes it like this: it looks at the registrable domain, not the origin, so a neighbour port or subdomain bypasses it. The main protection must be on the server.
+
+## Protection on the server: http.CrossOriginProtection
+
+The server itself checks **where** a state-changing request came from. Since Go 1.25 the standard library has `http.CrossOriginProtection` for this; the OWASP CSRF Prevention Cheat Sheet names it. It relies on two headers that the browser sends: `Sec-Fetch-Site` (seen above) and `Origin` (the origin of the page that started the request; the browser adds it to `POST`).
+
+```go
+var allowedOrigins = []string{"http://localhost:3000"}
+
+// errCrossOrigin — soʻrov boshqa origin'dagi sahifadan kelgan (problemFor → 403).
+var errCrossOrigin = errors.New("boshqa saytdan kelgan soʻrov")
+
+// protectCSRF — Go 1.25'dan beri standart kutubxonadagi http.CrossOriginProtection bilan:
+//   - GET, HEAD, OPTIONS — har doim oʻtadi (ular holatni oʻzgartirmasligi kerak);
+//   - Sec-Fetch-Site: same-origin yoki none (manzil qatoriga yozilgan) — oʻtadi; boshqa qiymat — rad;
+//   - Sec-Fetch-Site yoʻq, Origin bor — Origin'ning host'i Host sarlavhasiga teng boʻlsa oʻtadi;
+//   - ikkalasi ham yoʻq — Go buni brauzer emas deb hisoblaydi (curl, mobil ilova, boshqa server): oʻtadi (fail-open);
+//   - AddTrustedOrigin'dagi origin'lar — oʻtadi.
+//
+// Origin ↔ Host solishtiruvida sxema (http/https) koʻrilmaydi: production'da HTTPS + HSTS (GB-8.06).
+//
+// Brauzer bo'lmagan mijozda begona cookie yoʻq: CSRF — aynan brauzer cookie'ni oʻzi qoʻshgani uchun xavf.
+// Rad sababi (Check'ning xatosi) log'ga, mijozga — bizning matn (GB-6.02).
+func protectCSRF(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	for _, o := range allowedOrigins {
+		if err := cop.AddTrustedOrigin(o); err != nil {
+			panic(err) // roʻyxat kodimizda: notoʻgʻri yozilgan boʻlsa server ishga tushmasin
+		}
+	}
+```
+
+| Code | What it does |
+|---|---|
+| `var allowedOrigins = []string{…}` | the list of allowed origins: bozor's own web app, `http://localhost:3000` |
+| `func protectCSRF(next http.Handler) http.Handler` | middleware (the shape from GB-6.01) |
+| `cop := http.NewCrossOriginProtection()` | creates the checker object |
+| `for _, o := range allowedOrigins` | for each origin in the list |
+| `cop.AddTrustedOrigin(o)` | adds it to the **trusted** origins; returns an error if the entry is malformed (no scheme, has a path) |
+| `panic(err)` | the list is in our code: if it is wrong, the server must not start (GB-2.09) |
+
+The main part is the returned handler:
+
+```go
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := cop.Check(r); err != nil {
+			writeError(w, fmt.Errorf("%w: %w", errCrossOrigin, err))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Code | What it does |
+|---|---|
+| `cop.Check(r)` | checks the request; returns an error if it is rejected |
+| `fmt.Errorf("%w: %w", errCrossOrigin, err)` | combines two errors: our text and the reason from `Check` (GB-6.02) |
+| `writeError(w, …)` | writes a `403` problem response: our text to the client, the reason to the log |
+| `next.ServeHTTP(w, r)` | the check passed, the handler runs |
+
+The rules of `Check` (Go 1.27.4 source, `net/http/csrf.go`):
+
+1. `GET`, `HEAD`, `OPTIONS` **always pass**: these methods must not change state. So never change state in a GET.
+2. `Sec-Fetch-Site: same-origin` or `none` passes. Any other value (`same-site`, `cross-site`) is **rejected**, unless `Origin` is in the trusted list or the path is excepted with `AddInsecureBypassPattern`.
+3. `Sec-Fetch-Site` is absent, `Origin` is present: it passes if the host in `Origin` (with port) equals the `Host` header, otherwise it is rejected. The scheme is not compared.
+4. Neither is present: the request is assumed to be not from a browser or from the same origin, and it **passes**.
+
+Its place in the chain: `requestID → logRequests → recoverPanic → cors → protectCSRF → muxErrors → mux` (`cmd/api/middleware.go`, `newHandler`).
+
+### Predict: the page and curl
+
+A new server (`final`). The foreign page is at `localhost:9090`, and curl in the terminal carries Dilnoza's cookie from `jar.txt`: both send the same `POST /orders/41/cancel` with the same cookie. The result? **A)** both `403` · **B)** the page `403`, curl `200` · **C)** the page `200`, curl `403`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** In the page's request the browser writes `Sec-Fetch-Site: same-site`: rule 2 rejects it. Curl does not send these headers: rule 4 lets it pass. A is wrong: there is nothing to check in curl. C is the opposite: the rejection depends on the header.
+
+</details>
+
+The browser program, the foreign page at `localhost:9090` (server `final`):
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"2UQK2DTO7A4VA7DUD44YMHEUGR"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR POST "/orders/41/cancel" 403 115.527µs site="same-site" cookie=true
+2026/11/28 14:25:18 S3W4NBVELWNTMKWLRE73DBIZ3N GET "/orders/41" 200 119.195µs site="none" cookie=true
+```
+
+`403`, with our text in the response; the order stayed `yangi`. In the log the `xato 403` line holds the reason from `Check` (`cross-origin request detected from Sec-Fetch-Site header`), and the next line has `site="same-site" cookie=true`: the cookie **arrived**, but the handler did not run. From another site it is the same (a new server, `127.0.0.1:9090`):
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"A5ALNFEBTDWMJ4HK5OHQ6DE2UA"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+Now curl from the terminal. The first has no browser headers (`-X POST` selects the method), in the second we write the browser's headers by hand (`-H` adds a header):
+
+```console
+$ curl -s -X POST -b jar.txt localhost:8765/orders/41/cancel | mask
+{"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: same-site' -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"PQ6NJNCEWIUPZEO4MWFH2U6AD2"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: cross-site' -H 'Origin: http://localhost:3000' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"FEWF6V7VVNHDXV7TN3U7MS32RC"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"EJO3ZNELQYCCILIPSVKSAUCGSW"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:8765' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"PBFVLOUUFURXMUXZ3LUYOAGPGE"}
+```
+
+The first curl gave `200`: the order was cancelled. This is safe: we gave curl the cookie ourselves, and a foreign site cannot add a cookie to someone's curl. CSRF is dangerous exactly because the browser adds the cookie **by itself**. The second curl: with the browser's headers it also gets `403`.
+
+The output above has three more curl commands: you will not see them in the video, I added them to check the `Check` rules (they are not in the folder, the commands are complete on this page). The third has `Sec-Fetch-Site: cross-site` but `Origin: http://localhost:3000`, a trusted origin from `allowedOrigins`: `409` came, not `403` (the order was already cancelled above). So `CrossOriginProtection` let the check pass and the request reached the handler. The fourth has only `Origin: http://localhost:9090` and no `Sec-Fetch-Site` (rule 3): the host in `Origin` differs from `Host`, `403`. The fifth has `Origin: http://localhost:8765`, equal to `Host`, so it passes, `409` again. The reasons for the rejections are in the log:
+
+```console
+$ grep 'xato 40' server.log
+2026/11/28 14:25:21 PQ6NJNCEWIUPZEO4MWFH2U6AD2 xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:21 FEWF6V7VVNHDXV7TN3U7MS32RC xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+2026/11/28 14:25:21 EJO3ZNELQYCCILIPSVKSAUCGSW xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host"
+2026/11/28 14:25:21 PBFVLOUUFURXMUXZ3LUYOAGPGE xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+```
+
+Note: `409` is "Conflict", the order was already cancelled (`store.ErrAlreadyCancelled`); here its only meaning is: the request passed `CrossOriginProtection`.
+
+## CORS: the rule for reading a response
+
+**CORS** (cross-origin resource sharing) is the browser's **read** rule. A page from another origin can send a request to the server, but to read the response the server must name exactly that origin in the `Access-Control-Allow-Origin` header. If it does not, the browser does not give the response to the page. For a request with a cookie, `Access-Control-Allow-Credentials: true` is also needed. This rule does **not** protect the server: the request still runs. The experiment below shows it.
+
+`oqishPage` in `cmd/begona` is a page with a script:
+
+```html
+<pre id="natija">kutilmoqda…</pre>
+<script>
+fetch("http://localhost:8765/me", {credentials: "include"})
+  .then(r => r.text())
+  .then(t => { natija.textContent = "oʻqildi: " + t })
+  .catch(e => { natija.textContent = "oʻqib boʻlmadi: " + e })
+</script>
+```
+
+| Line | What it does |
+|---|---|
+| `<pre id="natija">kutilmoqda…</pre>` | the place where the result is written ("kutilmoqda" means "waiting") |
+| `fetch("http://localhost:8765/me", {credentials: "include"})` | requests bozor's `/me`; `credentials: "include"` sends the cookie too |
+| `.then(r => r.text())` | when the response arrives, takes its text |
+| `.then(t => { natija.textContent = "oʻqildi: " + t })` | writes the text on the page ("oʻqildi" means "read") |
+| `.catch(e => { … "oʻqib boʻlmadi: " + e })` | if reading is refused, writes the error ("oʻqib boʻlmadi" means "could not read") |
+
+The server is `final`, the foreign site is at `localhost:9090`. The browser program opens the page and waits for the result text:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqib boʻlmadi: TypeError: Failed to fetch
+```
+
+The page could not read the response: `fetch` ended with `TypeError: Failed to fetch`. The browser deliberately does not tell the script the reason (details are only in the browser console). But look at the server log:
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:22 YU6V7AC7JE45YS2SINT4X25D6E GET "/me" 200 40.408µs site="same-site" cookie=true
+```
+
+`GET "/me" 200`, `cookie=true`: the request **ran**. Because it is a `GET`, it also passed `CrossOriginProtection` (rule 1). CORS only did not give the response to the page. So CORS is not server protection: the CSRF check is what stops a state-changing request.
+
+### A common mistake: returning Origin as it is
+
+Developers want to allow everything, and instead of a list they return the request's own `Origin`, together with `Allow-Credentials: true`. This is the code from the `aks` copy:
+
+```go
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// XATO (video): roʻyxat oʻrniga soʻrovdagi Origin'ni oʻzini qaytarish — har qanday sahifa javobni oʻqiydi.
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+`r.Header.Get("Origin")` reads the request's `Origin`, `Set` writes it into the response: it tells every page "you are allowed". And `Allow-Credentials: true` allows reading responses with a cookie too. `Origin` is checked against nothing.
+
+**Predict.** With this code the foreign page's read path (`localhost:9090/oqish`) runs again. The result? **A)** the page reads Dilnoza's email · **B)** `TypeError: Failed to fetch` · **C)** `403`, `protectCSRF` stops it.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The server returns the page's own origin in `Allow-Origin` and says `Allow-Credentials: true`: the browser gives the response to the page. B was the result of the previous (correct) version. C: `protectCSRF` does not help here: it always lets `GET` pass.
+
+</details>
+
+The server from the `aks` copy:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqildi: {"id":1,"email":"[email]"}
+```
+
+The page read Dilnoza's data (the email is hidden by `mask`: in the real output it is there). With curl we write any `Origin`:
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: https://istalgan-sayt.example' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: https://istalgan-sayt.example
+Cache-Control: no-store
+Content-Type: application/json
+X-Request-Id: XMSGQRD5CIJJQNP4E75VWIAW7S
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+The server returned the same `Origin`. The result: **any** page on the same site can read Dilnoza's data this way; and if the cookie is `SameSite=None`, any site can.
+
+### The right way: an allow-list
+
+The list of allowed origins (the **allow-list**) is the same `allowedOrigins` that `protectCSRF` uses. This is the `cors` middleware (the final code):
+
+```go
+func cors(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		origin := r.Header.Get("Origin")
+		if !allowed[origin] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		// Preflight: brauzer haqiqiy soʻrovdan oldin OPTIONS bilan ruxsat soʻraydi (JSON body, PATCH, DELETE…).
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, PATCH, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600") // brauzer javobni 10 daqiqa eslab qoladi
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Code | What it does |
+|---|---|
+| `allowed := map[string]bool{}` and `for … allowed[o] = true` | turns the list into a `map` for fast checking |
+| `w.Header().Add("Vary", "Origin")` | tells the cache: "the response depends on `Origin`" (`Add` **adds** a value to a header, `Set` replaces it) |
+| `if !allowed[origin] { next.ServeHTTP(w, r); return }` | if the origin is not in the list, no CORS headers are **added**; the request runs as usual |
+| `Access-Control-Allow-Origin` = `origin` | if the origin is in the list, returns exactly that one |
+| `Access-Control-Allow-Credentials: true` | allows reading a response with a cookie |
+| `if r.Method == http.MethodOptions && …` | the preflight branch (below) |
+
+`/me` with an allowed origin (`localhost:3000`) and a disallowed one (`localhost:9090`):
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:3000' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: http://localhost:3000
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: YH3O7WIH5AQ6Q6LW2BG64WRDW6
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: B6W4MDQ3BEQVLDYSWTS76SGUDO
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+The allowed one has `Allow-Origin` with exactly that origin, `Allow-Credentials: true` and `Vary: Origin`. The disallowed one has only `Vary: Origin`: the response is `200`, the request ran, but the browser will not give it to the foreign page. `Vary: Origin` is needed so that a cache (the browser's or an intermediate server's) does not serve a response that fits one origin to another.
+
+### Preflight
+
+Before an unusual request (a JSON body, `PATCH`, `DELETE`, a custom header) the browser first sends an `OPTIONS` request and asks for permission: in `Access-Control-Request-Method` and `Access-Control-Request-Headers` it writes what it needs. This is the **preflight**. If the response does not give permission, the browser **does not send the real request at all**. A preflight with an allowed origin:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 204 No Content
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Allow-Methods: POST, PATCH, DELETE
+Access-Control-Allow-Origin: http://localhost:3000
+Access-Control-Max-Age: 600
+Vary: Origin
+X-Request-Id: CBSBM7HLJMTKV7ANIJRZFYZSPA
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+```
+
+`cors` itself answered `204 No Content` and listed the allowed methods and headers (`Max-Age: 600`: the browser remembers the answer for 10 minutes). With a foreign origin:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:9090' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 405 Method Not Allowed
+Allow: POST
+Content-Type: application/problem+json
+Vary: Origin
+X-Content-Type-Options: nosniff
+X-Request-Id: 462CYTNM7RMK7HCEVU5MWHYCUK
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 152
+
+{"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"462CYTNM7RMK7HCEVU5MWHYCUK"}
+```
+
+`cors` added nothing for this origin, the request passed `protectCSRF` (`OPTIONS` is a safe method: it passes) and reached the mux. There is no `OPTIONS` route for `/login`: `405 Method Not Allowed` and `Allow: POST`. The response has no `Access-Control-Allow-*`: the preflight failed, and the browser will not send the real `POST`.
+
+## Rate limit on login: token bucket
+
+Every login attempt computes argon2id: in GB-6.03 we saw that one attempt takes 46 MiB of memory and noticeable CPU time. In my run one `POST "/login"` log line showed `82.523656ms`. Without a limit, `POST /login` is open for password guessing and is a cheap way to load the server. Bozor before the lesson (`himoyasiz`): eight wrong logins in a row from one IP. The bash loop `for i in $(seq 8)` repeats the command eight times; in curl `-o /dev/null` discards the body, `-w "%{http_code} "` prints only the status code, and `echo` ends the line:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Eight `401`s: guessing is unlimited. The solution is a **token bucket**. For each key (now it is the IP) there is a bucket: it holds at most 5 tokens and starts full. Every attempt takes one token. One token returns to the bucket every 12 seconds. If there are no tokens, the answer is `429 Too Many Requests` and `Retry-After`: after how many seconds you may try again.
+
+| Attempt | In the bucket before | Result | In the bucket after |
+|---|---|---|---|
+| 1 | 5 | `401` (wrong password, but the attempt is allowed) | 4 |
+| 2 | 4 | `401` | 3 |
+| 3 | 3 | `401` | 2 |
+| 4 | 2 | `401` | 1 |
+| 5 | 1 | `401` | 0 |
+| 6, 7, 8 | 0 | `429`, `Retry-After` | 0 (no token is taken) |
+| after 12 seconds | 0 → 1 | the next attempt gives `401` | 0 |
+
+The code is in the `golang.org/x/time/rate` package: the Go team's token bucket (added with `go get golang.org/x/time/rate`, GB-2.06; `v0.16.0` in `go.mod`). The full `cmd/api/ratelimit.go`:
+
+```go filename="cmd/api/ratelimit.go" showLineNumbers
+package main
+
+// Login'ga rate limit (GB-6.07). Har login urinishi argon2id hisoblaydi (GB-6.03: 46 MiB xotira):
+// cheklovsiz POST /login — parol taxmin qilish uchun ochiq eshik va serverni band qilishning arzon yoʻli.
+//
+// golang.org/x/time/rate — Go jamoasining token bucket'i: chelakda eng koʻpi `burst` ta token,
+// har `every` vaqtda bittadan toʻladi; har soʻrov bitta token oladi; token yoʻq — 429 Too Many Requests
+// (RFC 6585 §4) va Retry-After: necha soniyadan keyin qayta urinish mumkin (RFC 9110 §10.2.3).
+
+import (
+	"math"
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// limiters — har kalit (IP yoki email) uchun alohida chelak. Map bir vaqtda koʻp soʻrovdan
+// ishlatiladi, shuning uchun mutex (GB-4.07). Kalitlar oʻchirilmaydi: uzoq ishlaydigan serverda
+// map oʻsib boradi — tozalash 🟡 ixtiyoriy vazifada (TASK.md, sweep).
+type limiters struct {
+	mu    sync.Mutex
+	m     map[string]*rate.Limiter
+	every rate.Limit
+	burst int
+}
+
+// newLimiters — har kalitga: boshida burst ta urinish, keyin har every'da bittadan.
+func newLimiters(every time.Duration, burst int) *limiters {
+	return &limiters{m: map[string]*rate.Limiter{}, every: rate.Every(every), burst: burst}
+}
+
+// get — kalitning chelagi; birinchi murojaatda yangisi (toʻla) yaratiladi.
+func (l *limiters) get(key string) *rate.Limiter {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.m[key]
+	if !ok {
+		lim = rate.NewLimiter(l.every, l.burst)
+		l.m[key] = lim
+	}
+	return lim
+}
+
+// wait — 0: urinish mumkin (token olindi). Aks holda — keyingi token qancha vaqtdan keyin.
+// Reserve navbat oladi, Delay — shu navbatgacha kutish; biz kutmaymiz: Cancel tokenni qaytaradi.
+func (l *limiters) wait(key string) time.Duration {
+	res := l.get(key).Reserve()
+	d := res.Delay()
+	if d > 0 {
+		res.Cancel()
+	}
+	return d
+}
+
+// limitByIP — middleware (GB-6.01 shakli): kalit — mijozning IP manzili. r.RemoteAddr — TCP ulanishning
+// manzili («IP:port»), uni mijoz soxtalashtira olmaydi. X-Forwarded-For sarlavhasiga ishonmaymiz: uni
+// har kim yozadi. Server proksi (Caddy, GB-8.06) ortida boʻlsa, RemoteAddr — proksining manzili: hamma mijoz bitta
+// chelakka tushadi. U holda IP'ni faqat ishonchli proksi yozgan sarlavhadan olish kerak (GB-8.06).
+// net/http serveri RemoteAddr'ni doim «IP:port» qiladi, shuning uchun SplitHostPort xatosi bu yerda kutilmaydi.
+// Eslatma: IPv6'da bitta foydalanuvchida odatda butun /64 tarmoq boʻladi — production'da kalitni /64 boʻyicha olish mumkin.
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tooManyRequests — 429 problem va Retry-After butun soniyalarda, yuqoriga yaxlitlangan.
+func tooManyRequests(w http.ResponseWriter, d time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
+	writeProblem(w, newProblem(http.StatusTooManyRequests, "urinishlar koʻp: keyinroq qayta urinib koʻring"))
+}
+```
+
+| Lines | What it does |
+|---|---|
+| 10–19 | the `import`s; `rate` is `golang.org/x/time/rate` |
+| 24–29 | `limiters`: `m` is key (IP or email) → one bucket (`*rate.Limiter`); `mu` is a mutex, because many requests use the `map` at the same time (GB-4.07); `every` is the interval between tokens (type `rate.Limit`), `burst` is the bucket size |
+| 32–34 | `newLimiters`: `rate.Every(every)` creates the rate "one token every `every`" |
+| 37–46 | `get`: the key's bucket; for a new key `rate.NewLimiter` creates a full bucket |
+| 50–57 | `wait`: `Reserve` takes a place in the queue (a token is taken), `Delay` is the wait time until that place (`time.Duration`). We will not wait: if `d > 0`, `Cancel` returns the token. The function returns `0` (allowed) or the wait time |
+| 65–74 | `limitByIP`: middleware (the shape from GB-6.01). `r.RemoteAddr` is the TCP connection's address, `"IP:port"`; `net.SplitHostPort` extracts the IP, the port and the error are thrown into `_`. If `wait(ip) > 0`: `429`, `return` |
+| 77–80 | `tooManyRequests`: writes `Retry-After` in whole seconds: `math.Ceil` rounds up (`11.9` → `12`), `strconv.Itoa` turns a whole number into text. The response is the problem JSON from GB-6.02 |
+
+Why is `Cancel` needed? `Reserve` takes a place in the queue even when tokens are short (it borrows a future token). So that a rejected attempt does not drain the bucket further, `Cancel` reverses its effect (the package documentation says "as much as possible"). Otherwise every rejected attempt would push the next permission later.
+
+`limitByIP` wraps `requireJSON` in the route, so it runs **before** argon2id:
+
+```go
+	mux.Handle("POST /login", a.loginIP.limitByIP(requireJSON(http.HandlerFunc(a.login))))
+```
+
+And `api.loginIP` is created in `newMux`: `newLimiters(12*time.Second, 5)` means five attempts, then one every 12 seconds (`handlers.go`, `loginIP: newLimiters(12*time.Second, 5)`).
+
+**Predict.** A new server (`final`), the same loop: eight wrong logins in a row from one IP. What is printed? **A)** eight times `401` · **B)** five times `401`, then three times `429` · **C)** one `401`, then seven `429`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The bucket starts with 5 tokens: five attempts pass (the password is wrong, so `401`), and the remaining three have no tokens. A is the result of bozor without the limit (above). C: the bucket does not start empty: a new key gets a full bucket.
+
+</details>
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+We look at the ninth attempt with `-i` (the headers are printed too):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | mask
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/problem+json
+Retry-After: 12
+Vary: Origin
+X-Request-Id: K7V3HIQQB55VIDP4I42XHAMIXC
+Date: Sat, 28 Nov 2026 09:24:26 GMT
+Content-Length: 166
+
+{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"urinishlar koʻp: keyinroq qayta urinib koʻring","request_id":"K7V3HIQQB55VIDP4I42XHAMIXC"}
+```
+
+`Retry-After: 12`, `Content-Type: application/problem+json`: the response shape from GB-6.02. Important: `12` is the **remaining** time, not a fixed number. Five seconds after the ninth attempt I sent one more request: the value went down (this is an extra experiment, not in the video):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | grep Retry-After
+Retry-After: 7
+```
+
+After eight more seconds a token returned to the bucket: the attempt is allowed again (wrong password, `401`):
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json
+401
+```
+
+The limit counts **all** attempts, including a login with the right password (another extra experiment; `login.json` has the right password): the sixth attempt gets `429`.
+
+```console
+$ for i in $(seq 6); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json; done; echo
+200 200 200 200 200 429
+```
+
+The key is the IP from `r.RemoteAddr`, that is, the address of the TCP connection: the client cannot forge it. We do not trust the `X-Forwarded-For` header: the client writes it itself. If the server is behind a proxy, `RemoteAddr` is the proxy's address and all clients fall into one bucket; we will solve getting the real IP in [GB-8.06](/lab/youtube/gb#gb-8-06).
+
+**At work tomorrow:** do not return `Origin` without checking it; on a state-changing request check where it came from; limit login both by IP and by account.
+
+## Going deeper (optional): the limits
+
+- **A request without headers passes (fail-open).** Because of rule 4 in `Check`, a request with neither `Sec-Fetch-Site` nor `Origin` passes, so that curl and mobile apps work. For sensitive endpoints OWASP recommends the opposite (fail-safe: no header means reject). Modern browsers have sent `Sec-Fetch-Site` since 2023 (OWASP), so for a browser this decision is not dangerous.
+- **The scheme is not compared when `Origin` and `Host` are compared.** Rule 3 cannot tell a cross-origin request from HTTP to HTTPS. The comment in the Go source names the answer: HTTPS and HSTS (GB-8.06).
+- **Fetch Metadata is sent only to trustworthy addresses:** `https`, `wss`, `file`, `localhost` and `127.0.0.0/8` (OWASP). In production HTTPS is required; on plain HTTP only the `Origin` check remains.
+- **A cookie without `SameSite`.** RFC 6265bis: if the attribute is missing or unknown, the default mode equals `Lax`. A browser (`MAY`) may also apply the `Lax-allowing-unsafe` mode to a recently created cookie: it sends it on a top-level `POST` from another site; the RFC suggests a cookie age of 2 minutes or less. So always write the attribute explicitly.
+- **A CSRF token** (synchronizer or signed double-submit) is the classic way. OWASP calls `Sec-Fetch-Site` the primary signal of a Fetch Metadata policy, and when the header is missing it advises an `Origin` check and, if needed, a token.
+- **XSS defeats every CSRF protection** (OWASP): a script that gets onto the page sends requests from the same origin. `HttpOnly` only stops stealing the token.
+- **The limits are in memory** and belong to one process. With several server instances you need a shared counter (for example Redis). Keys come from the client (IP, email), and a `map` that is never cleaned keeps growing: the homework's `sweep` cleans it.
+- **Limits of an IP key.** Many users behind one NAT share one bucket. In IPv6 one client usually has a whole `/64` network (in production the key can be taken by `/64`).
+- **DoS through lockout.** An email limit also lets an attacker lock Dilnoza out (OWASP, "Account Lockout"). That is why the email limit is softer than the IP limit: 10 attempts, then one per minute.
+
+## Common mistakes
+
+**1. "I set `SameSite=Lax`, so CSRF is closed."** We saw above: `Lax` stops a `POST` from **another site**, but not a neighbour port or a subdomain inside the same site. And with `None` the cookie goes from everywhere. The result: `200`, the order is cancelled (the table, three rows). The right way: keep `Lax` **and** use `protectCSRF` (`CrossOriginProtection`) on the server.
+
+**2. Treating CORS as server protection.** The real output: the foreign page got `TypeError: Failed to fetch`, but the log had `GET "/me" 200 … cookie=true`: the request ran. The error is visible in the browser, but the server worked. The right way: `protectCSRF` stops the state-changing request, and reading data is protected by authentication (`requireUser`) and the ownership check (GB-6.06).
+
+**3. Returning `Origin` without checking it.** The real output: the page read Dilnoza's data (`oʻqildi: {"id":1,…}`). The cause: `Allow-Origin` was taken from the request's `Origin` and `Allow-Credentials: true` was added. The right way: the `allowedOrigins` list, the `if !allowed[origin]` check in the `cors` code, `Vary: Origin` in every response. `Allow-Origin: *` cannot be used together with `Allow-Credentials`: the browser rejects such a response (OWASP).
+
+**4. `X-Forwarded-For` as the IP key.** This is not in the folder, it is my extra experiment: three lines were added to `limitByIP` (in the scratch copy; the code in the folder is unchanged).
+
+```go
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			ip = xff // XATO: sarlavhani mijoz yozadi
+		}
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+The attacker changes the header in every request (`-H "X-Forwarded-For: 203.0.113.$i"`):
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Eight times `401`: the limit did not work, every header value got a new full bucket. With the real code (the key is `RemoteAddr`) the same command hits the limit:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+## Check yourself
+
+**1.** Why did the page at `localhost:9090` get the `Lax` cookie, even though the cookie is `Lax`?
+
+<details>
+<summary>Answer</summary>
+
+A port does not change the site: `localhost:9090` and bozor (`localhost:8765`) are **one site**. `SameSite` limits only requests started from another site; inside one site the cookie goes with every request. That is why the server must check `Sec-Fetch-Site` and `Origin`: `Sec-Fetch-Site: same-site` is rejected in `CrossOriginProtection`.
+
+</details>
+
+**2.** Why is CORS not server protection?
+
+<details>
+<summary>Answer</summary>
+
+CORS controls only **reading** the response. The request reaches the server and runs: the log had `GET "/me" 200 … cookie=true`, and the page still got `Failed to fetch`. The state-changing request is stopped by `protectCSRF`.
+
+</details>
+
+**3. GB-6.04.** Why does an old copy of the cookie get `401` after logout?
+
+<details>
+<summary>Answer</summary>
+
+Logout deleted the session record on the server. On every request the server looks up the record by the hash of the token from the cookie and does not find it: `requireUser` returns `401`. The cookie itself (in the browser or in `jar.txt`) proves nothing.
+
+</details>
+
+**4. Predict.** On the `final` server Dilnoza logs in with the **right** password from one IP six times in a row. What are the statuses?
+
+<details>
+<summary>Answer</summary>
+
+`200 200 200 200 200 429`. The limit counts attempts, not whether the password is right: in the route `limitByIP` stands before `login`. For the sixth attempt there is no token. The output "The limit counts all attempts" above shows it.
+
+</details>
+
+**5. Predict.** `curl -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel` (without `Sec-Fetch-Site`): the result?
+
+<details>
+<summary>Answer</summary>
+
+`403`. `Sec-Fetch-Site` is missing, so rule 3 applies: the host in `Origin` (`localhost:9090`) differs from the `Host` header (`localhost:8765`), rejected. The reason in the log: `cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host`.
+
+</details>
+
+## Homework
+
+🟢 **A second limit per email.** The IP limit from the video limits one IP. If an attacker changes the IP (proxies, a botnet, IPv6), every new IP has a full bucket: guessing Dilnoza's password goes on without end. OWASP Authentication Cheat Sheet: tie the counter of attempts to the **account itself**, not to the source IP.
+
+The specification (from [TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/TASK.md) in the folder):
+
+- per one email: 10 attempts, then one per minute (`newLimiters(time.Minute, 10)`);
+- the email is case-insensitive: `Dilnoza@…` and `DILNOZA@…` are one bucket;
+- the 11th attempt (each time from a different IP) → `429` and `Retry-After`; another email gets a plain `401`;
+- the check is **before** argon2id: an attempt over the limit must not load the server.
+
+What to do: add a field `loginEmail *limiters` to the `api` struct in `cmd/api/handlers.go` and create it in `newMux` with `newLimiters(time.Minute, 10)`; in `login` in `cmd/api/auth.go`, after `decodeJSON` and before `checkPassword`, lowercase the email with `strings.ToLower`, call `a.loginEmail.wait(…)`, and if the result is greater than `0`, do `tooManyRequests(w, d)` and `return`. The shape is the same as `limitByIP`, the key is different. Do not change the `*_test.go` files. In the root of the folder (no copy is needed here, work in the folder itself):
+
+```console
+$ go test ./... 2>&1 | mask
+--- FAIL: TestLoginEmailLimit (0.68s)
+    tekshiruv_test.go:26: 11-urinish ([email], yangi IP 10.0.0.11): status 401, kutilgan 429 (TASK.md: email boʻyicha limit — 10 ta urinish, harf kattaligi farq qilmaydi)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	1.629s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.470s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+FAIL
+```
+
+`--- FAIL: TestLoginEmailLimit` is the failed test; the message says what was expected: `429` on the 11th attempt, now `401`. `[email]` is the lab user's email, hidden by `mask`. The test sends every attempt from a different IP: the IP limit does not work, only your limit does. The line starting with `FAIL` is the package, `ok` marks packages that passed, `[no test files]` is a package without tests.
+
+🟡 **Optional: `sweep`.** In `cmd/api/ratelimit.go` add `func (l *limiters) sweep(now time.Time) int`: it removes from the `map` keys whose bucket is **full** (not tried for a long time) and returns how many it removed. Hint: `lim.TokensAt(now) >= float64(l.burst)`. The checker `TestSweep` gives `SKIP` until `sweep` is written:
+
+```console
+$ go test -v -run "Sweep" ./cmd/api
+=== RUN   TestSweep
+    tekshiruv_test.go:43: 🟡 ixtiyoriy: (*limiters).sweep(now time.Time) int hali yozilmagan (TASK.md, 3-qadam)
+--- SKIP: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.095s
+```
+
+The solution is [in the solution/ folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/solution).
+
+<details>
+<summary>Answer: explanation</summary>
+
+The field and its creation in `handlers.go`:
+
+```go
+type api struct {
+	st         *store.Store
+	loginIP    *limiters // GB-6.07: bitta IP'dan login urinishlari
+	loginEmail *limiters // vazifa: bitta email'ga login urinishlari (IP'lar almashsa ham)
+}
+
+// newMux — hamma route'lar shu yerda: main ham, testlar ham bir xil mux'ni ishlatadi.
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{
+		st:         st,
+		loginIP:    newLimiters(12*time.Second, 5), // 5 ta urinish, keyin har 12 soniyada bittadan
+		loginEmail: newLimiters(time.Minute, 10),   // 10 ta urinish, keyin har daqiqada bittadan
+	}
+```
+
+In `login` in `auth.go`, after `decodeJSON` and before `checkPassword` (the import `"strings"` is added):
+
+```go
+	// Vazifa: email boʻyicha limit — argon2id'dan oldin, harf kattaligisiz (users_email_lower_idx, GB-6.04).
+	// OWASP Authentication Cheat Sheet: hujumchi IP'larni almashtirsa ham, bitta hisobga urinishlar cheklansin.
+	if d := a.loginEmail.wait(strings.ToLower(in.Email)); d > 0 {
+		tooManyRequests(w, d)
+		return
+	}
+```
+
+The key is the email lowercased: `Dilnoza@…` and `DILNOZA@…` fall into one bucket. The check is before `checkPassword`: argon2id is not computed. In the route the IP limit stands before the email limit: first the IP, then the email.
+
+`sweep` (🟡):
+
+```go
+func (l *limiters) sweep(now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for key, lim := range l.m {
+		if lim.TokensAt(now) >= float64(l.burst) {
+			delete(l.m, key) // range ichida delete mumkin (Go spec: For statements with range clause)
+			n++
+		}
+	}
+	return n
+}
+```
+
+`sweep` takes `mu` (other requests use the map at the same time), and if `TokensAt(now)` shows a key's bucket is full, it removes the key with `delete` (`delete` inside `range` is allowed). Removing a full bucket is safe: a new bucket is created full anyway. On a server it must be called periodically (a goroutine with a `time.Ticker`, GB-7.01).
+
+The tests of the solution folder:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.153s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.291s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+```
+
+To see that both tests passed, use `-v`:
+
+```console
+$ cd solution && go test -v -run "LoginEmailLimit|Sweep" ./cmd/api
+=== RUN   TestLoginEmailLimit
+--- PASS: TestLoginEmailLimit (0.64s)
+=== RUN   TestSweep
+--- PASS: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.730s
+```
+
+Format and static analysis print nothing (in the root of the folder):
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+</details>
+
+After the experiments stop the servers with `Ctrl+C` and delete the copies: `rm -rf /tmp/gb-6-07`.
+
+## Sources
+
+- [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) · [SameSite](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#samesite-cookie-attribute) · [Origin verification](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#verifying-origin-with-standard-headers)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#login-throttling): login throttling and account lockout
+- Go: [net/http · CrossOriginProtection](https://pkg.go.dev/net/http#CrossOriginProtection) · [Go 1.25 release notes](https://go.dev/doc/go1.25#nethttppkgnethttp) · [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) · [Request.RemoteAddr](https://pkg.go.dev/net/http#Request)
+- [RFC 6265bis · cookies](https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis) (draft-22): the `__Host-` prefix, `Max-Age`, `SameSite`
+- MDN: [Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie) · [Site](https://developer.mozilla.org/en-US/docs/Glossary/Site) · [Sec-Fetch-Site](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site) · [Document.cookie](https://developer.mozilla.org/en-US/docs/Web/API/Document/cookie) · [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS) · [CSRF](https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF)
+- [HTML Standard · same site](https://html.spec.whatwg.org/multipage/browsers.html#same-site) · [Fetch Standard · CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol) · [CORS-preflight request](https://fetch.spec.whatwg.org/#cors-preflight-request)
+- [RFC 6585 §4 · 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585#section-4) · [RFC 9110 §10.2.3 · Retry-After](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)
+- [PortSwigger Web Security Academy · CORS](https://portswigger.net/web-security/cors) · [chromedp](https://github.com/chromedp/chromedp) (only for the browser program)
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, jq 1.8.2, Google Chrome 155.0.8059.39 (headless, through chromedp), 2026-11-28. All outputs were re-run on this machine; in content they match the outputs in the video, and differ only in request IDs, tokens, dates and times (in the video, for example, `164.447µs`, `53.587µs`). The extra experiments (the `Check` rules, the falling `Retry-After`, logins with the right password, `X-Forwarded-For`) are not in the folder: I ran them myself, and their commands are complete on this page. Next lesson: [GB-6.08 · Checkpoint: the protected bozor](/lab/youtube/gb#gb-6-08).
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+---
+
+← Previous lesson: [GB-6.06](/lab/youtube/gb/gb-6-06/en) · Next lesson: [GB-6.08](/lab/youtube/gb#gb-6-08) → · [All lessons](/lab/youtube/gb)
+
+</div>

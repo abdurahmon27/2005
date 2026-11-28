@@ -1,0 +1,907 @@
+---
+title: "Сессия или JWT: честное сравнение"
+date: "2026/11/28"
+description: "Вы соберёте JWT вручную, проверите его через golang-jwt по четырём правилам и сравните с сессией после logout, чтобы обосновать выбор для bozor."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-05"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-05) · **Русский** · [English](/lab/youtube/gb/gb-6-05/en)  
+Урок GB-6.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-05) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+В GB-6.04 bozor («рынок», проект курса) при каждом защищённом запросе ищет запись сессии. Распространённая альтернатива — JWT: токен, который проверяется без обращения к базе. Какой путь верный? Сегодня мы проверим оба на одних и тех же запросах.
+
+**Главная идея:** JWT — три части через точку, `header.payload.подпись`. Подпись — это HMAC-SHA256 с ключом от первых двух частей. Сервер пересчитывает её при проверке, поэтому ничего не хранит. Именно поэтому при logout нечего удалять: украденный JWT работает до срока `exp`, а сессия умирает, как только запись удалена. Отзыв JWT (denylist или refresh-токен) снова возвращает состояние на сервер.
+
+К концу урока вы:
+
+- соберёте JWT без библиотеки и прочитаете payload без ключа;
+- проверите токен через `golang-jwt/jwt/v5` по четырём правилам и увидите, что пропускает `Parse` без правил;
+- увидите на своём экране: после logout старый cookie даёт `401`, а тот же JWT — `200`;
+- назовёте цену отзыва, обоснуете выбор для bozor и напишете denylist по `jti`, пока не пройдёт `go test`.
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| JWT | три части через точку: header, payload, подпись | JSON Web Token |
+| подпись | результат HMAC с ключом от первых двух частей | signature |
+| отзыв токена | пометка на сервере, чтобы токен отклонялся до истечения срока | token revocation |
+
+Два вспомогательных термина: **base64url** — превращение байтов в текст из букв, цифр, `-` и `_`; **HMAC** — хеш с ключом, без ключа его не вычислить. Оба видны ниже в коде. **Claim** — поле в payload: оно говорит, о ком и о чём токен.
+
+## Что нужно знать заранее
+
+Опорный урок по плану: [GB-6.04 · login и сессии](/lab/youtube/gb/gb-6-04/ru). Также понадобятся: [GB-6.03 · argon2id](/lab/youtube/gb/gb-6-03/ru), [GB-6.02 · единые ошибки API](/lab/youtube/gb/gb-6-02/ru), [GB-6.01 · middleware](/lab/youtube/gb/gb-6-01/ru), [GB-5.05 · time и pgx](/lab/youtube/gb/gb-5-05/ru), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08/ru), [GB-4.07 · mutex](/lab/youtube/gb/gb-4-07/ru), [GB-4.01 · HTTP как текст](/lab/youtube/gb/gb-4-01/ru), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/ru), [GB-2.09 · функциональный литерал](/lab/youtube/gb/gb-2-09/ru), [GB-2.08 · `%w`](/lab/youtube/gb/gb-2-08/ru), [GB-2.07 · `[]byte` и `any`](/lab/youtube/gb/gb-2-07/ru), [GB-2.06 · `go get`](/lab/youtube/gb/gb-2-06/ru), [GB-2.04 · `&T{}`](/lab/youtube/gb/gb-2-04/ru), [GB-2.02 · map и comma-ok](/lab/youtube/gb/gb-2-02/ru), [GB-1.08 · `go test`](/lab/youtube/gb/gb-1-08/ru), [GB-1.04 · `Sprintf`](/lab/youtube/gb/gb-1-04/ru).
+
+**Как запускать.** Работайте внутри [папки урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt). Go Playground не подойдёт: нужны сервер, `curl`, `jq` и `basenc` (GNU coreutils). Docker и Postgres не нужны: хранилище в памяти. Порт `8765` должен быть свободен. `CGO_ENABLED=0` собирает без компилятора C; `GOTOOLCHAIN` выбирает версию из записи:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+Результаты получены повторным запуском на этой машине. Значения токенов каждый раз другие: ключ при каждом запуске новый. Поэтому у вас `header` совпадёт, а `payload` и подпись будут другими.
+
+**Вспомните:** в GB-6.04 после login файл cookie скопировали в `eski.txt` («старый»), затем сделали logout. Что вернёт `/me` со старой копией? **A)** `200` · **B)** `401` · **C)** `500`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Logout удалил запись сессии. Cookie в копии остался, но строки на сервере нет: уже следующий запрос даёт `401`. Сегодня сравним это свойство с JWT.
+
+</details>
+
+## Лаборатория: два способа на одном сервере
+
+Папка урока начинается с итогового состояния GB-6.04. Отличия: хранилище в памяти вместо Postgres (`map` и mutex), добавлен пакет `internal/token` и две маленькие программы.
+
+| Место | Назначение |
+|---|---|
+| `internal/token/qolda.go` | сборка JWT без библиотеки (`SignHS256`) |
+| `internal/token/token.go` | выпуск (`Issue`) и проверка (`Parse`) через `golang-jwt/jwt/v5` |
+| `cmd/qolda` («вручную») | печатает три части токена, собранного вручную |
+| `cmd/tekshir` («проверка») | пропускает токен и его испорченные копии через `Parse` |
+| `cmd/api/auth.go` | login, `authenticate`, logout |
+| `internal/store` | пользователи, сессии и (задание) denylist в памяти |
+
+Хранилище в памяти потому, что урок о разнице двух подходов, а не о самой базе. Правило сессии как в GB-6.04: запись удалена — токен мёртв. После перезапуска сервера пропадают и сессии в памяти, и ключ JWT: старые cookie и старые JWT перестают работать.
+
+Для сравнения `POST /login` выдаёт оба: токен сессии в cookie, JWT в теле ответа (поле `token`). `GET /me` принимает оба. В работе выбирают один; выбор — в последних разделах.
+
+## Что внутри JWT
+
+**JWT** (JSON Web Token, [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519)) — три части через точку. Каждая часть — текст base64url.
+
+```text
+header . payload . подпись
+```
+
+| Часть | Что внутри | Для чего |
+|---|---|---|
+| header | `{"alg":"HS256","typ":"JWT"}` | `alg` — алгоритм подписи (`HS256` — HMAC и SHA-256), `typ` — тип токена |
+| payload | claim'ы | о ком и о чём токен |
+| подпись | результат HMAC | связывает первые две части с ключом |
+
+В payload этого урока четыре claim:
+
+| Claim | По-английски | Смысл | В bozor |
+|---|---|---|---|
+| `sub` | subject | о ком токен | ID пользователя: `1` |
+| `iss` | issuer | кто выдал | `bozor` |
+| `aud` | audience | для кого | `bozor-api` |
+| `exp` | expiration time | с этого момента токен не принимается | сейчас + 15 минут |
+
+`exp` записывается в Unix-времени: число секунд, прошедших с 1970-01-01 00:00:00 UTC ([RFC 7519 §2, NumericDate](https://www.rfc-editor.org/rfc/rfc7519#section-2)). Библиотека добавит ещё два claim: `iat` (issued at, время выдачи) и `jti` (JWT ID, уникальный ID токена).
+
+RFC 7519 описывает JWT в двух видах: подписанный (JWS, три части) и зашифрованный (JWE, [пять частей](https://www.rfc-editor.org/rfc/rfc7516#section-3.1)). Этот урок только о подписанном JWT; bozor выдаёт именно его.
+
+## Собираем JWT вручную
+
+Сначала соберём без библиотеки: пусть будет виден каждый байт. `cmd/qolda/main.go` собирает токен и печатает три части отдельными строками.
+
+```go filename="cmd/qolda/main.go" showLineNumbers
+// qolda — HS256 imzoli JWT'ni kutubxonasiz yasaydi va uch qismini alohida qatorda chiqaradi (GB-6.05).
+// Token: header.payload.imzo — uchala qism nuqta bilan ulanadi. Kalit har ishga tushishda yangi.
+//
+//	go run ./cmd/qolda
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/token"
+)
+
+func main() {
+	key := token.NewKey()
+	exp := time.Now().Add(15 * time.Minute).Unix() // Unix vaqt: 1970-01-01 UTC'dan beri soniyalar (RFC 7519 §2: NumericDate)
+	header := `{"alg":"HS256","typ":"JWT"}`
+	payload := fmt.Sprintf(`{"sub":"1","iss":"bozor","aud":"bozor-api","exp":%d}`, exp)
+	t := token.SignHS256(header, payload, key)
+
+	parts := strings.Split(t, ".")
+	fmt.Println("header: ", parts[0])
+	fmt.Println("payload:", parts[1])
+	fmt.Println("imzo:   ", parts[2])
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1–4 | комментарии `//` | говорят, что делает программа и как её запускать; компилятор их не читает |
+| 5–13 | `package main`, `import` | это запускаемая программа; нужные пакеты: `fmt`, `strings`, `time` и наш `internal/token` |
+| 16 | `key := token.NewKey()` | `NewKey` из `internal/token` возвращает 32 случайных байта. Кто знает ключ, тот может выпускать токены, поэтому ключ — секрет. Для HS256 ключ не короче 32 байт ([RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518#section-3.2)) |
+| 17 | `exp := time.Now().Add(15 * time.Minute).Unix()` | `Now()` — текущий момент, `Add` прибавляет 15 минут, `Unix()` переводит момент в секунды Unix-времени |
+| 18 | ``header := `\{"alg":"HS256","typ":"JWT"\}` `` | текст в обратных кавычках — готовый JSON (GB-3.02); кавычки внутри не нужно экранировать через `\` |
+| 19 | `payload := fmt.Sprintf(…, exp)` | `Sprintf` подставляет число `exp` вместо `%d` и собирает текст (GB-1.04) |
+| 20 | `t := token.SignHS256(header, payload, key)` | собирает токен из этих трёх значений |
+| 22 | `parts := strings.Split(t, ".")` | делит токен по точкам на три текста: `parts[0]`, `parts[1]`, `parts[2]` |
+| 23–25 | `fmt.Println(…)` | печатает каждую часть отдельной строкой |
+
+Теперь внутрь `SignHS256`. Она в файле `internal/token/qolda.go`. Сначала вспомогательная `b64`: превращает байты в текст base64url.
+
+```go filename="internal/token/qolda.go" showLineNumbers
+// Package token — bozor'ning JWT'lari (GB-6.05).
+//
+// qolda.go: HS256 imzoli JWT'ni kutubxonasiz, qoʻlda yasash — har bayti koʻrinsin deb (RFC 7519, RFC 7515).
+// token.go: ishdagi yoʻl — golang-jwt/jwt/v5 bilan yasash va qatʼiy tekshirish (RFC 8725).
+package token
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+)
+
+// b64 — base64url, "="siz (RFC 7515 §2: Base64url Encoding, padding yoʻq).
+// Alifbo: A–Z a–z 0–9 - _ ; oddiy base64'dagi + va / oʻrniga - va _, shuning uchun URL va sarlavhada xavfsiz.
+func b64(b []byte) string {
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// SignHS256 — JWT'ni qoʻlda yasaydi: base64url(header) . base64url(payload) . base64url(imzo).
+// Imzo — nuqtagacha boʻlgan matnning HMAC-SHA256'i, kalit bilan (RFC 7518 §3.2).
+// header va payload — tayyor JSON matnlar; ular shifrlanmaydi, faqat imzolanadi.
+func SignHS256(header, payload string, key []byte) string {
+	input := b64([]byte(header)) + "." + b64([]byte(payload))
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(input))
+	return input + "." + b64(mac.Sum(nil))
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 5 | `package token` | папка `internal/token` — пакет с этим именем (GB-2.06) |
+| 7–11 | `import` | `crypto/hmac` и `crypto/sha256` — для подписи; `encoding/base64` — для текста |
+| 15–17 | `func b64(b []byte) string` | принимает байты, возвращает текст. `RawURLEncoding` — алфавит для URL (`A–Z a–z 0–9 - _`), без `=` в конце; поэтому токен не портится ни в URL, ни в заголовке. `EncodeToString` возвращает результат как `string` |
+| 22 | `func SignHS256(header, payload string, key []byte) string` | на входе два текста и байты ключа, на выходе текст токена |
+| 23 | `input := b64([]byte(header)) + "." + b64([]byte(payload))` | `[]byte(…)` превращает текст в байты (GB-2.07); `b64` кодирует; `+` соединяет через точку. Это подписываемый текст |
+| 24 | `mac := hmac.New(sha256.New, key)` | счётчик хеша с ключом. `sha256.New` без скобок: передаётся сама функция, `hmac` вызовет её, когда понадобится |
+| 25 | `mac.Write([]byte(input))` | передаёт подписываемый текст счётчику |
+| 26 | `return input + "." + b64(mac.Sum(nil))` | `Sum(nil)` возвращает результат — 32 байта — в новом слайсе. `b64` делает из него текст: это третья часть |
+
+Токен считается так:
+
+| Шаг | Что | Значение |
+|---|---|---|
+| 1 | `b64(header)` | `eyJhbGci…` |
+| 2 | `b64(payload)` | base64url-вид JSON-текста payload |
+| 3 | `input` | 1 + `.` + 2 |
+| 4 | `HMAC-SHA256(ключ, input)` | 32 байта |
+| 5 | `b64(32 байта)` | 43 символа: это подпись |
+| 6 | токен | `input` + `.` + подпись |
+
+Запускаем:
+
+```console
+$ go run ./cmd/qolda
+header:  eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+payload: eyJzdWIiOiIxIiwiaXNzIjoiYm96b3IiLCJhdWQiOiJib3pvci1hcGkiLCJleHAiOjE3OTU4NTg0OTh9
+imzo:    C1q-jEJddLMip5WA-QKKdF8byGpmxhY4SR4JpBQ51TY
+```
+
+Три строки: на экране `header`, `payload` и `imzo` (подпись) отдельно, а в токене они соединены точками. Подпись — 43 символа: base64url от 32 байтов. У вас `payload` и подпись будут другими: другие `exp` и ключ.
+
+Обычно JWT начинается с `eyJ`. Причина: JSON-текст header начинается с `{"alg"…`. Его base64url-вид — `eyJhbGci…`. `eyJ` — это `{"` и начало следующей буквы. Если после `{` поставить пробел, начало будет другим. Это видно через `basenc` — команду GNU coreutils; с `--base64url` она кодирует. `printf` печатает текст без перевода строки:
+
+```console
+$ printf '{"alg"' | basenc --base64url
+eyJhbGci
+$ printf '{ "alg"' | basenc --base64url
+eyAiYWxnIg==
+```
+
+`basenc` добавил в конец заполнитель `=` (`==`). JWT его отбрасывает: именно это делает `RawURLEncoding`. `basenc` не печатает перевод строки, поэтому следующее приглашение в терминале может начаться на той же строке.
+
+## Payload не зашифрован
+
+Может ли человек, не знающий ключа, прочитать строку payload? **A)** нет: она зашифрована · **B)** да: это всего лишь base64url · **C)** только если есть и подпись.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Кодирование base64url — не шифрование: без ключа оно обращается. Если вы выбрали **A**, вы спутали кодирование с шифрованием. В варианте **C** подпись payload не скрывает; она лишь помогает проверить, что он не менялся.
+
+</details>
+
+`echo` печатает строку, `|` передаёт её следующей команде, а `basenc --base64url -d` с флагом `-d` раскодирует (decode):
+
+```console
+$ echo eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 | basenc --base64url -d
+{"alg":"HS256","typ":"JWT"}
+$ echo eyJzdWIiOiIxIiwiaXNzIjoiYm96b3IiLCJhdWQiOiJib3pvci1hcGkiLCJleHAiOjE3OTU4NTg0OTh9 | basenc --base64url -d
+{"sub":"1","iss":"bozor","aud":"bozor-api","exp":1795858498}
+```
+
+Ключ не понадобился: claim'ы — открытый текст. Поэтому в JWT не кладут секреты — пароли и личные данные. Подпись гарантирует только одно: текст написал тот, кто знает ключ, и он не менялся. OWASP: подпись HS256 доказывает лишь, что токен создал кто-то из знающих общий секрет ([OWASP JWT Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)).
+
+## Сервер пересчитывает подпись
+
+При проверке сервер повторяет вычисление из `SignHS256`:
+
+```text
+токен  =  header . payload . подпись
+          \_______  _______/    |
+                  \/            |
+     HMAC-SHA256(ключ сервера)   |
+                  |              |
+         вычисленная подпись  ==  подпись из токена ?
+                  |
+     да   → доверяем payload, в базу не ходим
+     нет  → токен отклоняется
+```
+
+Изменится одна буква — HMAC станет совсем другим. Сервер ничего не ищет: достаточно самого токена и ключа на сервере. Библиотека сравнивает через `hmac.Equal`, за постоянное время ([исходный код golang-jwt/jwt v5.3.1](https://github.com/golang-jwt/jwt/blob/v5.3.1/hmac.go)).
+
+## Библиотека и четыре правила
+
+В работе проверку вручную не пишут. [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725) — лучшие практики по JWT — перечисляет типичные ошибки: доверять `alg` из header, не проверять `iss` и `aud`. Мы берём [golang-jwt/jwt](https://github.com/golang-jwt/jwt/releases), пятую версию: она активно поддерживается. `go get` как в GB-2.06, версия указана точно:
+
+```console
+$ go get github.com/golang-jwt/jwt/v5@v5.3.1
+go: added github.com/golang-jwt/jwt/v5 v5.3.1
+```
+
+Этот вывод получен в новом пустом модуле. В папке урока строка уже есть, поэтому повторный `go get` ничего не печатает. Строка в `go.mod`:
+
+```console
+$ grep jwt go.mod
+	github.com/golang-jwt/jwt/v5 v5.3.1
+```
+
+Проверка — в функции `Parse` из `internal/token/token.go`:
+
+```go
+func Parse(s string, key []byte) (Claims, error) {
+	rc := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(s, rc, func(*jwt.Token) (any, error) {
+		return key, nil
+	},
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithIssuer(Issuer),
+		jwt.WithAudience(Audience),
+		jwt.WithExpirationRequired(),
+	)
+	if err != nil {
+		return Claims{}, err
+	}
+	id, err := strconv.ParseInt(rc.Subject, 10, 64)
+	if err != nil {
+		return Claims{}, fmt.Errorf("token: sub son emas: %w", err)
+	}
+	c := Claims{UserID: id, JTI: rc.ID}
+	if rc.ExpiresAt != nil { // WithExpirationRequired bilan doim bor; nil'ga baribir tayanmaymiz
+		c.Expires = rc.ExpiresAt.Time
+	}
+	return c, nil
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | `Parse` принимает текст токена `s` и ключ; возвращает `Claims` и `error` |
+| 2 | `jwt.RegisteredClaims` — структура библиотеки: у неё есть поля для стандартных claim'ов (`sub`, `iss`, `aud`, `exp`…). `&…{}` даёт её адрес (GB-2.04) |
+| 3–5 | `jwt.ParseWithClaims` делит токен на части, читает payload в `rc` и проверяет подпись. Третий аргумент — анонимная функция: библиотека просит у неё ключ, и мы отдаём тот самый `key` (GB-2.09). Её параметр `*jwt.Token` не нужен, поэтому он без имени. `any` — любой тип (GB-2.07) |
+| 6–9 | четыре правила: каждое — option, имя начинается с `With`. Таблица ниже |
+| 11–13 | если проверка вернула ошибку, возвращаются пустой `Claims{}` и ошибка |
+| 14–17 | `strconv.ParseInt(rc.Subject, 10, 64)` превращает текст `sub` в число `int64`; если это не число — ошибка (с обёрткой `%w`, GB-2.08) |
+| 18–22 | наш `Claims`: `UserID` (`sub`), `JTI`, `Expires` (`exp`, если он есть) и `return c, nil` |
+
+`Claims` — наша структура, в начале `token.go`:
+
+```go
+type Claims struct {
+	UserID  int64     // sub
+	JTI     string    // jti: shu tokenning noyob ID'si (RFC 7519 §4.1.7) — denylist kaliti
+	Expires time.Time // exp
+}
+```
+
+Четыре правила:
+
+| Option | Что отклоняет | Зачем |
+|---|---|---|
+| `WithValidMethods([]string{"HS256"})` | другой `alg` в header: `none`, `HS512`… | алгоритм выбирает сервер, а не токен ([RFC 8725 §3.1](https://www.rfc-editor.org/rfc/rfc8725#section-3.1)) |
+| `WithIssuer(Issuer)` | `iss` не равен `bozor` | проверка выдавшего ([§3.8](https://www.rfc-editor.org/rfc/rfc8725#section-3.8)); `Issuer` — константа пакета |
+| `WithAudience(Audience)` | в `aud` нет `bozor-api` | токен, выданный для другого сервиса, не должен подходить этому API ([§3.9](https://www.rfc-editor.org/rfc/rfc8725#section-3.9)) |
+| `WithExpirationRequired()` | нет `exp` | токен без `exp` не умирает никогда; в библиотеке `exp` по умолчанию необязателен |
+
+Если `exp` есть, библиотека проверяет его всегда: по [RFC 7519 §4.1.4](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.4) после этого момента токен не принимается. **Требовать** `exp` — наше правило.
+
+`cmd/tekshir` пропускает собранный вручную токен через `Parse`, затем пробует семь случаев. Список случаев:
+
+```go
+	cases := []struct{ name, tok string }{
+		{"qoʻlda yasalgan", good},
+		// payload'da sub 1 → 2, imzo eski: header va imzo oʻsha, faqat oʻrtadagi qism yangi.
+		{"sub 1 → 2, imzo eski", parts[0] + "." + b64([]byte(claims("2", "bozor-api", exp))) + "." + parts[2]},
+		// alg "none": imzo boʻsh (RFC 7519 §6: unsecured JWT).
+		{"alg none, imzo yoʻq", b64([]byte(`{"alg":"none","typ":"JWT"}`)) + "." + parts[1] + "."},
+		{"exp yoʻq", token.SignHS256(hs256, claims("1", "bozor-api", 0), key)},
+		{"aud boshqa xizmat", token.SignHS256(hs256, claims("1", "hisobot-api", exp), key)},
+		{"muddati oʻtgan", token.SignHS256(hs256, claims("1", "bozor-api", time.Now().Add(-time.Minute).Unix()), key)},
+		// alg HS512, imzo shu kalit bilan TOʻGʻRI hisoblangan: algoritmni token emas, server tanlaydi.
+		{"alg HS512, imzo toʻgʻri", signHS512(claims("1", "bozor-api", exp), key)},
+	}
+```
+
+Каждый случай — имя и текст токена. Первый — целый токен. Второй — копия: `parts[0]` и `parts[2]` (header и подпись) старые, средний payload новый: вместо `sub` один — два. У токена `alg none` подпись пустая ([RFC 7519 §6](https://www.rfc-editor.org/rfc/rfc7519#section-6): JWT без подписи). Последний подписан `HS512`, подпись посчитана тем же ключом верно.
+
+Два вопроса, потом запуск.
+
+**Предсказание 1:** в копии `sub` вместо 1 стоит 2, header и подпись старые. `Parse`? **A)** `ok, sub=2` · **B)** отказ: подпись неверна · **C)** отказ: payload не открывается.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Сервер считает HMAC от изменённого payload — результат не совпадает со старой подписью. Выбрав **A**, вы решили, что подпись не проверяется. В **C** открытие payload не зависит от ключа: это был открытый текст.
+
+</details>
+
+**Предсказание 2:** `alg` — `HS512`, подпись посчитана тем же ключом верно. `Parse`? **A)** ok: подпись верна · **B)** отказ: этот алгоритм не разрешён · **C)** отказ: ключ короткий.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `WithValidMethods` разрешает только `HS256`. Даже при верной подписи алгоритм выбирает сервер, а не токен. **C** неверно: ключ — 32 байта, для `HS512` он тоже принимается.
+
+</details>
+
+```console
+$ go run ./cmd/tekshir
+qoʻlda yasalgan:         ok, sub=1
+sub 1 → 2, imzo eski:    token signature is invalid: signature is invalid
+alg none, imzo yoʻq:     token signature is invalid: signing method none is invalid
+exp yoʻq:                token has invalid claims: token is missing required claim: exp claim is required
+aud boshqa xizmat:       token has invalid claims: token has invalid audience
+muddati oʻtgan:          token has invalid claims: token is expired
+alg HS512, imzo toʻgʻri: token signature is invalid: signing method HS512 is invalid
+```
+
+Прочитайте результат. Ошибка библиотеки состоит из двух слоёв: сначала вид ошибки, после двоеточия причина (обёртка через `%w`, GB-2.08).
+
+| Случай | Результат | Кто отклонил |
+|---|---|---|
+| собран вручную | `ok, sub=1` | формат тот же, подпись верна |
+| `sub` 1 → 2, подпись старая | `signature is invalid` | HMAC не совпал |
+| `alg none` | `signing method none is invalid` | `WithValidMethods` |
+| нет `exp` | `missing required claim: exp claim is required` | `WithExpirationRequired` |
+| `aud` другого сервиса | `token has invalid audience` | `WithAudience` |
+| срок истёк | `token is expired` | проверка `exp` |
+| `alg HS512`, подпись верна | `signing method HS512 is invalid` | `WithValidMethods` |
+
+В этой таблице нет `iss`. Его проверяет `TestParseRadEtadi` в `internal/token/token_test.go`: он пробует другой `iss`, другой ключ, `HS384`, нечисловой `sub` и другие случаи.
+
+## Классическая ошибка: Parse без правил
+
+Самая распространённая ошибка: вызвать `Parse` без четырёх option. Для опыта временно уберём четыре строки option. Я проверил на готовой копии из папки урока: `_video/stages/token-qoidasiz.go` — вариант `internal/token/token.go` без правил. В своей копии закомментируйте строки option, попробуйте, затем верните:
+
+```go
+	rc := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(s, rc, func(*jwt.Token) (any, error) {
+		return key, nil
+	})
+```
+
+**Предсказание:** какие токены пройдут через `Parse` без правил? **A)** никакие: подпись обязательна · **B)** без `exp`, с другим `aud`, `HS512` · **C)** только `alg none`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Подпись всё равно проверяется, поэтому **A** верно лишь отчасти: токен с испорченной подписью не пройдёт. Но в настройках библиотеки по умолчанию `exp` необязателен, `aud` не проверяется, а алгоритм берётся из header. **C** неверно: `none` библиотека отклоняет сама.
+
+</details>
+
+```console
+$ go run ./cmd/tekshir
+qoʻlda yasalgan:         ok, sub=1
+sub 1 → 2, imzo eski:    token signature is invalid: signature is invalid
+alg none, imzo yoʻq:     token signature is invalid: token is unverifiable: 'none' signature type is not allowed
+exp yoʻq:                ok, sub=1
+aud boshqa xizmat:       ok, sub=1
+muddati oʻtgan:          token has invalid claims: token is expired
+alg HS512, imzo toʻgʻri: ok, sub=1
+```
+
+- `alg none` библиотека отклонила сама: `token is unverifiable: 'none' signature type is not allowed`. v5 принимает `none` только с ключом `jwt.UnsafeAllowNoneSignatureType`.
+- Токен с истёкшим сроком тоже отклонён: если `exp` есть, он проверяется всегда.
+- **Токен без `exp` прошёл:** он не умрёт никогда.
+- **Токен, выданный для другого сервиса, прошёл:** `aud` не проверялся.
+- **`HS512` прошёл:** алгоритм выбирает токен.
+
+Исправление: вернуть четыре option. С одним ключом HMAC прохождение `HS512` ещё не атака. Но с алгоритмами на открытых ключах это превращается в «alg confusion» (ниже, в разделе «Глубже»).
+
+## Сервер: authenticate с двумя путями
+
+`requireUser` из GB-6.04 теперь вызывает `authenticate`. В нём два пути: если есть заголовок `Authorization: Bearer <token>` — JWT, иначе cookie.
+
+```go
+func (a *api) authenticate(r *http.Request) (store.User, error) {
+	if s, ok := bearer(r); ok {
+		c, err := token.Parse(s, a.jwtKey)
+		if err != nil {
+			return store.User{}, fmt.Errorf("%w: %w", errBadToken, err)
+		}
+		// VAZIFA (TASK.md, 3-qadam): c.JTI denylist'da boʻlsa (a.st.TokenRevoked) — errBadToken.
+		return store.User{ID: c.UserID}, nil
+	}
+	// aks holda: session cookie'si (GB-6.04)
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return store.User{}, err // http.ErrNoCookie → 401
+	}
+	return a.st.UserBySession(r.Context(), hashToken(cookie.Value))
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | `authenticate` принимает запрос, возвращает `store.User` или ошибку |
+| 2 | `bearer(r)` достаёт из заголовка `Authorization` токен после слова `Bearer`. Если токен есть, `ok` равен `true` (форма comma-ok из GB-2.02) |
+| 3–6 | `token.Parse` проверяет токен ключом сервера `a.jwtKey`. Если ошибка — оборачиваем её в `errBadToken` (`%w` дважды, GB-6.02); `problemFor` превращает это в `401` |
+| 7 | комментарий: в задании проверка denylist добавляется сюда |
+| 8 | ID пользователя берётся из `sub` токена. **Обращения к store нет** |
+| 10–15 | если Bearer нет — путь из GB-6.04: `r.Cookie` берёт cookie (нет — ошибка, `401`), `hashToken` хеширует его, `UserBySession` ищет в store |
+
+**Bearer** — токен, которым может пользоваться любая сторона, у которой он есть ([RFC 6750 §1.2](https://www.rfc-editor.org/rfc/rfc6750#section-1.2)). Вид заголовка: `Authorization: Bearer <token>`. Функция `bearer` разбирает этот заголовок:
+
+```go
+func bearer(r *http.Request) (string, bool) {
+	scheme, rest, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	t := strings.TrimLeft(rest, " ")
+	return t, t != ""
+}
+```
+
+`strings.Cut` делит текст по первому пробелу на две части: имя схемы и остаток. `EqualFold` сравнивает имя схемы без учёта регистра ([RFC 9110 §11.1](https://www.rfc-editor.org/rfc/rfc9110#section-11.1)). `TrimLeft` убирает лишние пробелы перед токеном.
+
+## Одни и те же запросы: login, /me, logout
+
+В первом терминале запускаем сервер. Он занимает терминал: запросы отправляем из второго.
+
+```console
+$ go run ./cmd/api
+bozor API: http://localhost:8765
+```
+
+Во втором терминале тоже откройте папку урока. В видео данные для входа вписаны прямо в команду. Чтобы на этой странице их не было видно, запишите адрес и пароль первого тестового пользователя из README в переменные. `read -r` принимает текст, `-s` не показывает пароль на экране, `jq -n --arg` собирает JSON. Команды ничего не печатают:
+
+```bash
+read -r LAB_EMAIL
+read -r -s LAB_PASSWORD
+jq -n --arg email "$LAB_EMAIL" --arg password "$LAB_PASSWORD" '{email:$email,password:$password}' > cred.json
+```
+
+Login. `-s` скрывает прогресс, `-c jar.txt` записывает cookie в файл `jar.txt`, `-H` задаёт тип содержимого, `--data-binary @cred.json` отправляет файл как тело. Ответ пишем в `login.json`. `jq -c keys` показывает имена полей: в теле ответа теперь есть и `token` — это JWT:
+
+```console
+$ curl -s -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @cred.json > login.json
+$ jq -c keys login.json
+["email","id","token"]
+```
+
+`jq -r .token` берёт токен без кавычек; `$(…)` записывает результат в переменную оболочки `T`. `cut -c1-36` показывает первые 36 символов — это часть header, она одинакова в каждом токене этого сервера:
+
+```console
+$ T=$(jq -r .token login.json)
+$ echo "$T" | cut -c1-36
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+```
+
+Раскроем payload. `cut -d. -f2` делит токен по точкам и берёт вторую часть:
+
+```console
+$ echo "$T" | cut -d. -f2 | basenc --base64url -d
+{"iss":"bozor","sub":"1","aud":["bozor-api"],"exp":1795858747,"iat":1795857847,"jti":"QRMH66VP3WITY52K3JFBCJSPGV"}
+```
+
+Четыре claim мы знали; два новых добавила библиотека: `iat` (время выдачи) и `jti` (уникальный ID токена). `aud` здесь списком: в JWT `aud` может быть и одной строкой, и списком строк ([RFC 7519 §4.1.3](https://www.rfc-editor.org/rfc/rfc7519#section-4.1.3)). `exp − iat` = 900 секунд = 15 минут.
+
+Теперь вызовем `/me` обоими путями. `-b jar.txt` отправляет cookie; `-H "Authorization: Bearer $T"` отправляет JWT:
+
+```console
+$ curl -s -b jar.txt localhost:8765/me | jq -c keys
+["email","id"]
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+```
+
+Путь через cookie берёт пользователя из store: `id` и `email`. Путь JWT знает только то, что в токене: `id`. Нужен email — читаете из базы: payload может прочитать кто угодно.
+
+Теперь смоделируем кражу. Копируем файл cookie в `eski.txt`: это «украденная» копия. Затем делаем logout. Logout отзывает каждый credential отдельно, поэтому отправляем и cookie, и тот же `$T`. `-i` показывает и заголовки ответа, `-X POST` задаёт метод:
+
+```console
+$ cp jar.txt eski.txt
+$ curl -s -i -X POST -b jar.txt -c jar.txt -H "Authorization: Bearer $T" localhost:8765/logout
+HTTP/1.1 204 No Content
+Set-Cookie: session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+X-Request-Id: LBKKRHY6FBOB7S2XRM7BIP6KRV
+Date: Sat, 28 Nov 2026 09:24:07 GMT
+```
+
+`204 No Content` — успех, тела нет. `Set-Cookie: session=; … Max-Age=0` велит браузеру удалить cookie, как в GB-6.04. Атрибуты `HttpOnly; Secure; SameSite=Lax` разберём в GB-6.07.
+
+**Предсказание:** logout выполнен. `/me` со старой копией cookie и `/me` с тем же `$T`. Что с JWT? **A)** `401`: logout сработал · **B)** `200`: токен ещё действителен · **C)** `500`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Со старым cookie `401` — как в GB-6.04. А с JWT `200`: на сервере нет записи о JWT, logout нечего было удалять. Если вы выбрали **A**, вы решили, что logout убивает любой credential.
+
+</details>
+
+```console
+$ curl -s -b eski.txt localhost:8765/me
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"4TPO4P23THH64ILRCGUDXACD2Y"}
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+```
+
+В первом терминале идёт лог сервера. Причина `401` (`session yoʻq yoki muddati oʻtgan`) клиенту не видна: она только в логе, под тем же `request_id`, что и в ответе (GB-6.02). Последняя строка — `/me` с JWT после logout, `200`:
+
+```text
+2026/11/28 14:24:07 SAQ37BTFTXRWNMEQG6DNNUXROO POST "/login" 200 433.789326ms
+2026/11/28 14:24:07 XT7WJKHHB5NOKLW6HVXKUX3ATO GET "/me" 200 462.78µs
+2026/11/28 14:24:07 Z3ONVJSPVM5AYFVHY3YGIG6V2N GET "/me" 200 768.897µs
+2026/11/28 14:24:07 LBKKRHY6FBOB7S2XRM7BIP6KRV POST "/logout" 204 150.893µs
+2026/11/28 14:24:07 4TPO4P23THH64ILRCGUDXACD2Y xato 401: "session yoʻq yoki muddati oʻtgan"
+2026/11/28 14:24:07 4TPO4P23THH64ILRCGUDXACD2Y GET "/me" 401 737.287µs
+2026/11/28 14:24:07 DTM5YDLPYMKTLWVDOTJ3IDEMAT GET "/me" 200 363.503µs
+```
+
+## Почему JWT работает после logout
+
+| | сессия | JWT |
+|---|---|---|
+| что есть на сервере | хеш токена → пользователь, срок | только ключ |
+| что делает logout | удаляет строку | нечего удалять |
+| следующий запрос | поиск: строки нет → `401` | подпись верна, `exp` не истёк → `200` |
+| украденная копия | умирает сразу | работает до `exp`: у нас 15 минут |
+
+Доказательство — в самом токене: раз подпись верна и `exp` не истёк, он действителен. Чтобы сервер его «забыл», на сервере должно было что-то храниться. С украденным токеном злоумышленник работает до `exp`.
+
+## Цена отзыва
+
+Обычных способов исправить два. Каждый возвращает состояние на сервер.
+
+1. **Denylist** — список отозванных `jti`. Его нужно проверять при каждом запросе, то есть это снова поиск. OWASP пишет: с denylist пользовательские сессии перестают быть полностью **stateless** (без состояния на сервере), поэтому стоит рассмотреть обычную систему сессий ([OWASP JWT Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)).
+2. **Короткий `exp` + refresh-токен.** Access-токен живёт несколько минут, новый выдаётся по **refresh-токену**. Refresh-токен хранится на сервере и отзывается, то есть это снова сессия.
+3. **Смена ключа** — способ без базы, но он убивает токены всех.
+
+**Размер.** JWT уходит с каждым запросом и растёт с каждым claim. `printf %s` печатает токен без перевода строки, `wc -c` считает байты. Значение cookie берём из формата `jar.txt`: файл cookie — колонки через табуляцию, седьмая — значение (`cut -f7`), `tr -d` убирает перевод строки:
+
+```console
+$ printf %s "$T" | wc -c
+233
+$ grep session eski.txt | cut -f7 | tr -d '\n' | wc -c
+43
+```
+
+JWT — 233 символа, токен сессии — 43. Это значение для лаборатории: каждый добавленный claim делает токен больше.
+
+## Выбор для bozor
+
+- **bozor: сессия.** Один API и один Postgres: запросы всё равно идут в базу, а поиск сессии — один `SELECT` по первичному ключу (GB-6.04). Обычно он дешёвый; в этом уроке не измерялся. Logout и блокировка должны действовать сразу.
+- **JWT уместен между сервисами:** один сервис выдаёт другому короткоживущий токен, сервис, принимающий токен, не подключается к базе.
+
+Это выбор для условий bozor, а не общее правило. Условия изменятся — изменится и выбор: главное — знать цену обоих путей. Завтра на работе: увидев JWT, проверьте четыре правила и то, что делает logout.
+
+## Глубже (необязательно): каждый credential отдельно, alg confusion и заголовок 401
+
+**Logout отзывает каждый credential отдельно.** `POST /login` выдаёт оба, поэтому в видео в logout отправили и cookie, и `$T`. Logout только с cookie JWT не трогает; `/logout-all` тоже удаляет только строки сессий. Оба случая проверяют тесты:
+
+```console
+$ go test -count=1 -run "TestLogoutHarBiriAlohida|TestUsersVaLogoutAll" -v ./cmd/api
+=== RUN   TestUsersVaLogoutAll
+--- PASS: TestUsersVaLogoutAll (0.16s)
+=== RUN   TestLogoutHarBiriAlohida
+--- PASS: TestLogoutHarBiriAlohida (0.03s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.290s
+```
+
+Чтобы убить JWT «на всех устройствах», нужна запись по пользователю («токены, выданные до этого момента, недействительны»): снова состояние на сервере.
+
+**Неверный Bearer.** Токеном здесь служит обычное слово `salom` («привет»). При неверном токене ответ — `401` и заголовок `WWW-Authenticate: Bearer error="invalid_token"` ([RFC 6750 §3](https://www.rfc-editor.org/rfc/rfc6750#section-3)). Если Bearer есть, но неверен, `authenticate` не переходит к cookie: клиент выбрал способ.
+
+```console
+$ curl -s -i -H "Authorization: Bearer salom" localhost:8765/me
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+Www-Authenticate: Bearer error="invalid_token"
+X-Request-Id: PNKR2JIJZAWHYTB6O5ZWTW5WMX
+Date: Sat, 28 Nov 2026 09:24:07 GMT
+Content-Length: 131
+
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"PNKR2JIJZAWHYTB6O5ZWTW5WMX"}
+```
+
+Заголовок `X-Request-Id` — из GB-6.01; `Content-Type: application/problem+json` — из GB-6.02. Причина — `token is malformed` — только в логе:
+
+```text
+2026/11/28 14:24:07 PNKR2JIJZAWHYTB6O5ZWTW5WMX xato 401: "JWT yaroqsiz: token is malformed: token contains an invalid number of segments"
+2026/11/28 14:24:07 PNKR2JIJZAWHYTB6O5ZWTW5WMX GET "/me" 401 340.984µs
+```
+
+**Alg confusion** (здесь не воспроизводилось; пересказ [RFC 8725 §2.1](https://www.rfc-editor.org/rfc/rfc8725#section-2.1)). В системе с подписью на открытом ключе (например, `RS256`) атакующий меняет `alg` в header на `HS256` и использует общеизвестный открытый ключ как секрет HMAC. Защита — чтобы разрешённые алгоритмы задавал сервер, то есть `WithValidMethods`. В нашей системе с одним ключом HMAC такой атаки нет; поэтому здесь это упомянуто только как правило.
+
+## Частые ошибки
+
+**1. `Parse` без правил.** Сообщения об ошибке нет: токен просто проходит. Токен без `exp` живёт вечно, токен для другого сервиса принимается, алгоритм по-прежнему выбирает токен. Подробный разбор — в разделе «Классическая ошибка: Parse без правил» выше. Исправление: четыре option.
+
+**2. Секреты в JWT.** Payload мы прочитали без ключа через `basenc` (раздел «Payload не зашифрован» выше). Не кладите в claim пароль или личные данные. Нужен email — читайте из базы по `sub`; поэтому `/me` по пути JWT вернул только `id`.
+
+**3. Считать, что «logout убивает и JWT».** Logout удаляет строку сессии; у JWT удалять нечего (раздел «Одни и те же запросы»: старый cookie `401`, JWT `200`). Исправление: denylist (задание) или смириться с коротким `exp`.
+
+## Проверьте себя
+
+1. Что гарантируют три части JWT и подпись?
+
+<details>
+<summary>Ответ</summary>
+
+Части: `header`, `payload`, подпись. Подпись гарантирует, что текст написал знающий ключ и он не менялся. Payload она не скрывает: секреты не хранит.
+
+</details>
+
+2. Почему JWT продолжает работать после logout?
+
+<details>
+<summary>Ответ</summary>
+
+На сервере нет записи о JWT, которую можно удалить. Раз подпись верна и `exp` не истёк, токен действителен до `exp`.
+
+</details>
+
+3. Из GB-6.02: `detail` у сегодняшних `401` одинаков. Где настоящая причина?
+
+<details>
+<summary>Ответ</summary>
+
+В логе сервера, под тем же ID запроса. Клиенту внутренняя причина не показывается.
+
+</details>
+
+4. Предсказание: `Parse` с четырьмя option, подпись токена верна, но в payload нет `exp`. Результат?
+
+<details>
+<summary>Ответ</summary>
+
+Отказ: `token has invalid claims: token is missing required claim: exp claim is required`. Именно это требует `WithExpirationRequired`; `Parse` без правил принял бы такой токен.
+
+</details>
+
+5. Предсказание: в токене `aud` — `hisobot-api` («API отчётов»), подпись верна. `Parse` с четырьмя option?
+
+<details>
+<summary>Ответ</summary>
+
+Отказ: `token has invalid claims: token has invalid audience`. `WithAudience(Audience)` принимает только токен, выданный для `bozor-api`.
+
+</details>
+
+## Домашнее задание
+
+[Папка урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt), [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-6-05-session-jwt/TASK.md), [ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt/solution).
+
+🟢 **Основное: logout отзывает и JWT (denylist по `jti`).** Три шага:
+
+1. `internal/store/store.go`: `RevokeToken(ctx, jti, expires)` пишет `s.revoked[jti] = expires` и возвращает `nil`; `TokenRevoked(ctx, jti)` читает map через comma-ok и возвращает `ok, nil`. Обе начинаются с `s.mu.Lock()` и `defer s.mu.Unlock()` (GB-4.07).
+2. `cmd/api/auth.go`, `logout`: если запрос пришёл с `Bearer`, откройте токен через `token.Parse`. Если ошибки нет, вызовите `RevokeToken(r.Context(), c.JTI, c.Expires)`; если он вернул ошибку — `writeError` и `return`. Если `Parse` вернул ошибку, ничего не делайте: такой токен всё равно не войдёт, а logout возвращает `204`.
+3. `cmd/api/auth.go`, `authenticate`: на пути JWT после `Parse`, если `TokenRevoked` вернул `true`, верните ошибку, обёрнутую в `errBadToken`.
+
+🟡 **Необязательно:** `PurgeRevoked(ctx, now)` удаляет записи, у которых `exp` раньше `now`, и возвращает число удалённых. Токен с истёкшим сроком всё равно не пройдёт `Parse`, его запись не нужна; без очистки map будет расти. Если не напишете, этот тест будет пропущен (`SKIP`).
+
+Файлы `tekshiruv_test.go` не меняйте.
+
+**Предсказание:** `go test ./...` на заготовке? **A)** всё проходит · **B)** падают два основных теста · **C)** ошибка компиляции.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Код компилируется, но `RevokeToken` ещё не написан, а `logout` не отзывает JWT. В **A** вы забыли, что тесты проверяют задание; в **C** запись кода верна: не хватает только содержания.
+
+</details>
+
+```console
+$ go test ./...
+--- FAIL: TestLogoutJWTniBekorQiladi (0.04s)
+    tekshiruv_test.go:19: logout'dan keyin oʻsha JWT bilan /me: status 200, kutilgan 401 — jti denylist'ga tushmadi yoki authenticate uni tekshirmayapti (TASK.md, 2–3-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.741s
+?   	github.com/abdurahmon27/bozor/cmd/qolda	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/tekshir	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.484s
+--- FAIL: TestRevokeToken (0.00s)
+    tekshiruv_test.go:15: RevokeToken: vazifa: RevokeToken hali yozilmagan (TASK.md) — TASK.md, 1-qadam: s.revoked'ga yozing va nil qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/store	0.004s
+ok  	github.com/abdurahmon27/bozor/internal/token	0.012s
+FAIL
+```
+
+Прочитайте результат. `FAIL` — тест упал. `tekshiruv_test.go:19` — файл и строка; дальше текст о том, что ожидалось (`kutilgan 401`, сейчас `200`). В `internal/store` сообщение `RevokeToken hali yozilmagan` указывает на шаг 1. `?  …  [no test files]` — в этом пакете нет тестов. Исправление — не удалять тест, а написать код.
+
+<details>
+<summary>Ответ и объяснение</summary>
+
+```go
+func (s *Store) RevokeToken(ctx context.Context, jti string, expires time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revoked[jti] = expires
+	return nil
+}
+
+// TokenRevoked jti denylist'da bormi? Bu — JWT'ni bekor qilishning narxi: har soʻrovda yana bitta qidiruv.
+func (s *Store) TokenRevoked(ctx context.Context, jti string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.revoked[jti]
+	return ok, nil
+}
+```
+
+В `logout` (сначала JWT, потом сессия) и в `authenticate`:
+
+```go
+	if s, ok := bearer(r); ok {
+		if c, err := token.Parse(s, a.jwtKey); err == nil {
+			if err := a.st.RevokeToken(r.Context(), c.JTI, c.Expires); err != nil {
+				writeError(w, err)
+				return
+			}
+		}
+	}
+```
+
+```go
+		revoked, err := a.st.TokenRevoked(r.Context(), c.JTI)
+		if err != nil {
+			return store.User{}, err
+		}
+		if revoked {
+			return store.User{}, fmt.Errorf("%w: jti %s bekor qilingan", errBadToken, c.JTI)
+		}
+```
+
+Первый фрагмент — в store, второй — в `logout`, третий — в `authenticate` после `Parse`. Необязательный `PurgeRevoked` обходит список и удаляет записи, у которых `exp` раньше `now`:
+
+```go
+func (s *Store) PurgeRevoked(ctx context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for jti, exp := range s.revoked {
+		if exp.Before(now) {
+			delete(s.revoked, jti)
+			n++
+		}
+	}
+	return n, nil
+}
+```
+
+Остальное: map `revoked` хранит `jti` → `exp`: после `exp` токен всё равно отклоняется, поэтому запись можно чистить (необязательная часть). Если `Parse` вернул ошибку, `logout` ничего не отзывает: неверный токен не войдёт. Порядок: сначала JWT, потом сессия. Если запись в denylist не удалась, сессия остаётся на месте, и logout можно повторить.
+
+</details>
+
+**Предсказание для решения:** `go test ./...` в папке `solution`. `cd` переходит в папку solution; в ней отдельный `go.mod`:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.704s
+?   	github.com/abdurahmon27/bozor/cmd/qolda	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/tekshir	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.414s
+ok  	github.com/abdurahmon27/bozor/internal/store	0.005s
+ok  	github.com/abdurahmon27/bozor/internal/token	0.005s
+```
+
+Запустите тот же сервер из `solution` и проверьте вручную JWT после logout. В первом терминале `cd solution && go run ./cmd/api`, во втором — login сверху и `T=$(jq -r .token login.json)`, затем:
+
+```console
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"id":1}
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $T" localhost:8765/logout
+204
+```
+
+Здесь `-o /dev/null` отбрасывает тело ответа, `-w '%{http_code}\n'` печатает только код статуса. Последний запрос — с тем же токеном:
+
+```console
+$ curl -s -H "Authorization: Bearer $T" localhost:8765/me
+{"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"3KI6N4F622SNZQNQVFNBUVW7TB"}
+```
+
+Теперь `401`. В логе сервера причина: `jti` отозван.
+
+```text
+2026/11/28 14:24:46 LJSWE4HDPBQKF7MGYGZKTMR52C POST "/logout" 204 130.945µs
+2026/11/28 14:24:46 3KI6N4F622SNZQNQVFNBUVW7TB xato 401: "JWT yaroqsiz: jti O2BZPFBFFHJDBB4PCKXKAVGYFC bekor qilingan"
+2026/11/28 14:24:46 3KI6N4F622SNZQNQVFNBUVW7TB GET "/me" 401 366.966µs
+```
+
+Вот цена: каждый запрос с JWT делает в store один поиск — как сессия. Что осталось от JWT по сравнению с сессией? Проверка подписи и ответ «кто это» без базы; мгновенное убийство украденного токена по-прежнему зависит от состояния на сервере.
+
+Формат и статический анализ:
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+Вывода нет: формат и `vet` чистые. Когда закончите, остановите сервер через Ctrl+C и удалите лабораторные файлы:
+
+```bash
+rm -f cred.json login.json jar.txt eski.txt
+unset LAB_EMAIL LAB_PASSWORD T
+```
+
+## Источники
+
+- [RFC 7519: JSON Web Token (JWT)](https://www.rfc-editor.org/rfc/rfc7519) — структура (§3), claim'ы (§4.1), JWT без подписи (§6)
+- [RFC 7516: JSON Web Encryption (JWE)](https://www.rfc-editor.org/rfc/rfc7516)
+- [RFC 7515: JSON Web Signature (JWS)](https://www.rfc-editor.org/rfc/rfc7515) — base64url (§2)
+- [RFC 7518 §3.2: HMAC with SHA-2](https://www.rfc-editor.org/rfc/rfc7518#section-3.2)
+- [RFC 8725: JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725)
+- [RFC 6750: Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750)
+- [RFC 9110: HTTP Semantics (схема аутентификации, §11.1)](https://www.rfc-editor.org/rfc/rfc9110#section-11.1)
+- [OWASP JSON Web Token Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)
+- [golang-jwt/jwt/v5: ParseWithClaims, parser options](https://pkg.go.dev/github.com/golang-jwt/jwt/v5)
+- [golang-jwt/jwt: релизы](https://github.com/golang-jwt/jwt/releases)
+- [Go crypto/hmac: New](https://pkg.go.dev/crypto/hmac#New)
+- [Go encoding/base64: RawURLEncoding](https://pkg.go.dev/encoding/base64#pkg-variables)
+- [GNU coreutils: basenc](https://www.gnu.org/software/coreutils/manual/html_node/basenc-invocation.html)
+
+Результаты получены на `go1.27.4 linux/amd64` (`CGO_ENABLED=0`), curl 8.22.0, jq 1.8.2, GNU coreutils 9.11, `golang-jwt/jwt/v5 v5.3.1`, 2026-11-28. Значения `exp`, `iat`, `jti`, подписи и ID запроса из видео другие: они меняются при каждом запуске; размер токена (233 и 43 символа) совпадает с видео.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-05-session-jwt)
+
+---
+
+← Предыдущий урок: [GB-6.04](/lab/youtube/gb/gb-6-04/ru) · Следующий урок: [GB-6.06](/lab/youtube/gb/gb-6-06/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

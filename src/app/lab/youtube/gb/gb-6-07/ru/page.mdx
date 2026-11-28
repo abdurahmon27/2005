@@ -1,0 +1,1113 @@
+---
+title: "Cookie, CSRF, CORS и rate limit: защита на стороне браузера"
+date: "2026/11/28"
+description: "Атрибуты cookie, закрываем поддельный POST с другого сайта через http.CrossOriginProtection, CORS с allow-list и token bucket на login."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-6-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-6-07"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-6-07) · **Русский** · [English](/lab/youtube/gb/gb-6-07/en)  
+Урок GB-6.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-6-07) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Дилноза вошла в bozor. Потом на чужой странице на другом порту нажала кнопку «Sovgʻani olish» («Получить подарок»). Это нажатие отменило заказ 41 в bozor, хотя session cookie было `SameSite=Lax`. Почему защита не сработала?
+
+**Одна идея:** браузер добавляет cookie к запросу **сам**, независимо от того, какая страница запрос начала. Атрибуты cookie управляют только тем, «когда добавлять», а `SameSite` смотрит на *site*: порт и поддомен site не меняют. Поэтому на запросе, меняющем состояние, сервер сам проверяет, **откуда** пришёл запрос. CORS управляет только тем, можно ли **прочитать** ответ: запрос всё равно выполняется. А login ограничивают числом попыток.
+
+К концу урока вы:
+
+- увидите в настоящем Chrome, что делает каждый атрибут `Set-Cookie` (`__Host-`, `Max-Age`, `HttpOnly`, `Secure`, `SameSite`);
+- воспроизведёте отмену заказа Дилнозы обычной HTML-формой с другой страницы и превратите её в `403` с помощью `http.CrossOriginProtection`;
+- настроите CORS через allow-list и `Vary: Origin` и своими глазами увидите ошибку «вернуть `Origin` без проверки»;
+- поставите на `POST /login` token bucket лимит по IP (`429` и `Retry-After`), а второй, по email, напишете сами в домашнем задании.
+
+| Слово | Простой смысл | По-английски |
+|---|---|---|
+| `SameSite` | атрибут: добавлять ли cookie к запросу, начатому с **другого site** | SameSite |
+| CSRF | страница чужого сайта отправляет запрос через браузер пользователя, с его cookie | cross-site request forgery |
+| token bucket | ограниченный запас токенов для каждого ключа (IP, email): каждая попытка забирает один | token bucket |
+
+Два вспомогательных понятия: заголовки `Sec-Fetch-Site` и `Origin` (кто начал запрос) и **CORS** (правило браузера на чтение). Остальные слова объясняются там, где встречаются впервые.
+
+## Что нужно знать заранее
+
+Урок опирается на [GB-6.06 · Чей это заказ?](/lab/youtube/gb/gb-6-06/ru) и [GB-6.04 · Login и сессии](/lab/youtube/gb/gb-6-04/ru): оттуда `requireUser`, `currentUser`, cookie, `jar.txt`, заказы 41 и 42. Ещё нужны: [GB-6.03 · Пароли: argon2id](/lab/youtube/gb/gb-6-03/ru), [GB-6.02 · Ответы с ошибками](/lab/youtube/gb/gb-6-02/ru), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01/ru), [GB-4.08 · curl](/lab/youtube/gb/gb-4-08/ru), [GB-4.07 · mutex](/lab/youtube/gb/gb-4-07/ru), [GB-1.08 · go test](/lab/youtube/gb/gb-1-08/ru).
+
+**Где работать.** Этот пример не для Go Playground: нужны несколько процессов и настоящий браузер. Postgres и Docker не нужны: в этом уроке store в памяти (map и mutex), его методы такие же, как в GB-6.04 и GB-6.06. Возьмите [папку урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors). Нужны: Go 1.27, curl, jq и Google Chrome. Порты `8765` и `9090` должны быть свободны. Если Chrome нет, прочитайте выводы трёх команд браузера на этой странице: они из моего прогона.
+
+Внутри самой папки не работаем: для каждого опыта делаем отдельную копию. Выполните этот блок **в каждом терминале**, подставив свои пути в две переменные:
+
+```bash
+lab=$PWD                 # папка урока
+work=/tmp/gb-6-07        # здесь будут копии
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+mask() { sed -E 's/[A-Za-z0-9._-]+@[A-Za-z0-9.-]+/[email]/g; s/(__Host-session[=[:space:]]+)[^;[:space:]]+/\1[redacted]/g'; }
+prepare() {              # prepare ИМЯ [этап]
+	rm -rf "$work/$1" && cp -a "$lab" "$work/$1"
+	[ -n "${2:-}" ] && cp "$lab/_video/stages/$2/"*.go "$work/$1/cmd/api/"
+	sed -n 's/^const dilnozaLogin = `\(.*\)`$/\1/p' "$work/$1/cmd/api/api_test.go" > "$work/$1/login.json"
+	jq '.password = "taxmin-1"' "$work/$1/login.json" > "$work/$1/wrong.json"
+}
+mkdir -p "$work"
+prepare final; prepare himoyasiz himoyasiz; prepare none none; prepare aks aks
+```
+
+`GOTOOLCHAIN` выбирает версию Go, использованную в уроке, `CGO_ENABLED=0` собирает без C-компилятора. `prepare` делает копию: `final` — итоговый код урока; `himoyasiz` («без защиты») — bozor в начале урока (нет защиты от CSRF и CORS, на login нет лимита); `none` — то же состояние и `SameSite=None`; `aks` — с ошибкой CORS. Файлы этапов лежат в `_video/stages/`. Строка `[ -n "${2:-}" ] && cp …` при заданном втором аргументе (имени этапа) копирует файлы этапа поверх `cmd/api/` в копии. `login.json` — тело login-запроса Дилнозы: его достаёт из тестового файла `sed`, поэтому email и пароль на этой странице не пишутся. `wrong.json` — то же тело с неверным паролем. `mask` прячет в выводе на странице email лабораторного пользователя и session token; на своём компьютере он не обязателен, но пригодится, если показываете экран другим.
+
+Лаборатория устроена так:
+
+```text
+ API bozor :8765  <----  Chrome (headless)  ---->  чужой сайт :9090
+ (store в памяти)              ^                  (cmd/begona: форма и страница чтения)
+                               |
+                  _video/brauzer (Go + chromedp)
+```
+
+Опыты идут так: в одном терминале сервер (`cd "$work/himoyasiz" && go run ./cmd/api 2>&1 | tee server.log`), во втором curl (`cd "$work/himoyasiz"`), в третьем чужой сайт (`cd "$lab" && go run ./cmd/begona`), в четвёртом программа-браузер (`cd "$lab/_video/brauzer"`). `tee server.log` пишет лог и на экран, и в файл. Перед следующим опытом остановите сервер `Ctrl+C` и смените имя папки (`himoyasiz`, `none`, `aks`, `final`). При первом запуске программы-браузера скачивается библиотека chromedp.
+
+**Вспомним, GB-6.06.** Маршрут `POST /orders/{id}/cancel` тоже проверяет владельца заказа. Тем не менее поддельный запрос с чужой страницы отменил заказ. Почему проверка владельца его не остановила? **A)** вернула `404`, но заказ всё равно отменился · **B)** запрос пришёл с собственным cookie Дилнозы · **C)** чужой сайт подменил `user_id`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Запрос отправил браузер Дилнозы, и он сам добавил cookie bozor. Сервер берёт из cookie `currentUser(r).ID`, а SQL-условие `AND user_id = $2` сравнивает с этим ID. Для сервера это сама Дилноза: условие проходит. A неверно: `404` бывает только на чужом заказе, а здесь заказ принадлежит Дилнозе. C неверно: `user_id` вообще не приходит от клиента, сервер берёт его из сессии (GB-6.06).
+
+</details>
+
+Эта атака называется **CSRF** (cross-site request forgery): чужой сайт подделывает запрос через собственный браузер пользователя. Сегодня мы воспроизведём её и закроем. План: атрибуты cookie, проверка на сервере, откуда пришёл запрос, чем CORS не является и rate limit на login, то есть ограничение числа попыток.
+
+## Атрибуты cookie: правила для браузера
+
+Хранить cookie и решать, к какому запросу его добавить, будет браузер. Сервер задаёт ему правила только **атрибутами** в заголовке `Set-Cookie`. Посмотрим ответ на login целиком (`-i` выводит и заголовки ответа, `-c jar.txt` сохраняет cookie в файл). Запустите сервер из папки `final` и выполните curl в той же папке:
+
+```console
+$ curl -s -i -c jar.txt localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax
+Vary: Origin
+X-Request-Id: GLYOPBEPBDRKAICL3Q3V6FD3N7
+Date: Sat, 28 Nov 2026 09:24:10 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+ID запроса, дата и токен при каждом запуске другие. Вместо токена стоит `[redacted]`: его подставил `mask`. `Cache-Control: no-store` знаком по GB-6.04; `Content-Type`, `Content-Length`, `Date` — обычные HTTP-заголовки (GB-4.01). `Vary: Origin` добавлен в этом уроке, объясню его в разделе про CORS. Смотрим на строку `Set-Cookie`. По сравнению с GB-6.04 изменились два места: перед именем появился префикс `__Host-`, а вместо `Expires` стоит `Max-Age`. Остальные атрибуты те же.
+
+| Часть | Что делает браузер |
+|---|---|
+| `__Host-session` | cookie с именем, начинающимся на `__Host-`, браузер принимает, только если выполнены три условия (см. ниже) |
+| `Path=/` | cookie добавляется ко всем путям сайта |
+| `Max-Age=86400` | браузер хранит cookie 86400 секунд, то есть 24 часа |
+| `HttpOnly` | скрипт на странице не может прочитать cookie через `document.cookie` |
+| `Secure` | cookie отправляется только по HTTPS; `http://localhost` — исключение |
+| `SameSite=Lax` | ограничивает добавление cookie к запросам, начатым с другого site (в следующих разделах) |
+
+Так эти атрибуты записаны в `setSessionCookie`:
+
+```go
+func setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+}
+```
+
+| Код | Что делает |
+|---|---|
+| `Name: sessionCookie` | имя cookie; значение этой константы — `"__Host-session"` |
+| `MaxAge: int(sessionTTL.Seconds())` | `sessionTTL` — это `24 * time.Hour`; `Seconds()` переводит её в секунды (`86400`), `int` делает целое число |
+| `HttpOnly: true`, `Secure: true` | записывают соответствующие атрибуты |
+| `SameSite: http.SameSiteLaxMode` | записывает `SameSite=Lax`; в GB-6.04 он только назывался |
+| `w.Header().Set("Cache-Control", "no-store")` | ответ не должен оставаться в кэше (GB-6.04) |
+
+**`Max-Age`** — *относительный* срок в секундах: браузер прибавляет его к своему текущему времени. `Expires` — точная дата, браузер сверяет её со своими часами, и при неверных часах срок сдвигается. Если указаны оба, главным считается `Max-Age` (RFC 6265bis §4.1.2.2). Браузер может и сократить срок, поэтому основным остаётся срок сессии на сервере (`sessionTTL`, GB-6.04).
+
+**Префикс `__Host-`** ставит браузеру условие: cookie должно быть `Secure`, иметь `Path=/` и не иметь атрибута `Domain`. Cookie без `Domain` — *host-only*: оно возвращается только тому host, который его выдал, а не поддоменам. Итог: `blog.bozor.uz` не может перезаписать `__Host-session` для bozor. Ограничение относится к host, а не к порту: RFC 6265bis прямо говорит, что порты — единственная часть модели origin, которую `__Host-` cookie игнорируют.
+
+Как curl сохранил это cookie? Последняя строка `jar.txt`:
+
+```console
+$ tail -1 jar.txt | mask
+#HttpOnly_localhost	FALSE	/	TRUE	1795944250	__Host-session	[redacted]
+```
+
+В строке семь столбцов, разделённых табами: домен (пометка `#HttpOnly_` — cookie `HttpOnly`), принимают ли его поддомены (`FALSE` — нет, `Domain` не было), путь, `Secure` (`TRUE`), время окончания (в секундах epoch: curl превратил `Max-Age` в абсолютное время), имя, значение. Curl сохраняет и возвращает `Secure` cookie для `http://localhost`: localhost — исключение (MDN, Set-Cookie).
+
+### HttpOnly: в настоящем браузере
+
+`HttpOnly` с помощью curl не показать: у curl нет скрипта страницы. Поэтому нужен настоящий Chrome. Он работает без окна (**headless**), а управляет им Go-программа в `_video/brauzer` через библиотеку **chromedp**. Сама программа не тема урока: она управляет браузером и печатает результат. Команда `httponly` входит в bozor на странице bozor как Дилноза (браузер сам сохраняет cookie), затем скриптом страницы делает два дела. Сервер запущен из `final`, команда в папке браузера:
+
+```console
+$ go run . httponly | mask
+login: 200 {"id":1,"email":"[email]"}
+document.cookie: ""
+fetch /me: 200 {"id":1,"email":"[email]"}
+```
+
+1. `login: 200 …` — вход удался, в браузере есть cookie.
+2. `document.cookie: ""` — скрипт читает cookie через `document.cookie` и получает пустую строку: так работает `HttpOnly`.
+3. `fetch /me: 200 …` — `fetch` это функция браузера для запросов. Она шлёт запрос на `/me`, браузер сам добавляет cookie: ответ `200`.
+
+Вывод: вредоносный скрипт на странице **не может украсть** токен, но пока страница открыта, может отправлять запросы от имени Дилнозы. `HttpOnly` защищает от первого, но не от второго.
+
+## Origin и site: когда cookie считается «пришедшим из другого места»
+
+Чтобы понять `SameSite`, нужно точно знать, что значит «из другого места». Есть два понятия.
+
+**Origin** — схема, host и порт вместе: `http://localhost:8765`. Если отличается хотя бы одно, origin другой.
+
+**Site** — схема и *регистрируемый домен* (registrable domain): запись из Public Suffix List и одна часть перед ней, например `bozor.uz`. **Порт не учитывается.** У `localhost` и IP-адресов регистрируемого домена нет: там должен совпасть весь host (HTML Standard, «same site»). Схема тоже учитывается: в правилах cookie `http://` и `https://` — разные site (MDN, Site).
+
+| Одна страница | Другая страница | Origin | Site |
+|---|---|---|---|
+| `http://localhost:8765` | `http://localhost:8765/me` | тот же | тот же |
+| `http://localhost:8765` | `http://localhost:9090` | **другой** (порт) | **тот же** (порт не учитывается) |
+| `https://app.bozor.uz` | `https://blog.bozor.uz` | другой (host) | **тот же** (`bozor.uz`) |
+| `http://localhost:8765` | `http://127.0.0.1:9090` | другой | **другой** (host другой) |
+| `http://localhost` | `https://localhost` | другой | другой (схема другая) |
+
+Чужой сайт в лаборатории открывается с одного сервера под двумя именами: `http://localhost:9090` (**тот же site**, что и bozor, но другой origin) и `http://127.0.0.1:9090` (**другой site**). Первый моделирует соседний сервис внутри сети (сосед по порту или поддомен), второй — обычный чужой сайт.
+
+## SameSite: когда cookie добавляется
+
+`SameSite` определяет, добавлять ли cookie к запросу, **начатому с другого site**. Значений три. Внутри одного site cookie уходит во всех трёх случаях при любом типе запроса.
+
+| Запрос, начатый с другого site | `Strict` | `Lax` | `None` (нужен `Secure`) |
+|---|---|---|---|
+| страница, открытая по ссылке (навигация верхнего уровня, `GET`) | не уходит | **уходит** | уходит |
+| `POST` через форму | не уходит | не уходит | уходит |
+| `iframe` (страница внутри страницы) или `fetch` | не уходит | не уходит | уходит |
+
+`Lax` — значение cookie этого урока. Его правило: с другого site уходит только при навигации верхнего уровня с безопасным методом (`GET`) (RFC 6265bis §4.1.2.7). По этой таблице предскажите: если чужая страница на другом site, что получит `POST`-форма?
+
+## CSRF: форма на чужой странице
+
+Страница атаки лежит в константе `formaPage` в `cmd/begona`: обычная HTML-форма, скрипта нет.
+
+```html
+<form method="post" action="http://localhost:8765/orders/41/cancel">
+  <button>Sovgʻani olish</button>
+</form>
+```
+
+| Строка | Что делает |
+|---|---|
+| `<form method="post" action="…">` | при отправке формы браузер шлёт `POST`-запрос; `action` — куда: путь отмены заказа в bozor |
+| `<button>Sovgʻani olish</button>` | кнопка; при нажатии браузер отправляет форму |
+| `</form>` | форма закончилась |
+
+Отправляя форму, браузер **сам** добавляет cookie bozor, если `SameSite` позволяет. У этого маршрута нет тела, поэтому нет и `requireJSON` (GB-6.01): обычная форма тоже может до него дойти. Вот маршрут `cancelOrder`:
+
+```go
+	mux.Handle("POST /orders/{id}/cancel", a.requireUser(http.HandlerFunc(a.cancelOrder)))
+```
+
+| Шаг | Кто | Что |
+|---|---|---|
+| 1 | Дилноза | входит в bozor; браузер сохраняет cookie |
+| 2 | Дилноза | открывает чужую страницу |
+| 3 | Дилноза | нажимает «Sovgʻani olish» |
+| 4 | браузер | отправляет форму как `POST /orders/41/cancel` и (если разрешено) сам добавляет cookie |
+| 5 | bozor | cookie верное, владелец верный: заказ отменён |
+
+### Два новых поля в логе сервера
+
+Чтобы видеть, кто начал запрос, в `logRequests` добавлены два поля:
+
+```go
+		_, err := r.Cookie(sessionCookie)
+		log.Printf("%s %s %q %d %s site=%q cookie=%t", w.Header().Get("X-Request-Id"),
+			r.Method, r.URL.Path, rec.status, time.Since(start), r.Header.Get("Sec-Fetch-Site"), err == nil)
+```
+
+`site=` — заголовок `Sec-Fetch-Site`: браузер сам добавляет его к каждому запросу на HTTPS или localhost-адреса, и в нём записано, какая страница начала запрос. Значения: `same-origin`, `same-site`, `cross-site`, `none` (адрес набран в адресной строке или открыт из закладки). `cookie=` — пришло ли session cookie (`true`/`false`). `r.Header.Get` читает заголовок, `err == nil` означает, что cookie есть (GB-6.04).
+
+### Предскажите: форма с другого site
+
+Откроем чужую страницу теперь через `127.0.0.1`, то есть на **другом site**. Cookie `SameSite=Lax`. Что будет при нажатии «Sovgʻani olish»? **A)** `200`, заказ отменён · **B)** `401`, cookie не пришло · **C)** `403`, нет прав.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Lax` не добавляет cookie к `POST` формы, пришедшей с другого site (вторая строка таблицы). Cookie нет: `requireUser` отвечает `401` (GB-6.04). A: чтобы заказ отменился, нужно cookie. C: `403` в GB-6.06 бывает при отсутствии прав по роли, а здесь сервер Дилнозу вообще не узнал.
+
+</details>
+
+Это bozor до урока (копия `himoyasiz`): проверки CSRF ещё нет. Сервер запущен из `himoyasiz`, чужой сайт — `go run ./cmd/begona`. Команда `csrf` программы-браузера открывает страницу, нажимает кнопку и печатает ответ:
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Unauthorized","status":401,"detail":"avval login qiling","request_id":"ACVH6PKV4N4FAPNLU3FZIDAK5C"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+Ответ `401`, заказ 41 по-прежнему `yangi` («новый»). Лог сервера (`grep` убирает шум от login, health и favicon):
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C xato 401: "http: named cookie not present"
+2026/11/28 14:24:14 ACVH6PKV4N4FAPNLU3FZIDAK5C POST "/orders/41/cancel" 401 44.065µs site="cross-site" cookie=false
+2026/11/28 14:24:15 OM23C5KFFSB7OQLTCEPDHLLBRF GET "/orders/41" 200 125.151µs site="none" cookie=true
+```
+
+Время в строке запроса (`44.065µs`) зависит от нагрузки: в видео тот же запрос занял `164.447µs`. Важно не время, а поля `site=` и `cookie=`. Первая строка — сообщение о запуске сервера. `xato 401: "http: named cookie not present"` — `requireUser` не нашёл cookie (`ErrNoCookie`, GB-6.04). В следующей строке `site="cross-site"`: браузер сам записал, что запрос пришёл с другого site, `cookie=false`: cookie не добавлено. Последняя строка — запрос `GET /orders/41`, который программа-браузер отправила, чтобы проверить состояние: адрес набран в адресной строке, поэтому `site="none"`.
+
+### Атака всё равно работает: чужая страница на соседнем порту
+
+Теперь атака из начала урока: чужая страница на `http://localhost:9090`, то есть на **том же site**, что и bozor. Сервер снова из `himoyasiz`:
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:12 EAB3D6NLO5XWZPSATRJ64CSIBV POST "/orders/41/cancel" 200 47.942µs site="same-site" cookie=true
+2026/11/28 14:24:13 PYKFJVQKYKGXLZXBOCEEHVAMNU GET "/orders/41" 200 64.841µs site="none" cookie=true
+```
+
+`site="same-site"`, `cookie=true`: внутри одного site браузер добавил `Lax` cookie и к форме (время в видео `53.587µs`, в моём прогоне `47.942µs`: оба в микросекундах). `200`: заказ отменён. Это не обход `Lax`: правило говорит «с **другого site**», а `localhost:9090` с bozor — один site. Порт и поддомен site не меняют.
+
+### Предскажите: SameSite=None
+
+Мы сделали cookie `SameSite=None` (копия `none`; в коде меняется только эта строка: `SameSite: http.SameSiteNoneMode`). Что теперь получит страница на `127.0.0.1:9090`? **A)** `401`, cookie не приходит · **B)** `200`, заказ отменяется · **C)** `400`, нет `Secure`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `None` добавляет cookie и к запросам, начатым с другого site. `Secure` уже был включён, и Chrome отправил `Secure` cookie и на `http://127.0.0.1` (опыт это показал: для надёжных адресов есть исключение для `Secure`). A — это был результат `Lax`. C — в bozor такой проверки нет: атрибутами cookie распоряжается браузер, а не сервер.
+
+</details>
+
+Заголовок cookie и результат:
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json | grep Set-Cookie | mask
+Set-Cookie: __Host-session=[redacted]; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=None
+```
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+GET /orders/41: {"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:16 UGJMHRV2FH6I7W57PIWUYIGFWU POST "/orders/41/cancel" 200 100.054µs site="cross-site" cookie=true
+2026/11/28 14:24:17 IHC74EO7MAZQAHXL4Z5Q2WQARL GET "/orders/41" 200 76.7µs site="none" cookie=true
+```
+
+`site="cross-site"`, но `cookie=true` и `200`. Всего три случая:
+
+| Чужая страница | Cookie | Результат (без защиты) | Поля в логе |
+|---|---|---|---|
+| `http://localhost:9090` (тот же site) | `Lax` | **`200`, заказ отменён** | `same-site`, `cookie=true` |
+| `http://127.0.0.1:9090` (другой site) | `Lax` | `401` | `cross-site`, `cookie=false` |
+| `http://127.0.0.1:9090` | `None` | **`200`, заказ отменён** | `cross-site`, `cookie=true` |
+
+Вывод: `SameSite` — полезный дополнительный слой, но не основная защита от CSRF. OWASP пишет так: он смотрит на регистрируемый домен, а не на origin, поэтому соседний порт или поддомен его обходит. Основная защита должна быть на сервере.
+
+## Защита на сервере: http.CrossOriginProtection
+
+Сервер сам проверяет, **откуда** пришёл запрос, меняющий состояние. С Go 1.25 для этого в стандартной библиотеке есть `http.CrossOriginProtection`; OWASP CSRF Prevention Cheat Sheet называет его прямо. Он опирается на два заголовка, которые шлёт браузер: `Sec-Fetch-Site` (видели выше) и `Origin` (origin страницы, начавшей запрос; браузер добавляет его к `POST`).
+
+```go
+var allowedOrigins = []string{"http://localhost:3000"}
+
+// errCrossOrigin — soʻrov boshqa origin'dagi sahifadan kelgan (problemFor → 403).
+var errCrossOrigin = errors.New("boshqa saytdan kelgan soʻrov")
+
+// protectCSRF — Go 1.25'dan beri standart kutubxonadagi http.CrossOriginProtection bilan:
+//   - GET, HEAD, OPTIONS — har doim oʻtadi (ular holatni oʻzgartirmasligi kerak);
+//   - Sec-Fetch-Site: same-origin yoki none (manzil qatoriga yozilgan) — oʻtadi; boshqa qiymat — rad;
+//   - Sec-Fetch-Site yoʻq, Origin bor — Origin'ning host'i Host sarlavhasiga teng boʻlsa oʻtadi;
+//   - ikkalasi ham yoʻq — Go buni brauzer emas deb hisoblaydi (curl, mobil ilova, boshqa server): oʻtadi (fail-open);
+//   - AddTrustedOrigin'dagi origin'lar — oʻtadi.
+//
+// Origin ↔ Host solishtiruvida sxema (http/https) koʻrilmaydi: production'da HTTPS + HSTS (GB-8.06).
+//
+// Brauzer bo'lmagan mijozda begona cookie yoʻq: CSRF — aynan brauzer cookie'ni oʻzi qoʻshgani uchun xavf.
+// Rad sababi (Check'ning xatosi) log'ga, mijozga — bizning matn (GB-6.02).
+func protectCSRF(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	for _, o := range allowedOrigins {
+		if err := cop.AddTrustedOrigin(o); err != nil {
+			panic(err) // roʻyxat kodimizda: notoʻgʻri yozilgan boʻlsa server ishga tushmasin
+		}
+	}
+```
+
+| Код | Что делает |
+|---|---|
+| `var allowedOrigins = []string{…}` | список разрешённых origin: собственное веб-приложение bozor, `http://localhost:3000` |
+| `func protectCSRF(next http.Handler) http.Handler` | middleware (форма из GB-6.01) |
+| `cop := http.NewCrossOriginProtection()` | создаёт объект-проверяющий |
+| `for _, o := range allowedOrigins` | для каждого origin из списка |
+| `cop.AddTrustedOrigin(o)` | добавляет его в **доверенные** origin; если запись неверна (нет схемы, есть путь), возвращает ошибку |
+| `panic(err)` | список в нашем коде: при ошибке сервер не должен запускаться (GB-2.09) |
+
+Главная часть — возвращаемый handler:
+
+```go
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := cop.Check(r); err != nil {
+			writeError(w, fmt.Errorf("%w: %w", errCrossOrigin, err))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Код | Что делает |
+|---|---|
+| `cop.Check(r)` | проверяет запрос; при отказе возвращает ошибку |
+| `fmt.Errorf("%w: %w", errCrossOrigin, err)` | объединяет две ошибки: наш текст и причину от `Check` (GB-6.02) |
+| `writeError(w, …)` | пишет `403` в виде problem: клиенту наш текст, причина идёт в лог |
+| `next.ServeHTTP(w, r)` | проверка пройдена, handler работает |
+
+Правила `Check` (исходник Go 1.27.4, `net/http/csrf.go`):
+
+1. `GET`, `HEAD`, `OPTIONS` — **всегда проходят**: эти методы не должны менять состояние. Поэтому не меняйте состояние в GET.
+2. `Sec-Fetch-Site: same-origin` или `none` — проходит. Другое значение (`same-site`, `cross-site`) — **отказ**, если только `Origin` не в списке доверенных или путь не исключён через `AddInsecureBypassPattern`.
+3. `Sec-Fetch-Site` нет, `Origin` есть — проходит, если host в `Origin` (с портом) равен заголовку `Host`, иначе отказ. Схема не сравнивается.
+4. Нет ни того, ни другого — считается, что запрос не из браузера или из того же origin, и он **проходит**.
+
+Место в цепочке: `requestID → logRequests → recoverPanic → cors → protectCSRF → muxErrors → mux` (`cmd/api/middleware.go`, `newHandler`).
+
+### Предскажите: страница и curl
+
+Новый сервер (`final`). Чужая страница на `localhost:9090`, а curl в терминале — с cookie Дилнозы из `jar.txt`: оба шлют один и тот же `POST /orders/41/cancel` с одним и тем же cookie. Результат? **A)** оба `403` · **B)** страница `403`, curl `200` · **C)** страница `200`, curl `403`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** В запросе страницы браузер пишет `Sec-Fetch-Site: same-site`: правило 2 отказывает. Curl этих заголовков не шлёт: правило 4 пропускает. A неверно: у curl проверять нечего. C — наоборот: отказ зависит от заголовка.
+
+</details>
+
+Программа-браузер, чужая страница на `localhost:9090` (сервер `final`):
+
+```console
+$ go run . csrf http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"2UQK2DTO7A4VA7DUD44YMHEUGR"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:18 2UQK2DTO7A4VA7DUD44YMHEUGR POST "/orders/41/cancel" 403 115.527µs site="same-site" cookie=true
+2026/11/28 14:25:18 S3W4NBVELWNTMKWLRE73DBIZ3N GET "/orders/41" 200 119.195µs site="none" cookie=true
+```
+
+`403`, в ответе наш текст; заказ остался `yangi`. В логе строка `xato 403` содержит причину от `Check` (`cross-origin request detected from Sec-Fetch-Site header`), а в следующей `site="same-site" cookie=true`: cookie **пришло**, но handler не выполнился. С другого site то же самое (новый сервер, `127.0.0.1:9090`):
+
+```console
+$ go run . csrf http://127.0.0.1:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://127.0.0.1:9090 → «Sovgʻani olish» bosildi
+javob: {"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"A5ALNFEBTDWMJ4HK5OHQ6DE2UA"}
+GET /orders/41: {"id":41,"user_id":1,"status":"yangi","note":"Chilonzor 9-kvartal, 12-uy"}
+```
+
+Теперь curl из терминала. Первый без браузерных заголовков (`-X POST` выбирает метод), во втором заголовки браузера пишем вручную (`-H` добавляет заголовок):
+
+```console
+$ curl -s -X POST -b jar.txt localhost:8765/orders/41/cancel | mask
+{"id":41,"user_id":1,"status":"bekor qilindi","note":"Chilonzor 9-kvartal, 12-uy"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: same-site' -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"PQ6NJNCEWIUPZEO4MWFH2U6AD2"}
+$ curl -s -X POST -b jar.txt -H 'Sec-Fetch-Site: cross-site' -H 'Origin: http://localhost:3000' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"FEWF6V7VVNHDXV7TN3U7MS32RC"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"boshqa saytdan kelgan soʻrov","request_id":"EJO3ZNELQYCCILIPSVKSAUCGSW"}
+$ curl -s -X POST -b jar.txt -H 'Origin: http://localhost:8765' localhost:8765/orders/41/cancel
+{"type":"about:blank","title":"Conflict","status":409,"detail":"buyurtma allaqachon bekor qilingan","request_id":"PBFVLOUUFURXMUXZ3LUYOAGPGE"}
+```
+
+Первый curl дал `200`: заказ отменён. Это безопасно: cookie мы дали curl сами, чужой сайт не может добавить cookie в чужой curl. Опасность CSRF существует именно потому, что браузер добавляет cookie **сам**. Второй curl: с заголовками браузера он тоже получает `403`.
+
+В выводе выше есть ещё три curl: в видео вы их не увидите, я добавил их для проверки правил `Check` (в папке их нет, команды на странице полные). В третьем `Sec-Fetch-Site: cross-site`, но `Origin: http://localhost:3000` — доверенный origin из `allowedOrigins`: пришёл `409`, а не `403` (заказ выше уже отменён). Значит, `CrossOriginProtection` проверку пропустил и запрос дошёл до handler. В четвёртом есть только `Origin: http://localhost:9090`, а `Sec-Fetch-Site` нет (правило 3): host в `Origin` отличается от `Host`, `403`. В пятом `Origin: http://localhost:8765` равен `Host`, проходит, снова `409`. Причины отказов в логе:
+
+```console
+$ grep 'xato 40' server.log
+2026/11/28 14:25:21 PQ6NJNCEWIUPZEO4MWFH2U6AD2 xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected from Sec-Fetch-Site header"
+2026/11/28 14:25:21 FEWF6V7VVNHDXV7TN3U7MS32RC xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+2026/11/28 14:25:21 EJO3ZNELQYCCILIPSVKSAUCGSW xato 403: "boshqa saytdan kelgan soʻrov: cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host"
+2026/11/28 14:25:21 PBFVLOUUFURXMUXZ3LUYOAGPGE xato 409: "buyurtma 41: buyurtma allaqachon bekor qilingan"
+```
+
+Заметка: `409` — «Conflict», заказ уже отменён (`store.ErrAlreadyCancelled`); здесь его смысл только в одном: запрос прошёл `CrossOriginProtection`.
+
+## CORS: правило на чтение ответа
+
+**CORS** (cross-origin resource sharing) — правило браузера на **чтение**. Страница с другого origin может отправить запрос серверу, но чтобы прочитать ответ, сервер должен указать именно этот origin в заголовке `Access-Control-Allow-Origin`. Если не указал, браузер не отдаст ответ странице. Для запроса с cookie нужен ещё `Access-Control-Allow-Credentials: true`. Это правило сервер **не защищает**: запрос всё равно выполняется. Опыт ниже это показывает.
+
+`oqishPage` в `cmd/begona` — страница со скриптом:
+
+```html
+<pre id="natija">kutilmoqda…</pre>
+<script>
+fetch("http://localhost:8765/me", {credentials: "include"})
+  .then(r => r.text())
+  .then(t => { natija.textContent = "oʻqildi: " + t })
+  .catch(e => { natija.textContent = "oʻqib boʻlmadi: " + e })
+</script>
+```
+
+| Строка | Что делает |
+|---|---|
+| `<pre id="natija">kutilmoqda…</pre>` | место, куда пишется результат («kutilmoqda» — «ожидается») |
+| `fetch("http://localhost:8765/me", {credentials: "include"})` | запрашивает `/me` у bozor; `credentials: "include"` отправляет и cookie |
+| `.then(r => r.text())` | когда ответ получен, берёт его текст |
+| `.then(t => { natija.textContent = "oʻqildi: " + t })` | записывает текст на страницу («oʻqildi» — «прочитано») |
+| `.catch(e => { … "oʻqib boʻlmadi: " + e })` | если чтение отклонено, записывает ошибку («oʻqib boʻlmadi» — «прочитать не удалось») |
+
+Сервер `final`, чужой сайт на `localhost:9090`. Программа-браузер открывает страницу и ждёт текст результата:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqib boʻlmadi: TypeError: Failed to fetch
+```
+
+Страница не смогла прочитать ответ: `fetch` завершился с `TypeError: Failed to fetch`. Браузер намеренно не говорит скрипту причину (подробности только в консоли браузера). Но посмотрите в лог сервера:
+
+```console
+$ grep -v -e '"/health"' -e '"/favicon.ico"' -e 'POST "/login"' server.log
+bozor API: http://localhost:8765
+2026/11/28 14:24:22 YU6V7AC7JE45YS2SINT4X25D6E GET "/me" 200 40.408µs site="same-site" cookie=true
+```
+
+`GET "/me" 200`, `cookie=true`: запрос **выполнен**. Так как это `GET`, он прошёл и `CrossOriginProtection` (правило 1). CORS лишь не отдал ответ странице. Значит, CORS не защита сервера: запрос, меняющий состояние, останавливает проверка CSRF.
+
+### Частая ошибка: вернуть Origin как есть
+
+Разработчики хотят всё разрешить и вместо списка возвращают сам `Origin` из запроса, вместе с `Allow-Credentials: true`. Это код из копии `aks`:
+
+```go
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// XATO (video): roʻyxat oʻrniga soʻrovdagi Origin'ni oʻzini qaytarish — har qanday sahifa javobni oʻqiydi.
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+`r.Header.Get("Origin")` читает `Origin` из запроса, `Set` записывает его в ответ: любой странице говорится «вам можно». А `Allow-Credentials: true` разрешает читать и ответы с cookie. `Origin` ничем не проверяется.
+
+**Предскажите.** С этим кодом снова запускается страница чтения (`localhost:9090/oqish`). Результат? **A)** страница читает email Дилнозы · **B)** `TypeError: Failed to fetch` · **C)** `403`, останавливает `protectCSRF`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Сервер возвращает в `Allow-Origin` origin самой страницы и говорит `Allow-Credentials: true`: браузер отдаёт ответ странице. B — это результат предыдущей (правильной) версии. C — `protectCSRF` здесь не помогает: `GET` он пропускает всегда.
+
+</details>
+
+Сервер из копии `aks`:
+
+```console
+$ go run . cors http://localhost:9090 | mask
+login: 200 {"id":1,"email":"[email]"}
+sahifa: http://localhost:9090/oqish
+oʻqildi: {"id":1,"email":"[email]"}
+```
+
+Страница прочитала данные Дилнозы (email спрятан через `mask`: в настоящем выводе он есть). Через curl подставим любой `Origin`:
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: https://istalgan-sayt.example' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: https://istalgan-sayt.example
+Cache-Control: no-store
+Content-Type: application/json
+X-Request-Id: XMSGQRD5CIJJQNP4E75VWIAW7S
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+Сервер вернул тот же `Origin`. Итог: **любая** страница того же site так читает данные Дилнозы; а если cookie `SameSite=None` — любой сайт.
+
+### Как правильно: allow-list
+
+Список разрешённых origin (**allow-list**) — тот же `allowedOrigins`, которым пользуется `protectCSRF`. Вот middleware `cors` (итоговый код):
+
+```go
+func cors(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Origin")
+		origin := r.Header.Get("Origin")
+		if !allowed[origin] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		// Preflight: brauzer haqiqiy soʻrovdan oldin OPTIONS bilan ruxsat soʻraydi (JSON body, PATCH, DELETE…).
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, PATCH, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600") // brauzer javobni 10 daqiqa eslab qoladi
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+| Код | Что делает |
+|---|---|
+| `allowed := map[string]bool{}` и `for … allowed[o] = true` | превращает список в `map` для быстрой проверки |
+| `w.Header().Add("Vary", "Origin")` | говорит кэшу: «ответ зависит от `Origin`» (`Add` **добавляет** значение к заголовку, `Set` заменяет) |
+| `if !allowed[origin] { next.ServeHTTP(w, r); return }` | если origin нет в списке, CORS-заголовки **не добавляются**; запрос выполняется как обычно |
+| `Access-Control-Allow-Origin` = `origin` | если origin в списке, возвращает именно его |
+| `Access-Control-Allow-Credentials: true` | разрешает читать ответ с cookie |
+| `if r.Method == http.MethodOptions && …` | ветка preflight (ниже) |
+
+`/me` с разрешённым origin (`localhost:3000`) и с неразрешённым (`localhost:9090`):
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:3000' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Origin: http://localhost:3000
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: YH3O7WIH5AQ6Q6LW2BG64WRDW6
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+```console
+$ curl -s -i -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/me | mask
+HTTP/1.1 200 OK
+Cache-Control: no-store
+Content-Type: application/json
+Vary: Origin
+X-Request-Id: B6W4MDQ3BEQVLDYSWTS76SGUDO
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 38
+
+{"id":1,"email":"[email]"}
+```
+
+У разрешённого есть `Allow-Origin` именно с этим origin, `Allow-Credentials: true` и `Vary: Origin`. У неразрешённого только `Vary: Origin`: ответ `200`, запрос выполнен, но браузер не отдаст его чужой странице. `Vary: Origin` нужен, чтобы кэш (браузера или промежуточного сервера) не отдавал ответ, подходящий одному origin, другому.
+
+### Preflight
+
+Перед необычным запросом (JSON-тело, `PATCH`, `DELETE`, нестандартный заголовок) браузер сначала шлёт запрос `OPTIONS` и спрашивает разрешение: в `Access-Control-Request-Method` и `Access-Control-Request-Headers` пишет, что ему нужно. Это **preflight**. Если ответ разрешения не даёт, браузер настоящий запрос **вообще не отправляет**. Preflight с разрешённым origin:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 204 No Content
+Access-Control-Allow-Credentials: true
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Allow-Methods: POST, PATCH, DELETE
+Access-Control-Allow-Origin: http://localhost:3000
+Access-Control-Max-Age: 600
+Vary: Origin
+X-Request-Id: CBSBM7HLJMTKV7ANIJRZFYZSPA
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+```
+
+`cors` сам ответил `204 No Content` и перечислил разрешённые методы и заголовки (`Max-Age: 600` — браузер запомнит ответ на 10 минут). С чужим origin:
+
+```console
+$ curl -s -i -X OPTIONS -H 'Origin: http://localhost:9090' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' localhost:8765/login
+HTTP/1.1 405 Method Not Allowed
+Allow: POST
+Content-Type: application/problem+json
+Vary: Origin
+X-Content-Type-Options: nosniff
+X-Request-Id: 462CYTNM7RMK7HCEVU5MWHYCUK
+Date: Sat, 28 Nov 2026 09:24:24 GMT
+Content-Length: 152
+
+{"type":"about:blank","title":"Method Not Allowed","status":405,"detail":"bu yoʻl uchun bunday metod yoʻq","request_id":"462CYTNM7RMK7HCEVU5MWHYCUK"}
+```
+
+`cors` ничего не добавил для этого origin, запрос прошёл `protectCSRF` (`OPTIONS` безопасный метод: проходит) и дошёл до mux. Для `/login` маршрута `OPTIONS` нет: `405 Method Not Allowed` и `Allow: POST`. В ответе нет `Access-Control-Allow-*`: preflight не удался, браузер настоящий `POST` не отправит.
+
+## Rate limit на login: token bucket
+
+Каждая попытка входа считает argon2id: в GB-6.03 мы видели, что одна попытка занимает 46 MiB памяти и заметное время CPU. В моём прогоне одна строка `POST "/login"` в логе показала `82.523656ms`. Без ограничения `POST /login` открыт для подбора паролей и это дешёвый способ загрузить сервер. Bozor до урока (`himoyasiz`): подряд восемь неверных login с одного IP. Bash-цикл `for i in $(seq 8)` повторяет команду восемь раз; в curl `-o /dev/null` отбрасывает тело, `-w "%{http_code} "` печатает только код статуса, `echo` завершает строку:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Восемь `401`: подбор безграничен. Решение — **token bucket** («ведро с токенами»). Для каждого ключа (сейчас это IP) есть ведро: в нём не больше 5 токенов, в начале оно полное. Каждая попытка забирает один токен. В ведро каждые 12 секунд возвращается один токен. Если токенов нет — `429 Too Many Requests` и `Retry-After`: через сколько секунд можно попробовать снова.
+
+| Попытка | В ведре до | Результат | В ведре после |
+|---|---|---|---|
+| 1 | 5 | `401` (пароль неверный, но попытка разрешена) | 4 |
+| 2 | 4 | `401` | 3 |
+| 3 | 3 | `401` | 2 |
+| 4 | 2 | `401` | 1 |
+| 5 | 1 | `401` | 0 |
+| 6, 7, 8 | 0 | `429`, `Retry-After` | 0 (токен не берётся) |
+| через 12 секунд | 0 → 1 | следующая попытка `401` | 0 |
+
+Код — в пакете `golang.org/x/time/rate`: token bucket от команды Go (добавлен через `go get golang.org/x/time/rate`, GB-2.06; в `go.mod` `v0.16.0`). Полный `cmd/api/ratelimit.go`:
+
+```go filename="cmd/api/ratelimit.go" showLineNumbers
+package main
+
+// Login'ga rate limit (GB-6.07). Har login urinishi argon2id hisoblaydi (GB-6.03: 46 MiB xotira):
+// cheklovsiz POST /login — parol taxmin qilish uchun ochiq eshik va serverni band qilishning arzon yoʻli.
+//
+// golang.org/x/time/rate — Go jamoasining token bucket'i: chelakda eng koʻpi `burst` ta token,
+// har `every` vaqtda bittadan toʻladi; har soʻrov bitta token oladi; token yoʻq — 429 Too Many Requests
+// (RFC 6585 §4) va Retry-After: necha soniyadan keyin qayta urinish mumkin (RFC 9110 §10.2.3).
+
+import (
+	"math"
+	"net"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// limiters — har kalit (IP yoki email) uchun alohida chelak. Map bir vaqtda koʻp soʻrovdan
+// ishlatiladi, shuning uchun mutex (GB-4.07). Kalitlar oʻchirilmaydi: uzoq ishlaydigan serverda
+// map oʻsib boradi — tozalash 🟡 ixtiyoriy vazifada (TASK.md, sweep).
+type limiters struct {
+	mu    sync.Mutex
+	m     map[string]*rate.Limiter
+	every rate.Limit
+	burst int
+}
+
+// newLimiters — har kalitga: boshida burst ta urinish, keyin har every'da bittadan.
+func newLimiters(every time.Duration, burst int) *limiters {
+	return &limiters{m: map[string]*rate.Limiter{}, every: rate.Every(every), burst: burst}
+}
+
+// get — kalitning chelagi; birinchi murojaatda yangisi (toʻla) yaratiladi.
+func (l *limiters) get(key string) *rate.Limiter {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.m[key]
+	if !ok {
+		lim = rate.NewLimiter(l.every, l.burst)
+		l.m[key] = lim
+	}
+	return lim
+}
+
+// wait — 0: urinish mumkin (token olindi). Aks holda — keyingi token qancha vaqtdan keyin.
+// Reserve navbat oladi, Delay — shu navbatgacha kutish; biz kutmaymiz: Cancel tokenni qaytaradi.
+func (l *limiters) wait(key string) time.Duration {
+	res := l.get(key).Reserve()
+	d := res.Delay()
+	if d > 0 {
+		res.Cancel()
+	}
+	return d
+}
+
+// limitByIP — middleware (GB-6.01 shakli): kalit — mijozning IP manzili. r.RemoteAddr — TCP ulanishning
+// manzili («IP:port»), uni mijoz soxtalashtira olmaydi. X-Forwarded-For sarlavhasiga ishonmaymiz: uni
+// har kim yozadi. Server proksi (Caddy, GB-8.06) ortida boʻlsa, RemoteAddr — proksining manzili: hamma mijoz bitta
+// chelakka tushadi. U holda IP'ni faqat ishonchli proksi yozgan sarlavhadan olish kerak (GB-8.06).
+// net/http serveri RemoteAddr'ni doim «IP:port» qiladi, shuning uchun SplitHostPort xatosi bu yerda kutilmaydi.
+// Eslatma: IPv6'da bitta foydalanuvchida odatda butun /64 tarmoq boʻladi — production'da kalitni /64 boʻyicha olish mumkin.
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tooManyRequests — 429 problem va Retry-After butun soniyalarda, yuqoriga yaxlitlangan.
+func tooManyRequests(w http.ResponseWriter, d time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
+	writeProblem(w, newProblem(http.StatusTooManyRequests, "urinishlar koʻp: keyinroq qayta urinib koʻring"))
+}
+```
+
+| Строки | Что делает |
+|---|---|
+| 10–19 | `import`; `rate` — `golang.org/x/time/rate` |
+| 24–29 | `limiters`: `m` — ключ (IP или email) → одно ведро (`*rate.Limiter`); `mu` — mutex, потому что `map` одновременно использует много запросов (GB-4.07); `every` — интервал между токенами (тип `rate.Limit`), `burst` — размер ведра |
+| 32–34 | `newLimiters`: `rate.Every(every)` создаёт скорость «один токен каждые `every`» |
+| 37–46 | `get`: ведро ключа; для нового ключа `rate.NewLimiter` создаёт полное ведро |
+| 50–57 | `wait`: `Reserve` занимает очередь (токен берётся), `Delay` — время ожидания до этой очереди (`time.Duration`). Ждать мы не будем: при `d > 0` `Cancel` возвращает токен. Функция возвращает `0` (можно) или время ожидания |
+| 65–74 | `limitByIP`: middleware (форма из GB-6.01). `r.RemoteAddr` — адрес TCP-соединения, `"IP:port"`; `net.SplitHostPort` выделяет IP, порт и ошибка отбрасываются в `_`. Если `wait(ip) > 0` — `429`, `return` |
+| 77–80 | `tooManyRequests`: пишет `Retry-After` целым числом секунд: `math.Ceil` округляет вверх (`11.9` → `12`), `strconv.Itoa` превращает целое число в текст. Ответ — problem JSON из GB-6.02 |
+
+Зачем нужен `Cancel`? `Reserve` занимает очередь, даже если токенов не хватает (берёт будущий токен «в долг»). Чтобы отклонённая попытка не опустошала ведро ещё сильнее, `Cancel` отменяет её эффект (документация пакета: «насколько возможно»). Иначе каждая отклонённая попытка отодвигала бы следующее разрешение.
+
+`limitByIP` оборачивает в маршруте `requireJSON`, поэтому срабатывает **до** argon2id:
+
+```go
+	mux.Handle("POST /login", a.loginIP.limitByIP(requireJSON(http.HandlerFunc(a.login))))
+```
+
+А `api.loginIP` создаётся в `newMux`: `newLimiters(12*time.Second, 5)` — пять попыток, потом по одной каждые 12 секунд (`handlers.go`, `loginIP: newLimiters(12*time.Second, 5)`).
+
+**Предскажите.** Новый сервер (`final`), тот же цикл: подряд восемь неверных login с одного IP. Что выведется? **A)** восемь раз `401` · **B)** пять раз `401`, затем три раза `429` · **C)** один раз `401`, затем семь раз `429`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Ведро начинается с 5 токенов: пять попыток проходят (пароль неверный, поэтому `401`), на оставшиеся три токенов не хватает. A — это результат bozor без лимита (выше). C — ведро не начинается пустым: новому ключу дают полное ведро.
+
+</details>
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+Девятую попытку посмотрим с `-i` (заголовки тоже выводятся):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | mask
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/problem+json
+Retry-After: 12
+Vary: Origin
+X-Request-Id: K7V3HIQQB55VIDP4I42XHAMIXC
+Date: Sat, 28 Nov 2026 09:24:26 GMT
+Content-Length: 166
+
+{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"urinishlar koʻp: keyinroq qayta urinib koʻring","request_id":"K7V3HIQQB55VIDP4I42XHAMIXC"}
+```
+
+`Retry-After: 12`, `Content-Type: application/problem+json`: форма ответа из GB-6.02. Важно: `12` — это **оставшееся** время, а не постоянное число. Через пять секунд после девятой попытки я отправил ещё один запрос: значение уменьшилось (это дополнительный опыт, его нет в видео):
+
+```console
+$ curl -s -i localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json | grep Retry-After
+Retry-After: 7
+```
+
+Ещё через восемь секунд в ведро вернулся токен: попытка снова разрешена (пароль неверный, `401`):
+
+```console
+$ curl -s -o /dev/null -w "%{http_code}\n" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json
+401
+```
+
+Лимит считает **все** попытки, в том числе login с верным паролем (ещё один дополнительный опыт; `login.json` — верный пароль): шестая попытка получает `429`.
+
+```console
+$ for i in $(seq 6); do curl -s -o /dev/null -w "%{http_code} " localhost:8765/login -H "Content-Type: application/json" --data-binary @login.json; done; echo
+200 200 200 200 200 429
+```
+
+Ключ — IP из `r.RemoteAddr`, то есть адрес TCP-соединения: клиент не может его подделать. Заголовку `X-Forwarded-For` мы не верим: его пишет сам клиент. Если сервер стоит за прокси, `RemoteAddr` — адрес прокси, и все клиенты попадают в одно ведро; как получить настоящий IP, решим в [GB-8.06](/lab/youtube/gb#gb-8-06).
+
+**На работе завтра:** не возвращайте `Origin` без проверки; в запросе, меняющем состояние, проверяйте, откуда он пришёл; ограничивайте login и по IP, и по учётной записи.
+
+## Глубже (необязательно): границы
+
+- **Запрос без заголовков проходит (fail-open).** Из-за правила 4 в `Check` запрос без `Sec-Fetch-Site` и без `Origin` проходит: чтобы работали curl и мобильные приложения. OWASP для чувствительных endpoint рекомендует обратное (fail-safe: заголовка нет — отказ). Современные браузеры шлют `Sec-Fetch-Site` с 2023 года (OWASP), поэтому для браузера это решение не опасно.
+- **При сравнении `Origin` и `Host` схема не учитывается.** Запрос между origin с HTTP на HTTPS правило 3 отличить не может. Комментарий в исходнике Go называет решение: HTTPS и HSTS (GB-8.06).
+- **Fetch Metadata шлётся только на надёжные адреса:** `https`, `wss`, `file`, `localhost` и `127.0.0.0/8` (OWASP). В production HTTPS обязателен; на обычном HTTP остаётся только проверка `Origin`.
+- **Cookie без `SameSite`.** RFC 6265bis: если атрибута нет или он неизвестен, режим по умолчанию равен `Lax`. Браузер (`MAY`) может ещё применить к недавно созданному cookie режим `Lax-allowing-unsafe`: отправлять его на `POST` верхнего уровня с другого site; RFC рекомендует возраст cookie не более 2 минут. Поэтому всегда пишите атрибут явно.
+- **CSRF-токен** (synchronizer или signed double-submit) — классический путь. OWASP называет `Sec-Fetch-Site` основным сигналом политики Fetch Metadata, а если заголовка нет, советует проверку `Origin` и при необходимости токен.
+- **XSS побеждает любую защиту от CSRF** (OWASP): скрипт, попавший на страницу, шлёт запросы с того же origin. `HttpOnly` останавливает только кражу токена.
+- **Лимиты в памяти** и относятся к одному процессу. Если экземпляров сервера несколько, нужен общий счётчик (например, Redis). Ключи приходят от клиента (IP, email), и `map`, который не очищают, растёт: `sweep` из домашнего задания его чистит.
+- **Границы ключа-IP.** Много пользователей за одним NAT делят одно ведро. В IPv6 у одного клиента обычно целая сеть `/64` (в production ключ можно брать по `/64`).
+- **DoS через блокировку.** Лимит по email позволяет злоумышленнику заблокировать и Дилнозу (OWASP, «Account Lockout»). Поэтому лимит по email мягче, чем по IP: 10 попыток, затем одна в минуту.
+
+## Частые ошибки
+
+**1. «Поставил `SameSite=Lax`, CSRF закрыт».** Мы видели выше: `Lax` останавливает `POST` с **другого site**, но не соседний порт или поддомен внутри одного site. А при `None` cookie уходит отовсюду. Итог: `200`, заказ отменён (таблица, три строки). Правильно: оставьте `Lax` **и** включите на сервере `protectCSRF` (`CrossOriginProtection`).
+
+**2. Считать CORS защитой сервера.** Реальный вывод: чужая страница получила `TypeError: Failed to fetch`, но в логе была строка `GET "/me" 200 … cookie=true`: запрос выполнен. Ошибка видна в браузере, а сервер отработал. Правильно: запрос, меняющий состояние, останавливает `protectCSRF`, а чтение данных защищают аутентификация (`requireUser`) и проверка владельца (GB-6.06).
+
+**3. Возвращать `Origin` без проверки.** Реальный вывод: страница прочитала данные Дилнозы (`oʻqildi: {"id":1,…}`). Причина: `Allow-Origin` взят из `Origin` запроса и добавлен `Allow-Credentials: true`. Правильно: список `allowedOrigins`, проверка `if !allowed[origin]` в коде `cors`, `Vary: Origin` в каждом ответе. `Allow-Origin: *` вместе с `Allow-Credentials` использовать нельзя: браузер отклонит такой ответ (OWASP).
+
+**4. `X-Forwarded-For` как ключ IP.** Этого нет в папке, это мой дополнительный опыт: в `limitByIP` добавлены три строки (в копии для опыта; код в папке не менялся).
+
+```go
+func (l *limiters) limitByIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			ip = xff // XATO: sarlavhani mijoz yozadi
+		}
+		if d := l.wait(ip); d > 0 {
+			tooManyRequests(w, d)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+Атакующий меняет заголовок в каждом запросе (`-H "X-Forwarded-For: 203.0.113.$i"`):
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 401 401 401
+```
+
+Восемь раз `401`: лимит не сработал, каждому значению заголовка выдали новое полное ведро. В настоящем коде (ключ — `RemoteAddr`) та же команда упирается в лимит:
+
+```console
+$ for i in $(seq 8); do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" localhost:8765/login -H "Content-Type: application/json" --data-binary @wrong.json; done; echo
+401 401 401 401 401 429 429 429
+```
+
+## Проверьте себя
+
+**1.** Почему страница на `localhost:9090` получила `Lax` cookie, хотя cookie `Lax`?
+
+<details>
+<summary>Ответ</summary>
+
+Порт site не меняет: `localhost:9090` с bozor (`localhost:8765`) — **один site**. `SameSite` ограничивает только запросы, начатые с другого site, внутри одного site cookie уходит при любом запросе. Поэтому на сервере нужно проверять `Sec-Fetch-Site` и `Origin`: `Sec-Fetch-Site: same-site` в `CrossOriginProtection` отклоняется.
+
+</details>
+
+**2.** Почему CORS не защита сервера?
+
+<details>
+<summary>Ответ</summary>
+
+CORS управляет только **чтением** ответа. Запрос доходит до сервера и выполняется: в логе была строка `GET "/me" 200 … cookie=true`, а страница всё равно получила `Failed to fetch`. Запрос, меняющий состояние, останавливает `protectCSRF`.
+
+</details>
+
+**3. GB-6.04.** Почему старая копия cookie после logout получает `401`?
+
+<details>
+<summary>Ответ</summary>
+
+Logout удалил запись сессии на сервере. Сервер при каждом запросе ищет запись по хешу токена из cookie и не находит: `requireUser` отвечает `401`. Само cookie (в браузере или в `jar.txt`) ничего не доказывает.
+
+</details>
+
+**4. Предскажите.** На сервере `final` Дилноза входит с **верным** паролем с одного IP шесть раз подряд. Какие статусы?
+
+<details>
+<summary>Ответ</summary>
+
+`200 200 200 200 200 429`. Лимит считает попытки, а не верность пароля: в маршруте `limitByIP` стоит перед `login`. На шестую попытку токена не хватает. Вывод «Лимит считает все попытки» выше это показывает.
+
+</details>
+
+**5. Предскажите.** `curl -X POST -b jar.txt -H 'Origin: http://localhost:9090' localhost:8765/orders/41/cancel` (без `Sec-Fetch-Site`): результат?
+
+<details>
+<summary>Ответ</summary>
+
+`403`. `Sec-Fetch-Site` нет, поэтому правило 3: host в `Origin` (`localhost:9090`) отличается от заголовка `Host` (`localhost:8765`), отказ. Причина в логе: `cross-origin request detected, and/or browser is out of date: Sec-Fetch-Site is missing, and Origin does not match Host`.
+
+</details>
+
+## Домашнее задание
+
+🟢 **Второй лимит по email.** Лимит по IP из видео ограничивает один IP. Если атакующий меняет IP (прокси, ботнет, IPv6), у каждого нового IP ведро полное: подбор пароля Дилнозы продолжается без конца. OWASP Authentication Cheat Sheet: счётчик попыток привязывают к **самой учётной записи**, а не к IP источника.
+
+Спецификация (из [TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/TASK.md) в папке):
+
+- на один email: 10 попыток, затем по одной в минуту (`newLimiters(time.Minute, 10)`);
+- email без учёта регистра: `Dilnoza@…` и `DILNOZA@…` — одно ведро;
+- 11-я попытка (каждый раз с другого IP) → `429` и `Retry-After`; на другой email обычный `401`;
+- проверка **до** argon2id: попытка сверх лимита не должна нагружать сервер.
+
+Что сделать: в структуру `api` в `cmd/api/handlers.go` добавьте поле `loginEmail *limiters`, а в `newMux` создайте его через `newLimiters(time.Minute, 10)`; в `login` в `cmd/api/auth.go` после `decodeJSON` и перед `checkPassword` приведите email к нижнему регистру через `strings.ToLower`, вызовите `a.loginEmail.wait(…)`, и если результат больше `0`, сделайте `tooManyRequests(w, d)` и `return`. Форма та же, что у `limitByIP`, ключ другой. Файлы `*_test.go` не меняйте. В корне папки (копия здесь не нужна, работайте в самой папке):
+
+```console
+$ go test ./... 2>&1 | mask
+--- FAIL: TestLoginEmailLimit (0.68s)
+    tekshiruv_test.go:26: 11-urinish ([email], yangi IP 10.0.0.11): status 401, kutilgan 429 (TASK.md: email boʻyicha limit — 10 ta urinish, harf kattaligi farq qilmaydi)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	1.629s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.470s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+FAIL
+```
+
+`--- FAIL: TestLoginEmailLimit` — упавший тест; сообщение говорит, чего ждали: на 11-й попытке `429`, сейчас `401`. `[email]` — email лабораторного пользователя, спрятанный через `mask`. Тест шлёт каждую попытку с другого IP: лимит по IP не работает, работает только ваш лимит. Строка с `FAIL` — пакет, `ok` — пакеты, прошедшие тесты, `[no test files]` — пакет без тестов.
+
+🟡 **Необязательно: `sweep`.** В `cmd/api/ratelimit.go` добавьте `func (l *limiters) sweep(now time.Time) int`: она удаляет из `map` ключи с **полным** ведром (давно не пробовавшие) и возвращает, сколько удалила. Подсказка: `lim.TokensAt(now) >= float64(l.burst)`. Проверяет `TestSweep`: пока `sweep` не написана, он даёт `SKIP`:
+
+```console
+$ go test -v -run "Sweep" ./cmd/api
+=== RUN   TestSweep
+    tekshiruv_test.go:43: 🟡 ixtiyoriy: (*limiters).sweep(now time.Time) int hali yozilmagan (TASK.md, 3-qadam)
+--- SKIP: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.095s
+```
+
+Решение — [в папке solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors/solution).
+
+<details>
+<summary>Ответ: разбор</summary>
+
+Поле и его создание в `handlers.go`:
+
+```go
+type api struct {
+	st         *store.Store
+	loginIP    *limiters // GB-6.07: bitta IP'dan login urinishlari
+	loginEmail *limiters // vazifa: bitta email'ga login urinishlari (IP'lar almashsa ham)
+}
+
+// newMux — hamma route'lar shu yerda: main ham, testlar ham bir xil mux'ni ishlatadi.
+func newMux(st *store.Store) *http.ServeMux {
+	a := &api{
+		st:         st,
+		loginIP:    newLimiters(12*time.Second, 5), // 5 ta urinish, keyin har 12 soniyada bittadan
+		loginEmail: newLimiters(time.Minute, 10),   // 10 ta urinish, keyin har daqiqada bittadan
+	}
+```
+
+В `login` в `auth.go` после `decodeJSON` и перед `checkPassword` (в импорты добавляется `"strings"`):
+
+```go
+	// Vazifa: email boʻyicha limit — argon2id'dan oldin, harf kattaligisiz (users_email_lower_idx, GB-6.04).
+	// OWASP Authentication Cheat Sheet: hujumchi IP'larni almashtirsa ham, bitta hisobga urinishlar cheklansin.
+	if d := a.loginEmail.wait(strings.ToLower(in.Email)); d > 0 {
+		tooManyRequests(w, d)
+		return
+	}
+```
+
+Ключ — email, приведённый к нижнему регистру: `Dilnoza@…` и `DILNOZA@…` попадают в одно ведро. Проверка стоит перед `checkPassword`: argon2id не считается. В маршруте лимит по IP стоит перед лимитом по email: сначала IP, потом email.
+
+`sweep` (🟡):
+
+```go
+func (l *limiters) sweep(now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for key, lim := range l.m {
+		if lim.TokensAt(now) >= float64(l.burst) {
+			delete(l.m, key) // range ichida delete mumkin (Go spec: For statements with range clause)
+			n++
+		}
+	}
+	return n
+}
+```
+
+`sweep` берёт `mu` (`map` одновременно используют другие запросы), и если `TokensAt(now)` показывает у ведра ключа полное ведро, удаляет ключ через `delete` (внутри `range` `delete` допустим). Удалять полное ведро безопасно: новое всё равно создаётся полным. На сервере её нужно вызывать периодически (горутиной с `time.Ticker`, GB-7.01).
+
+Тесты папки с решением:
+
+```console
+$ cd solution && go test ./...
+ok  	github.com/abdurahmon27/bozor/cmd/api	1.153s
+?   	github.com/abdurahmon27/bozor/cmd/begona	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/password	0.291s
+?   	github.com/abdurahmon27/bozor/internal/store	[no test files]
+```
+
+Увидеть, что оба теста прошли, можно с `-v`:
+
+```console
+$ cd solution && go test -v -run "LoginEmailLimit|Sweep" ./cmd/api
+=== RUN   TestLoginEmailLimit
+--- PASS: TestLoginEmailLimit (0.64s)
+=== RUN   TestSweep
+--- PASS: TestSweep (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.730s
+```
+
+Формат и статический анализ ничего не выводят (в корне папки):
+
+```console
+$ gofmt -l . && go vet ./...
+```
+
+</details>
+
+После опытов остановите серверы `Ctrl+C` и удалите копии: `rm -rf /tmp/gb-6-07`.
+
+## Источники
+
+- [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) · [SameSite](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#samesite-cookie-attribute) · [проверка Origin](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#verifying-origin-with-standard-headers)
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#login-throttling): login throttling и account lockout
+- Go: [net/http · CrossOriginProtection](https://pkg.go.dev/net/http#CrossOriginProtection) · [Go 1.25 release notes](https://go.dev/doc/go1.25#nethttppkgnethttp) · [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) · [Request.RemoteAddr](https://pkg.go.dev/net/http#Request)
+- [RFC 6265bis · cookie](https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis) (draft-22): префикс `__Host-`, `Max-Age`, `SameSite`
+- MDN: [Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie) · [Site](https://developer.mozilla.org/en-US/docs/Glossary/Site) · [Sec-Fetch-Site](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site) · [Document.cookie](https://developer.mozilla.org/en-US/docs/Web/API/Document/cookie) · [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS) · [CSRF](https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF)
+- [HTML Standard · same site](https://html.spec.whatwg.org/multipage/browsers.html#same-site) · [Fetch Standard · CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol) · [CORS-preflight request](https://fetch.spec.whatwg.org/#cors-preflight-request)
+- [RFC 6585 §4 · 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585#section-4) · [RFC 9110 §10.2.3 · Retry-After](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)
+- [PortSwigger Web Security Academy · CORS](https://portswigger.net/web-security/cors) · [chromedp](https://github.com/chromedp/chromedp) (только для программы-браузера)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, curl 8.22.0, jq 1.8.2, Google Chrome 155.0.8059.39 (headless, через chromedp), 2026-11-28. Все выводы перезапущены на этой машине; по содержанию они совпадают с выводами из видео, отличаются только ID запросов, токены, даты и время (в видео, например, `164.447µs`, `53.587µs`). Дополнительные опыты (правила `Check`, уменьшение `Retry-After`, login с верным паролем, `X-Forwarded-For`) в папке отсутствуют: я их запускал сам, команды на странице полные. Следующий урок: [GB-6.08 · Контрольная точка: защищённый bozor](/lab/youtube/gb#gb-6-08).
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-6-07-cookie-csrf-cors)
+
+---
+
+← Предыдущий урок: [GB-6.06](/lab/youtube/gb/gb-6-06/ru) · Следующий урок: [GB-6.08](/lab/youtube/gb#gb-6-08) → · [Все уроки](/lab/youtube/gb)
+
+</div>
