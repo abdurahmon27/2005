@@ -1,0 +1,792 @@
+---
+title: "Configuration and secrets: stop with a clear error for invalid settings"
+date: "2026/11/28"
+description: "Read Go API configuration from environment and flags, validate at startup, and keep passwords out of logs and git."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-8-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-8-01"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-8-01) · [Русский](/lab/youtube/gb/gb-8-01/ru) · **English**  
+Lesson GB-8.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-8-01) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Port `8765` is occupied on the server running the bozor API. Why should choosing another port require rebuilding the code?
+Who sees the Postgres password if it reaches the startup log?
+
+**The one idea:** configuration enters the process from outside and is checked in one place at startup.
+An invalid port or missing database address makes the API return the problems together, before connecting or opening its HTTP port.
+Only values approved for disclosure belong in logs and git.
+
+After this lesson you will:
+
+- implement `flag > environment > default` precedence and distinguish missing from empty values;
+- put validation before external resources using `loadConfig` and `run`;
+- reproduce a password leak through `%+v` and define an explicit log view;
+- keep `.env` outside git and add `HOST` until the tests pass.
+
+| Term | Plain meaning | English term |
+|---|---|---|
+| configuration | a port, database address and other inputs that change between deployments | configuration |
+| startup validation | checking values before the service starts work | startup validation |
+| secret | a password or key that must not be disclosed; marked `secret` in the code | secret |
+
+## Before you start
+
+- [GB-7.07 · Importer checkpoint](/lab/youtube/gb/gb-7-07/en) — the previous lesson in course order.
+- [GB-6.08 · Protected bozor](/lab/youtube/gb/gb-6-08/en) — today's API starts from a copy of its `solution/`.
+- [GB-5.10 · Orders API](/lab/youtube/gb/gb-5-10/en) and [GB-5.05 · pgx pool](/lab/youtube/gb/gb-5-05/en) — `main → run`, `defer`, context, connections and `Ping`.
+- [GB-5.02 · Postgres and Compose](/lab/youtube/gb/gb-5-02/en) and [GB-5.06 · Migrations](/lab/youtube/gb/gb-5-06/en) — the local database, volume and migration commands in the `main.go` comment.
+- [GB-2.08 · Errors](/lab/youtube/gb/gb-2-08/en) and [GB-2.07 · Interface and Stringer](/lab/youtube/gb/gb-2-07/en) — `errors.Join`, `errors.Is`, `String()`.
+- [GB-2.06 · Packages](/lab/youtube/gb/gb-2-06/en), [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04/en), [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03/en) — lowercase fields, `*p`, a method and `%+v`.
+- [GB-2.02 · Comma-ok](/lab/youtube/gb/gb-2-02/en) and [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01/en) — `v, ok`, `append`, `len`, `[1:]`.
+- [GB-1.07 · Arguments and errors](/lab/youtube/gb/gb-1-07/en), [GB-1.05 · Conditions](/lab/youtube/gb/gb-1-05/en), [GB-1.04 · Formatting](/lab/youtube/gb/gb-1-04/en), [GB-1.02 · Values and types](/lab/youtube/gb/gb-1-02/en), [GB-1.01 · Build](/lab/youtube/gb/gb-1-01/en) — the basic syntax used below.
+- [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/en) — lowercase fields are excluded from JSON.
+- [GB-7.04 · Bounded concurrency](/lab/youtube/gb/gb-7-04/en) — the closing question about `SetLimit`.
+
+The code runs in `lessons/gb-8-01-config`, with its own `go.mod`. Run commands from that folder's root.
+This is a local Linux lab: it needs Go 1.27.4, Docker Compose and free ports `5581` and `8781`.
+Config tests do not need Postgres. The full API tests do.
+
+We reran the results in a fresh Bash session. The environment setup commands printed nothing:
+
+```console
+$ export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+$ unset PORT DATABASE_URL HOST
+$ go version
+go version go1.27.4 linux/amd64
+```
+
+`CGO_ENABLED=0` builds this lab without a C compiler.
+First, recall GB-6.08: what status does Dilnoza get when requesting Jasur's order 42?
+
+**A)** `401` · **B)** `403` · **C)** `404`
+
+<details>
+<summary>Answer</summary>
+
+**C: `404`.** SQL checks the order owner too. A foreign order and a missing order produce the same response.
+
+</details>
+
+## Configuration outside the code
+
+**Deploy in Twelve-Factor** means a running instance of the application in a particular environment: local, test or production, where real users work.
+This definition comes from the [Codebase section](https://12factor.net/codebase).
+[Twelve-Factor](https://12factor.net/config) defines configuration as values that change between deployments.
+Changing the port does not change the code. The same binary works after changing the password.
+
+The database password enters through an environment variable. A **flag** is a named command-line parameter, such as `-port 8781`.
+The flags in this lesson are a convenience; Twelve-Factor recommends storing configuration in the environment.
+
+| Input | Flag | Default | Validation |
+|---|---|---|---|
+| `PORT` | `-port` | `8765` | integer from 1 to 65535 |
+| `DATABASE_URL` | none | none | nonempty; pgx checks format and connectivity later |
+
+This API deliberately rejects port 0. That is an application rule, not a general rule about all TCP ports.
+The secret is the password in the database connection string. These bozor sessions have no extra signature key; we do not invent one.
+Publishing the source code must not disclose real credentials.
+
+## Environment, flags and precedence
+
+`cmd/api/config.go` has two fields. Lowercase names keep them inside the `main` package; they do not hide them from logs.
+These are fragments of that file. The full file appears after we fix secret disclosure.
+
+```go
+type config struct {
+	port        int
+	databaseURL string // secret: ichida parol bor
+}
+
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+```
+
+`key` is the environment name; `def` is the default. `LookupEnv` returns the value and a presence boolean, `ok`.
+The `:=` inside `if` receives both results; `; ok` checks presence. `Getenv` cannot distinguish these cases.
+
+| `PORT` state | `v` | `ok` | `envOr("PORT", "8765")` |
+|---|---|---|---|
+| absent | `""` | `false` | `"8765"` |
+| `PORT=` | `""` | `true` | `""` |
+| `PORT=9090` | `"9090"` | `true` | `"9090"` |
+
+```go
+func loadConfig(args []string) (config, error) {
+	fs := flag.NewFlagSet("api", flag.ContinueOnError)
+	port := fs.String("port", envOr("PORT", "8765"), "HTTP port (muhitda: PORT)")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+```
+
+`args []string` holds arguments without the program name. `NewFlagSet` creates a separate set named `api` on each call.
+With `ContinueOnError`, `Parse` returns an error instead of terminating the process. This makes the function callable from tests.
+`fs.String` takes a name, default value and help text. It returns `*string`, a pointer to a string.
+It initially holds the environment value or default. `Parse` replaces it with the supplied `-port` value.
+`config{}` is an empty struct returned alongside an error. Do not use it as successful configuration.
+
+| Step | `PORT=9090`, argument `-port 8781` | Only `PORT=9090` | Neither |
+|---|---|---|---|
+| `*port` after `fs.String` | `"9090"` | `"9090"` | `"8765"` |
+| `*port` after `fs.Parse` | `"8781"` | `"9090"` | `"8765"` |
+
+No flag is registered for `DATABASE_URL`: secrets must stay out of the command line.
+
+## Validate before opening resources
+
+```go
+	var errs []error
+	n, err := strconv.Atoi(*port)
+	if err != nil || n < 1 || n > 65535 {
+		errs = append(errs, fmt.Errorf("port %q: 1–65535 oraligʻidagi butun son kerak", *port))
+	}
+	db := os.Getenv("DATABASE_URL")
+	if db == "" {
+		errs = append(errs, errors.New("DATABASE_URL qoʻyilmagan: .env.example'ga qarang"))
+	}
+	if len(errs) > 0 {
+		return config{}, errors.Join(errs...)
+	}
+	return config{port: n, databaseURL: db}, nil
+}
+```
+
+`errs` is an error slice. `Atoi(*port)` converts the string behind the pointer to an integer.
+`||` adds an error if any condition holds. The result of `append` is assigned back to `errs`.
+`%q` adds quotes: even an empty port appears as `""`. The database error includes the name, without its value.
+If `len(errs)` is positive, `errs...` passes the elements to `Join` as separate arguments.
+`Join` returns one error value and separates messages with newlines. With no problems, a `config` with named fields and `nil` are returned.
+
+Here is the complete course `main.go`. In the current file, its `Printf` line uses `String()`.
+The next section reproduces the stage without that method in a separate copy.
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor API'si (GB-6.08'dagi himoyalangan bozor), endi sozlamasi tashqaridan (GB-8.01, config.go):
+// port flag yoki muhitdan, DATABASE_URL faqat muhitdan; notoʻgʻri sozlamada server aniq xato bilan toʻxtaydi.
+//
+//	docker compose up -d --wait
+//	goose up                     (GOOSE_DRIVER, GOOSE_DBSTRING, GOOSE_MIGRATION_DIR: GB-5.06)
+//	docker compose exec db psql -f /lab/seed.sql
+//	cp .env.example .env         (bir marta; .env gitga tushmaydi)
+//	set -a; . ./.env; set +a     (.env'dagi qatorlarni muhitga eksport qiladi)
+//	go build ./cmd/api && ./api  → config: port=8765 db=localhost:5581/bozor
+//	./api -h                     → flag'lar roʻyxati
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// newServer — bozor API serveri (GB-4.04). Handler — newHandler: middleware zanjiri, ichida newMux (GB-6.01).
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newHandler(st),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func main() {
+	err := run(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		return // -h: flag yordam matnini chiqardi, bu xato emas
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+
+// run — dasturning hammasi shu yerda (GB-5.10): xato qaytaradi, defer'lar ishlaydi, chiqish kodini main hal qiladi.
+func run(args []string) error {
+	cfg, err := loadConfig(args)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("config: %+v\n", cfg) // String() chaqiriladi: parol chiqmaydi
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil { // baza ishlamasa server ishga tushmaydi
+		return err
+	}
+	srv := newServer(cfg.addr(), store.New(pool))
+	fmt.Printf("bozor API: http://localhost:%d\n", cfg.port)
+	return srv.ListenAndServe()
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1–10 | startup comments; not executed |
+| 11 | executable `main` package |
+| 13–24 | context, errors, flags, formatting, HTTP, environment, time, store and pgx pool packages |
+| 26–33 | `newServer`: address, handler and a 5-second header-reading limit; `&` returns a server pointer |
+| 35–39 | `os.Args[1:]` removes the program name; `ErrHelp` exits successfully |
+| 40–44 | writes other errors to stderr and calls `os.Exit(1)` |
+| 46–51 | `run` loads configuration; on error, returns before external resources |
+| 52 | prints the configuration's log view |
+| 53–54 | a 5-second database context; `defer cancel()` runs on return |
+| 55–62 | creates the pool, schedules its closure and checks connectivity with `Ping` |
+| 63–65 | creates the HTTP server, prints its address and listens; returns its error |
+
+`loadConfig` checks only the port and a nonempty `DATABASE_URL`. It does not validate URI syntax or database availability.
+`pgxpool.New` and `Ping` are the next stage; both also run before HTTP listening.
+An invalid flag makes `Parse` return immediately: subsequent validation errors are not collected in that case.
+
+| State | `loadConfig` | Postgres | HTTP port |
+|---|---|---|---|
+| invalid port or missing DB | error, `run` returns | not opened | not opened |
+| DB text present, connection invalid | returns configuration | creation or `Ping` fails | not opened |
+| everything valid | returns configuration | `Ping` succeeds | opened by `ListenAndServe` |
+
+`PORT=80a` and `DATABASE_URL` is absent. What appears?
+
+**A)** only a port error · **B)** port and DB errors · **C)** a Postgres connection error
+
+<details>
+<summary>Answer</summary>
+
+**B.** `append` retains both problems. A assumes an early return on the first error; C assumes a connection before validation.
+
+</details>
+
+```console
+$ go build ./cmd/api && ./api ; echo "kod: $?"
+xato: DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+$ PORT=80a ./api ; echo "kod: $?"
+xato: port "80a": 1–65535 oraligʻidagi butun son kerak
+DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+```
+
+`go build ./cmd/api` creates the `api` binary at the root. `PORT=80a` sets an environment value for that command only.
+`$?` is the previous command's exit code. `main` adds the `xato:` prefix only once.
+This is an application error, not a compiler `file:line:column` message. The message names the problem and the setting to fix.
+
+## Help and an empty value
+
+Which default does `PORT=9090 ./api -h` show?
+
+**A)** `8765` · **B)** `9090` · **C)** a DB error
+
+<details>
+<summary>Answer</summary>
+
+**B.** `fs.String` has already read the environment. `-h` prints help and returns `ErrHelp`; `main` treats it as success.
+
+</details>
+
+```console
+$ PORT=9090 ./api -h
+Usage of api:
+  -port string
+    	HTTP port (muhitda: PORT) (default "9090")
+$ ./api -h 2> /dev/null ; echo "kod: $?"
+kod: 0
+```
+
+`Usage of api` names the set; `string` is the flag value's type; the next line is our help text.
+Help goes to stderr by default; `2> /dev/null` hides that stream. The separate check in `main` produces exit code 0.
+
+Now try `PORT=`. What happens?
+
+**A)** falls back to `8765` · **B)** a `port ""` error · **C)** runs on port 0
+
+<details>
+<summary>Answer</summary>
+
+**B.** The variable is present but empty. `LookupEnv` returns true for `ok`, then `Atoi("")` fails. A conflates absent and empty; C does not turn the text into a valid number.
+
+</details>
+
+```console
+$ PORT= ./api ; echo "kod: $?"
+xato: port "": 1–65535 oraligʻidagi butun son kerak
+DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+```
+
+## Keep secrets out of git
+
+`.env.example` holds only names and a template. `PAROL` ("password") is not a real credential.
+This template matches the course file:
+
+```text
+# Nusxa oling: cp .env.example .env — haqiqiy qiymatlar faqat .env'da (u gitga tushmaydi).
+PORT=8765
+DATABASE_URL='postgres://bozor:PAROL@localhost:5581/bozor'
+```
+
+In the URI, `bozor` is the user, `PAROL` the password, `localhost:5581` the host and port, and `/bozor` the database.
+Single quotes prevent shell interpretation; special characters inside the URI may still need percent-encoding.
+A single quote in the password itself cannot be inserted unchanged into this quoted form.
+
+Bash executes the file as code instead of reading it as data. Source only a trusted `.env`.
+The git rules already exist. Which file is ignored: `.env` or `.env.example`?
+
+**A)** both · **B)** only `.env` · **C)** neither
+
+<details>
+<summary>Answer</summary>
+
+**B.** The `.env` rule does not match `.env.example`. `/api` ignores only the root binary; `api` would also match `cmd/api`.
+
+</details>
+
+```console
+$ cat .gitignore
+.env
+/api
+$ git check-ignore -v .env
+.gitignore:1:.env	.env
+$ git check-ignore -v .env.example ; echo "kod: $?"
+kod: 1
+$ cp .env.example .env
+```
+
+The `-v` result contains the rule file, line, pattern, then a Tab and the checked path. Here `kod: 1` means no ignore rule matched.
+`cp` printed nothing. In the copy, replace `PAROL` with `bozor-lab` in your editor; keep the quotes.
+**This is a deliberately public lab password**, also used by `compose.yaml`. Never put a real password on the page or in git.
+
+`set -a` exports subsequent values; `.` executes the file in the current shell; `set +a` disables automatic export.
+Go does not read `.env` automatically. Only `echo` printed output below:
+
+```console
+$ set -a; . ./.env; set +a
+$ echo $PORT
+8765
+```
+
+`.gitignore` helps only with untracked files. A previously committed secret remains in history.
+Immediately revoke or replace an exposed password or key. Ignoring the file does not repair that exposure.
+On the server, Docker or systemd supplies the environment; GB-8.04 and GB-8.06 cover them.
+
+## Log only selected values
+
+A startup log is a line written when the program starts. What does this code print at the stage without `String()`?
+
+```go
+fmt.Printf("config: %+v\n", cfg)
+```
+
+**A)** every field, including the password · **B)** only the port · **C)** `{}`
+
+In a disposable learning copy only, we removed `String()` and the now-unused `net/url` import, then rebuilt.
+The original course files were unchanged. The leak below was rerun on this machine, not quoted from the video.
+
+<details>
+<summary>Answer</summary>
+
+**A.** `%+v` prints struct fields, including lowercase fields. B and C incorrectly apply JSON rules to `fmt`.
+
+</details>
+
+Compose starts the database. `-d` runs it in the background; `--wait` waits for readiness.
+The ports were free during verification. The Docker command below shows the complete output from this run:
+
+```console
+$ docker compose up -d --wait
+ Volume gb801_pgdata Creating 
+ Volume gb801_pgdata Creating 
+ Network gb801_default Creating 
+ Network gb801_default Creating 
+ Volume gb801_pgdata Created 
+ Volume gb801_pgdata Created 
+ Network gb801_default Created 
+ Network gb801_default Created 
+ Container gb801-db-1 Creating 
+ Container gb801-db-1 Created 
+ Container gb801-db-1 Starting 
+ Container gb801-db-1 Started 
+ Container gb801-db-1 Waiting 
+ Container gb801-db-1 Healthy
+```
+
+```console
+$ ./api -port 8781
+config: {port:8781 databaseURL:postgres://bozor:bozor-lab@localhost:5581/bozor}
+bozor API: http://localhost:8781
+```
+
+The flag selected `8781` over the `8765` in `.env`. The server occupies the current terminal; stop it with `Ctrl+C` after checking.
+But the log disclosed the password. A lowercase field does not provide secrecy.
+
+[OWASP Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude) recommends keeping passwords and raw connection strings out of logs.
+A log copy may reach a file, logging service or screenshot.
+The fix selects fields approved for output instead of trying to remove the user and password from the original string.
+`net/url` provides `Parse` to split an address; `Host` holds host and port, and `Path` holds the database path.
+
+Here is the complete corrected course `config.go`:
+
+```go filename="cmd/api/config.go" showLineNumbers
+package main
+
+// Sozlama (GB-8.01). Kod hamma muhitda bir xil; muhitga qarab oʻzgaradigan narsa (port, baza manzili, kalitlar)
+// tashqaridan keladi: muhit oʻzgaruvchilari va flag'lardan (Twelve-Factor App, III. Config).
+// Ustunlik: flag > muhit oʻzgaruvchisi > standart qiymat. Hammasi ishga tushishda BIR MARTA tekshiriladi:
+// biror qiymat notoʻgʻri boʻlsa server hech narsa ochmaydi, hamma xatolarni sanab, 1 kodi bilan chiqadi.
+//
+//	PORT          -port   HTTP port, 1–65535 (standart 8765)
+//	DATABASE_URL  —       Postgres manzili. SECRET: ichida parol bor. Faqat muhitdan, flag emas:
+//	                      buyruq qatori (ps, /proc/PID/cmdline) shu kompyuterdagi hamma foydalanuvchiga koʻrinadi.
+//
+// Qiymatlar: .env.example (gitda) → nusxasi .env (gitda emas, .gitignore).
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+)
+
+// config — serverning ishga tushish sozlamalari.
+type config struct {
+	port        int
+	databaseURL string // secret: ichida parol bor
+}
+
+// envOr — key qoʻyilgan boʻlsa uning qiymati (boʻsh boʻlsa ham), qoʻyilmagan boʻlsa def.
+// «PORT=» (boʻsh) — xato sozlama: u standart qiymatga jim almashmaydi, tekshiruvda ushlanadi.
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+// loadConfig — args (os.Args[1:]) va muhitdan config. Hamma xato bitta error'da (errors.Join), har biri alohida qatorda.
+// flag.ContinueOnError: notoʻgʻri flag'da Parse dasturni toʻxtatmaydi, xato qaytaradi (testlar uchun ham).
+func loadConfig(args []string) (config, error) {
+	fs := flag.NewFlagSet("api", flag.ContinueOnError)
+	port := fs.String("port", envOr("PORT", "8765"), "HTTP port (muhitda: PORT)")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	var errs []error
+	n, err := strconv.Atoi(*port)
+	if err != nil || n < 1 || n > 65535 {
+		errs = append(errs, fmt.Errorf("port %q: 1–65535 oraligʻidagi butun son kerak", *port))
+	}
+	db := os.Getenv("DATABASE_URL")
+	if db == "" {
+		errs = append(errs, errors.New("DATABASE_URL qoʻyilmagan: .env.example'ga qarang"))
+	}
+	if len(errs) > 0 {
+		return config{}, errors.Join(errs...)
+	}
+	return config{port: n, databaseURL: db}, nil
+}
+
+// addr — http.Server'ning Addr maydoni: ":8765" — shu portda, kompyuterning hamma tarmoq manzillarida.
+func (c config) addr() string {
+	return fmt.Sprintf(":%d", c.port)
+}
+
+// String — config'ning log'dagi koʻrinishi. fmt'ning %v, %+v va %s'i shu metodni chaqiradi (GB-2.07).
+// Bazadan faqat host va baza nomi: foydalanuvchi, parol va ?parametrlar chiqmaydi (OWASP Logging Cheat Sheet:
+// «Database connection strings» log'ga toʻgʻridan-toʻgʻri yozilmaydi). %#v String'ni chaqirmaydi: config'ni %#v bilan yozmang.
+func (c config) String() string {
+	db := "[yashirin]"
+	if u, err := url.Parse(c.databaseURL); err == nil && u.Host != "" {
+		db = u.Host + u.Path
+	}
+	return fmt.Sprintf("port=%d db=%s", c.port, db)
+}
+```
+
+The previously explained `envOr` and `loadConfig` are unchanged. The full file adds these lines:
+
+| Line | What it does |
+|---|---|
+| 1–13 | package and comments; the comment's "everything" is limited to the validation scope described above |
+| 14–21 | imports the required standard packages |
+| 23–27 | the two `config` fields |
+| 29–36 | `envOr` distinguishes absent from empty |
+| 38–60 | flag parsing, validation and returning one error |
+| 62–65 | `addr()` uses `%d` to format the port as `":8765"` |
+| 67–69 | comments describing `String()` and the `%#v` limitation |
+| 70–71 | a value-receiver method, with `[yashirin]` ("hidden") as its initial result |
+| 72 | uses `&&` to require successful `Parse` and a nonempty host |
+| 73–74 | selects only `u.Host + u.Path`; neither `u.User` nor query is included |
+| 75–76 | returns formatted text: `%d` for the port, `%s` for the selected DB text |
+
+A nonempty `Host` does not prove that a complete Postgres address is valid. It is a condition for the log view.
+`[yashirin]` means the address format did not fit this method; there is no need to print the raw value.
+
+Rebuild. What appears now?
+
+**A)** the password again · **B)** port, host and database name · **C)** an empty string
+
+<details>
+<summary>Answer</summary>
+
+**B.** `fmt` calls `String()` on the directly supplied `config`. Output changes even though `Printf` is unchanged.
+
+</details>
+
+```console
+$ go build ./cmd/api && ./api -port 8781
+config: port=8781 db=localhost:5581/bozor
+bozor API: http://localhost:8781
+```
+
+This result was also rerun. `%v`, `%+v` and `%s` use `String()` on a directly supplied `config` value.
+**Limit:** `%#v` bypasses this method. An invalid `%d` or config nested in another struct's lowercase field can also expose raw data.
+Do not send entire structs to logs using arbitrary formats. This method controls only the demonstrated output path.
+The next lesson shows `LogValue` for `slog`.
+
+Your system must also permit disclosure of the selected `Host` and `Path`.
+The error constructed by `loadConfig` omits the secret value; that is not a guarantee about every library error.
+Check those paths separately before logging a raw connection string or an unreviewed external error in production.
+
+## Going deeper (optional): command lines are visible too
+
+There is a reason we did not add a `DATABASE_URL` flag. On Linux, command lines are usually visible to other users.
+The video uses `ps -o args= -C api` and `pid=$(pgrep -x api)`.
+`-o args=` prints arguments without a header; `-C api` selects all processes with that name; `pgrep -x` matches the full name.
+Another lab with the same process name was running during our check. We therefore selected only our process's PID.
+PID means process ID. Here is the real second-terminal output while the server ran the preceding command:
+
+```console
+$ ps -o args= -p 1036694
+./api -port 8781
+$ stat -c '%A %n' /proc/1036694/cmdline /proc/1036694/environ
+-r--r--r-- /proc/1036694/cmdline
+-r-------- /proc/1036694/environ
+```
+
+`-p` selects one PID; in the `stat -c` template, `%A` means permissions and `%n` means filename.
+The video PID is `990337`; ours is shown above. PIDs change between runs.
+Here, `cmdline` permissions were `-r--r--r--`, while `environ` permissions were `-r--------`.
+That does not make the environment absolute secret protection: access also depends on procfs mount settings, process state and ptrace checks.
+The [Linux documentation](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html) specifies a ptrace access check for `environ`.
+
+[OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html) notes that environment values can reach logs and memory dumps.
+Larger systems use a secret manager, a separate service for managing secrets.
+Do not print the process's entire environment. After checking, stop the server with `Ctrl+C` and remove the lab database and its volume:
+
+```console
+$ docker compose down -v
+ Container gb801-db-1 Stopping 
+ Container gb801-db-1 Stopped 
+ Container gb801-db-1 Removing 
+ Container gb801-db-1 Removed 
+ Volume gb801_pgdata Removing 
+ Network gb801_default Removing 
+ Volume gb801_pgdata Removed 
+ Network gb801_default Removed
+```
+
+`down -v` deletes this lab's data. Do not run it against another service's Compose project.
+The video has no speed measurements; the important results are exit status, validation order and keeping secrets out of output.
+
+## Common mistakes
+
+1. **"Lowercase hides the password."** The broken code is the earlier `fmt.Printf("config: %+v\n", cfg)` at the stage without `String()`.
+   Its real output disclosed the password. Select approved values; JSON's field rules do not apply to `fmt`.
+2. **Replacing an empty `PORT` with the default.** The earlier `PORT=` run produced `port ""` and exit code 1.
+   Use the default only when `LookupEnv` returns `ok == false`. Do not silently hide invalid input.
+3. **An undefined flag.** The starter does not yet have `-host`. The homework test below really reports `flag provided but not defined: -host`.
+   It means the supplied flag has not been registered. Add `fs.String("host", …)` before `Parse`.
+4. **Trying to repair an old commit with `.gitignore`.** The rule does not affect a tracked file.
+   Immediately revoke or replace exposed credentials, then clean the repository and history using the appropriate process.
+5. **Assuming `loadConfig` validates everything.** pgx validates the database URI later; this code does not reject positional arguments.
+   `flag.Parse` stops at the first ordinary argument. Check `fs.NArg()` if extra arguments must be rejected.
+
+## Check yourself
+
+**1.** Why validate at the start of `run`?
+
+<details>
+<summary>Answer</summary>
+
+An invalid port or missing DB is reported before resources open. Problems appear together instead of remaining hidden until the first HTTP request.
+
+</details>
+
+**2.** Which port does `PORT=9090 ./api -port 8781` select?
+
+<details>
+<summary>Answer</summary>
+
+`8781`. `fs.String` starts with `9090`; `Parse` replaces it with `8781`.
+
+</details>
+
+**3.** Why did `%+v` disclose the password, and what limits does `String()` have?
+
+<details>
+<summary>Answer</summary>
+
+`fmt` formats lowercase fields too. `String()` defines the directly supplied value's chosen log view; it does not protect every format or nested field.
+
+</details>
+
+**4.** From GB-7.04: with `SetLimit(10)` and 1000 IDs, how many jobs run at once?
+
+<details>
+<summary>Answer</summary>
+
+At most 10. `g.Go` waits for room when the limit is full. This does not limit the total ID count.
+
+</details>
+
+## Homework
+
+🟢 **Add the `HOST` setting.** One required task: [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config),
+[TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/TASK.md),
+[answer](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/solution/cmd/api/config.go).
+
+1. Add a `host string` field and a `-host` flag. Default to `envOr("HOST", "")`; the flag overrides the environment.
+2. Accept empty text and `localhost`. Other values must be IP addresses; `net.ParseIP` returns `nil` for invalid text.
+3. Add errors to `errs`: include `host`, its `%q` value and the requirement; preserve other problems too.
+4. Implement `addr()` using `net.JoinHostPort`. `strconv.Itoa(c.port)` converts the port to a string. Do not change the test file.
+
+| Input (`DATABASE_URL` present) | Expected `addr()` |
+|---|---|
+| `HOST` absent or empty | `:8765`, all network addresses |
+| `HOST=127.0.0.1` | `127.0.0.1:8765`, only this computer |
+| `HOST=localhost` | `localhost:8765` |
+| `HOST=::1` | `[::1]:8765`, IPv6 loopback |
+| `HOST=0.0.0.0`, flag `-host 127.0.0.1` | `127.0.0.1:8765`; `0.0.0.0` means all IPv4 interfaces |
+| `HOST=127.0.0.300` or `HOST=bozor.uz` | error; both problems if DB is missing too |
+
+With another server such as Caddy in front, `HOST=127.0.0.1` restricts the API to local connections.
+The starter test does not yet pass: it does not read `HOST` and has no `-host`. Here is the full rerun result:
+
+```console
+$ go test ./cmd/api -run Config
+flag provided but not defined: -host
+Usage of api:
+  -port string
+    	HTTP port (muhitda: PORT) (default "8765")
+--- FAIL: TestConfigHost (0.00s)
+    tekshiruv_test.go:85: HOST=127.0.0.1 []: addr() ":8765", kutilgan "127.0.0.1:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:85: HOST=localhost []: addr() ":8765", kutilgan "localhost:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:85: HOST=::1 []: addr() ":8765", kutilgan "[::1]:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:80: HOST=0.0.0.0 [-host 127.0.0.1]: xato flag provided but not defined: -host
+          kutilgan addr() "127.0.0.1:8765" (TASK.md, 1-qadam: -host flag'i, standarti envOr("HOST", ""))
+    tekshiruv_test.go:94: HOST="127.0.0.300" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host "127.0.0.300" … va DATABASE_URL … (TASK.md, 2-qadam)
+    tekshiruv_test.go:94: HOST="bozor.uz" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host "bozor.uz" … va DATABASE_URL … (TASK.md, 2-qadam)
+    tekshiruv_test.go:94: HOST=" 127.0.0.1" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host " 127.0.0.1" … va DATABASE_URL … (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.048s
+FAIL
+```
+
+`tekshiruv_test.go:85` identifies the assertion line in the test. The old `addr()` result and expected value appear side by side.
+`flag provided but not defined` means `-host` is not yet registered. This failure is expected in the starter.
+
+Predict the solution's result: **A)** the same errors · **B)** `ok` · **C)** requires a database.
+
+<details>
+<summary>Answer</summary>
+
+**B.** These tests call only config, not `run` or Postgres. Below, `cd` changes into the solution folder.
+
+</details>
+
+```console
+$ cd solution && go test ./cmd/api -run Config
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.050s
+```
+
+<details>
+<summary>Answer</summary>
+
+The solution registers the flag before `Parse` and collects an invalid host together with port and DB errors.
+`net.JoinHostPort` brackets an IPv6 host; plain `host + ":" + port` breaks this case.
+Also add `host: *host` to the returned `config`. The solution's `String()` prints the selected address using `addr=`.
+The full answer reference is above. There are no other required levels.
+
+After finishing the task, run the full check below. `./...` means the current module's packages; `solution` is a separate module.
+Every package passed when we reran the solution. Test times vary with machine load:
+
+```bash
+docker compose up -d --wait
+go test ./...
+docker compose down -v
+```
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	2.778s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.252s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.657s
+```
+
+</details>
+
+## Sources
+
+These sources were used to check the code and observed behaviour:
+
+- [The Twelve-Factor App: III. Config](https://12factor.net/config)
+- [OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html), [remediation](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html#92-remediation), [environment injection](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html#51-injection-of-secrets-file-in-memory)
+- [OWASP Logging: Data to exclude](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude)
+- [Go: os.LookupEnv](https://pkg.go.dev/os#LookupEnv), [os.Getenv](https://pkg.go.dev/os#Getenv), [os.Args](https://pkg.go.dev/os#pkg-variables)
+- [Go: flag](https://pkg.go.dev/flag), [NewFlagSet](https://pkg.go.dev/flag#NewFlagSet), [errors.Join](https://pkg.go.dev/errors#Join)
+- [Go: fmt printing](https://pkg.go.dev/fmt#hdr-Printing), [net/url.URL](https://pkg.go.dev/net/url#URL), [exported identifiers](https://go.dev/ref/spec#Exported_identifiers)
+- [Go: net.ParseIP](https://pkg.go.dev/net#ParseIP), [net.JoinHostPort](https://pkg.go.dev/net#JoinHostPort), [errgroup.SetLimit](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.SetLimit)
+- [PostgreSQL 18: connection URIs](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNSTRING-URIS)
+- [Bash: set](https://www.gnu.org/software/bash/manual/bash.html#The-Set-Builtin), [simple command expansion](https://www.gnu.org/software/bash/manual/bash.html#Simple-Command-Expansion)
+- [Git: gitignore](https://git-scm.com/docs/gitignore), [git check-ignore](https://git-scm.com/docs/git-check-ignore)
+- [Linux: proc_pid_cmdline(5)](https://man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html), [proc_pid_environ(5)](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html)
+- [RFC 9293 §3.1](https://www.rfc-editor.org/rfc/rfc9293#section-3.1), [OWASP API1:2023](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/)
+- [README](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/README.md), [video run script](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/_video/chiqishlar.sh)
+
+Results: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL 18 (`postgres:18-alpine`), Bash, 2026-11-28.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config)
+
+---
+
+← Previous lesson: [GB-7.07](/lab/youtube/gb/gb-7-07/en) · Next lesson: [GB-8.02](/lab/youtube/gb#gb-8-02) → · [All lessons](/lab/youtube/gb)
+
+</div>

@@ -1,0 +1,771 @@
+---
+title: "Chegaralangan worker'lar va errgroup"
+date: "2026/11/28"
+description: "Ming mahsulotni oʻntadan soʻrang: worker pool, SetLimit, birinchi xatoda bekor qilish va Wait tugagach context tanlash."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 54
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-7-04/ru) · [English](/lab/youtube/gb/gb-7-04/en)  
+Dars GB-7.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-04) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+bozor importeri katalog qoldiqlarini yangilaydi. U har kecha 1000 mahsulot qoldigʻini yetkazib beruvchidan soʻraydi. Ketma-ket ishlash taxminan 20 soniya oladi. Har mahsulotga goroutine ochsak, tajribadagi yetkazib beruvchi 990 soʻrovni rad etadi. Qanday qilib importni tezlatib, soʻrovlar sonini chegaralaymiz?
+
+**Bitta gʻoya:** bir vaqtda ishlaydigan soʻrovlar sonini kirish hajmi belgilamasin. Oʻzingiz tanlagan chegara va bekor qilish signali importni boshqaradi.
+
+Darsdan keyin siz:
+
+- cheksiz goroutine ochishning oqibatini soʻrov, goroutine va xotira oʻlchovlarida tekshirasiz;
+- bitta kanal ustida oʻnta worker yozasiz;
+- `errgroup` bilan limit va birinchi xatoni qaytarishni birlashtirasiz;
+- guruh contextini ishlatib, xatodan keyingi ishlarni bekor qilasiz va `Wait`dan keyingi context xatosini tuzatasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| worker pool | bitta kanaldan ish oladigan doimiy goroutine guruhi | worker pool |
+| `errgroup.Group` | funksiyalar tugashini kutadi, birinchi xatoni qaytaradi | errgroup |
+| `errgroup.WithContext` | xatoda yoki `Wait` qaytganda guruh contextini bekor qiladi | WithContext |
+
+**Chegaralangan parallellik** — bir vaqtda koʻpi bilan N ta ish. Bu yerda “bir vaqtda” soʻrovlarning kutish vaqti ustma-ust kelishini ham bildiradi. `SetLimit` shu chegarani qoʻyadi. Yordamchi yozuv `errs...` slice elementlarini alohida argumentlarga yoyadi. `golang.org/x/sync` — standart kutubxonadan tashqaridagi Go moduli.
+
+## Oldin bilish kerak
+
+Asos: [GB-7.03 · select va context](/lab/youtube/gb/gb-7-03), [GB-7.02 · Kanal](/lab/youtube/gb/gb-7-02), [GB-7.01 · Goroutine hayoti](/lab/youtube/gb/gb-7-01).
+
+Amaliy tayanch: [GB-6.07 · 429 va rate limit](/lab/youtube/gb/gb-6-07), [GB-6.03 · golang.org/x moduli](/lab/youtube/gb/gb-6-03), [GB-5.05 · pgx pool](/lab/youtube/gb/gb-5-05), [GB-4.07 · Poyga va mutex](/lab/youtube/gb/gb-4-07).
+
+Go yozuvlari: [GB-2.09 · defer va panic](/lab/youtube/gb/gb-2-09), [GB-2.08 · %w va errors.Join](/lab/youtube/gb/gb-2-08), [GB-2.06 · Modullar](/lab/youtube/gb/gb-2-06), [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01), [GB-1.08 · Test](/lab/youtube/gb/gb-1-08), [GB-1.07 · Funksiya va error](/lab/youtube/gb/gb-1-07), [GB-1.06 · for](/lab/youtube/gb/gb-1-06), [GB-1.05 · if](/lab/youtube/gb/gb-1-05), [GB-1.03 · const va int64](/lab/youtube/gb/gb-1-03), [GB-1.02 · Oʻzgaruvchi](/lab/youtube/gb/gb-1-02), [GB-1.01 · go run](/lab/youtube/gb/gb-1-01).
+
+Kodni `lessons/gb-7-04-worker-errgroup` papkasida bajaring. Bu mustaqil modul: `go.mod`da `go 1.27` va `golang.org/x/sync v0.25.0` bor. Go, Bash va race tekshiruvi uchun Docker kerak. Server ochilmaydi.
+
+Oddiy buyruqlar uchun muhitni tanlang:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` Go versiyasini tanlaydi; `CGO_ENABLED=0` C kompilyatorisiz quradi. `_video/run.sh` bosqich faylini, `supplier.go`, `go.mod` va `go.sum`ni vaqtinchalik papkaga nusxalaydi. Buyruq oʻsha yerda bajariladi. `(chiqish kodi: 0)` — yordamchi skript muvaffaqiyatli chiqishni yozgan qator; bu dastur xatosi yoʻqligini anglatmaydi.
+
+**Eslash:** `checkStock` contextni hurmat qiladi. Timeout 1 soniya, yetkazib beruvchi 3 soniya kutadi. Nima chiqadi? **A)** 3 soniyada qoldiq · **B)** taxminan 1 soniyada `context deadline exceeded` · **C)** darhol xato.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `ctx.Done()` yopilganda `select` kutishni tugatadi. `ctx.Err()` — `context deadline exceeded`, yaʼni muddat tugadi. A bekor qilishni eʼtiborsiz qoldiradi; C esa muddat oʻtishini kutmaydi.
+
+</details>
+
+## Ketma-ket import: oʻlchov uchun asos
+
+Bu safar yetkazib beruvchi soxta va tarmoqsiz: `supplier.go`. `checkStock(ctx, id)` bitta qoldiqni qaytaradi. ID 1 — olma, 40; ID 2 — non, 120; ID 3 — oʻrik, 5. Qolgan mavjud ID uchun qoldiq `id % 50`. Faqat 1…1000 ID mavjud.
+
+Har soʻrov taxminan 20 ms kutadi. Bir vaqtda 10 tadan ortiq soʻrov kirsa, ortigʻi `ErrTooMany` oladi: `429 too many requests`. Bu laboratoriyaning bir vaqtdagi ishlar chegarasi; vaqt birligidagi rate limit bilan aynan bir narsa emas. Haqiqiy HTTP javobi yuborilmaydi. `catalogIDs(n)` 1…n ID slice'ini yasaydi; `saveStocks` faqat contextni tekshiradi. Postgres'ga yozish GB-7.07 da keladi.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	for i, id := range ids {
+		n, err := checkStock(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("mahsulot %d: %w", id, err)
+		}
+		stocks[i] = n
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1 | `package main` | bajariladigan paket |
+| 3–7 | `import` | context, xato matni va vaqt paketlari |
+| 9 | `importStocks` | `ctx` va `[]int64` oladi; `[]int` va `error` qaytaradi |
+| 10 | `stocks := make(...)` | har ID uchun bittadan natija joyi |
+| 11–12 | `range`, `checkStock` | indeks `i`, ID `id`; keyingi ish oldingisi tugagach |
+| 13–15 | `if`, `fmt.Errorf` | xatoda `nil`; `%d` ID, `%w` sababni oʻraydi |
+| 16–19 | `stocks[i] = n`, `return` | qoldiqni yozadi; sikl tugagach slice va `nil` |
+| 21–25 | `main`, `time.Now`, `report` | boshlanish vaqtini oladi, boshlangʻich context bilan import qiladi, natijani chiqaradi |
+
+`[]` slice turini bildiradi; `len(ids)` uning uzunligi. `:=` yangi oʻzgaruvchi yaratadi, `=` mavjud joyga qiymat yozadi. Qavslar chaqiruv va parametrlarni, `{}` funksiya yoki sikl tanasini chegaralaydi.
+
+**Bashorat:** 1000 × 20 ms ketma-ket qancha? **A)** 20 ms · **B)** taxminan 20 s · **C)** taxminan 2 s.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Har chaqiruv oldingisini kutadi. A faqat bitta soʻrov vaqti; C uchun oʻnta soʻrovni ustma-ust bajarish kerak.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+soʻrov: 1000 · bir vaqtda: 1 · rad: 0 · vaqt: 20.106s
+qoldiqlar: 1000
+goroutine: 1 · xotira: 7 MB
+(chiqish kodi: 0)
+```
+
+Barcha konsol natijalari 2026-11-28 kuni qayta olingan; iqtibos qilingan natija yoʻq. Videodagi ketma-ket vaqt 20.218 s, bu safar 20.106 s.
+
+`soʻrov` — yetkazib beruvchi sanagan chaqiruvlar; `bir vaqtda` — faol soʻrovlar eng koʻp soni; `rad` — rad etilganlar. `vaqt` import davomiyligi. `qoldiqlar` natija uzunligi; `goroutine` esa soʻrov boshlangan paytlarda kuzatilgan eng katta son. Bu doimiy kuzatuv emas.
+
+`xotira` — `runtime.MemStats.Sys`, yaʼni runtime operatsion tizimdan olgan jami xotira; tirik obyektlar hajmi emas. Kod `Sys >> 20` hisoblab, `MB` yozadi: birlik aslida MiB. 1 MiB = 1 048 576 bayt.
+
+## Har ID uchun goroutine: chegara yoʻq
+
+```go filename="_video/02-cheksiz/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Go(func() {
+			stocks[i], errs[i] = checkStock(ctx, id)
+		})
+	}
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+11–12-qatorlarda qoldiq va xato uchun alohida slice yaratiladi. 13-qator `WaitGroup` yaratadi; 14–18 har ID uchun `wg.Go` bilan ish boshlaydi. 16-qator faqat oʻz `i` indeksiga yozadi. Bu yerda `append` yoʻq. 19-qator hammasini kutadi; 20-qator `errors.Join(errs...)` bilan nil boʻlmagan xatolarni yigʻadi. Yangi importlar `errors` va `sync`; `main` avvalgidek.
+
+**Bashorat:** 1000 goroutine, yetkazib beruvchi koʻpi bilan 10 tasini qabul qiladi. Bu tez ishga tushirilgan tajribada nima kutamiz? **A)** 0 rad, avtomatik navbat · **B)** 12 rad, CPU sonicha · **C)** 990 rad.
+
+<details>
+<summary>Javob</summary>
+
+**C**, bu tajribada. `go` chaqiruvchini ish tugaguncha kutdirmaydi. CPU soni bir vaqtda javob kutayotgan soʻrovlarga limit bermaydi. Til barcha goroutine darhol bir paytda ishlashini kafolatlamaydi; 990 — shu ishga tushirish natijasi.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-cheksiz go run .
+soʻrov: 1000 · bir vaqtda: 1000 · rad: 990 · vaqt: 22ms
+xato: 429 too many requests (va yana 989 ta)
+goroutine: 1001 · xotira: 16 MB
+(chiqish kodi: 0)
+```
+
+`too many requests` — soʻrovlar haddan ortiq. `va yana 989 ta` — `report` koʻp qatorli xatoning qolgan qatorlarini sanagan. Video: 30 ms va 12 MiB; hozir: 22 ms va 16 MiB. Tez tugashi muvaffaqiyat emas: 990 soʻrov rad etildi.
+
+100 000 ID uchun faqat `main`dagi argument oʻzgaradi. `_video/03-xotira/main.go` qolgan qatorlarda ikkinchi variant bilan bir xil:
+
+```go
+	stocks, err := importStocks(context.Background(), catalogIDs(100_000))
+```
+
+**Bashorat:** katta roʻyxat goroutine va xotirani qanday oʻzgartiradi? **A)** oʻzgarmaydi · **B)** oʻsishi mumkin · **C)** soʻrovlar avtomatik oʻntadan ketadi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Sikl kirish hajmicha ish boshlaydi. A va C uchun kodda tegishli chegara yoʻq. Boshlanish va tugash ustma-ust kelgani uchun sonlar har safar farqlanadi.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-xotira go run .
+soʻrov: 100000 · bir vaqtda: 31123 · rad: 99990 · vaqt: 188ms
+xato: 429 too many requests (va yana 99989 ta)
+goroutine: 39955 · xotira: 167 MB
+(chiqish kodi: 0)
+```
+
+Video: 23 580 faol soʻrov, 25 151 goroutine, 123 MiB va 249 ms. Hozir: 31 123, 39 955, 167 MiB va 188 ms. Bular kafolatlangan chegaralar emas. Yetkazib beruvchi chegarasi, Postgres pool ulanishlari va xotira tugashi mumkin; chegarani chaqiruvchi tanlasin.
+
+## Bitta jobs kanali, oʻnta worker
+
+Har ID uchun yangi goroutine oʻrniga **worker pool** tuzamiz. `main` ish indeksini yuboradi; oʻnta doimiy goroutine ularni oladi.
+
+| Holat | main / jobs | Worker va soʻrovlar |
+|---|---|---|
+| boshlanish | buffersiz `jobs`, ish yoʻq | 10 worker qabul qilishni kutadi |
+| 10 ta band | keyingi `jobs <- i` kutadi | koʻpi bilan 10 soʻrov |
+| bittasi tugadi | indeks oʻsha workerga oʻtadi | u keyingi soʻrovni boshlaydi |
+| yuborish tugadi | `close(jobs)`, keyin `wg.Wait()` | range tugaydi, hammasi kutiladi |
+
+```go filename="_video/04-worker/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				stocks[i], errs[i] = checkStock(ctx, ids[i])
+			}
+		})
+	}
+	for i := range ids {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+10-qator `workers = 10` chegarasi. 15-qator buffersiz `chan int` yaratadi: kanalga ID emas, indeks yuboriladi. 17–23 oʻnta `wg.Go` boshlaydi. 19–21-qatorlar kanal yopilguncha indeks olib, faqat oʻsha natija joyiga yozadi.
+
+24–26 har indeksni `jobs <- i` bilan yuboradi. Boʻsh worker boʻlmasa, yuboruvchi kutadi. 27-qator kanalni yopadi; `for i := range jobs` tugaydi. 28-qator barcha workerlarni kutadi. 29-qator xatolarni yigʻadi.
+
+**Bashorat:** 1000 mahsulot, 10 worker, har soʻrov 20 ms. Taxminiy vaqt? **A)** 20 ms · **B)** 2 s · **C)** 20 s.
+
+<details>
+<summary>Javob</summary>
+
+**B.** 1000 / 10 × 20 ms = 2 s. A faqat oʻnta mahsulotni bir davrada tugatadi; C ketma-ket variant. Amalda rejalashtirish va boshqa xarajatlar bor.
+
+</details>
+
+```console
+$ ./_video/race.sh 04-worker go run -race .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.023s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+Bu `-race` buyrugʻi Docker ichida qayta bajarildi. Mahalliy `gcc` yoʻq; `race.sh` C kompilyatori bor image va Go 1.27.4 toolchainini ishlatadi. Race hisoboti chiqmadi: bajarilgan yoʻllarda poyga aniqlanmadi. Bu barcha mumkin boʻlgan bajarilishlar isboti emas.
+
+Video: 2.024 s; hozir: 2.023 s. Ketma-ket 20.106 / 2.023 ≈ 9.9 marta. Muhim nisbat — taxminan oʻn baravar tezroq, 0 rad va koʻpi bilan 10 faol soʻrov. Xatolar esa hali oxirida yigʻiladi; birinchi xato keyingi ishlarni toʻxtatmaydi.
+
+## errgroup: limit va birinchi xato
+
+Qoʻlda kanal, worker sikli va xatolar slice'ini boshqardik. **errgroup** funksiyalar tugashini kutish va xato qaytarishni birlashtiradi. Bu `golang.org/x/sync` modulidagi paket.
+
+Bogʻliqlik dars papkasida allaqachon bor. Quyidagi buyruq oʻsha bogʻliqligi hali yoʻq alohida vaqtinchalik modulda qayta bajarildi:
+
+```console
+$ go get golang.org/x/sync/errgroup
+go: added golang.org/x/sync v0.25.0
+```
+
+`go: added` — modul `go.mod`ga qoʻshildi; `go.sum` tekshiruv summalarini saqlaydi. Videoda qoʻshimcha `go: downloading` qatori bor edi; hozir modul keshda, yuklash qatori chiqmadi.
+
+```go filename="_video/05-errgroup/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	var g errgroup.Group
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+8-qator paketni import qiladi. 15-qator nol qiymatli `Group`; u tayyor, lekin oʻzi limit ham, xatoda bekor qilish ham bermaydi. 16-qator `SetLimit(workers)` bilan faol ishlar sonini chegaralaydi.
+
+18-qator `g.Go`ga `func() error` beradi. Limit band boʻlsa, aynan `g.Go` chaqiruvchisi kutadi. Bu oʻnta doimiy worker emas: har ish uchun goroutine boshlanadi, faol ishlar soni cheklanadi. 19–25 avvalgidek qoldiqni oladi, ID bilan xatoni oʻraydi yoki `stocks[i]`ga yozib `nil` qaytaradi.
+
+27–29-qatorlar barcha boshlangan funksiyalar tugashini kutadi va birinchi nil boʻlmagan xatoni qaytaradi. “Birinchi” ID tartibidagi birinchi emas; birinchi qayd etilgan xato. 30-qator faqat xatosiz natijani qaytaradi.
+
+| Holat | `g.Go` chaqiruvchisi | Natija |
+|---|---|---|
+| 0 faol | birinchi ishni boshlaydi | 1 faol |
+| 10 faol | 11-ishni qoʻshishda kutadi | chegara saqlanadi |
+| bittasi tugadi | joy ochilib, keyingisi boshlanadi | koʻpi bilan 10 faol |
+| sikl tugadi | `g.Wait()` | hammasi tugaydi, birinchi xato yoki `nil` |
+
+**Bashorat:** xatosiz 1000 ID bilan nima oʻzgaradi? **A)** yana 990 rad · **B)** taxminan 2 s, koʻpi bilan 10 faol · **C)** faqat 10 ta natija.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `SetLimit` jami ishlar sonini emas, bir vaqtdagi ishlarni cheklaydi. A chegarani eʼtiborsiz qoldiradi, C esa uni umumiy natija soni deb oʻqiydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-errgroup go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.024s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.034 s, 12 goroutine; hozir: 2.024 s, 11. v0.25.0 da tugayotgan goroutine joyni chiqib ulgurmasdan boʻshatishi mumkin. Umumiy goroutine hisobiga `main` ham kiradi. `SetLimit(10)` butun jarayondagi jami goroutine soniga chegara emas.
+
+Faol ishlar chegaralandi, ammo `ids` va `stocks` slice'lari hali roʻyxat uzunligicha xotira oladi. Bu toʻliq import uchun oʻzgarmas xotira vaʼdasi emas.
+
+## WithContext: xatodan keyingi ishlar
+
+Avval oddiy `Group`ni tekshiramiz. `_video/06-xato/main.go` oldingi fayldan faqat `main` bilan farq qiladi:
+
+```go
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+`ids[499]` — roʻyxatdagi 500-chi element; 9999 yetkazib beruvchida yoʻq. **Bashorat:** jami nechta soʻrov? **A)** 1000 · **B)** taxminan 510 · **C)** 500.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Oddiy `Group` xatoni eslab qoladi, lekin qolgan ishlarni bekor qilmaydi. `Wait` baribir hammasini kutadi. B va C bekor qilish bor deb taxmin qiladi.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-xato go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.016s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.043 s; hozir: 2.016 s. `mahsulot topilmadi` — mahsulot mavjud emas. Endi `WithContext` guruh va unga tegishli context qaytaradi:
+
+```go filename="_video/07-withctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+15-qator `g, ctx := errgroup.WithContext(ctx)`. Bu funksiya tanasida `ctx` parametr bilan bir xil blokda. `:=` faqat `g`ni yaratadi; mavjud `ctx`ga yangi context qiymatini yozadi. 19-qator endi guruh contextini beradi. Birinchi nil boʻlmagan xato shu contextni bekor qiladi.
+
+Yetkazib beruvchi bunga ikki joyda javob beradi: chaqiruv boshida `ctx.Err()`ni tekshiradi; kutayotganda `select` orqali `ctx.Done()`ni ham kuzatadi. Bekor qilish goroutine'ni majburan oʻldirmaydi. Ikkala `select` tarmogʻi tayyor boʻlsa, bekor qilish tarmogʻi doim tanlanishi kafolatlanmaydi.
+
+**Oraliq savol:** 9999 mahsulot xatosi bekor qilishni boshladi; boshqa funksiyalar `context canceled` qaytardi. `Wait` nimani beradi? **A)** 9999 haqidagi birinchi xato · **B)** `context canceled` · **C)** hamma xato, `errors.Join` orqali.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Guruh birinchi xatoni saqlaydi. Keyingi bekor qilish xatolari uni almashtirmaydi va unga qoʻshilmaydi. `Wait` qaytishdan oldin barcha boshlangan funksiyalarni kutadi.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-withctx go run .
+soʻrov: 509 · bir vaqtda: 10 · rad: 0 · vaqt: 1.005s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 13 MB
+(chiqish kodi: 0)
+```
+
+Video: 509 soʻrov, 1.026 s; hozir: 509, 1.005 s. Oddiy guruhdagi 2.016 / 1.005 ≈ 2 marta. Xato roʻyxat oʻrtasida boʻlgani uchun bu tajribada vaqt deyarli yarmiga tushdi. 509 — API kafolati emas; rejalashtirishga qarab son oʻzgaradi.
+
+Sikl hali barcha `g.Go`larni chaqiradi. Bekor qilishdan keyin boshlangan `checkStock` odatda boshidagi tekshiruvdan qaytadi, yetkazib beruvchi hisoblagichini oshirmaydi. Ishlayotgan chaqiruvlar signalga javob beradi. Limitda kutayotgan `g.Go`ning oʻzi context sababli avtomatik qaytmaydi; joy ochilishini kutadi.
+
+| Hodisa | Guruh contexti | Ishlar |
+|---|---|---|
+| xatogacha | faol | koʻpi bilan 10 soʻrov |
+| birinchi xato | bekor qilinadi | ishlayotganlar signalni koʻradi |
+| qolgan sikl | bekor qilingan | yangi funksiyalar ham chaqiriladi, tekshiruv tez qaytaradi |
+| `Wait` | bekor qilingan | hamma funksiya tugagach, birinchi xato |
+
+## Wait tugagach qaysi context?
+
+Endi xato ID yoʻq. Importdan keyin qoldiqlarni `saveStocks` bilan saqlaymiz. `g, ctx :=` parametrdagi contextni almashtirgan. `_video/08-wait-ctx/main.go`da qoʻshilgan qism:
+
+```go
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+```
+
+Qoida: `WithContext` bergan context birinchi xatoda **yoki `Wait` qaytganda** bekor qilinadi. Xatosiz tugash ham bundan mustasno emas.
+
+**Bashorat:** toʻgʻri 1000 ID bilan natija nima? **A)** 1000 qoldiq, xato yoʻq · **B)** `saqlash: context canceled` · **C)** mahsulot topilmadi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `Wait` muvaffaqiyatli tugadi, lekin keyingi `saveStocks` bekor qilingan guruh contextini oldi. A uning umrini notoʻgʻri taxmin qiladi; C uchun xato ID yoʻq.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-wait-ctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.026s
+xato: saqlash: context canceled
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.027 s; hozir: 2.026 s. `saqlash` — saqlash bosqichi; `context canceled` — context bekor qilingan. Bu kompilyatsiya xatosi emas: fayl va qator raqami yoʻq. Xato `saveStocks`ning `ctx.Err()` tekshiruvidan chiqdi.
+
+Tuzatish: guruh contextiga alohida `gctx` nomini bering. Guruh ishlarida `gctx`; `Wait`dan keyin tashqi `ctx`. Quyidagi toʻliq bosqich kodi dars papkasidagi `importStocks` bilan bir xil ishlaydi:
+
+```go filename="_video/09-gctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(gctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+15-qator endi yangi `g` va `gctx` yaratadi, parametr `ctx`ni saqlaydi. 19-qator `checkStock(gctx, id)`; 30–32-qatorlar `saveStocks(ctx, stocks)`. Tashqi contextning oʻz muddati yoki bekor qilinishi hali amal qiladi.
+
+**Bashorat:** tashqi context faol, hamma ID toʻgʻri. **A)** 1000 qoldiq · **B)** yana `context canceled` · **C)** faqat 10 qoldiq.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Saqlash faol tashqi contextni oladi. B guruh contextini yana ishlatganda yuz beradi; C limitni jami natija soni bilan adashtiradi.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-gctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.02s
+qoldiqlar: 1000
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.024 s; hozir: 2.02 s. Qoldiqlar tartibi tugash tartibiga bogʻliq emas: har funksiya `stocks[i]`ga yozadi. Slice faqat `Wait`dan keyin oʻqiladi; bu kutish yozuvlar tugashini ham taʼminlaydi.
+
+## Chuqurroq (ixtiyoriy): limit ichidagi kanal
+
+v0.25.0 manbasida `SetLimit(n)` sigʻimi n boʻlgan buferli kanal yaratadi. `g.Go` joy olish uchun yuboradi; funksiya tugaganda qabul qilish joyni boʻshatadi. Bu detal versiyaga tegishli, API vaʼdasi esa faol ishlar chegarasidir.
+
+`SetLimit(0)` yangi goroutine qoʻshilishiga yoʻl bermaydi. Limit oʻzgarmasa, keyingi `g.Go` kutishda qoladi. Barcha goroutine oldinga siljiy olmasa, runtime deadlock bilan toʻxtatishi mumkin. Serverda boshqa ish yoki taymerlar bor boʻlsa, bitta osilgan chaqiruv uchun bunday xabar kafolatlanmaydi. Manfiy limit cheklovni olib tashlaydi. Faol ishlar bor paytda limitni oʻzgartirmang.
+
+`errgroup` panicni ushlamaydi. Ushlanmagan panic butun dasturni toʻxtatadi; `Wait` uni oddiy `error`ga aylantirmaydi.
+
+## Koʻp uchraydigan xatolar
+
+1. **Oddiy Group xatoda hammasini toʻxtatadi deb oʻylash.** Yuqoridagi 06-bosqichda 1000 soʻrov ketdi. Tuzatish — `WithContext`, ishlar ichida uning contexti va signalni tekshiradigan funksiya.
+2. **`Wait`dan keyin guruh contextini ishlatish.** 08-bosqichdagi `saveStocks(ctx, stocks)` haqiqiy `saqlash: context canceled` xatosini berdi. 09-bosqichda `gctx` alohida, saqlashga tashqi `ctx` berilgan.
+3. **Hamma goroutine bitta slice'ga `append` qilishi.** Indekslar alohida boʻlishi qoidasini buzadi. Natija uzunligini oldindan ajrating, har ish faqat `stocks[i]`ga yozsin; oʻqishdan oldin `Wait`.
+4. **Limitni tekshirmaslik.** Nol bilan yangi ish boshlanmaydi; manfiy son chegarani olib tashlaydi. Vazifada `limit < 1` boʻlsa, `SetLimit`gacha `errBadLimit` qaytaring.
+5. **0 chiqish kodini muvaffaqiyatli import deb oʻqish.** Bu laboratoriyaning `main` funksiyasi xatoni chiqaradi, `os.Exit(1)` chaqirmaydi. Natija qatoridagi `xato`ni ham oʻqing.
+
+## Oʻzingizni tekshiring
+
+**1.** Har mahsulotga alohida goroutine nega nazoratsiz importga olib keladi?
+
+<details>
+<summary>Javob</summary>
+
+Ish boshlash soni roʻyxat uzunligiga bogʻlanadi. Javob kutish CPUni band qilmasa ham, faol soʻrovlar va goroutine'lar resurs talab qiladi. Limitni kod tanlasin.
+
+</details>
+
+**2.** Birinchi xatoda qolgan ishlar bekor boʻlishi uchun nimalar kerak?
+
+<details>
+<summary>Javob</summary>
+
+`WithContext(ctx)`, `g.Go` ichida `gctx`, `checkStock` ichida signalni tekshirish. `SetLimit` esa bir vaqtdagi ishlar chegarasi; oʻzi bekor qilmaydi.
+
+</details>
+
+**3. Bashorat:** `g.SetLimit(2)` va beshta toʻgʻri ID boʻlsa, natija uzunligi qancha? **A)** 2 · **B)** 5 · **C)** qaysi ish avval tugashiga bogʻliq.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Chegara faol ishlar soniga tegishli. Barcha beshta ID ishlanadi, natija `ids` tartibida yoziladi.
+
+</details>
+
+**4. GB-7.01:** `main` tugasa, ishlayotgan goroutine'lar nima boʻladi?
+
+<details>
+<summary>Javob</summary>
+
+Dastur tugaydi, boshqa goroutine'larni kutmaydi. Shuning uchun egasi `wg.Wait()` yoki `g.Wait()` bilan ishlar tugashini kutadi.
+
+</details>
+
+## Uy vazifasi
+
+🟢 [Dars papkasi va TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup): `main.go`dagi `fetchPrices(ctx, ids, limit)`ni qayta yozing. Bu avtomatik tekshiruvlarga ega bitta vazifa:
+
+1. Bir vaqtda koʻpi bilan `limit` soʻrov: `WithContext` va `SetLimit` ishlating.
+2. `prices[i]` — `ids[i]` narxi, tiyinda (`int64`); tugash tartibi natijani oʻzgartirmasin.
+3. Birinchi xatoda `nil` va `narx <ID>: <xato>` qaytsin. `%w` orqali oʻrang, `errors.Is(err, ErrNotFound)` ishlasin; qolgan ishlar bekor qilinsin.
+4. `limit < 1` boʻlsa, hech soʻrov yubormasdan `errBadLimit` qaytaring.
+
+`importStocks`, `supplier.go`, `import_test.go` va `tekshiruv_test.go`ni oʻzgartirmang. `checkPrice` mahsulot narxini qaytaradi; starter har ID uchun goroutine ochadi. **Bashorat:** oʻzgartirilmagan starter testi? **A)** oʻtadi · **B)** limit, bekor qilish va nol limit tekshiruvlari yiqiladi · **C)** faqat tartib yiqiladi.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Starter limitni ishlatmaydi, contexti guruhga bogʻlanmagan va notoʻgʻri limitni tekshirmaydi. Alohida indeksga yozish tartibni saqlaydi, shuning uchun C sabab emas.
+
+</details>
+
+```console
+$ go test .
+--- FAIL: TestVazifaLimit (0.01s)
+    tekshiruv_test.go:45: limit 5 edi, lekin yetkazib beruvchiga bir vaqtda 200 ta soʻrov ketdi.
+        	Har ID uchun alohida goroutine ochilyapti: errgroup'ning SetLimit(limit)'i kerak.
+--- FAIL: TestVazifaBirinchiXato (0.01s)
+    tekshiruv_test.go:74: xatodan keyin ham soʻrovlar ketaverdi: jami 200 ta (200 tadan), qolganlari bekor qilinmadi.
+        	errgroup.WithContext(ctx) bergan ctx'ni g.Go ichida checkPrice'ga bering.
+--- FAIL: TestVazifaNolLimit (0.01s)
+    tekshiruv_test.go:96: fetchPrices(…, 0): errBadLimit kutilgan, keldi <nil>
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.221s
+FAIL
+```
+
+`tekshiruv_test.go:45` — fayl va qator; `limit 5 edi` — beshta kutilgan, 200 kuzatilgan. 74-qator bekor qilishni, 96-qator `errBadLimit`ni tekshiradi. `FAIL` vazifa tugamaganini bildiradi. Test vaqtlarining farqi odatiy.
+
+Maslahat: `importStocks`dagi andoza, lekin `stocks` oʻrniga `prices`, `checkStock` oʻrniga `checkPrice`, `workers` oʻrniga `limit`. Limit tekshiruvini eng boshiga qoʻying. [Javob kodi](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-04-worker-errgroup/solution/main.go) va izoh:
+
+<details>
+<summary>Javob va tekshiruv</summary>
+
+```go
+func fetchPrices(ctx context.Context, ids []int64, limit int) ([]int64, error) {
+	if limit < 1 {
+		return nil, errBadLimit
+	}
+	prices := make([]int64, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for i, id := range ids {
+		g.Go(func() error {
+			p, err := checkPrice(gctx, id)
+			if err != nil {
+				return fmt.Errorf("narx %d: %w", id, err)
+			}
+			prices[i] = p
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return prices, nil
+}
+```
+
+Birinchi uch qator notoʻgʻri limitni qaytaradi. Keyin natija slice'i, `g` va `gctx`, limit va har ID uchun ish. Faqat `prices[i]` yoziladi. Xato `narx %d: %w` bilan oʻraladi; `Wait`dan keyin xato boʻlsa `nil`, aks holda toʻliq slice qaytadi.
+
+**Bashorat:** javobdagi tekshiruvlar? **A)** oʻtadi · **B)** yana 429 · **C)** nol limitda osiladi.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Limit, tartib, birinchi xato va notoʻgʻri limit tekshiriladi. `gctx` yetkazib beruvchiga berilgan; nol limit `SetLimit`gacha qaytarilgan.
+
+</details>
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.973s
+```
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	2.024s
+(chiqish kodi: 0)
+```
+
+`ok` — testlar oʻtdi. `./solution/` javob paketini tekshiradi. `-count=1` test natijasi keshini ishlatmaydi; `-race` bajarilgan yoʻllarda poyga izlaydi. Docker tekshiruvi ham qayta bajarildi.
+
+Format va statik tekshiruv ham qayta bajarildi:
+
+```console
+$ gofmt -l .
+```
+
+```console
+$ go vet ./...
+```
+
+Ikkala buyruq hech narsa chiqarmadi: format farqi ham, `vet` topilmasi ham yoʻq. `./...` joriy modulning paketlarini qamrab oladi. Oʻz yechimingizni esa asosiy papkada `go test .` bilan tekshiring.
+
+</details>
+
+## Manbalar
+
+- [errgroup v0.25.0: Group, Go, SetLimit, Wait, WithContext](https://pkg.go.dev/golang.org/x/sync@v0.25.0/errgroup) va [paket hujjati](https://pkg.go.dev/golang.org/x/sync/errgroup).
+- [errgroup.go v0.25.0 manbasi](https://cs.opensource.google/go/x/sync/+/refs/tags/v0.25.0:errgroup/errgroup.go).
+- [Go spec: go](https://go.dev/ref/spec#Go_statements), [range](https://go.dev/ref/spec#For_range), [qisqa eʼlon va parametr](https://go.dev/ref/spec#Short_variable_declarations), [select](https://go.dev/ref/spec#Select_statements), [dastur tugashi](https://go.dev/ref/spec#Program_execution).
+- [Go xotira modeli](https://go.dev/ref/mem), [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup).
+- [Pipelines: chegaralangan parallellik](https://go.dev/blog/pipelines#bounded-parallelism).
+- [context](https://pkg.go.dev/context), [WithTimeout](https://pkg.go.dev/context#WithTimeout), [errors.Join](https://pkg.go.dev/errors#Join), [fmt.Errorf va %w](https://pkg.go.dev/fmt#Errorf).
+- [Race detector: imkoniyat va talablar](https://go.dev/doc/articles/race_detector).
+- [RFC 6585 §4: 429](https://www.rfc-editor.org/rfc/rfc6585#section-4), [pgxpool ulanishlar chegarasi](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig), [runtime.MemStats.Sys](https://pkg.go.dev/runtime#MemStats).
+
+Natijalar: `go1.27.4 linux/amd64`, 2026-11-28; oddiy buyruqlar `CGO_ENABLED=0`, race buyruqlari Docker ichida `CGO_ENABLED=1`.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+---
+
+← Oldingi dars: [GB-7.03](/lab/youtube/gb/gb-7-03) · Keyingi dars: [GB-7.05](/lab/youtube/gb/gb-7-05) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>

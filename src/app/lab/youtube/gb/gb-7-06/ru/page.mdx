@@ -1,0 +1,1368 @@
+---
+title: "Тестирование конкурентного кода: утечки, время и synctest"
+date: "2026/11/28"
+description: "Найдите утечку горутин через профиль и synctest, исправьте её с context и точно проверьте срок с искусственными часами."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-06) · **Русский** · [English](/lab/youtube/gb/gb-7-06/en)  
+Урок GB-7.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-06) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Bozor одновременно запрашивает цену яблок у трёх поставщиков. Первый ответ получен, тест проходит, но каждый вызов оставляет две горутины. Как это обнаружить?
+
+**Одна идея:** проверки результата недостаточно; проверяйте и завершение запущенных горутин. `testing/synctest` управляет ожиданием и искусственным временем в изолированной тестовой среде.
+
+После урока вы сможете:
+
+- подсчитать утечку горутин и найти строку ожидания по профилю;
+- поймать через `synctest.Test` ошибку, которую пропускает обычный тест;
+- отменить медленную работу через контекст;
+- точно проверить срок 50 мс и обнаружить забытый `Close`.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| утечка горутины | горутина ждёт вечно, хотя уже должна завершиться | goroutine leak |
+| пузырь | изолированная среда для теста и запущенных им горутин | bubble |
+| искусственные часы | часы переходят к концу ожидания без ожидания в реальном времени | fake clock |
+
+## Что нужно знать заранее
+
+Основные предпосылки: [GB-7.05 · Mutex или channel](/lab/youtube/gb/gb-7-05/ru) и [GB-1.08 · Первый тест](/lab/youtube/gb/gb-1-08/ru).
+Также используются следующие понятия:
+
+- [GB-1.01 · Первая программа](/lab/youtube/gb/gb-1-01/ru), [GB-1.02 · Переменные](/lab/youtube/gb/gb-1-02/ru), [GB-1.05 · Условия](/lab/youtube/gb/gb-1-05/ru): пакеты, импорты, `var`, `:=`, `if`;
+- [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03/ru): поля и литералы структур;
+
+- [GB-7.01 · Жизнь горутины](/lab/youtube/gb/gb-7-01/ru): `go func()`, переменная цикла и стек;
+- [GB-7.02 · Каналы](/lab/youtube/gb/gb-7-02/ru): буфер, отправка, получение, `close`, `range`;
+- [GB-7.03 · Select и context](/lab/youtube/gb/gb-7-03/ru): `Done`, `Err`, `WithCancel`, `time.After`, `NumGoroutine`;
+- [GB-7.04 · Ограниченная конкурентность](/lab/youtube/gb/gb-7-04/ru): дочерний контекст и отмена;
+- [GB-5.05 · Пул pgx](/lab/youtube/gb/gb-5-05/ru): `WithTimeout`;
+- [GB-4.07 · Mutex и race](/lab/youtube/gb/gb-4-07/ru): `-race`;
+- [GB-4.04 · HTTP-сервер](/lab/youtube/gb/gb-4-04/ru): `net/http/pprof`;
+- [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru): `errors.Is`;
+- [GB-2.07 · Файлы](/lab/youtube/gb/gb-2-07/ru): `os.Stdout`;
+- [GB-2.01 · Слайсы](/lab/youtube/gb/gb-2-01/ru), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/ru) и [GB-2.04 · Указатели](/lab/youtube/gb/gb-2-04/ru): типы в коде;
+- [GB-1.03 · Числа](/lab/youtube/gb/gb-1-03/ru), [GB-1.06 · Циклы](/lab/youtube/gb/gb-1-06/ru), [GB-1.07 · Функции и error](/lab/youtube/gb/gb-1-07/ru): тийины, `for range`, возвращаемые значения;
+- [GB-6.07 · Срок](/lab/youtube/gb/gb-6-07/ru): `time.Duration`.
+
+Используйте [папку урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest). В ней свой `go.mod`: `go 1.27`.
+Выполняйте команды из этой папки. Окружение для измерений ниже:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0 GOFLAGS=-trimpath
+```
+
+`GOTOOLCHAIN` выбирает версию; `CGO_ENABLED=0` позволяет работать без инструментов C. `-trimpath` заменяет локальные пути в стеках путями модуля.
+`./_video/run.sh ШАГ КОМАНДА` копирует выбранный снимок во временную папку `bozor` и выполняет команду.
+`(chiqish kodi: 0)` означает успех; `1` — ошибка вложенной команды. Последнюю строку с кодом выхода печатает вспомогательный скрипт.
+`go run .` запускает программу; `go test` выполняет тесты; `-v` показывает каждый тест.
+В начальной папке домашнее задание ещё не выполнено: падение общего запуска тестов ожидаемо.
+
+**Вспомните:** `OwnedStore.loop` ждёт в `for r := range s.sells`. Что произойдёт без вызова `Close`?
+**A)** `range` завершится сам · **B)** будет ждать следующий запрос · **C)** немедленная паника.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `range` ждёт до закрытия канала. Без следующего отправителя и без `close` горутина не завершится. Её стек и удерживаемая map останутся в памяти.
+
+</details>
+
+## Один ответ, две оставшиеся горутины
+
+Начнём с ошибочного снимка. `prices` сопоставляет ID с ценой в тийинах; `supplierDelays` хранит время ответа трёх поставщиков.
+`quote` имитирует ожидание вместо настоящей сети.
+
+```go filename="_video/01-leak/price.go" showLineNumbers
+package main
+
+import "time"
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+func quote(delay time.Duration, id int64) int64 {
+	time.Sleep(delay)
+	return prices[id]
+}
+
+func fastestPrice(id int64) int64 {
+	ch := make(chan int64)
+	for _, d := range supplierDelays {
+		go func() {
+			ch <- quote(d, id)
+		}()
+	}
+	return <-ch
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1, 3 | `package main`, `import "time"` | исполняемый пакет и пакет времени |
+| 5–6 | `prices` | комментарий и `map[int64]int64`; ID 1 стоит 1 200 000 тийинов, то есть 12 000 сумов |
+| 8–13 | `supplierDelays` | комментарий и слайс `[]time.Duration`; `*` — умножение, последняя запятая нужна в многострочном литерале |
+| 15–18 | `quote` | принимает `delay` и `id`, спит, возвращает значение map |
+| 20–21 | `fastestPrice`, `make(chan int64)` | функция и небуферизованный канал результата |
+| 22 | `for _, d := range` | отбрасывает индекс через `_`; в каждой итерации новая `d` |
+| 23 | `go func() {` | запускает анонимную функцию в отдельной горутине |
+| 24 | `ch <- quote(d, id)` | сначала вычисляет цену, затем пытается отправить |
+| 25–26 | `}()`, `}` | вызывает анонимную функцию и закрывает цикл |
+| 27–28 | `return <-ch`, `}` | получает одну цену и возвращается из функции |
+
+Пустые строки разделяют код; строки с `//` — комментарии. `{}` задают границы блока; `:=` объявляет новую переменную.
+
+```go filename="_video/01-leak/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+`main.go`: строка 1 — пакет; 3–7 — импорты; 9 — функция; 10 — внешний цикл; 11–13 — сто вызовов; 14 — ожидание секунды.
+Строка 15 печатает число всех живых горутин через `fmt.Println`; 16–17 закрывают блоки.
+`for range 3` — три итерации без переменной-счётчика.
+
+**Предскажите:** сколько горутин останется после 300 вызовов? **A)** 1 · **B)** 301 · **C)** 601.
+
+<details>
+<summary>Ответ</summary>
+
+**C: 1 + 300 × 2 = 601.** 1 — это `main`. Каждый вызов запускает три горутины, но получает только один ответ.
+A предполагает завершение всей работы; B учитывает лишь одну оставшуюся горутину на вызов.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-leak go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+(chiqish kodi: 0)
+```
+
+| Время | Первый поставщик | Второй | Третий | Получатель |
+|---|---|---|---|---|
+| 0 мс | ждёт | ждёт | ждёт | `<-ch` |
+| 100 мс | отправляет, завершается | ждёт | ждёт | получает цену и возвращается |
+| 200 мс | завершился | застрял на отправке | ждёт | отсутствует |
+| 300 мс | завершился | застрял на отправке | застрял на отправке | отсутствует |
+
+Это **утечка горутины**: у двух оставшихся отправителей больше не будет получателя.
+Ресурсы ожидающей горутины не освобождаются автоматически; она должна завершиться.
+
+## Профиль: на какой строке ожидание?
+
+Счётчик показывает рост. **Профиль** показывает стеки горутин — последовательности вызовов функций.
+Следующий снимок добавляет один вызов в конце `main`:
+
+```go filename="_video/02-profil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+}
+```
+
+Новая строка 5 импортирует `os`, строка 7 — `runtime/pprof`. Строка 19 выбирает профиль через `Lookup("goroutine")`.
+`WriteTo(os.Stdout, 1)` пишет его в стандартный вывод; `1` выбирает текст с группировкой одинаковых стеков.
+
+**Предскажите:** сколько всего горутин в профиле? **A)** 600 · **B)** 601 · **C)** 3.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Обычный профиль `goroutine` включает работающую `main` наряду с утечками. 600 — только ожидающие отправители.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-profil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutine profile: total 601
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+1 @ 0x440e11 0x47cbfd 0x4ccab1 0x4cc785 0x4c96e9 0x4debfd 0x44aa27 0x4835c1
+#	0x4ccab0	runtime/pprof.writeRuntimeProfile+0xb0	runtime/pprof/pprof.go:848
+#	0x4cc784	runtime/pprof.writeGoroutine+0x44	runtime/pprof/pprof.go:781
+#	0x4c96e8	runtime/pprof.(*Profile).WriteTo+0x148	runtime/pprof/pprof.go:405
+#	0x4debfc	main.main+0x13c				github.com/abdurahmon27/bozor/main.go:19
+#	0x44aa26	runtime.main+0x426			runtime/proc.go:302
+
+(chiqish kodi: 0)
+```
+
+`total 601` — общее число. `600 @` — 600 горутин с одинаковым стеком. Значения `0x…` — шестнадцатеричные адреса кода.
+Строка с `#` — кадр стека; `fastestPrice.func1` — первая анонимная функция внутри неё. `+0x5b` — смещение внутри функции.
+`price.go:24` — строка отправки. Группа `1 @` — записывающая профиль `main` и её вызовы.
+Адреса кода и номера горутин могут отличаться при другой сборке.
+
+На сервере из [GB-4.04](/lab/youtube/gb/gb-4-04/ru) `net/http/pprof` отдаёт эти сведения по `/debug/pprof/goroutine?debug=1`.
+`debug=1` выбирает тот же текстовый формат. Открывайте адрес профиля только на внутреннем порту.
+
+## Обычный тест не проверяет утечки
+
+```go filename="_video/03-test/price_test.go" showLineNumbers
+package main
+
+import "testing"
+
+func TestFastestPrice(t *testing.T) {
+	got := fastestPrice(1)
+	if got != 1_200_000 {
+		t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+	}
+}
+```
+
+Строка 1 — пакет; 3 — пакет тестирования; 5 — функция теста; 6 — результат `got`; 7 — сравнение с ожидаемой ценой.
+Строка 8 помечает тест как неуспешный через `t.Errorf`; `%d` печатает целое число; 9–10 закрывают блоки.
+
+**Предскажите:** результат и время? **A)** PASS, примерно 0.10 с · **B)** PASS, примерно 0.30 с · **C)** FAIL, утечка.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Тест ждёт только первую цену. Остальные горутины не проверяются; при завершении процесса теста они тоже исчезают.
+B предполагает ожидание всех поставщиков. C предполагает, что обычный `go test` автоматически ищет утечки.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-test go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.102s
+(chiqish kodi: 0)
+```
+
+В видео время пакета — 0.103 с; в этом запуске — 0.102 с. Сам тест в обоих случаях занял 0.10 с.
+`=== RUN` — начало; `--- PASS` — тест пройден; `PASS` — общий успех; `ok` — результат пакета.
+
+## synctest: тест вернулся, работа осталась
+
+`testing/synctest` доступен без экспериментального флага начиная с Go 1.25. Он выполняет тест внутри **пузыря**.
+Это изолированная тестовая среда: запущенные внутри горутины тоже ей принадлежат. `synctest.Test` ждёт завершения их всех.
+
+**Устойчивая блокировка** (*durably blocked*) — ожидание, которое может закончить только работа внутри того же пузыря.
+К ней относятся ожидание на созданном в пузыре канале и `time.Sleep`.
+Когда так ждут все горутины, часы переходят к следующему пробуждению. Начальное время: `2000-01-01 00:00:00 UTC`.
+После завершения корневой функции пузыря часы останавливаются. Если пробуждение невозможно, а ожидание осталось, возникает deadlock.
+
+```go filename="_video/04-synctest/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got := fastestPrice(1)
+		if got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+		}
+	})
+}
+```
+
+Новая строка 5 импортирует пакет; строка 9 передаёт внешний `t` и анонимную функцию со своим параметром `t`.
+Строки 10–13 сохраняют прежнюю проверку; 14–15 закрывают пузырь и тест.
+
+**Предскажите:** **A)** PASS · **B)** FAIL: deadlock · **C)** ждёт 300 мс и проходит.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Цена приходит на 100 мс искусственного времени. Функция теста возвращается, часы останавливаются; две горутины ещё спят.
+A учитывает только цену. C предполагает, что часы продолжают идти после выхода из функции теста.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-synctest go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 7 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x1b38f891c000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x1b38f891c000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x1b38f88e0160)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x1b38f8992248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x1b38f8992248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x1b38f8992248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 11 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+
+goroutine 12 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`main bubble goroutine has exited` означает, что корневая горутина пузыря завершилась.
+`blocked goroutines remain` — остались ожидающие горутины. `[recovered, repanicked]` — механизм тестирования перехватил и повторно вызвал панику.
+Верхние кадры `testing` и `internal/synctest` — путь выполнения теста; два нижних стека — наша работа.
+`sleep (durable)` — сон в искусственном времени; `bubble 1` — номер пузыря.
+`0xbebc200` — 200 мс в наносекундах, записанные шестнадцатерично; `0x11e1a300` — 300 мс.
+Кадр `quote(...)` над `price.go:24` показывает источник ожидания; `(...)` означает, что аргументы не выведены.
+`created by` указывает место запуска горутины. `exit status 2` приходит от тестового бинарного файла с паникой; итоговый код `1` — от `go test`.
+`0.00s` не означает ровно ноль: реальная длительность округлена до сотых секунды. По искусственным часам прошло 100 мс.
+
+| Состояние | Часы пузыря | Две оставшиеся горутины |
+|---|---|---|
+| начало | 00:00:00 | начинают ждать |
+| все ждут | +100 мс | ещё спят |
+| функция теста вернулась | останавливаются | не могут закончить сон |
+| `synctest.Test` | deadlock | FAIL |
+
+## Буфер не отменяет ожидание
+
+Первая попытка: в `_video/05-buffer/price.go` меняется только создание канала:
+
+```go
+ch := make(chan int64, len(supplierDelays))
+```
+
+`len(supplierDelays)` даёт три места. Каждая горутина отправляет один ответ, поэтому последующая отправка не застрянет.
+
+**Предскажите:** **A)** PASS · **B)** тот же deadlock · **C)** неверная цена.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Буфер даёт место отправке, но не отменяет `Sleep`. При возврате из теста оставшаяся работа ещё ждёт 200 и 300 мс.
+Вне пузыря она завершилась бы примерно на 300 мс. Это устраняет вечную утечку, но не останавливает ненужную работу немедленно.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-buffer go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 5 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x150d11704000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x150d11704000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x150d11646140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x150d11664248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x150d11664248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x150d11664248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 9 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+
+goroutine 10 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+Причина и сообщение прежние. Исправление: отправляйте оставшейся работе сигнал отмены, когда ответ уже не нужен.
+
+## Остановка оставшейся работы через context
+
+Итоговый `price.go` из папки урока:
+
+```go filename="price.go" showLineNumbers
+// bozor: bitta mahsulot narxini uch yetkazib beruvchidan birdan soʻrab, eng tez javobni olish (GB-7.06).
+// Videoning oxiridagi holat: goroutine'lar fastestPrice bilan birga tugaydi (ctx + cancel), leak yoʻq.
+package main
+
+import (
+	"context"
+	"time"
+)
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+// quote bitta yetkazib beruvchidan narx soʻrashni taqlid qiladi: delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func quote(ctx context.Context, delay time.Duration, id int64) (int64, error) {
+	select {
+	case <-time.After(delay):
+		return prices[id], nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// fastestPrice hamma yetkazib beruvchidan birdan soʻraydi va birinchi kelgan javobni qaytaradi.
+// Qaytishdan oldin cancel() qolgan soʻrovlarni toʻxtatadi: oʻzi boshlagan goroutine'lar uning bilan tugaydi.
+func fastestPrice(ctx context.Context, id int64) (int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan int64, len(supplierDelays))
+	for _, d := range supplierDelays {
+		go func() {
+			p, err := quote(ctx, d, id)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+```
+
+Изменённые строки:
+
+| Строка | Что делает |
+|---|---|
+| 5–8 | импортирует `context` и `time` |
+| 21 | `quote` принимает контекст и возвращает `(int64, error)` |
+| 22–28 | `select`: цена и `nil`, если время прошло; 0 и `ctx.Err()`, если `Done` закрыт |
+| 32–34 | `WithCancel` создаёт дочерний контекст; `ctx` переприсваивает параметр в этом блоке, `cancel` — новый; `defer` сигнализирует при возврате |
+| 35 | сохраняет буфер на три места |
+| 36–43 | каждая горутина запрашивает с дочерним контекстом; `p` — цена, `err` — ошибка; отправка только при `err == nil` |
+| 44–50 | ждёт первую цену или отмену вызывающей стороны |
+
+Строки 1–2, 10, 13, 20 и 30–31 — комментарии. Не читайте «birga tugaydi» («завершаются вместе») как гарантию ожидания завершения.
+[`CancelFunc`](https://pkg.go.dev/context#CancelFunc) только сигнализирует; завершения работы он не ждёт.
+Здесь оставшиеся горутины видят сигнал и выходят; их завершения ждёт `synctest.Test`.
+Если вызывающая функция обязана дождаться их перед возвратом, нужна группа ожидания, как в [GB-7.01](/lab/youtube/gb/gb-7-01/ru).
+Буфер тоже остаётся полезен: если время и отмена готовы одновременно, отправка успешной цены не застрянет.
+
+| Этап | Результат |
+|---|---|
+| первая цена | `fastestPrice` начинает возвращаться |
+| `defer cancel()` | закрывается канал `Done` дочернего контекста |
+| оставшиеся вызовы `quote` | видят отмену, возвращают ошибки, не отправляют |
+| `synctest.Test` | ждёт завершения всех горутин |
+
+`main` тоже вызывает новую сигнатуру:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"time"
+)
+
+// main 3 × 100 marta narx soʻraydi va har yuztadan keyin tirik goroutine'lar sonini chiqaradi.
+// Leak boʻlsa, son oʻsadi (videoda: 201, 401, 601); tuzatilgan fastestPrice bilan doim 1.
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(context.Background(), 1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+Новый импорт — `context`; строка 15 передаёт неотменяемый начальный контекст через `context.Background()`.
+Тест использует `t.Context()`. Он отменяется непосредственно перед выполнением функций очистки теста.
+Внутри пузыря `t.Context().Done()` тоже принадлежит этому пузырю.
+
+```go filename="_video/06-ctx/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+```
+
+Строка 10 передаёт контекст и ID; 11 через `||` обнаруживает ошибку или неверную цену; 12 печатает ошибку через `%v`.
+
+**Предскажите:** **A)** PASS и 1, 1, 1 · **B)** FAIL · **C)** PASS и 201, 401, 601.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Отмена завершает оставшиеся ожидания. Тест ждёт завершения работы в пузыре; программа даёт ей секунду после каждых ста вызовов.
+C соответствует варианту, который игнорирует сигнал отмены.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-ctx go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/run.sh 06-ctx go run .
+goroutine'lar: 1
+goroutine'lar: 1
+goroutine'lar: 1
+(chiqish kodi: 0)
+```
+
+Счётчик относится ко всему процессу. В лаборатории 1 — это `main`; в настоящем сервере число меняется из-за фоновой работы.
+
+## Ровно 50 мс и тест на один час
+
+Срок — 50 мс, самый быстрый ответ — 100 мс. В пузыре можно проверить точное равенство вместо приблизительной границы:
+
+```go filename="_video/07-timeout/price_test.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi testlar. synctest.Test funksiyani "pufak" ichida ishga tushiradi: soxta soat, va funksiya
+// tugaganda pufakda kutib qolgan goroutine boʻlsa, test yiqiladi.
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+
+func TestFastestPriceTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := fastestPrice(ctx, 1)
+		took := time.Since(start) // pufakda soat soxta: aniq tenglik mumkin (haqiqiy soatda emas)
+		if !errors.Is(err, context.DeadlineExceeded) || took != 50*time.Millisecond {
+			t.Errorf("xato %v, %v oʻtdi; kutilgan deadline, 50ms", err, took)
+		}
+	})
+}
+```
+
+Новые импорты — `context`, `errors`, `time`. Строки 16–18 проверяют результат вместе с ошибкой.
+25–26 задают дочерний срок и очистку. 27 — начало; 28 отбрасывает ненужную цену через `_`; 29 сохраняет прошедшее время в `took`.
+Строка 30 проверяет `DeadlineExceeded` через `errors.Is` и отличие от 50 мс через `!=`; 31 печатает ошибку и время через `%v`.
+Остальное — знакомая форма теста и границы блоков.
+
+**Предскажите:** **A)** оба теста PASS · **B)** тест срока FAIL · **C)** 100 мс вместо 50 мс.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Часы переходят к 50 мс; срок истекает; `fastestPrice` возвращает ошибку срока.
+На настоящих часах не полагайтесь на точное равенство: планировщик может задержать выполнение.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-timeout go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+=== RUN   TestFastestPriceTimeout
+--- PASS: TestFastestPriceTimeout (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+В видео и здесь пакет занял 0.002 с; обычный тест — 0.102 с: отношение примерно 51.
+Это не гарантия стабильной скорости. Существенно то, что реальное ожидание 100 мс исчезло, а искусственные 50 мс всё ещё проверяются.
+Нельзя делить два значения `0.00s`, чтобы вычислять ускорение: они округлены.
+
+**Проверка race:** **A)** DATA RACE · **B)** ok · **C)** утечка вызывает race.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Результат приходит через канал, `prices` не меняется. `-race` проверяет гонки данных на выполненных путях, а не весь жизненный цикл горутин.
+
+</details>
+
+На этой машине нет компилятора C. Следующая команда запустила тот же Go 1.27.4 внутри Docker с cgo и компилятором C:
+
+```console
+$ ./_video/race.sh 07-timeout go test -race .
+ok  	github.com/abdurahmon27/bozor	1.012s
+(chiqish kodi: 0)
+```
+
+В видео 1.014 с, здесь 1.012 с. Инструментирование race добавляет расходы; не сравнивайте это как ускорение от искусственных часов.
+`./_video/race.sh` передаёт снимок и инструменты контейнеру; `-race .` проверяет этот пакет.
+
+Теперь сон на один час. **A)** ждёт час · **B)** проходит почти сразу · **C)** deadlock.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Корневая горутина теста ещё жива. У `Sleep` есть время пробуждения, часы переходят к нему.
+Deadlock возникает, когда вся работа устойчиво заблокирована без будущего пробуждения, либо такое ожидание осталось после выхода корневой горутины.
+
+```go filename="_video/11-soat/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi savol: pufak ichida bir soatlik time.Sleep. Soat soxta: test bir zumda tugaydi.
+func TestHour(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		time.Sleep(time.Hour)
+		t.Log(time.Since(start), start.UTC())
+	})
+}
+```
+
+Строка 12 сохраняет начало; 13 спит час; 14 записывает прошедшее время и начало в UTC.
+Остальное — знакомая форма импортов, теста и пузыря.
+
+```console
+$ ./_video/run.sh 11-soat go test -v
+=== RUN   TestHour
+    price_test.go:14: 1h0m0s 2000-01-01 00:00:00 +0000 UTC
+--- PASS: TestHour (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## Забытый Close: другое ожидание, та же ошибка
+
+`store.go` — сокращённый `OwnedStore` из прошлого урока. К map обращается только горутина-владелец.
+
+```go filename="store.go" showLineNumbers
+package main
+
+// OwnedStore — GB-7.05'dagi qoldiq doʻkoni (qisqartirilgan): stock map'iga faqat loop goroutine'i tegadi,
+// Sell unga channel orqali soʻrov yuboradi. loop sells yopilganda (Close) tugaydi.
+type OwnedStore struct {
+	sells chan sellReq
+}
+
+// sellReq — egasiga yuboriladigan sotish soʻrovi: qaysi mahsulot, necha dona va javob qaytadigan channel.
+type sellReq struct {
+	id    int64
+	n     int
+	reply chan bool
+}
+
+// NewOwnedStore loop'ni yangi goroutine'da boshlaydi va stock map'ini unga topshiradi.
+func NewOwnedStore(stock map[int64]int) *OwnedStore {
+	s := &OwnedStore{sells: make(chan sellReq)}
+	go s.loop(stock)
+	return s
+}
+
+func (s *OwnedStore) loop(stock map[int64]int) {
+	for r := range s.sells {
+		ok := stock[r.id] >= r.n
+		if ok {
+			stock[r.id] -= r.n
+		}
+		r.reply <- ok
+	}
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *OwnedStore) Sell(id int64, n int) bool {
+	reply := make(chan bool)
+	s.sells <- sellReq{id, n, reply}
+	return <-reply
+}
+
+// Close loop goroutine'ini toʻxtatadi. Close'dan keyin Sell chaqirilmaydi.
+func (s *OwnedStore) Close() { close(s.sells) }
+```
+
+Строки 5–7 хранят канал запросов; 10–14 — `id` запроса, количество `n` и канал ответа `reply`.
+17–21 создают хранилище и передают map в `loop`. 23–31 последовательно получают запросы, уменьшают достаточный остаток и отправляют ответ.
+34–38 заставляют `Sell` отправить запрос и получить ответ. Строка 41 закрывает канал запросов в `Close`.
+`>=` сравнивает доступность; `-=` уменьшает; `&` берёт адрес; `*OwnedStore` — указательный получатель метода.
+Пакет, комментарии и скобки соответствуют прежним формам.
+
+Ошибочный тест:
+
+```go filename="_video/08-close/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+Новая строка 10 создаёт хранилище с 5 единицами; 11–13 проверяют продажу двух. `!` — логическое отрицание.
+**Предскажите:** **A)** PASS · **B)** deadlock: receive · **C)** гонка данных остатка.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Sell` успешно возвращается. Но `loop` ждёт следующий запрос; никто не закрыл `sells`.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-close go test
+--- FAIL: TestOwnedStore (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 19 [running]:
+testing.tRunner.func1.2({0x6c2748, 0x2304924b2150})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2748?, 0x2304924b2150?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x2304924b6140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x2304924da248, 0x6d5780)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestOwnedStore(0x2304924da248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x2304924da248, 0x6d56d8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 22 [chan receive (durable), synctest bubble 1]:
+github.com/abdurahmon27/bozor.(*OwnedStore).loop(...)
+	github.com/abdurahmon27/bozor/store.go:24
+created by github.com/abdurahmon27/bozor.NewOwnedStore in goroutine 21
+	github.com/abdurahmon27/bozor/store.go:19 +0xc7
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`chan receive (durable)` теперь означает ожидание получения, а не отправки.
+`(*OwnedStore).loop(...)` и `store.go:24` указывают на `range`. Ошибка в жизненном цикле, а не в расчёте продажи.
+Исправление — `defer s.Close()` на строке 11:
+
+```go filename="_video/09-close-fix/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		defer s.Close()
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+При возврате из теста `sells` закрывается; `range` заканчивается, `loop` выходит. После `Close` не вызывайте новый `Sell`.
+**Предскажите:** **A)** ok · **B)** тот же deadlock · **C)** неверный остаток.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Как и в тесте цены, synctest ждёт завершения и горутины-владельца.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-close-fix go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+## Глубже (необязательно): goroutineleak и границы synctest
+
+В Go 1.27 профиль `goroutineleak` вышел из эксперимента; `GOEXPERIMENT=goroutineleakprofile` не нужен, старая настройка удалена.
+GC — сборка мусора: освобождение неиспользуемой памяти.
+Профиль доступен в обычной сборке, но это не означает автоматического поиска утечек при каждом GC.
+В исходниках Go 1.27.4 `writeGoroutineLeak` сначала вызывает `runtime_goroutineLeakGC()`, затем записывает профиль.
+Значит, запрос профиля запускает цикл GC с поиском утечек.
+
+```go filename="_video/10-leakprofil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutineleak").WriteTo(os.Stdout, 1)
+}
+```
+
+Меняется только строка 19: `Lookup("goroutineleak")`. **Предскажите:** **A)** 601 · **B)** 600 · **C)** 0.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `main` работает и не является утечкой; остаются 600 ожидающих отправителей.
+
+</details>
+
+```console
+$ ./_video/run.sh 10-leakprofil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutineleak profile: total 600
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+(chiqish kodi: 0)
+```
+
+Поиск основан на достижимости: если ни одна потенциально исполнимая горутина не может добраться до примитива ожидания, она не сможет его разблокировать.
+Утечки через примитивы, достижимые из глобальных переменных или работающих горутин, могут остаться незамеченными.
+`WriteTo(..., 2)` печатает все стеки, отмечая утечки как `(leaked)`; это не список только утечек.
+
+Искусственные часы в `synctest` не определяют весь порядок выполнения. При нескольких готовых ветках `select` не полагайтесь на их порядок.
+Ожидание mutex, файловый и сетевой ввод-вывод не являются устойчивой блокировкой.
+Если внешнее событие не придёт, тест может зависнуть до общего тайм-аута вместо быстрого сообщения deadlock.
+
+```go filename="_video/13-mutex/price_test.go" showLineNumbers
+package main
+
+import (
+	"sync"
+	"testing"
+	"testing/synctest"
+)
+
+// Videodagi "synctest chegarasi": mutex'da kutish durable emas. Goroutine qulfda abadiy qolsa,
+// synctest deadlock demaydi: test -timeout tugaguncha osilib turadi.
+func TestMutexHang(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		mu.Lock()
+		go func() {
+			mu.Lock() // hech kim Unlock qilmaydi
+		}()
+	})
+}
+```
+
+Строки 13–14 берут блокировку и не освобождают; 15–17 запускают горутину, которая снова пытается её взять. Ошибка — отсутствие `Unlock`.
+**Предскажите:** **A)** сразу PASS · **B)** сразу deadlock от synctest · **C)** тайм-аут через 5 реальных секунд.
+
+<details>
+<summary>Ответ</summary>
+
+**C.** Ожидание блокировки не входит в список durable; `-timeout 5s` задаёт процессу тестов границу реального времени.
+
+```console
+$ ./_video/run.sh 13-mutex go test -timeout 5s
+panic: test timed out after 5s
+
+goroutine 19 [running]:
+testing.(*M).startAlarm.func1()
+	testing/testing.go:2961 +0x34a
+created by time.goFunc
+	time/sleep.go:182 +0x2d
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0x28c07d728008, {0x55729d?, 0x28c07d6ccaa0?}, 0x6d4e70)
+	testing/testing.go:2268 +0x4f2
+testing.runTests.func1(0x28c07d728008)
+	testing/testing.go:2744 +0x37
+testing.tRunner(0x28c07d728008, 0x28c07d6ccbc8)
+	testing/testing.go:2195 +0xea
+testing.runTests({0x55c0ed, 0x1d}, {0x55c0ed, 0x1d}, 0x28c07d60c0c0, {0x6ef708, 0x1, 0x1}, {0xc2baca0f36c036fc, 0x12a087041, ...})
+	testing/testing.go:2742 +0x510
+testing.(*M).Run(0x28c07d7001e0)
+	testing/testing.go:2602 +0x6af
+main.main()
+	_testmain.go:46 +0x9b
+
+goroutine 5 [synctest.Run (durable), synctest bubble 1]:
+internal/synctest.Run(0x28c07d70a140)
+	runtime/synctest.go:214 +0x1da
+testing/synctest.Test(0x28c07d728248, 0x6d4f18)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestMutexHang(0x28c07d728248?)
+	github.com/abdurahmon27/bozor/price_test.go:12 +0x1a
+testing.tRunner(0x28c07d728248, 0x6d4e70)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 8 [sync.Mutex.Lock, synctest bubble 1]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
+	runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0x28c07d60e248)
+	internal/sync/mutex.go:149 +0x15a
+internal/sync.(*Mutex).Lock(...)
+	internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	sync/mutex.go:46
+github.com/abdurahmon27/bozor.TestMutexHang.func1.1()
+	github.com/abdurahmon27/bozor/price_test.go:16 +0x2d
+created by github.com/abdurahmon27/bozor.TestMutexHang.func1 in goroutine 7
+	github.com/abdurahmon27/bozor/price_test.go:15 +0x8b
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	5.006s
+(chiqish kodi: 1)
+```
+
+</details>
+
+`panic: test timed out after 5s` означает истечение срока теста. В этом примере ожидание нужно завершить через `Unlock`.
+Для тестов с настоящей сетью `go.uber.org/goleak` проверяет лишние горутины в конце тестирования.
+`VerifyNone` проверяет один тест, `VerifyTestMain` — пакет; прекращение ожиданий остаётся обязанностью кода.
+
+## Частые ошибки
+
+1. **«PASS — значит утечек нет».** Обычный тест проверил только цену. Сравните два снимка в разделах об обычном тесте и synctest; добавьте тест в пузыре.
+2. **«Буфер завершает всю работу».** Реальный deadlock выше показал оставшиеся сны. Пусть `quote` следит за отменой, а вызывающая сторона вызывает `cancel`.
+3. **«cancel ждёт».** Он сигнализирует. Для строгого завершения добавьте ожидание; в тесте `synctest.Test` ждёт все внутренние горутины.
+4. **Забытый `Close`.** Ошибочный тест выше упал на получении в `store.go:24`. Исправление: `defer s.Close()`.
+5. **`took == 50*time.Millisecond` на настоящих часах.** Нагрузка среды задерживает выполнение. Оставьте точное равенство для искусственного времени внутри пузыря.
+6. **«`synctest.Wait()` означает завершение всей работы».** Он ждёт выхода остальных или их устойчивой блокировки. Заблокированная утечка может остаться.
+7. **Запуск `-race` без cgo.** Используйте среду с компилятором C или Docker-скрипт выше. Проверка гонок не заменяет проверку утечек.
+
+## Проверьте себя
+
+**1.** Почему synctest может упасть, хотя все проверки цены прошли?
+
+<details>
+<summary>Ответ</summary>
+
+Работа в пузыре может попасть в deadlock. Здесь его корневая функция завершается, часы останавливаются, остаются две устойчиво заблокированные горутины.
+
+</details>
+
+**2.** Почему буфера на три места недостаточно?
+
+<details>
+<summary>Ответ</summary>
+
+Отправка могла бы закончиться позже, но горутины ещё спят. После выхода корневой функции пузыря часы не разбудят их; нужна отмена через контекст.
+
+</details>
+
+**3.** Других горутин в пузыре нет. Что даст `start := time.Now(); time.Sleep(time.Hour); time.Since(start)`?
+**A)** примерно 0 · **B)** ровно 1 час · **C)** deadlock.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Искусственная длительность — час, а реальное выполнение очень короткое. Это проверенный выше случай `TestHour`.
+
+</details>
+
+**4.** Из GB-7.03: что отправляет `ctx.Done()` и когда он закрывается?
+
+<details>
+<summary>Ответ</summary>
+
+Это `<-chan struct{}`: значение не отправляется, сигналом служит закрытие. Он закрывается при отмене контекста или истечении его срока.
+У `Background` `Done()` равен nil; сам он не закроется.
+
+</details>
+
+**5.** Что гарантирует наличие `goroutineleak` в Go 1.27?
+
+<details>
+<summary>Ответ</summary>
+
+Можно запросить профиль без экспериментального флага. Это не означает обнаружения всех утечек или автоматического поиска при каждом GC.
+Запрос профиля запускает специальный GC; достижимость может скрыть часть утечек.
+
+</details>
+
+## Домашнее задание
+
+🟢 **Modify: `cheapestPrice(ctx)`**. [Папка урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest),
+[TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-06-leak-synctest/TASK.md),
+[ответы](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest/solution).
+В папке одно проверяемое задание; дополнительных уровней не назначено.
+
+```go filename="offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+//
+// VAZIFA (TASK.md): shu funksiyani yozing.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	return 0, errors.New("VAZIFA: cheapestPrice hali yozilmagan (TASK.md)")
+}
+```
+
+Строки 9–13 задают `priceOffer`, хранящую задержку ответа и цену. В `priceOffers` на строках 15–20 три предложения; третье дешевле всех, но требует трёх секунд.
+На строках 22–26 `quoteTimeout` — одна секунда; `errNoOffer` сообщает, что никто не ответил вовремя. `askOffer` на строках 28–36 повторяет форму прежней `quote`.
+Незавершённая функция на строках 38–44 пока возвращает ошибку задания через `errors.New`.
+Не меняйте `askOffer`, готовые данные и файлы тестов.
+
+Требования:
+
+1. Запросите все предложения одновременно.
+2. Выберите самое дешёвое из полученных за секунду. Если все ответили раньше, вернитесь после последнего ответа.
+3. Без ответов верните `0, errNoOffer`.
+4. При более ранней отмене или истечении срока вызывающей стороны верните `0, ctx.Err()`, даже если цена уже приходила.
+5. Отмените медленную работу; не оставляйте отправителей результата заблокированными.
+
+Проверка сравнивает искусственное время и результат. Затем `synctest.Wait()` даёт отменённой работе завершиться, после чего считаются горутины.
+Счётчик относится ко всему процессу, поэтому эти тесты не выполняются параллельно.
+
+**Предскажите:** начальный снимок даст **A)** ok · **B)** FAIL с сообщениями задания · **C)** race.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `tekshiruv_test.go:57`, `:71`, `:84`, `:93` указывают на четыре требования.
+`VAZIFA: … hali yozilmagan` означает, что функцию ещё надо написать, а не ошибку установки synctest.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaEngArzon (0.00s)
+    tekshiruv_test.go:57: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 1s.
+        	1 soniya ichida ikki taklif keladi, arzoni 1 150 000; 3 soniyalik taklifni kutmang (quoteTimeout).
+--- FAIL: TestVazifaHammasiTez (0.00s)
+    tekshiruv_test.go:71: hamma taklif 300ms ichida: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 300ms.
+        	Hamma javob kelgach, quoteTimeout'ni kutmasdan qayting; eng arzoni ikkinchisi.
+--- FAIL: TestVazifaHechKim (0.00s)
+    tekshiruv_test.go:84: hech kim 1 soniyada javob bermaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, errNoOffer, aniq 1s.
+--- FAIL: TestVazifaChaqiruvchi (0.00s)
+    tekshiruv_test.go:93: chaqiruvchi ctx'i 150ms'da tugaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, context deadline exceeded, aniq 150ms.
+        	quoteTimeout'ni chaqiruvchi ctx'idan yasang (WithTimeout(ctx, quoteTimeout)) va u tugaganda ctx.Err()ni qaytaring.
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+(chiqish kodi: 1)
+```
+
+Проверяйте свой код командой `go test .` в папке урока. Сначала попробуйте сами, не открывая ответ ниже.
+
+<details>
+<summary>Ответ</summary>
+
+```go filename="solution/offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	tctx, cancel := context.WithTimeout(ctx, quoteTimeout)
+	defer cancel()
+	ch := make(chan int64, len(priceOffers))
+	for _, o := range priceOffers {
+		go func() {
+			p, err := askOffer(tctx, o)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	var best int64
+	found := false
+	take := func(p int64) {
+		if !found || p < best {
+			best, found = p, true
+		}
+	}
+	for range priceOffers {
+		select {
+		case p := <-ch:
+			take(p)
+		case <-tctx.Done():
+			if err := ctx.Err(); err != nil {
+				return 0, err // chaqiruvchi bekor qildi yoki uning muddati tugadi
+			}
+			for len(ch) > 0 { // muddat bilan bir paytda kelib, buffer'da turgan javoblar
+				take(<-ch)
+			}
+			if !found {
+				return 0, errNoOffer
+			}
+			return best, nil
+		}
+	}
+	return best, nil
+}
+```
+
+Новые части: 41–42 создают `tctx` со сроком из контекста вызывающей стороны и планируют отмену.
+43–51 дают горутину каждому предложению и достаточно буфера; 52–53 хранят цену `best` и флаг `found`.
+54–58 задают анонимную функцию `take`, сохраняющую минимальную цену. `!found` позволяет считать нулевую цену допустимым предложением.
+59–62 собирают каждый ожидаемый ответ. 63–66 отличают ошибку родительского контекста от собственного срока операции.
+67–69 забирают также ответы, уже лежащие в буфере. Это не добавляет гарантированного порядка для всех одновременных событий.
+70–76 возвращают ошибку отсутствия предложений либо минимальную цену. Остальные строки — знакомые блоки и готовые помощники.
+
+| Случай | Результат | Искусственное время |
+|---|---|---|
+| три стандартных предложения | 1 150 000, nil | 1 с |
+| все отвечают за 100/200/300 мс | 1 150 000, nil | 300 мс |
+| никто не отвечает вовремя | 0, `errNoOffer` | 1 с |
+| у вызывающей стороны срок 150 мс | 0, `DeadlineExceeded` | 150 мс |
+
+**Предскажите:** снимок ответа даст **A)** ok · **B)** FAIL · **C)** ждёт 3 с.
+**A**: проверки времени, цены и оставшихся горутин проходят.
+
+```console
+$ ./_video/run.sh solution go test .
+ok  	github.com/abdurahmon27/bozor	0.003s
+(chiqish kodi: 0)
+```
+
+Снимок ответа в видео тоже занял 0.003 с. Эти времена зависят от среды; искусственные времена в таблице проверяются точно.
+`cancel` просит работу завершиться; эта функция тоже не ждёт её явно. Проверка даёт ей выйти и проверяет оставшихся.
+
+</details>
+
+## Источники
+
+- [`testing/synctest`: Test, Wait, Time, Blocking](https://pkg.go.dev/testing/synctest), [Time](https://pkg.go.dev/testing/synctest#hdr-Time), [Blocking](https://pkg.go.dev/testing/synctest#hdr-Blocking), [Test](https://pkg.go.dev/testing/synctest#Test), [пример WithTimeout](https://pkg.go.dev/testing/synctest#hdr-Example__Context_WithTimeout).
+- [Go 1.25: synctest](https://go.dev/doc/go1.25#new-testingsynctest-package), [Go 1.26](https://go.dev/doc/go1.26), [Go 1.27](https://go.dev/doc/go1.27).
+- [`runtime/pprof`](https://pkg.go.dev/runtime/pprof), [`Profile.WriteTo`](https://pkg.go.dev/runtime/pprof#Profile.WriteTo), [`runtime.NumGoroutine`](https://pkg.go.dev/runtime#NumGoroutine), [`net/http/pprof`](https://pkg.go.dev/net/http/pprof).
+- Исходники Go 1.27.4: [`testing/synctest/synctest.go`](https://github.com/golang/go/blob/go1.27.4/src/testing/synctest/synctest.go), [`runtime/pprof/pprof.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/pprof/pprof.go), [`runtime/mgc.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/mgc.go), [`context/context.go`](https://github.com/golang/go/blob/go1.27.4/src/context/context.go).
+- [`context`](https://pkg.go.dev/context), [`Context`](https://pkg.go.dev/context#Context), [`WithCancel`](https://pkg.go.dev/context#WithCancel), [`CancelFunc`](https://pkg.go.dev/context#CancelFunc).
+- Правила Go: [отправка](https://go.dev/ref/spec#Send_statements), [типы каналов](https://go.dev/ref/spec#Channel_types), [создание каналов](https://go.dev/ref/spec#Making_slices_maps_and_channels), [range](https://go.dev/ref/spec#For_range), [модель памяти: каналы](https://go.dev/ref/mem#chan).
+- Блог Go: [Pipelines and cancellation](https://go.dev/blog/pipelines), [Testing concurrent code with testing/synctest](https://go.dev/blog/synctest). Вторая статья показывает старый экспериментальный API Go 1.24; этот урок использует `synctest.Test`.
+- [`go.uber.org/goleak`](https://pkg.go.dev/go.uber.org/goleak), [README урока](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest).
+
+Результаты получены с `go1.27.4 linux/amd64`, 2026-11-28: все показанные команды выполнены повторно, `-race` — в Docker.
+Обычные запуски: `CGO_ENABLED=0`, `GOFLAGS=-trimpath`; скрипт race: `CGO_ENABLED=1`.
+Числа из видео и README приведены в тексте как отдельно записанные измерения.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+---
+
+← Предыдущий урок: [GB-7.05](/lab/youtube/gb/gb-7-05/ru) · Следующий урок: [GB-7.07](/lab/youtube/gb/gb-7-07/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

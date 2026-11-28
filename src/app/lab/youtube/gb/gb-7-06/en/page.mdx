@@ -1,0 +1,1368 @@
+---
+title: "Testing concurrent code: leaks, time and synctest"
+date: "2026/11/28"
+description: "Find goroutine leaks with profiles and synctest, fix them with context, and check deadlines precisely with a fake clock."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-06) · [Русский](/lab/youtube/gb/gb-7-06/ru) · **English**  
+Lesson GB-7.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-06) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Bozor asks three suppliers for the price of apples concurrently. The fastest reply wins and the test passes, but each call leaves two goroutines. How do you catch this?
+
+**The one idea:** checking the result is not enough; check how the goroutines you start will exit. `testing/synctest` controls waiting and fake time in an isolated test environment.
+
+After this lesson you will:
+
+- count a goroutine leak and find the waiting line in a profile;
+- catch a bug missed by an ordinary test using `synctest.Test`;
+- cancel slow work through context;
+- check a 50 ms deadline precisely and find a missing `Close`.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| goroutine leak | a goroutine waiting forever when it should have exited | goroutine leak |
+| bubble | an isolated environment for a test and the goroutines it starts | bubble |
+| fake clock | a clock that advances to the end of a wait without waiting in real time | fake clock |
+
+## Before you start
+
+The main prerequisites are [GB-7.05 · Mutex or channel](/lab/youtube/gb/gb-7-05/en) and [GB-1.08 · First test](/lab/youtube/gb/gb-1-08/en).
+Other concepts used here:
+
+- [GB-1.01 · First program](/lab/youtube/gb/gb-1-01/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.05 · Conditions](/lab/youtube/gb/gb-1-05/en): packages, imports, `var`, `:=`, `if`;
+- [GB-2.03 · Structs](/lab/youtube/gb/gb-2-03/en): fields and struct literals;
+
+- [GB-7.01 · Goroutine lifetime](/lab/youtube/gb/gb-7-01/en): `go func()`, loop variables and stacks;
+- [GB-7.02 · Channels](/lab/youtube/gb/gb-7-02/en): buffers, sends, receives, `close`, `range`;
+- [GB-7.03 · Select and context](/lab/youtube/gb/gb-7-03/en): `Done`, `Err`, `WithCancel`, `time.After`, `NumGoroutine`;
+- [GB-7.04 · Bounded concurrency](/lab/youtube/gb/gb-7-04/en): child contexts and cancellation;
+- [GB-5.05 · pgx pool](/lab/youtube/gb/gb-5-05/en): `WithTimeout`;
+- [GB-4.07 · Mutex and race](/lab/youtube/gb/gb-4-07/en): `-race`;
+- [GB-4.04 · HTTP server](/lab/youtube/gb/gb-4-04/en): `net/http/pprof`;
+- [GB-2.08 · Errors](/lab/youtube/gb/gb-2-08/en): `errors.Is`;
+- [GB-2.07 · Files](/lab/youtube/gb/gb-2-07/en): `os.Stdout`;
+- [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en), [GB-2.02 · Maps](/lab/youtube/gb/gb-2-02/en) and [GB-2.04 · Pointers](/lab/youtube/gb/gb-2-04/en): the types in the code;
+- [GB-1.03 · Numbers](/lab/youtube/gb/gb-1-03/en), [GB-1.06 · Loops](/lab/youtube/gb/gb-1-06/en), [GB-1.07 · Functions and error](/lab/youtube/gb/gb-1-07/en): tiyin, `for range`, return values;
+- [GB-6.07 · Expiration](/lab/youtube/gb/gb-6-07/en): `time.Duration`.
+
+Use the [lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest). It has its own `go.mod`: `go 1.27`.
+Run commands from that folder. The environment for the measurements below is:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0 GOFLAGS=-trimpath
+```
+
+`GOTOOLCHAIN` selects the version; `CGO_ENABLED=0` runs without C tools. `-trimpath` replaces local paths in stacks with module paths.
+`./_video/run.sh STEP COMMAND` copies the selected snapshot into a temporary `bozor` folder and executes the command.
+`(chiqish kodi: 0)` means success; `1` means the inner command failed. The helper script prints this final line.
+`go run .` runs the program; `go test` runs tests; `-v` shows each test.
+The homework is unfinished in the starter copy: the full test run is expected to fail.
+
+**Recall:** `OwnedStore.loop` waits with `for r := range s.sells`. What happens if `Close` is never called?
+**A)** `range` ends by itself · **B)** it waits for another request · **C)** immediate panic.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `range` waits until the channel is closed. With no next sender and no `close`, the goroutine never exits. Its stack and the map it holds remain in memory.
+
+</details>
+
+## One reply, two remaining goroutines
+
+Start with the broken snapshot. `prices` maps IDs to prices in tiyin; `supplierDelays` holds three suppliers' response times.
+`quote` simulates a wait instead of using a real network.
+
+```go filename="_video/01-leak/price.go" showLineNumbers
+package main
+
+import "time"
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+func quote(delay time.Duration, id int64) int64 {
+	time.Sleep(delay)
+	return prices[id]
+}
+
+func fastestPrice(id int64) int64 {
+	ch := make(chan int64)
+	for _, d := range supplierDelays {
+		go func() {
+			ch <- quote(d, id)
+		}()
+	}
+	return <-ch
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1, 3 | `package main`, `import "time"` | executable package and time package |
+| 5–6 | `prices` | comment and `map[int64]int64`; ID 1 costs 1,200,000 tiyin, or 12,000 soʻm |
+| 8–13 | `supplierDelays` | comment and `[]time.Duration` slice; `*` multiplies, the trailing comma is required in a multiline literal |
+| 15–18 | `quote` | takes `delay` and `id`, sleeps, returns the map value |
+| 20–21 | `fastestPrice`, `make(chan int64)` | function and unbuffered result channel |
+| 22 | `for _, d := range` | discards the index with `_`; creates a new `d` each iteration |
+| 23 | `go func() {` | starts an anonymous function in another goroutine |
+| 24 | `ch <- quote(d, id)` | computes the price first, then tries to send it |
+| 25–26 | `}()`, `}` | invokes the anonymous function and closes the loop |
+| 27–28 | `return <-ch`, `}` | receives one price and returns from the function |
+
+Blank lines separate code; `//` lines are comments. `{}` marks block boundaries; `:=` declares a new variable.
+
+```go filename="_video/01-leak/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+`main.go`: line 1 is the package; 3–7 imports; 9 the function; 10 the outer loop; 11–13 one hundred calls; 14 a one-second wait.
+Line 15 prints all live goroutines with `fmt.Println`; 16–17 close the blocks.
+`for range 3` is three iterations without a counter variable.
+
+**Predict:** how many goroutines remain after 300 calls? **A)** 1 · **B)** 301 · **C)** 601.
+
+<details>
+<summary>Answer</summary>
+
+**C: 1 + 300 × 2 = 601.** The 1 is `main`. Each call starts three goroutines but receives only one reply.
+A assumes all work finishes; B counts only one remaining goroutine per call.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-leak go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+(chiqish kodi: 0)
+```
+
+| Time | First supplier | Second | Third | Receiver |
+|---|---|---|---|---|
+| 0 ms | waiting | waiting | waiting | `<-ch` |
+| 100 ms | sends, exits | waiting | waiting | receives price and returns |
+| 200 ms | exited | stuck sending | waiting | gone |
+| 300 ms | exited | stuck sending | stuck sending | gone |
+
+This is a **goroutine leak**: nobody will receive from the two remaining senders.
+A waiting goroutine's resources are not released automatically; it must exit.
+
+## Profile: where is it waiting?
+
+The count shows growth. A **profile** shows goroutine stacks: the sequence of function calls.
+The next snapshot adds one call at the end of `main`:
+
+```go filename="_video/02-profil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+}
+```
+
+New line 5 imports `os`, line 7 imports `runtime/pprof`. Line 19 selects the profile with `Lookup("goroutine")`.
+`WriteTo(os.Stdout, 1)` writes it to standard output; `1` selects text with identical stacks grouped together.
+
+**Predict:** what is the profile total? **A)** 600 · **B)** 601 · **C)** 3.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The ordinary `goroutine` profile includes the running `main` as well as leaks. 600 counts only the waiting senders.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-profil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutine profile: total 601
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+1 @ 0x440e11 0x47cbfd 0x4ccab1 0x4cc785 0x4c96e9 0x4debfd 0x44aa27 0x4835c1
+#	0x4ccab0	runtime/pprof.writeRuntimeProfile+0xb0	runtime/pprof/pprof.go:848
+#	0x4cc784	runtime/pprof.writeGoroutine+0x44	runtime/pprof/pprof.go:781
+#	0x4c96e8	runtime/pprof.(*Profile).WriteTo+0x148	runtime/pprof/pprof.go:405
+#	0x4debfc	main.main+0x13c				github.com/abdurahmon27/bozor/main.go:19
+#	0x44aa26	runtime.main+0x426			runtime/proc.go:302
+
+(chiqish kodi: 0)
+```
+
+`total 601` is the total count. `600 @` means 600 goroutines with the same stack. `0x…` values are hexadecimal code addresses.
+A `#` line is a stack frame; `fastestPrice.func1` is its first anonymous function. `+0x5b` is an offset within the function.
+`price.go:24` is the send line. The `1 @` group is `main` writing the profile and its calls.
+Code addresses and goroutine numbers can differ in another build.
+
+On the server from [GB-4.04](/lab/youtube/gb/gb-4-04/en), `net/http/pprof` serves this information at `/debug/pprof/goroutine?debug=1`.
+`debug=1` selects the same text format. Expose the profile endpoint only on an internal port.
+
+## An ordinary test does not check for leaks
+
+```go filename="_video/03-test/price_test.go" showLineNumbers
+package main
+
+import "testing"
+
+func TestFastestPrice(t *testing.T) {
+	got := fastestPrice(1)
+	if got != 1_200_000 {
+		t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+	}
+}
+```
+
+Line 1 is the package; 3 the test package; 5 the test function; 6 the result `got`; 7 comparison with the expected price.
+Line 8 marks the test as failed with `t.Errorf`; `%d` prints an integer; 9–10 close the blocks.
+
+**Predict:** result and time? **A)** PASS, about 0.10 s · **B)** PASS, about 0.30 s · **C)** FAIL, leak.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The test waits only for the first price. It does not check the remaining goroutines; they disappear when the test process exits.
+B assumes all suppliers are awaited. C assumes ordinary `go test` searches for leaks automatically.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-test go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.102s
+(chiqish kodi: 0)
+```
+
+The video recorded a package time of 0.103 s; this rerun took 0.102 s. The test itself took 0.10 s in both.
+`=== RUN` means starting; `--- PASS` means the test passed; `PASS` means overall success; `ok` is the package result.
+
+## synctest: the test returned, but work remains
+
+`testing/synctest` has been available without an experiment flag since Go 1.25. It runs the test in a **bubble**.
+This is an isolated test environment: goroutines started inside also belong to it. `synctest.Test` waits for all of them to exit.
+
+**Durable blocking** (*durably blocked*) means a goroutine can only be unblocked by work within its bubble.
+Waiting on a channel created in the bubble and `time.Sleep` qualify.
+When all goroutines wait this way, the clock advances to the next wakeup. Its initial time is `2000-01-01 00:00:00 UTC`.
+The clock stops advancing when the bubble's root function exits. If no work can wake and waiting remains, there is a deadlock.
+
+```go filename="_video/04-synctest/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got := fastestPrice(1)
+		if got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+		}
+	})
+}
+```
+
+New line 5 imports the package; line 9 passes the outer `t` and an anonymous function with its own `t` parameter.
+Lines 10–13 keep the same assertion; 14–15 close the bubble and test.
+
+**Predict:** **A)** PASS · **B)** FAIL: deadlock · **C)** waits 300 ms and passes.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The price arrives at 100 ms of fake time. The test function returns and the clock stops; two goroutines are still sleeping.
+A considers only the price. C assumes the clock keeps advancing after the test function exits.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-synctest go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 7 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x1b38f891c000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x1b38f891c000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x1b38f88e0160)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x1b38f8992248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x1b38f8992248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x1b38f8992248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 11 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+
+goroutine 12 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`main bubble goroutine has exited` means the bubble's root goroutine has ended.
+`blocked goroutines remain` means some goroutines are still waiting. `[recovered, repanicked]` means the test machinery caught and raised the panic again.
+The upper `testing` and `internal/synctest` frames trace test execution; the two lower stacks are our work.
+`sleep (durable)` is a fake-time sleep; `bubble 1` identifies the bubble.
+`0xbebc200` is 200 ms in nanoseconds, written in hexadecimal; `0x11e1a300` is 300 ms.
+The `quote(...)` frame above `price.go:24` shows the source of the wait; `(...)` means arguments were omitted.
+`created by` identifies where the goroutine started. `exit status 2` comes from the panicking test binary; final code `1` comes from `go test`.
+`0.00s` is not exactly zero: real duration is rounded to hundredths of a second. The fake clock advanced by 100 ms.
+
+| State | Bubble clock | Two remaining goroutines |
+|---|---|---|
+| start | 00:00:00 | begin waiting |
+| all waiting | +100 ms | still sleeping |
+| test function returns | stops | cannot finish sleeping |
+| `synctest.Test` | deadlock | FAIL |
+
+## A buffer does not cancel waiting
+
+First attempt: only channel creation changes in `_video/05-buffer/price.go`:
+
+```go
+ch := make(chan int64, len(supplierDelays))
+```
+
+`len(supplierDelays)` gives three slots. Each goroutine sends one reply, so its later send will not get stuck.
+
+**Predict:** **A)** PASS · **B)** the same deadlock · **C)** wrong price.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The buffer provides space for sends; it does not cancel `Sleep`. When the test returns, the remaining work still waits for 200 and 300 ms.
+Outside a bubble, it would finish at around 300 ms. This removes the permanent leak but does not stop unnecessary work immediately.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-buffer go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 5 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x150d11704000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x150d11704000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x150d11646140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x150d11664248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x150d11664248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x150d11664248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 9 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+
+goroutine 10 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+The cause and message are the same. Fix it by signaling cancellation to the remaining work when its reply is no longer needed.
+
+## Stop the remaining work with context
+
+The final `price.go` in the lesson folder:
+
+```go filename="price.go" showLineNumbers
+// bozor: bitta mahsulot narxini uch yetkazib beruvchidan birdan soʻrab, eng tez javobni olish (GB-7.06).
+// Videoning oxiridagi holat: goroutine'lar fastestPrice bilan birga tugaydi (ctx + cancel), leak yoʻq.
+package main
+
+import (
+	"context"
+	"time"
+)
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+// quote bitta yetkazib beruvchidan narx soʻrashni taqlid qiladi: delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func quote(ctx context.Context, delay time.Duration, id int64) (int64, error) {
+	select {
+	case <-time.After(delay):
+		return prices[id], nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// fastestPrice hamma yetkazib beruvchidan birdan soʻraydi va birinchi kelgan javobni qaytaradi.
+// Qaytishdan oldin cancel() qolgan soʻrovlarni toʻxtatadi: oʻzi boshlagan goroutine'lar uning bilan tugaydi.
+func fastestPrice(ctx context.Context, id int64) (int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan int64, len(supplierDelays))
+	for _, d := range supplierDelays {
+		go func() {
+			p, err := quote(ctx, d, id)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+```
+
+Changed lines:
+
+| Line | What it does |
+|---|---|
+| 5–8 | imports `context` and `time` |
+| 21 | `quote` takes a context and returns `(int64, error)` |
+| 22–28 | `select`: price and `nil` when time passes; 0 and `ctx.Err()` when `Done` closes |
+| 32–34 | `WithCancel` creates a child context; `ctx` reassigns the parameter in this block, `cancel` is new; `defer` signals on return |
+| 35 | keeps the three-slot buffer |
+| 36–43 | each goroutine queries with the child context; `p` is price, `err` is error; sends only when `err == nil` |
+| 44–50 | waits for the first price or caller cancellation |
+
+Lines 1–2, 10, 13, 20 and 30–31 are comments. Do not read «birga tugaydi» ("finish together") as a guarantee of joining.
+[`CancelFunc`](https://pkg.go.dev/context#CancelFunc) only signals; it does not wait for work to exit.
+Here the remaining goroutines observe the signal and exit; `synctest.Test` waits for their exit.
+If the caller must strictly wait before returning, use a wait group as in [GB-7.01](/lab/youtube/gb/gb-7-01/en).
+The buffer remains useful: if time and cancellation become ready together, a successful price send cannot get stuck.
+
+| Stage | Result |
+|---|---|
+| first price | `fastestPrice` begins returning |
+| `defer cancel()` | closes the child context's `Done` channel |
+| remaining `quote` calls | observe cancellation, return errors, do not send |
+| `synctest.Test` | waits for all goroutines to exit |
+
+`main` also calls the new signature:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"time"
+)
+
+// main 3 × 100 marta narx soʻraydi va har yuztadan keyin tirik goroutine'lar sonini chiqaradi.
+// Leak boʻlsa, son oʻsadi (videoda: 201, 401, 601); tuzatilgan fastestPrice bilan doim 1.
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(context.Background(), 1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+The new import is `context`; line 15 supplies a non-cancelable initial context with `context.Background()`.
+The test instead uses `t.Context()`. It is canceled just before the test's cleanup functions run.
+Inside a bubble, `t.Context().Done()` also belongs to that bubble.
+
+```go filename="_video/06-ctx/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+```
+
+Line 10 passes context and ID; 11 uses `||` to detect an error or wrong price; 12 prints the error with `%v`.
+
+**Predict:** **A)** PASS and 1, 1, 1 · **B)** FAIL · **C)** PASS and 201, 401, 601.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Cancellation ends the remaining waits. The test waits for work inside the bubble to exit; the program gives it one second after each hundred calls.
+C describes the version that ignores cancellation.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-ctx go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/run.sh 06-ctx go run .
+goroutine'lar: 1
+goroutine'lar: 1
+goroutine'lar: 1
+(chiqish kodi: 0)
+```
+
+The count covers the whole process. In this lab, 1 is `main`; background work makes real server counts different.
+
+## Exactly 50 ms and a one-hour test
+
+The deadline is 50 ms; the fastest offer takes 100 ms. Inside a bubble you can check exact equality instead of an approximate bound:
+
+```go filename="_video/07-timeout/price_test.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi testlar. synctest.Test funksiyani "pufak" ichida ishga tushiradi: soxta soat, va funksiya
+// tugaganda pufakda kutib qolgan goroutine boʻlsa, test yiqiladi.
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+
+func TestFastestPriceTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := fastestPrice(ctx, 1)
+		took := time.Since(start) // pufakda soat soxta: aniq tenglik mumkin (haqiqiy soatda emas)
+		if !errors.Is(err, context.DeadlineExceeded) || took != 50*time.Millisecond {
+			t.Errorf("xato %v, %v oʻtdi; kutilgan deadline, 50ms", err, took)
+		}
+	})
+}
+```
+
+New imports are `context`, `errors`, `time`. Lines 16–18 check the result and error together.
+25–26 set a child deadline and its cleanup. 27 records the start; 28 discards the unneeded price with `_`; 29 stores elapsed time in `took`.
+Line 30 checks `DeadlineExceeded` using `errors.Is` and a difference from 50 ms using `!=`; 31 prints error and time with `%v`.
+The remaining lines are the familiar test structure and block boundaries.
+
+**Predict:** **A)** both tests PASS · **B)** timeout test FAIL · **C)** 100 ms instead of 50 ms.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The clock advances to 50 ms; the deadline expires; `fastestPrice` returns the deadline error.
+Do not rely on exact equality with a real clock because scheduling can delay execution.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-timeout go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+=== RUN   TestFastestPriceTimeout
+--- PASS: TestFastestPriceTimeout (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+The package took 0.002 s both in the video and here; the ordinary test took 0.102 s: a ratio of about 51.
+This is not a stable speed guarantee. The useful difference is removing a real 100 ms wait while still checking 50 ms of fake time.
+You cannot divide two `0.00s` values to calculate a speedup: they are rounded.
+
+**Race check:** **A)** DATA RACE · **B)** ok · **C)** a leak causes a race.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The result arrives through a channel and `prices` is unchanged. `-race` checks data races on executed paths; it does not fully check goroutine lifetimes.
+
+</details>
+
+This machine has no C compiler. The following command ran the same Go 1.27.4 inside Docker with cgo and a C compiler:
+
+```console
+$ ./_video/race.sh 07-timeout go test -race .
+ok  	github.com/abdurahmon27/bozor	1.012s
+(chiqish kodi: 0)
+```
+
+The video recorded 1.014 s; this run took 1.012 s. Race instrumentation adds overhead; do not compare this as a fake-clock test speedup.
+`./_video/race.sh` supplies the snapshot and tools to the container; `-race .` checks this package.
+
+Now a one-hour sleep. **A)** waits one hour · **B)** passes almost immediately · **C)** deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The test's root goroutine is still alive. `Sleep` has a wakeup time, so the clock advances to it.
+Deadlock occurs when all work is durably blocked with no remaining wakeup time, or such waiting remains after the root goroutine exits.
+
+```go filename="_video/11-soat/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi savol: pufak ichida bir soatlik time.Sleep. Soat soxta: test bir zumda tugaydi.
+func TestHour(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		time.Sleep(time.Hour)
+		t.Log(time.Since(start), start.UTC())
+	})
+}
+```
+
+Line 12 records the start; 13 sleeps for one hour; 14 logs elapsed time and the start in UTC.
+The remaining lines are the familiar imports, test and bubble structure.
+
+```console
+$ ./_video/run.sh 11-soat go test -v
+=== RUN   TestHour
+    price_test.go:14: 1h0m0s 2000-01-01 00:00:00 +0000 UTC
+--- PASS: TestHour (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## A missing Close: another wait, the same bug
+
+`store.go` is a shortened `OwnedStore` from the previous lesson. Only the owner goroutine accesses the map.
+
+```go filename="store.go" showLineNumbers
+package main
+
+// OwnedStore — GB-7.05'dagi qoldiq doʻkoni (qisqartirilgan): stock map'iga faqat loop goroutine'i tegadi,
+// Sell unga channel orqali soʻrov yuboradi. loop sells yopilganda (Close) tugaydi.
+type OwnedStore struct {
+	sells chan sellReq
+}
+
+// sellReq — egasiga yuboriladigan sotish soʻrovi: qaysi mahsulot, necha dona va javob qaytadigan channel.
+type sellReq struct {
+	id    int64
+	n     int
+	reply chan bool
+}
+
+// NewOwnedStore loop'ni yangi goroutine'da boshlaydi va stock map'ini unga topshiradi.
+func NewOwnedStore(stock map[int64]int) *OwnedStore {
+	s := &OwnedStore{sells: make(chan sellReq)}
+	go s.loop(stock)
+	return s
+}
+
+func (s *OwnedStore) loop(stock map[int64]int) {
+	for r := range s.sells {
+		ok := stock[r.id] >= r.n
+		if ok {
+			stock[r.id] -= r.n
+		}
+		r.reply <- ok
+	}
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *OwnedStore) Sell(id int64, n int) bool {
+	reply := make(chan bool)
+	s.sells <- sellReq{id, n, reply}
+	return <-reply
+}
+
+// Close loop goroutine'ini toʻxtatadi. Close'dan keyin Sell chaqirilmaydi.
+func (s *OwnedStore) Close() { close(s.sells) }
+```
+
+Lines 5–7 hold the request channel; 10–14 hold the request's `id`, quantity `n` and response channel `reply`.
+17–21 create the store and pass the map to `loop`. 23–31 receive requests sequentially, reduce stock if sufficient, and send a reply.
+34–38 make `Sell` send a request and receive a reply. Line 41 makes `Close` close the request channel.
+`>=` compares availability; `-=` subtracts; `&` takes an address; `*OwnedStore` is a pointer receiver.
+The package, comments and braces follow earlier patterns.
+
+The broken test:
+
+```go filename="_video/08-close/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+New line 10 creates a store with 5 items; 11–13 check that two were sold. `!` is logical negation.
+**Predict:** **A)** PASS · **B)** deadlock: receive · **C)** stock data race.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Sell` returns successfully. But `loop` waits for another request; nobody closed `sells`.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-close go test
+--- FAIL: TestOwnedStore (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 19 [running]:
+testing.tRunner.func1.2({0x6c2748, 0x2304924b2150})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2748?, 0x2304924b2150?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x2304924b6140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x2304924da248, 0x6d5780)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestOwnedStore(0x2304924da248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x2304924da248, 0x6d56d8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 22 [chan receive (durable), synctest bubble 1]:
+github.com/abdurahmon27/bozor.(*OwnedStore).loop(...)
+	github.com/abdurahmon27/bozor/store.go:24
+created by github.com/abdurahmon27/bozor.NewOwnedStore in goroutine 21
+	github.com/abdurahmon27/bozor/store.go:19 +0xc7
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`chan receive (durable)` now means waiting to receive rather than send.
+`(*OwnedStore).loop(...)` and `store.go:24` identify the `range`. This is a lifetime bug, not a sale calculation error.
+The fix is `defer s.Close()` at line 11:
+
+```go filename="_video/09-close-fix/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		defer s.Close()
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+When the test returns, `sells` closes; `range` ends and `loop` exits. Do not call `Sell` again after `Close`.
+**Predict:** **A)** ok · **B)** the same deadlock · **C)** wrong stock.
+
+<details>
+<summary>Answer</summary>
+
+**A.** As with the price test, synctest waits for the owner goroutine to exit too.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-close-fix go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+## Going deeper (optional): goroutineleak and synctest limits
+
+In Go 1.27 the `goroutineleak` profile graduated from experiment; `GOEXPERIMENT=goroutineleakprofile` is unnecessary and the old setting was removed.
+GC means garbage collection: reclaiming unused memory.
+The profile is normally available, but that does not mean automatic leak detection is enabled for every GC.
+In the Go 1.27.4 source, `writeGoroutineLeak` first calls `runtime_goroutineLeakGC()`, then writes the profile.
+Requesting the profile therefore triggers a GC cycle with leak detection.
+
+```go filename="_video/10-leakprofil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutineleak").WriteTo(os.Stdout, 1)
+}
+```
+
+Only line 19 changes: `Lookup("goroutineleak")`. **Predict:** **A)** 601 · **B)** 600 · **C)** 0.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `main` is running and is not leaked; 600 waiting senders remain.
+
+</details>
+
+```console
+$ ./_video/run.sh 10-leakprofil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutineleak profile: total 600
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+(chiqish kodi: 0)
+```
+
+Detection uses reachability: if no potentially runnable goroutine can reach a waiting primitive, it cannot wake that wait.
+Leaks through primitives reachable from globals or running goroutines can be missed.
+`WriteTo(..., 2)` prints all stacks, marking leaks with `(leaked)`; do not treat it as a list containing only leaks.
+
+The fake clock in `synctest` does not completely determine execution order. If multiple `select` cases are ready, do not rely on their order.
+Waiting on a mutex, file I/O or network I/O is not durable blocking.
+If the outside event that would unblock it never arrives, the test may hang until its overall timeout instead of quickly reporting deadlock.
+
+```go filename="_video/13-mutex/price_test.go" showLineNumbers
+package main
+
+import (
+	"sync"
+	"testing"
+	"testing/synctest"
+)
+
+// Videodagi "synctest chegarasi": mutex'da kutish durable emas. Goroutine qulfda abadiy qolsa,
+// synctest deadlock demaydi: test -timeout tugaguncha osilib turadi.
+func TestMutexHang(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		mu.Lock()
+		go func() {
+			mu.Lock() // hech kim Unlock qilmaydi
+		}()
+	})
+}
+```
+
+Lines 13–14 take the lock without releasing it; 15–17 start a goroutine that tries to take it again. The missing `Unlock` is the bug.
+**Predict:** **A)** immediate PASS · **B)** immediate synctest deadlock · **C)** timeout after 5 real seconds.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Lock waiting is not in the durable list; `-timeout 5s` sets a real-time bound on the test process.
+
+```console
+$ ./_video/run.sh 13-mutex go test -timeout 5s
+panic: test timed out after 5s
+
+goroutine 19 [running]:
+testing.(*M).startAlarm.func1()
+	testing/testing.go:2961 +0x34a
+created by time.goFunc
+	time/sleep.go:182 +0x2d
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0x28c07d728008, {0x55729d?, 0x28c07d6ccaa0?}, 0x6d4e70)
+	testing/testing.go:2268 +0x4f2
+testing.runTests.func1(0x28c07d728008)
+	testing/testing.go:2744 +0x37
+testing.tRunner(0x28c07d728008, 0x28c07d6ccbc8)
+	testing/testing.go:2195 +0xea
+testing.runTests({0x55c0ed, 0x1d}, {0x55c0ed, 0x1d}, 0x28c07d60c0c0, {0x6ef708, 0x1, 0x1}, {0xc2baca0f36c036fc, 0x12a087041, ...})
+	testing/testing.go:2742 +0x510
+testing.(*M).Run(0x28c07d7001e0)
+	testing/testing.go:2602 +0x6af
+main.main()
+	_testmain.go:46 +0x9b
+
+goroutine 5 [synctest.Run (durable), synctest bubble 1]:
+internal/synctest.Run(0x28c07d70a140)
+	runtime/synctest.go:214 +0x1da
+testing/synctest.Test(0x28c07d728248, 0x6d4f18)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestMutexHang(0x28c07d728248?)
+	github.com/abdurahmon27/bozor/price_test.go:12 +0x1a
+testing.tRunner(0x28c07d728248, 0x6d4e70)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 8 [sync.Mutex.Lock, synctest bubble 1]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
+	runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0x28c07d60e248)
+	internal/sync/mutex.go:149 +0x15a
+internal/sync.(*Mutex).Lock(...)
+	internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	sync/mutex.go:46
+github.com/abdurahmon27/bozor.TestMutexHang.func1.1()
+	github.com/abdurahmon27/bozor/price_test.go:16 +0x2d
+created by github.com/abdurahmon27/bozor.TestMutexHang.func1 in goroutine 7
+	github.com/abdurahmon27/bozor/price_test.go:15 +0x8b
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	5.006s
+(chiqish kodi: 1)
+```
+
+</details>
+
+`panic: test timed out after 5s` means the test deadline expired. In this example, end the wait with `Unlock`.
+For tests using a real network, `go.uber.org/goleak` checks for unexpected goroutines at the end of testing.
+`VerifyNone` checks one test and `VerifyTestMain` checks a package; stopping the waits remains the code's responsibility.
+
+## Common mistakes
+
+1. **“PASS means no leak.”** The ordinary test checked only the price. Compare the two snapshots in the ordinary test and synctest sections; add the bubble test.
+2. **“A buffer finishes all work.”** The real deadlock above showed the remaining sleeps. Make `quote` observe cancellation and have the caller call `cancel`.
+3. **“cancel waits.”** It signals. Add waiting for strict completion; `synctest.Test` waits for all internal goroutines in the test.
+4. **Forgetting `Close`.** The broken test above failed with a receive at `store.go:24`. Fix: `defer s.Close()`.
+5. **`took == 50*time.Millisecond` with a real clock.** Execution can be delayed by system load. Keep exact equality for fake time inside a bubble.
+6. **Thinking `synctest.Wait()` means all work finished.** It waits until the others have exited or become durably blocked. A blocked leak can still remain.
+7. **Running `-race` without cgo.** Use an environment with a C compiler or the Docker script above. Race checking does not replace leak checking.
+
+## Check yourself
+
+**1.** Why can synctest fail even when every price assertion passes?
+
+<details>
+<summary>Answer</summary>
+
+The work in the bubble can deadlock. Here its root function exits, time stops, and two durably blocked goroutines remain.
+
+</details>
+
+**2.** Why was a three-slot buffer insufficient?
+
+<details>
+<summary>Answer</summary>
+
+Sending could finish later, but the goroutines are still sleeping. After the bubble's root function exits, its clock will not wake them; context cancellation is needed.
+
+</details>
+
+**3.** There are no other goroutines in the bubble. What does `start := time.Now(); time.Sleep(time.Hour); time.Since(start)` produce?
+**A)** approximately 0 · **B)** exactly 1 hour · **C)** deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The fake duration is one hour and real execution is very short. This is the verified `TestHour` case above.
+
+</details>
+
+**4.** From GB-7.03: what does `ctx.Done()` send, and when is it closed?
+
+<details>
+<summary>Answer</summary>
+
+It is `<-chan struct{}`: no value is sent; closure is the signal. It closes when the context is canceled or its deadline expires.
+With `Background`, `Done()` is nil; it does not close by itself.
+
+</details>
+
+**5.** What does having `goroutineleak` in Go 1.27 guarantee?
+
+<details>
+<summary>Answer</summary>
+
+You can request the profile without an experiment flag. It does not mean every leak is found or every GC automatically searches for leaks.
+A profile request triggers the special GC; reachability can hide some leaks.
+
+</details>
+
+## Homework
+
+🟢 **Modify: `cheapestPrice(ctx)`**. [Lesson folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest),
+[TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-06-leak-synctest/TASK.md),
+[answers](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest/solution).
+The folder contains one checked task; no additional levels are assigned.
+
+```go filename="offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+//
+// VAZIFA (TASK.md): shu funksiyani yozing.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	return 0, errors.New("VAZIFA: cheapestPrice hali yozilmagan (TASK.md)")
+}
+```
+
+Lines 9–13 define `priceOffer`, storing response delay and price. Lines 15–20 define `priceOffers` with three offers; the third is cheapest but takes three seconds.
+Lines 22–26 define `quoteTimeout` as one second; `errNoOffer` reports that nobody replied in time. Lines 28–36 define `askOffer` following the earlier `quote` pattern.
+The unfinished function on lines 38–44 currently returns the task error with `errors.New`.
+Do not change `askOffer`, the supplied data or test files.
+
+Requirements:
+
+1. Query all offers concurrently.
+2. Take the cheapest received within one second. If everyone replies earlier, return after the last reply.
+3. With no reply, return `0, errNoOffer`.
+4. If the caller cancels or its deadline expires earlier, return `0, ctx.Err()`, even if a price already arrived.
+5. Cancel slow work; do not leave result senders stuck.
+
+The checker compares fake duration and result. Then `synctest.Wait()` lets canceled work exit, and it counts goroutines.
+The count is process-wide, so these tests do not run in parallel.
+
+**Predict:** the starter produces **A)** ok · **B)** FAIL with task messages · **C)** race.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `tekshiruv_test.go:57`, `:71`, `:84`, `:93` identify four requirements.
+`VAZIFA: … hali yozilmagan` means the function still needs implementing, not that synctest is installed incorrectly.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaEngArzon (0.00s)
+    tekshiruv_test.go:57: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 1s.
+        	1 soniya ichida ikki taklif keladi, arzoni 1 150 000; 3 soniyalik taklifni kutmang (quoteTimeout).
+--- FAIL: TestVazifaHammasiTez (0.00s)
+    tekshiruv_test.go:71: hamma taklif 300ms ichida: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 300ms.
+        	Hamma javob kelgach, quoteTimeout'ni kutmasdan qayting; eng arzoni ikkinchisi.
+--- FAIL: TestVazifaHechKim (0.00s)
+    tekshiruv_test.go:84: hech kim 1 soniyada javob bermaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, errNoOffer, aniq 1s.
+--- FAIL: TestVazifaChaqiruvchi (0.00s)
+    tekshiruv_test.go:93: chaqiruvchi ctx'i 150ms'da tugaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, context deadline exceeded, aniq 150ms.
+        	quoteTimeout'ni chaqiruvchi ctx'idan yasang (WithTimeout(ctx, quoteTimeout)) va u tugaganda ctx.Err()ni qaytaring.
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+(chiqish kodi: 1)
+```
+
+Check your code with `go test .` in the lesson folder. Try it yourself before opening the answer below.
+
+<details>
+<summary>Answer</summary>
+
+```go filename="solution/offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	tctx, cancel := context.WithTimeout(ctx, quoteTimeout)
+	defer cancel()
+	ch := make(chan int64, len(priceOffers))
+	for _, o := range priceOffers {
+		go func() {
+			p, err := askOffer(tctx, o)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	var best int64
+	found := false
+	take := func(p int64) {
+		if !found || p < best {
+			best, found = p, true
+		}
+	}
+	for range priceOffers {
+		select {
+		case p := <-ch:
+			take(p)
+		case <-tctx.Done():
+			if err := ctx.Err(); err != nil {
+				return 0, err // chaqiruvchi bekor qildi yoki uning muddati tugadi
+			}
+			for len(ch) > 0 { // muddat bilan bir paytda kelib, buffer'da turgan javoblar
+				take(<-ch)
+			}
+			if !found {
+				return 0, errNoOffer
+			}
+			return best, nil
+		}
+	}
+	return best, nil
+}
+```
+
+New parts: 41–42 create a timed `tctx` from the caller's context and arrange cancellation.
+43–51 provide a goroutine per offer and enough buffer space; 52–53 hold the `best` price and `found` flag.
+54–58 define `take`, an anonymous function that keeps the lowest price. `!found` allows zero to be a valid offer too.
+59–62 collect each expected reply. 63–66 distinguish the parent context's error from the operation's own deadline.
+67–69 also take replies already in the buffer. This does not add an ordering guarantee for all simultaneous events.
+70–76 return the no-offer error or the lowest price. Other lines are familiar blocks and the supplied helpers.
+
+| Case | Result | Fake time |
+|---|---|---|
+| three standard offers | 1,150,000, nil | 1 s |
+| all reply at 100/200/300 ms | 1,150,000, nil | 300 ms |
+| nobody replies in time | 0, `errNoOffer` | 1 s |
+| caller has a 150 ms deadline | 0, `DeadlineExceeded` | 150 ms |
+
+**Predict:** the answer snapshot produces **A)** ok · **B)** FAIL · **C)** waits 3 s.
+**A**: duration, price and remaining-goroutine checks pass.
+
+```console
+$ ./_video/run.sh solution go test .
+ok  	github.com/abdurahmon27/bozor	0.003s
+(chiqish kodi: 0)
+```
+
+The video's answer snapshot also took 0.003 s. These durations depend on the environment; the table's fake durations are checked exactly.
+`cancel` asks work to exit; this function also does not join it explicitly. The checker lets it exit and checks what remains.
+
+</details>
+
+## Sources
+
+- [`testing/synctest`: Test, Wait, Time, Blocking](https://pkg.go.dev/testing/synctest), [Time](https://pkg.go.dev/testing/synctest#hdr-Time), [Blocking](https://pkg.go.dev/testing/synctest#hdr-Blocking), [Test](https://pkg.go.dev/testing/synctest#Test), [WithTimeout example](https://pkg.go.dev/testing/synctest#hdr-Example__Context_WithTimeout).
+- [Go 1.25: synctest](https://go.dev/doc/go1.25#new-testingsynctest-package), [Go 1.26](https://go.dev/doc/go1.26), [Go 1.27](https://go.dev/doc/go1.27).
+- [`runtime/pprof`](https://pkg.go.dev/runtime/pprof), [`Profile.WriteTo`](https://pkg.go.dev/runtime/pprof#Profile.WriteTo), [`runtime.NumGoroutine`](https://pkg.go.dev/runtime#NumGoroutine), [`net/http/pprof`](https://pkg.go.dev/net/http/pprof).
+- Go 1.27.4 source: [`testing/synctest/synctest.go`](https://github.com/golang/go/blob/go1.27.4/src/testing/synctest/synctest.go), [`runtime/pprof/pprof.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/pprof/pprof.go), [`runtime/mgc.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/mgc.go), [`context/context.go`](https://github.com/golang/go/blob/go1.27.4/src/context/context.go).
+- [`context`](https://pkg.go.dev/context), [`Context`](https://pkg.go.dev/context#Context), [`WithCancel`](https://pkg.go.dev/context#WithCancel), [`CancelFunc`](https://pkg.go.dev/context#CancelFunc).
+- Go rules: [sends](https://go.dev/ref/spec#Send_statements), [channel types](https://go.dev/ref/spec#Channel_types), [creating channels](https://go.dev/ref/spec#Making_slices_maps_and_channels), [range](https://go.dev/ref/spec#For_range), [memory model: channels](https://go.dev/ref/mem#chan).
+- Go blog: [Pipelines and cancellation](https://go.dev/blog/pipelines), [Testing concurrent code with testing/synctest](https://go.dev/blog/synctest). The second article shows the old Go 1.24 experimental API; this lesson uses `synctest.Test`.
+- [`go.uber.org/goleak`](https://pkg.go.dev/go.uber.org/goleak), [lesson README](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest).
+
+Results from `go1.27.4 linux/amd64`, 2026-11-28: every displayed command was rerun, with `-race` in Docker.
+Ordinary runs used `CGO_ENABLED=0`, `GOFLAGS=-trimpath`; the race script used `CGO_ENABLED=1`.
+Video and README numbers appear in the prose as separately recorded measurements.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+---
+
+← Previous lesson: [GB-7.05](/lab/youtube/gb/gb-7-05/en) · Next lesson: [GB-7.07](/lab/youtube/gb/gb-7-07/en) → · [All lessons](/lab/youtube/gb)
+
+</div>
