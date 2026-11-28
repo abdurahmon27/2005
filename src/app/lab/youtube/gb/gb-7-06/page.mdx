@@ -1,0 +1,1368 @@
+---
+title: "Concurrent kodni test qilish: leak, vaqt va synctest"
+date: "2026/11/28"
+description: "Goroutine leak'ni profil va synctest bilan toping, context bilan tuzating va soxta soatda muddatni aniq tekshiring."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 56
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-06/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-06"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-7-06/ru) · [English](/lab/youtube/gb/gb-7-06/en)  
+Dars GB-7.06 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-06) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+Bozor uch yetkazib beruvchidan olma narxini birdan soʻraydi. Eng tez javob olinadi, test oʻtadi, lekin har chaqiruv ikkita goroutine qoldiradi. Buni qanday ushlaysiz?
+
+**Bitta gʻoya:** natijani tekshirish yetmaydi; boshlangan goroutine qanday tugashini ham tekshiring. `testing/synctest` ajratilgan test muhitida kutishni va soxta vaqtni boshqaradi.
+
+Darsdan keyin siz:
+
+- goroutine leak'ni sanab, profil orqali kutayotgan qatorni topasiz;
+- oddiy test koʻrmagan xatoni `synctest.Test` bilan ushlaysiz;
+- sekin ishlarni context orqali bekor qilasiz;
+- 50 ms muddatni taxminsiz tekshirasiz va unutilgan `Close`ni topasiz.
+
+| Soʻz | Oddiy maʼnosi | English term |
+|---|---|---|
+| goroutine leak | tugashi kerak boʻlsa ham abadiy kutayotgan goroutine | goroutine leak |
+| pufak | test va uning ichida boshlangan goroutine'lar uchun ajratilgan muhit | bubble |
+| soxta soat | kutish tugaydigan paytga haqiqiy kutishsiz suriladigan soat | fake clock |
+
+## Oldin bilish kerak
+
+Asosiy tayanchlar: [GB-7.05 · Mutex yoki channel](/lab/youtube/gb/gb-7-05) va [GB-1.08 · Birinchi test](/lab/youtube/gb/gb-1-08).
+Qoʻshimcha ishlatiladigan tushunchalar:
+
+- [GB-1.01 · Birinchi dastur](/lab/youtube/gb/gb-1-01), [GB-1.02 · Oʻzgaruvchilar](/lab/youtube/gb/gb-1-02), [GB-1.05 · Shartlar](/lab/youtube/gb/gb-1-05): paket, import, `var`, `:=`, `if`;
+- [GB-2.03 · Struct](/lab/youtube/gb/gb-2-03): maydonlar va struct literal;
+
+- [GB-7.01 · Goroutine hayoti](/lab/youtube/gb/gb-7-01): `go func()`, sikl oʻzgaruvchisi va stek;
+- [GB-7.02 · Channel](/lab/youtube/gb/gb-7-02): buffer, yuborish, qabul qilish, `close`, `range`;
+- [GB-7.03 · Select va context](/lab/youtube/gb/gb-7-03): `Done`, `Err`, `WithCancel`, `time.After`, `NumGoroutine`;
+- [GB-7.04 · Chegaralangan parallellik](/lab/youtube/gb/gb-7-04): bola context va bekor qilish;
+- [GB-5.05 · pgx pool](/lab/youtube/gb/gb-5-05): `WithTimeout`;
+- [GB-4.07 · Mutex va race](/lab/youtube/gb/gb-4-07): `-race`;
+- [GB-4.04 · HTTP server](/lab/youtube/gb/gb-4-04): `net/http/pprof`;
+- [GB-2.08 · Xatolar](/lab/youtube/gb/gb-2-08): `errors.Is`;
+- [GB-2.07 · Fayllar](/lab/youtube/gb/gb-2-07): `os.Stdout`;
+- [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02) va [GB-2.04 · Pointer](/lab/youtube/gb/gb-2-04): koddagi turlar;
+- [GB-1.03 · Sonlar](/lab/youtube/gb/gb-1-03), [GB-1.06 · Sikl](/lab/youtube/gb/gb-1-06), [GB-1.07 · Funksiya va error](/lab/youtube/gb/gb-1-07): tiyin, `for range`, qaytish qiymatlari;
+- [GB-6.07 · Muddat](/lab/youtube/gb/gb-6-07): `time.Duration`.
+
+Kod uchun [dars papkasidan](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest) foydalaning. Unda oʻz `go.mod` fayli bor: `go 1.27`.
+Buyruqlarni shu papkada bajaring. Quyidagi oʻlchovlar uchun muhit:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0 GOFLAGS=-trimpath
+```
+
+`GOTOOLCHAIN` versiyani tanlaydi; `CGO_ENABLED=0` C vositalarisiz ishlatadi. `-trimpath` stekdagi mahalliy yoʻllarni modul yoʻllariga almashtiradi.
+`./_video/run.sh QADAM BUYRUQ` kerakli nusxani vaqtinchalik `bozor` papkasiga koʻchirib, buyruqni bajaradi.
+`(chiqish kodi: 0)` — muvaffaqiyat, `1` — bajarilgan buyruq muvaffaqiyatsiz. Bu oxirgi qatorni yordamchi skript chiqaradi.
+`go run .` dastur bajaradi; `go test` testlarni bajaradi; `-v` har testni koʻrsatadi.
+Boshlangʻich papkada uy vazifasi hali yozilmagan: umumiy testning yiqilishi kutilgan.
+
+**Eslash:** `OwnedStore.loop` `for r := range s.sells` bilan kutadi. `Close` chaqirilmasa nima boʻladi?
+**A)** `range` oʻzi tugaydi · **B)** keyingi soʻrovni kutadi · **C)** darhol panic.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `range` channel yopilguncha kutadi. Keyingi yuboruvchi ham, `close` ham boʻlmasa, goroutine tugamaydi. Uning steki va ushlab turgan map'i xotirada qoladi.
+
+</details>
+
+## Bitta javob, ikkita qolgan goroutine
+
+Avval xatoli nusxa. `prices` — ID boʻyicha tiyin narxi; `supplierDelays` — uch yetkazib beruvchining javob vaqti.
+`quote` haqiqiy tarmoq oʻrniga kutishni taqlid qiladi.
+
+```go filename="_video/01-leak/price.go" showLineNumbers
+package main
+
+import "time"
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+func quote(delay time.Duration, id int64) int64 {
+	time.Sleep(delay)
+	return prices[id]
+}
+
+func fastestPrice(id int64) int64 {
+	ch := make(chan int64)
+	for _, d := range supplierDelays {
+		go func() {
+			ch <- quote(d, id)
+		}()
+	}
+	return <-ch
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1, 3 | `package main`, `import "time"` | bajariladigan paket va vaqt paketi |
+| 5–6 | `prices` | izoh va `map[int64]int64`; ID 1 narxi 1 200 000 tiyin, yaʼni 12 000 soʻm |
+| 8–13 | `supplierDelays` | izoh va `[]time.Duration` slice'i; `*` koʻpaytirish, oxirgi vergul koʻp qatorli literal uchun |
+| 15–18 | `quote` | `delay` va `id` parametrlarini oladi, uxlaydi, map qiymatini qaytaradi |
+| 20–21 | `fastestPrice`, `make(chan int64)` | funksiya va buffer'siz natija channel'i |
+| 22 | `for _, d := range` | indeksni `_` bilan tashlaydi; har aylanishda yangi `d` |
+| 23 | `go func() {` | nomsiz funksiyani alohida goroutine'da boshlaydi |
+| 24 | `ch <- quote(d, id)` | oldin narxni hisoblaydi, keyin yuborishga urinadi |
+| 25–26 | `}()`, `}` | nomsiz funksiyani chaqiradi va siklni yopadi |
+| 27–28 | `return <-ch`, `}` | bitta narxni qabul qilib, funksiyadan qaytadi |
+
+Boʻsh qatorlar kodni ajratadi; `//` qatorlari izoh. `{}` blok chegaralari, `:=` yangi oʻzgaruvchi yaratish.
+
+```go filename="_video/01-leak/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+`main.go`: 1-qator paket; 3–7 paketlar; 9 funksiya; 10 tashqi sikl; 11–13 yuz chaqiruv; 14 bir soniya kutish.
+15-qator `fmt.Println` bilan barcha tirik goroutine'lar sonini chiqaradi; 16–17 bloklarni yopadi.
+`for range 3` hisoblagich kerak boʻlmagan uch aylanishdir.
+
+**Bashorat:** 300 chaqiruvdan keyin nechta goroutine? **A)** 1 · **B)** 301 · **C)** 601.
+
+<details>
+<summary>Javob</summary>
+
+**C: 1 + 300 × 2 = 601.** 1 — `main`. Har chaqiruv uch goroutine boshlab, faqat bitta javob oladi.
+A barcha ish tugaydi deb taxmin qiladi; B har chaqiruvda faqat bitta goroutine qoladi deb sanaydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-leak go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+(chiqish kodi: 0)
+```
+
+| Payt | Birinchi yetkazuvchi | Ikkinchi | Uchinchi | Qabul qiluvchi |
+|---|---|---|---|---|
+| 0 ms | kutadi | kutadi | kutadi | `<-ch` |
+| 100 ms | yuboradi, tugaydi | kutadi | kutadi | narxni olib qaytadi |
+| 200 ms | tugagan | yuborishda qoladi | kutadi | yoʻq |
+| 300 ms | tugagan | yuborishda qoladi | yuborishda qoladi | yoʻq |
+
+Bu **goroutine leak**: ikkita yuboruvchini endi hech kim qabul qilmaydi.
+Kutayotgan goroutine'ning resurslari oʻz-oʻzidan ozod boʻlmaydi; u chiqishi kerak.
+
+## Profil: qaysi qatorda kutyapti?
+
+Sanoq oʻsishni koʻrsatadi. **Profil** goroutine'larning steklarini, yaʼni funksiya chaqiruvlari izini koʻrsatadi.
+Keyingi nusxada `main` oxiriga bitta chaqiruv qoʻshilgan:
+
+```go filename="_video/02-profil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+}
+```
+
+Yangi 5-qator `os`, 7-qator `runtime/pprof` paketini oladi. 19-qator `Lookup("goroutine")` bilan profilni tanlaydi.
+`WriteTo(os.Stdout, 1)` uni standart chiqishga yozadi; `1` bir xil steklarni guruhlagan matn shaklidir.
+
+**Bashorat:** profilda jami nechta? **A)** 600 · **B)** 601 · **C)** 3.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Oddiy `goroutine` profili leak'lardan tashqari ishlayotgan `main`ni ham oladi. 600 — faqat kutayotgan yuboruvchilar.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-profil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutine profile: total 601
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+1 @ 0x440e11 0x47cbfd 0x4ccab1 0x4cc785 0x4c96e9 0x4debfd 0x44aa27 0x4835c1
+#	0x4ccab0	runtime/pprof.writeRuntimeProfile+0xb0	runtime/pprof/pprof.go:848
+#	0x4cc784	runtime/pprof.writeGoroutine+0x44	runtime/pprof/pprof.go:781
+#	0x4c96e8	runtime/pprof.(*Profile).WriteTo+0x148	runtime/pprof/pprof.go:405
+#	0x4debfc	main.main+0x13c				github.com/abdurahmon27/bozor/main.go:19
+#	0x44aa26	runtime.main+0x426			runtime/proc.go:302
+
+(chiqish kodi: 0)
+```
+
+`total 601` — jami son. `600 @` — bir xil stekdagi 600 goroutine. `0x…` — oʻn oltilik kod manzillari.
+`#` qatori stek kadridir; `fastestPrice.func1` — uning birinchi nomsiz funksiyasi. `+0x5b` — funksiya ichidagi siljish.
+`price.go:24` — yuborish qatori. `1 @` guruhi profil yozayotgan `main` va uning chaqiruvlaridir.
+Kod manzillari va goroutine raqamlari boshqa yigʻishda farq qilishi mumkin.
+
+[GB-4.04](/lab/youtube/gb/gb-4-04) serverida `net/http/pprof` shu maʼlumotni `/debug/pprof/goroutine?debug=1` orqali beradi.
+`debug=1` shu matn shaklini tanlaydi. Profil manzilini faqat ichki portda oching.
+
+## Oddiy test leak'ni tekshirmaydi
+
+```go filename="_video/03-test/price_test.go" showLineNumbers
+package main
+
+import "testing"
+
+func TestFastestPrice(t *testing.T) {
+	got := fastestPrice(1)
+	if got != 1_200_000 {
+		t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+	}
+}
+```
+
+1-qator paket; 3 test paketi; 5 test funksiyasi; 6 `got` natija; 7 kutilgan narx bilan solishtirish.
+8-qator `t.Errorf` testni yiqilgan deb belgilaydi; `%d` butun sonni chiqaradi; 9–10 bloklarni yopadi.
+
+**Bashorat:** natija va vaqt? **A)** PASS, taxminan 0.10 s · **B)** PASS, taxminan 0.30 s · **C)** FAIL, leak.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Test faqat birinchi narxni kutadi. Qolgan goroutine'lar tekshirilmaydi; test jarayoni tugaganda ular ham yoʻqoladi.
+B barcha yetkazuvchilar kutiladi deb oʻylaydi. C oddiy `go test` leak'ni avtomatik izlaydi deb taxmin qiladi.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-test go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.10s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.102s
+(chiqish kodi: 0)
+```
+
+Videoda paket vaqti 0.103 s, bu qayta ishga tushirishda 0.102 s. Testning oʻzi ikkala holatda 0.10 s.
+`=== RUN` boshlanish, `--- PASS` test muvaffaqiyati, `PASS` umumiy muvaffaqiyat, `ok` paket natijasidir.
+
+## synctest: test tugadi, lekin ish qoldi
+
+`testing/synctest` Go 1.25'dan beri eksperiment bayrogʻisiz mavjud. U testni **pufak** ichida bajaradi.
+Bu ajratilgan test muhiti: ichida boshlangan goroutine'lar ham unga tegishli. `synctest.Test` ularning hammasi chiqishini kutadi.
+
+**Barqaror bloklanish** (*durably blocked*) — goroutine'ni faqat shu pufakdagi ish uygʻota oladigan kutish.
+Pufakda yaratilgan channel'dagi kutish va `time.Sleep` bunga kiradi.
+Barcha goroutine'lar shunday kutsa, soat keyingi uygʻonish paytiga suriladi. Boshlangʻich vaqt: `2000-01-01 00:00:00 UTC`.
+Pufakning asosiy funksiyasi chiqqach, soat surilmaydi. Uygʻonadigan ish boʻlmasa va kutish qolsa, deadlock yuz beradi.
+
+```go filename="_video/04-synctest/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got := fastestPrice(1)
+		if got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d; kutilgan 1200000", got)
+		}
+	})
+}
+```
+
+Yangi 5-qator paketni oladi; 9-qator tashqi `t` va oʻz `t` parametrini oladigan nomsiz funksiyani beradi.
+10–13 tekshiruv oʻsha; 14–15 pufak va testni yopadi.
+
+**Bashorat:** **A)** PASS · **B)** FAIL: deadlock · **C)** 300 ms kutib PASS.
+
+<details>
+<summary>Javob</summary>
+
+**B.** 100 ms soxta vaqtda narx keladi. Test funksiyasi qaytadi, soat toʻxtaydi; ikki goroutine hali uxlayapti.
+A faqat narxni hisobga oladi. C soat test funksiyasi chiqqach ham yuradi deb oʻylaydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-synctest go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 7 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x1b38f891c000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x1b38f891c000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x1b38f88e0160)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x1b38f8992248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x1b38f8992248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x1b38f8992248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 11 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+
+goroutine 12 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 9
+	github.com/abdurahmon27/bozor/price.go:23 +0x65
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`main bubble goroutine has exited` — pufakning asosiy goroutine'i tugagan.
+`blocked goroutines remain` — kutayotgan goroutine'lar qolgan. `[recovered, repanicked]` — test vositasi panic'ni ushlab, yana chiqargan.
+Yuqoridagi `testing` va `internal/synctest` kadrlari test bajarilishining izidir; pastdagi ikki stek bizning ishlarimizdir.
+`sleep (durable)` — soxta vaqtdagi uyqu; `bubble 1` — pufak raqami.
+`0xbebc200` — 200 msʼning nanosekunddagi oʻn oltilik yozuvi; `0x11e1a300` — 300 ms.
+`price.go:24`dan yuqoridagi `quote(...)` kadri kutish qayerdan kelganini koʻrsatadi; `(...)` argumentlar chiqarilmaganini bildiradi.
+`created by` — goroutine'ni boshlagan joy. `exit status 2` panic bilan tugagan test binary'sidan, yakuniy kod `1` esa `go test`dan.
+`0.00s` aniq nol emas: yuzdan bir soniyagacha yaxlitlangan haqiqiy davomiylik. Soxta soatda esa 100 ms oʻtdi.
+
+| Holat | Pufakning soati | Qolgan ikki goroutine |
+|---|---|---|
+| boshlanish | 00:00:00 | kutishni boshlaydi |
+| hamma kutadi | +100 ms | hali uxlaydi |
+| test funksiyasi qaytdi | toʻxtaydi | uyquni tugatolmaydi |
+| `synctest.Test` | deadlock | FAIL |
+
+## Buffer kutishni bekor qilmaydi
+
+Birinchi urinish: `_video/05-buffer/price.go`da faqat channel yaratilishi oʻzgaradi:
+
+```go
+ch := make(chan int64, len(supplierDelays))
+```
+
+`len(supplierDelays)` uchta oʻrin beradi. Har goroutine bittadan javob yuboradi, shuning uchun keyinchalik yuborishda tiqilmaydi.
+
+**Bashorat:** **A)** PASS · **B)** oʻsha deadlock · **C)** narx notoʻgʻri.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Buffer yuborishga joy beradi; `Sleep`ni bekor qilmaydi. Test qaytganida qolgan ishlar hali 200 va 300 msʼni kutyapti.
+Pufaksiz dasturda ular 300 ms atrofida tugardi. Bu cheksiz leak'ni bartaraf qiladi, lekin keraksiz ishni darhol toʻxtatmaydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-buffer go test
+--- FAIL: TestFastestPrice (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 5 [running]:
+testing.tRunner.func1.2({0x6c2040, 0x150d11704000})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2040?, 0x150d11704000?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x150d11646140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x150d11664248, 0x6d5080)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestFastestPrice(0x150d11664248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x150d11664248, 0x6d4fd8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 9 [sleep (durable), synctest bubble 1]:
+time.Sleep(0xbebc200)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+
+goroutine 10 [sleep (durable), synctest bubble 1]:
+time.Sleep(0x11e1a300)
+	runtime/time.go:366 +0x145
+github.com/abdurahmon27/bozor.quote(...)
+	github.com/abdurahmon27/bozor/price.go:16
+github.com/abdurahmon27/bozor.fastestPrice.func1()
+	github.com/abdurahmon27/bozor/price.go:24 +0x29
+created by github.com/abdurahmon27/bozor.fastestPrice in goroutine 7
+	github.com/abdurahmon27/bozor/price.go:23 +0x66
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+Sabab va xabar oldingi bilan bir xil. Tuzatish: javob kerak boʻlmaganda qolgan ishga bekor qilish signalini yuboring.
+
+## Context bilan qolgan ishni toʻxtatish
+
+Dars papkasidagi yakuniy `price.go`:
+
+```go filename="price.go" showLineNumbers
+// bozor: bitta mahsulot narxini uch yetkazib beruvchidan birdan soʻrab, eng tez javobni olish (GB-7.06).
+// Videoning oxiridagi holat: goroutine'lar fastestPrice bilan birga tugaydi (ctx + cancel), leak yoʻq.
+package main
+
+import (
+	"context"
+	"time"
+)
+
+// prices: yetkazib beruvchilar aytadigan narx, tiyinda (ID → tiyin): olma 1, non 2, oʻrik 3.
+var prices = map[int64]int64{1: 1_200_000, 2: 500_000, 3: 3_000_000}
+
+// supplierDelays: uch yetkazib beruvchining (chorsu, oloy, siyob) javob vaqti.
+var supplierDelays = []time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+}
+
+// quote bitta yetkazib beruvchidan narx soʻrashni taqlid qiladi: delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func quote(ctx context.Context, delay time.Duration, id int64) (int64, error) {
+	select {
+	case <-time.After(delay):
+		return prices[id], nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// fastestPrice hamma yetkazib beruvchidan birdan soʻraydi va birinchi kelgan javobni qaytaradi.
+// Qaytishdan oldin cancel() qolgan soʻrovlarni toʻxtatadi: oʻzi boshlagan goroutine'lar uning bilan tugaydi.
+func fastestPrice(ctx context.Context, id int64) (int64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan int64, len(supplierDelays))
+	for _, d := range supplierDelays {
+		go func() {
+			p, err := quote(ctx, d, id)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+```
+
+Oʻzgargan qatorlar:
+
+| Qator | Nima qiladi |
+|---|---|
+| 5–8 | `context` va `time` paketlarini oladi |
+| 21 | `quote` context oladi va `(int64, error)` qaytaradi |
+| 22–28 | `select`: vaqt oʻtsa narx va `nil`; `Done` yopilsa 0 va `ctx.Err()` |
+| 32–34 | `WithCancel` bola context yaratadi; `ctx` shu blokdagi parametrga qayta yoziladi, `cancel` yangi; `defer` qaytishda signal beradi |
+| 35 | uch oʻrinli buffer saqlanadi |
+| 36–43 | har goroutine bola context bilan soʻraydi; `p` narx, `err` xato; faqat `err == nil` boʻlsa yuboradi |
+| 44–50 | birinchi narxni yoki chaqiruvchi bekor qilishini kutadi |
+
+1–2, 10, 13, 20 va 30–31 — izohlar. Izohdagi «birga tugaydi» ni kutib qoʻshilish kafolati deb oʻqimang.
+[`CancelFunc`](https://pkg.go.dev/context#CancelFunc) faqat signal beradi, ishning chiqishini kutmaydi.
+Bu misolda qolgan goroutine'lar signalni koʻrib chiqadi; `synctest.Test` ularning chiqishini kutadi.
+Chaqiruvchi qaytishidan oldin qatʼiy kutish kerak boʻlsa, [GB-7.01](/lab/youtube/gb/gb-7-01) kabi kutish guruhi kerak.
+Buffer ham qoladi: vaqt va bekor qilish bir paytda tayyor boʻlsa, muvaffaqiyatli narx yuborilishi tiqilib qolmaydi.
+
+| Bosqich | Natija |
+|---|---|
+| birinchi narx | `fastestPrice` qaytishni boshlaydi |
+| `defer cancel()` | bola context'ning `Done` channel'i yopiladi |
+| qolgan `quote` | bekor qilishni koʻradi, xato qaytaradi, yubormaydi |
+| `synctest.Test` | barcha goroutine'lar chiqishini kutadi |
+
+`main` ham yangi imzoni chaqiradi:
+
+```go filename="main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"time"
+)
+
+// main 3 × 100 marta narx soʻraydi va har yuztadan keyin tirik goroutine'lar sonini chiqaradi.
+// Leak boʻlsa, son oʻsadi (videoda: 201, 401, 601); tuzatilgan fastestPrice bilan doim 1.
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(context.Background(), 1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+}
+```
+
+Yangi import — `context`; 15-qator `context.Background()` bilan bekor qilinmaydigan boshlangʻich context beradi.
+Testda esa `t.Context()` ishlatiladi. U test tozalash funksiyalari bajarilishidan oldin bekor qilinadi.
+Pufak ichidagi `t.Context().Done()` ham shu pufakka tegishli.
+
+```go filename="_video/06-ctx/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+```
+
+10-qator context va IDʼni beradi; 11-qator `||` bilan xato yoki notoʻgʻri narxni aniqlaydi; 12-qator `%v` bilan xatoni chiqaradi.
+
+**Bashorat:** **A)** PASS va 1, 1, 1 · **B)** FAIL · **C)** PASS va 201, 401, 601.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Bekor qilish qolgan kutishlarni tugatadi. Test pufakdagi ishlar chiqishini kutadi; dastur esa har yuz chaqiruvdan keyin bir soniya beradi.
+C bekor qilish signalini eʼtiborsiz qoldirgan variantga mos.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-ctx go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/run.sh 06-ctx go run .
+goroutine'lar: 1
+goroutine'lar: 1
+goroutine'lar: 1
+(chiqish kodi: 0)
+```
+
+Sanoq butun jarayonniki. Bu laboratoriyada 1 — `main`; haqiqiy serverda fon ishlari sabab son boshqa boʻladi.
+
+## Aniq 50 ms va bir soatlik test
+
+Muddat 50 ms, eng tez taklif 100 ms. Pufak ichida taxminiy chegara oʻrniga aniq tenglikni tekshirish mumkin:
+
+```go filename="_video/07-timeout/price_test.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi testlar. synctest.Test funksiyani "pufak" ichida ishga tushiradi: soxta soat, va funksiya
+// tugaganda pufakda kutib qolgan goroutine boʻlsa, test yiqiladi.
+
+func TestFastestPrice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		got, err := fastestPrice(t.Context(), 1)
+		if err != nil || got != 1_200_000 {
+			t.Errorf("fastestPrice(1) = %d, %v; kutilgan 1200000", got, err)
+		}
+	})
+}
+
+func TestFastestPriceTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := fastestPrice(ctx, 1)
+		took := time.Since(start) // pufakda soat soxta: aniq tenglik mumkin (haqiqiy soatda emas)
+		if !errors.Is(err, context.DeadlineExceeded) || took != 50*time.Millisecond {
+			t.Errorf("xato %v, %v oʻtdi; kutilgan deadline, 50ms", err, took)
+		}
+	})
+}
+```
+
+Yangi importlar `context`, `errors`, `time`. 16–18 natija bilan xatoni birga tekshiradi.
+25–26 bola muddat va uning tozalashini oʻrnatadi. 27 boshlanish vaqti; 28 narx kerak emasligi uchun `_`; 29 oʻtgan vaqt — `took`.
+30-qator `errors.Is` bilan `DeadlineExceeded`ni, `!=` bilan 50 msʼdan farqni tekshiradi; 31 xato va vaqtni `%v` bilan chiqaradi.
+Qolgan qatorlar oldingi test shakli va blok chegaralaridir.
+
+**Bashorat:** **A)** ikkala test PASS · **B)** timeout testi FAIL · **C)** 50 ms oʻrniga 100 ms.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Soat 50 msʼga suriladi; muddat tugaydi; `fastestPrice` deadline xatosini qaytaradi.
+Haqiqiy soatda rejalashtirish kechikishi sabab bunday aniq tenglikka tayanmang.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-timeout go test -v
+=== RUN   TestFastestPrice
+--- PASS: TestFastestPrice (0.00s)
+=== RUN   TestFastestPriceTimeout
+--- PASS: TestFastestPriceTimeout (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+Videoda ham, bu tekshiruvda ham paket 0.002 s; oddiy test esa 0.102 s boʻldi: taxminan 51 baravar nisbat.
+Bu barqaror tezlik kafolati emas. Muhim farq: haqiqiy 100 ms kutish olib tashlandi; soxta 50 ms hali tekshirilyapti.
+Ikki `0.00s`ni boʻlib tezlanish hisoblab boʻlmaydi: qiymatlar yaxlitlangan.
+
+**Race tekshiruvi:** **A)** DATA RACE · **B)** ok · **C)** leak sabab race.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Natija channel orqali keladi, `prices` oʻzgarmaydi. `-race` bajarilgan yoʻllardagi data raceʼni tekshiradi, goroutine hayotini toʻliq tekshirmaydi.
+
+</details>
+
+Bu mashinada C kompilyatori yoʻq. Quyidagi buyruq Docker ichida cgo va C kompilyatori bilan ayni Go 1.27.4'ni ishlatdi:
+
+```console
+$ ./_video/race.sh 07-timeout go test -race .
+ok  	github.com/abdurahmon27/bozor	1.012s
+(chiqish kodi: 0)
+```
+
+Videoda 1.014 s, bu yerda 1.012 s. Race vositasining qoʻshimcha vaqti bor; buni fake-clock testining tezlanishi deb solishtirmang.
+`./_video/race.sh` kerakli nusxa va vositalarni konteynerga beradi; `-race .` shu paketni tekshiradi.
+
+Endi bir soatlik uyqu. **A)** bir soat kutadi · **B)** deyarli darhol oʻtadi · **C)** deadlock.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Testning asosiy goroutine'i hali yashaydi. `Sleep`ning tugash payti bor, soat oʻsha paytga suriladi.
+Deadlock: barcha ish barqaror kutib, uygʻotadigan vaqt qolmaganida; yoki asosiy goroutine chiqqach shunday kutish qolganida.
+
+```go filename="_video/11-soat/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+	"time"
+)
+
+// Videodagi savol: pufak ichida bir soatlik time.Sleep. Soat soxta: test bir zumda tugaydi.
+func TestHour(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		time.Sleep(time.Hour)
+		t.Log(time.Since(start), start.UTC())
+	})
+}
+```
+
+12-qator boshlanishni oladi; 13 bir soat uxlaydi; 14 oʻtgan vaqt va UTC boshlanishni yozadi.
+Qolgan qatorlar import, test va pufakning tanish shaklidir.
+
+```console
+$ ./_video/run.sh 11-soat go test -v
+=== RUN   TestHour
+    price_test.go:14: 1h0m0s 2000-01-01 00:00:00 +0000 UTC
+--- PASS: TestHour (0.00s)
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## Unutilgan Close: boshqa kutish, oʻsha xato
+
+`store.go` — oldingi darsdagi qisqa `OwnedStore`. Mapʼga faqat egasi goroutine tegadi.
+
+```go filename="store.go" showLineNumbers
+package main
+
+// OwnedStore — GB-7.05'dagi qoldiq doʻkoni (qisqartirilgan): stock map'iga faqat loop goroutine'i tegadi,
+// Sell unga channel orqali soʻrov yuboradi. loop sells yopilganda (Close) tugaydi.
+type OwnedStore struct {
+	sells chan sellReq
+}
+
+// sellReq — egasiga yuboriladigan sotish soʻrovi: qaysi mahsulot, necha dona va javob qaytadigan channel.
+type sellReq struct {
+	id    int64
+	n     int
+	reply chan bool
+}
+
+// NewOwnedStore loop'ni yangi goroutine'da boshlaydi va stock map'ini unga topshiradi.
+func NewOwnedStore(stock map[int64]int) *OwnedStore {
+	s := &OwnedStore{sells: make(chan sellReq)}
+	go s.loop(stock)
+	return s
+}
+
+func (s *OwnedStore) loop(stock map[int64]int) {
+	for r := range s.sells {
+		ok := stock[r.id] >= r.n
+		if ok {
+			stock[r.id] -= r.n
+		}
+		r.reply <- ok
+	}
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *OwnedStore) Sell(id int64, n int) bool {
+	reply := make(chan bool)
+	s.sells <- sellReq{id, n, reply}
+	return <-reply
+}
+
+// Close loop goroutine'ini toʻxtatadi. Close'dan keyin Sell chaqirilmaydi.
+func (s *OwnedStore) Close() { close(s.sells) }
+```
+
+5–7 soʻrov channel'ini saqlaydi; 10–14 soʻrovning `id`, miqdor `n` va javob channel'i `reply`.
+17–21 doʻkonni yaratib, map'ni `loop`ga beradi. 23–31 soʻrovlarni ketma-ket oladi, qoldiq yetsa kamaytiradi, javob yuboradi.
+34–38 `Sell` soʻrov yuborib, javob oladi. 41-qator `Close` soʻrov channel'ini yopadi.
+`>=` yetarlilikni solishtiradi; `-=` kamaytiradi; `&` manzil oladi; `*OwnedStore` pointer qabul qiluvchidir.
+Paket, izohlar va qavslar oldingi shakllar.
+
+Xatoli test:
+
+```go filename="_video/08-close/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+Yangi 10-qator doʻkonni 5 dona bilan yaratadi; 11–13 ikki dona sotilganini tekshiradi. `!` — mantiqiy inkor.
+**Bashorat:** **A)** PASS · **B)** deadlock: receive · **C)** stock data race.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `Sell` muvaffaqiyatli qaytadi. Lekin `loop` keyingi soʻrovni kutadi; `sells`ni hech kim yopmadi.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-close go test
+--- FAIL: TestOwnedStore (0.00s)
+panic: deadlock: main bubble goroutine has exited but blocked goroutines remain [recovered, repanicked]
+
+goroutine 19 [running]:
+testing.tRunner.func1.2({0x6c2748, 0x2304924b2150})
+	testing/testing.go:2125 +0x232
+testing.tRunner.func1()
+	testing/testing.go:2128 +0x329
+panic({0x6c2748?, 0x2304924b2150?})
+	runtime/panic.go:859 +0x125
+internal/synctest.Run(0x2304924b6140)
+	runtime/synctest.go:247 +0x2dd
+testing/synctest.Test(0x2304924da248, 0x6d5780)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestOwnedStore(0x2304924da248?)
+	github.com/abdurahmon27/bozor/price_test.go:9 +0x1a
+testing.tRunner(0x2304924da248, 0x6d56d8)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 22 [chan receive (durable), synctest bubble 1]:
+github.com/abdurahmon27/bozor.(*OwnedStore).loop(...)
+	github.com/abdurahmon27/bozor/store.go:24
+created by github.com/abdurahmon27/bozor.NewOwnedStore in goroutine 21
+	github.com/abdurahmon27/bozor/store.go:19 +0xc7
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	0.004s
+(chiqish kodi: 1)
+```
+
+`chan receive (durable)` — endi yuborish emas, qabul qilishda kutish.
+`(*OwnedStore).loop(...)` va `store.go:24` `range`ni koʻrsatadi. Sotuv xatosi emas, hayot davomiyligi xatosi.
+Tuzatish — 11-qatorga `defer s.Close()`:
+
+```go filename="_video/09-close-fix/price_test.go" showLineNumbers
+package main
+
+import (
+	"testing"
+	"testing/synctest"
+)
+
+func TestOwnedStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := NewOwnedStore(map[int64]int{1: 5})
+		defer s.Close()
+		if !s.Sell(1, 2) {
+			t.Errorf("Sell(1, 2) = false, kutilgan true (qoldiq 5)")
+		}
+	})
+}
+```
+
+Test qaytishida `sells` yopiladi; `range` tugab, `loop` chiqadi. `Close`dan keyin yangi `Sell` chaqirmang.
+**Bashorat:** **A)** ok · **B)** oʻsha deadlock · **C)** notoʻgʻri qoldiq.
+
+<details>
+<summary>Javob</summary>
+
+**A.** Narx testi kabi, synctest egasi goroutine ham chiqishini kutadi.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-close-fix go test
+PASS
+ok  	github.com/abdurahmon27/bozor	0.002s
+(chiqish kodi: 0)
+```
+
+## Chuqurroq (ixtiyoriy): goroutineleak va synctest chegarasi
+
+Go 1.27'da `goroutineleak` profili eksperimentdan chiqqan; `GOEXPERIMENT=goroutineleakprofile` kerak emas va eski sozlama olib tashlangan.
+GC — keraksiz xotirani yigʻish bosqichi.
+Profil odatda mavjud, lekin bu har bir GC'da avtomatik leak tekshiruvi yoqilgan degani emas.
+Go 1.27.4 manba kodida `writeGoroutineLeak` avval `runtime_goroutineLeakGC()`ni chaqiradi, keyin profilni yozadi.
+Demak profilni soʻrash leak qidiradigan GC bosqichini ishga tushiradi.
+
+```go filename="_video/10-leakprofil/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func main() {
+	for range 3 {
+		for range 100 {
+			fastestPrice(1)
+		}
+		time.Sleep(time.Second)
+		fmt.Println("goroutine'lar:", runtime.NumGoroutine())
+	}
+	pprof.Lookup("goroutineleak").WriteTo(os.Stdout, 1)
+}
+```
+
+19-qatorgina oʻzgargan: `Lookup("goroutineleak")`. **Bashorat:** **A)** 601 · **B)** 600 · **C)** 0.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `main` ishlayapti, leak emas; 600 kutayotgan yuboruvchi qoladi.
+
+</details>
+
+```console
+$ ./_video/run.sh 10-leakprofil go run .
+goroutine'lar: 201
+goroutine'lar: 401
+goroutine'lar: 601
+goroutineleak profile: total 600
+600 @ 0x47d88a 0x41421c 0x413e17 0x4ded9c 0x4835c1
+#	0x4ded9b	main.fastestPrice.func1+0x5b	github.com/abdurahmon27/bozor/price.go:24
+
+(chiqish kodi: 0)
+```
+
+Tekshiruv yetib borish mumkinligiga tayanadi: hech bir ishlashi mumkin boʻlgan goroutine kutish vositasiga yetolmasa, u uygʻonolmaydi.
+Global oʻzgaruvchidan yoki ishlayotgan goroutine'dan yetish mumkin boʻlgan vositadagi leak oʻtkazib yuborilishi mumkin.
+`WriteTo(..., 2)` barcha steklarni yozadi, leak'lar `(leaked)` bilan belgilanadi; faqat leak'lar roʻyxati deb oʻqimang.
+
+`synctest`dagi soxta soat ishlash tartibini toʻliq belgilamaydi. Bir necha `select` holati tayyor boʻlsa, tartibga tayanmang.
+Mutexʼda kutish, fayl yoki tarmoq kiritish-chiqarishi barqaror bloklanish emas.
+Uygʻotadigan tashqi hodisa kelmasa, test tez deadlock bermay, umumiy timeoutʼgacha osilishi mumkin.
+
+```go filename="_video/13-mutex/price_test.go" showLineNumbers
+package main
+
+import (
+	"sync"
+	"testing"
+	"testing/synctest"
+)
+
+// Videodagi "synctest chegarasi": mutex'da kutish durable emas. Goroutine qulfda abadiy qolsa,
+// synctest deadlock demaydi: test -timeout tugaguncha osilib turadi.
+func TestMutexHang(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		mu.Lock()
+		go func() {
+			mu.Lock() // hech kim Unlock qilmaydi
+		}()
+	})
+}
+```
+
+13–14 qulfni olib, ochmaydi; 15–17 yana olishga urinadigan goroutine boshlaydi. `Unlock` yoʻqligi — xato.
+**Bashorat:** **A)** darhol PASS · **B)** synctest darhol deadlock · **C)** haqiqiy 5 sʼdan keyin timeout.
+
+<details>
+<summary>Javob</summary>
+
+**C.** Qulf kutishi durable roʻyxatida yoʻq; `-timeout 5s` butun test jarayoniga haqiqiy vaqt chegarasini beradi.
+
+```console
+$ ./_video/run.sh 13-mutex go test -timeout 5s
+panic: test timed out after 5s
+
+goroutine 19 [running]:
+testing.(*M).startAlarm.func1()
+	testing/testing.go:2961 +0x34a
+created by time.goFunc
+	time/sleep.go:182 +0x2d
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0x28c07d728008, {0x55729d?, 0x28c07d6ccaa0?}, 0x6d4e70)
+	testing/testing.go:2268 +0x4f2
+testing.runTests.func1(0x28c07d728008)
+	testing/testing.go:2744 +0x37
+testing.tRunner(0x28c07d728008, 0x28c07d6ccbc8)
+	testing/testing.go:2195 +0xea
+testing.runTests({0x55c0ed, 0x1d}, {0x55c0ed, 0x1d}, 0x28c07d60c0c0, {0x6ef708, 0x1, 0x1}, {0xc2baca0f36c036fc, 0x12a087041, ...})
+	testing/testing.go:2742 +0x510
+testing.(*M).Run(0x28c07d7001e0)
+	testing/testing.go:2602 +0x6af
+main.main()
+	_testmain.go:46 +0x9b
+
+goroutine 5 [synctest.Run (durable), synctest bubble 1]:
+internal/synctest.Run(0x28c07d70a140)
+	runtime/synctest.go:214 +0x1da
+testing/synctest.Test(0x28c07d728248, 0x6d4f18)
+	testing/synctest/synctest.go:291 +0x99
+github.com/abdurahmon27/bozor.TestMutexHang(0x28c07d728248?)
+	github.com/abdurahmon27/bozor/price_test.go:12 +0x1a
+testing.tRunner(0x28c07d728248, 0x6d4e70)
+	testing/testing.go:2195 +0xea
+created by testing.(*T).Run in goroutine 1
+	testing/testing.go:2260 +0x4d4
+
+goroutine 8 [sync.Mutex.Lock, synctest bubble 1]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
+	runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0x28c07d60e248)
+	internal/sync/mutex.go:149 +0x15a
+internal/sync.(*Mutex).Lock(...)
+	internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	sync/mutex.go:46
+github.com/abdurahmon27/bozor.TestMutexHang.func1.1()
+	github.com/abdurahmon27/bozor/price_test.go:16 +0x2d
+created by github.com/abdurahmon27/bozor.TestMutexHang.func1 in goroutine 7
+	github.com/abdurahmon27/bozor/price_test.go:15 +0x8b
+exit status 2
+FAIL	github.com/abdurahmon27/bozor	5.006s
+(chiqish kodi: 1)
+```
+
+</details>
+
+`panic: test timed out after 5s` — test muddati tugadi. Bu misolda kutishni `Unlock` bilan tugatish kerak.
+Haqiqiy tarmoqli testlar uchun `go.uber.org/goleak` test oxirida ortiqcha goroutine'larni tekshiradi.
+`VerifyNone` bitta testni, `VerifyTestMain` paketni tekshirishga xizmat qiladi; kutishlarni toʻxtatish baribir kodning vazifasi.
+
+## Koʻp uchraydigan xatolar
+
+1. **«PASS — leak yoʻq».** Oddiy test narxnigina tekshirdi. «Oddiy test» va «synctest» boʻlimlaridagi ikki nusxani solishtiring; pufakdagi testni qoʻshing.
+2. **«Buffer hamma ishni tugatadi».** Yuqoridagi haqiqiy deadlock qolgan uyqularni koʻrsatdi. `quote` bekor qilishni kuzatsin, chaqiruvchi `cancel` qilsin.
+3. **«cancel kutadi».** U signal beradi. Qatʼiy yakunlanish uchun kutish qoʻshing; testda `synctest.Test` barcha ichki goroutine'larni kutadi.
+4. **`Close`ni unutish.** Yuqoridagi xatoli test `store.go:24`da receive bilan yiqildi. Tuzatish: `defer s.Close()`.
+5. **Haqiqiy soatda `took == 50*time.Millisecond`.** Muhit yukiga qarab kechikadi. Aniq tenglikni pufakdagi soxta vaqt uchun saqlang.
+6. **`synctest.Wait()` barcha ish tugadi degani.** U boshqalar chiqqan yoki barqaror bloklangan holatga yetishini kutadi. Bloklangan leak hali qolishi mumkin.
+7. **`-race`ni cgoʼsiz ishlatish.** C kompilyatori mavjud muhit yoki yuqoridagi Docker skriptidan foydalaning. Race tekshiruvi leak tekshiruvini almashtirmaydi.
+
+## Oʻzingizni tekshiring
+
+**1.** Hamma narx tekshiruvlari oʻtsa ham synctest nega yiqiladi?
+
+<details>
+<summary>Javob</summary>
+
+Pufakdagi ishlar deadlock boʻlsa. Bu misolda testning asosiy funksiyasi tugaydi, soat toʻxtaydi, ikkita barqaror kutayotgan goroutine qoladi.
+
+</details>
+
+**2.** Uch oʻrinli buffer nega yetmadi?
+
+<details>
+<summary>Javob</summary>
+
+Yuborish keyinchalik tugashi mumkin, lekin goroutine'lar hali uxlaydi. Pufakning asosiy funksiyasi chiqqach soat ularni uygʻotmaydi; context bilan bekor qilish kerak.
+
+</details>
+
+**3.** Pufakda boshqa goroutine yoʻq. `start := time.Now(); time.Sleep(time.Hour); time.Since(start)` nima beradi?
+**A)** taxminan 0 · **B)** aniq 1 soat · **C)** deadlock.
+
+<details>
+<summary>Javob</summary>
+
+**B.** Soxta davomiylik bir soat, haqiqiy bajarilish esa juda qisqa. Bu yuqoridagi `TestHour`ning tekshirilgan holati.
+
+</details>
+
+**4.** GB-7.03: `ctx.Done()` nimani yuboradi va qachon yopiladi?
+
+<details>
+<summary>Javob</summary>
+
+U `<-chan struct{}`: qiymat yuborilmaydi, yopilish signal boʻladi. Context bekor qilinganda yoki muddati tugaganda yopiladi.
+`Background`da `Done()` nil; u oʻz-oʻzidan yopilmaydi.
+
+</details>
+
+**5.** Go 1.27'da `goroutineleak` borligi nimani kafolatlaydi?
+
+<details>
+<summary>Javob</summary>
+
+Profilni eksperiment bayrogʻisiz soʻrash mumkin. Bu barcha leak topiladi yoki har GC avtomatik leak qidiradi degani emas.
+Profil soʻrovi maxsus GC'ni ishga tushiradi; yetib borish mumkinligi sabab ayrim leak'lar koʻrinmaydi.
+
+</details>
+
+## Uy vazifasi
+
+🟢 **Modify: `cheapestPrice(ctx)`**. [Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest),
+[TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-06-leak-synctest/TASK.md),
+[javoblar](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest/solution).
+Bu papkada bitta tekshiriladigan vazifa bor; qoʻshimcha darajalar belgilanmagan.
+
+```go filename="offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+//
+// VAZIFA (TASK.md): shu funksiyani yozing.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	return 0, errors.New("VAZIFA: cheapestPrice hali yozilmagan (TASK.md)")
+}
+```
+
+9–13-qatorlardagi `priceOffer` javob kechikishi va narxini saqlaydi. 15–20-qatorlardagi `priceOffers`da uch taklif bor; uchinchisi eng arzon, lekin uch soniyalik.
+22–26-qatorlarda `quoteTimeout` bir soniya; `errNoOffer` — vaqtida hech kim javob bermagan xato. 28–36-qatorlardagi `askOffer` oldingi `quote` shaklida.
+38–44-qatorlardagi yozilmagan funksiya hozir `errors.New` bilan vazifa xatosini qaytaradi.
+`askOffer`, tayyor maʼlumotlar va test fayllarini oʻzgartirmang.
+
+Talablar:
+
+1. Barcha taklifni birdan soʻrang.
+2. Bir soniya ichida kelgan eng arzonini oling. Hamma oldinroq javob bersa, oxirgi javobdan soʻng qayting.
+3. Javob boʻlmasa `0, errNoOffer` qaytaring.
+4. Chaqiruvchi oldinroq bekor qilinsa yoki muddati tugasa, `0, ctx.Err()` qaytaring, hatto oldin narx kelgan boʻlsa ham.
+5. Sekin ishlarni bekor qiling; natija yuboruvchilarni osiltirmang.
+
+Tekshiruvchi soxta vaqtni va natijani solishtiradi. Keyin `synctest.Wait()` bilan bekor qilingan ishlarga chiqish imkonini beradi va goroutine'larni sanaydi.
+Sanoq butun jarayonniki, shuning uchun bu testlar parallel bajarilmaydi.
+
+**Bashorat:** boshlangʻich nusxa **A)** ok · **B)** vazifa xabarlari bilan FAIL · **C)** race.
+
+<details>
+<summary>Javob</summary>
+
+**B.** `tekshiruv_test.go:57`, `:71`, `:84`, `:93` toʻrtta talabni koʻrsatadi.
+`VAZIFA: … hali yozilmagan` — funksiyani bajarish kerakligini bildiradi, synctest oʻrnatish xatosi emas.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaEngArzon (0.00s)
+    tekshiruv_test.go:57: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 1s.
+        	1 soniya ichida ikki taklif keladi, arzoni 1 150 000; 3 soniyalik taklifni kutmang (quoteTimeout).
+--- FAIL: TestVazifaHammasiTez (0.00s)
+    tekshiruv_test.go:71: hamma taklif 300ms ichida: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 1150000, <nil>, aniq 300ms.
+        	Hamma javob kelgach, quoteTimeout'ni kutmasdan qayting; eng arzoni ikkinchisi.
+--- FAIL: TestVazifaHechKim (0.00s)
+    tekshiruv_test.go:84: hech kim 1 soniyada javob bermaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, errNoOffer, aniq 1s.
+--- FAIL: TestVazifaChaqiruvchi (0.00s)
+    tekshiruv_test.go:93: chaqiruvchi ctx'i 150ms'da tugaydi: cheapestPrice() = 0, VAZIFA: cheapestPrice hali yozilmagan (TASK.md) (0s oʻtdi); kutilgan 0, context deadline exceeded, aniq 150ms.
+        	quoteTimeout'ni chaqiruvchi ctx'idan yasang (WithTimeout(ctx, quoteTimeout)) va u tugaganda ctx.Err()ni qaytaring.
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.002s
+FAIL
+(chiqish kodi: 1)
+```
+
+Oʻzingiz yozgan kodni dars papkasida `go test .` bilan tekshiring. Quyida hali javobni koʻrmasdan ishlang.
+
+<details>
+<summary>Javob</summary>
+
+```go filename="solution/offer.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// priceOffer — bitta yetkazib beruvchining olma uchun taklifi: qancha vaqtda javob beradi va qancha narx aytadi (tiyin).
+type priceOffer struct {
+	delay time.Duration
+	price int64
+}
+
+// priceOffers: uch yetkazib beruvchi. Uchinchisi eng arzon, lekin juda sekin.
+var priceOffers = []priceOffer{
+	{100 * time.Millisecond, 1_250_000},
+	{200 * time.Millisecond, 1_150_000},
+	{3 * time.Second, 1_100_000},
+}
+
+// quoteTimeout: cheapestPrice takliflarni shuncha vaqtdan koʻp kutmaydi.
+const quoteTimeout = time.Second
+
+// errNoOffer: quoteTimeout ichida hech bir yetkazib beruvchi javob bermadi.
+var errNoOffer = errors.New("hech bir yetkazib beruvchi vaqtida javob bermadi")
+
+// askOffer bitta yetkazib beruvchidan taklif soʻraydi: o.delay oʻtguncha yoki ctx bekor qilinguncha kutadi.
+func askOffer(ctx context.Context, o priceOffer) (int64, error) {
+	select {
+	case <-time.After(o.delay):
+		return o.price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// cheapestPrice hamma yetkazib beruvchidan birdan soʻraydi, quoteTimeout ichida kelgan takliflarning eng arzonini
+// qaytaradi va qaytganda oʻzi boshlagan birorta goroutine'ni ham ortda qoldirmaydi.
+func cheapestPrice(ctx context.Context) (int64, error) {
+	tctx, cancel := context.WithTimeout(ctx, quoteTimeout)
+	defer cancel()
+	ch := make(chan int64, len(priceOffers))
+	for _, o := range priceOffers {
+		go func() {
+			p, err := askOffer(tctx, o)
+			if err == nil {
+				ch <- p
+			}
+		}()
+	}
+	var best int64
+	found := false
+	take := func(p int64) {
+		if !found || p < best {
+			best, found = p, true
+		}
+	}
+	for range priceOffers {
+		select {
+		case p := <-ch:
+			take(p)
+		case <-tctx.Done():
+			if err := ctx.Err(); err != nil {
+				return 0, err // chaqiruvchi bekor qildi yoki uning muddati tugadi
+			}
+			for len(ch) > 0 { // muddat bilan bir paytda kelib, buffer'da turgan javoblar
+				take(<-ch)
+			}
+			if !found {
+				return 0, errNoOffer
+			}
+			return best, nil
+		}
+	}
+	return best, nil
+}
+```
+
+Yangi qismlar: 41–42 chaqiruvchi context'idan muddatli `tctx` yaratadi va bekor qilishni rejalaydi.
+43–51 har taklif uchun goroutine va yetarli buffer; 52–53 `best` narx va `found` belgisi.
+54–58 `take` nomsiz funksiya eng kichik narxni saqlaydi. `!found` nol narxni ham haqiqiy taklif sifatida saqlashga imkon beradi.
+59–62 har kutilgan javobni yigʻadi. 63–66 ota context xatosini oʻz muddatidan ajratadi.
+67–69 buffer'da allaqachon turgan javoblarni ham oladi. Bu barcha bir vaqtdagi hodisalarga yangi tartib kafolati bermaydi.
+70–76 javob yoʻq xatosi yoki eng arzon narxni qaytaradi. Qolgan qatorlar tanish bloklar va oldingi tayyor yordamchilardir.
+
+| Holat | Natija | Soxta vaqt |
+|---|---|---|
+| standart uch taklif | 1 150 000, nil | 1 s |
+| hammasi 100/200/300 msʼda | 1 150 000, nil | 300 ms |
+| hech kim vaqtida emas | 0, `errNoOffer` | 1 s |
+| chaqiruvchida 150 ms muddat | 0, `DeadlineExceeded` | 150 ms |
+
+**Bashorat:** javob nusxasi **A)** ok · **B)** FAIL · **C)** 3 s kutadi.
+**A**: vaqt, narx va qolgan goroutine tekshiruvlari oʻtadi.
+
+```console
+$ ./_video/run.sh solution go test .
+ok  	github.com/abdurahmon27/bozor	0.003s
+(chiqish kodi: 0)
+```
+
+Videodagi javob nusxasi ham 0.003 s edi. Bu vaqtlar muhitga bogʻliq; jadvaldagi soxta vaqtlar aniq tekshiriladi.
+`cancel` ishlarni chiqishga undaydi; bu funksiya ham alohida kutib qoʻshilmaydi. Tekshiruvchi ularga chiqish imkonini berib, qolganlarini tekshiradi.
+
+</details>
+
+## Manbalar
+
+- [`testing/synctest`: Test, Wait, Time, Blocking](https://pkg.go.dev/testing/synctest), [Time](https://pkg.go.dev/testing/synctest#hdr-Time), [Blocking](https://pkg.go.dev/testing/synctest#hdr-Blocking), [Test](https://pkg.go.dev/testing/synctest#Test), [WithTimeout misoli](https://pkg.go.dev/testing/synctest#hdr-Example__Context_WithTimeout).
+- [Go 1.25: synctest](https://go.dev/doc/go1.25#new-testingsynctest-package), [Go 1.26](https://go.dev/doc/go1.26), [Go 1.27](https://go.dev/doc/go1.27).
+- [`runtime/pprof`](https://pkg.go.dev/runtime/pprof), [`Profile.WriteTo`](https://pkg.go.dev/runtime/pprof#Profile.WriteTo), [`runtime.NumGoroutine`](https://pkg.go.dev/runtime#NumGoroutine), [`net/http/pprof`](https://pkg.go.dev/net/http/pprof).
+- Go 1.27.4 manbasi: [`testing/synctest/synctest.go`](https://github.com/golang/go/blob/go1.27.4/src/testing/synctest/synctest.go), [`runtime/pprof/pprof.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/pprof/pprof.go), [`runtime/mgc.go`](https://github.com/golang/go/blob/go1.27.4/src/runtime/mgc.go), [`context/context.go`](https://github.com/golang/go/blob/go1.27.4/src/context/context.go).
+- [`context`](https://pkg.go.dev/context), [`Context`](https://pkg.go.dev/context#Context), [`WithCancel`](https://pkg.go.dev/context#WithCancel), [`CancelFunc`](https://pkg.go.dev/context#CancelFunc).
+- Go qoidalari: [yuborish](https://go.dev/ref/spec#Send_statements), [channel turlari](https://go.dev/ref/spec#Channel_types), [channel yasash](https://go.dev/ref/spec#Making_slices_maps_and_channels), [range](https://go.dev/ref/spec#For_range), [xotira modeli: channel](https://go.dev/ref/mem#chan).
+- Go blog: [Pipelines and cancellation](https://go.dev/blog/pipelines), [Testing concurrent code with testing/synctest](https://go.dev/blog/synctest). Ikkinchi maqola eski Go 1.24 eksperimental API'sini koʻrsatadi; bu dars `synctest.Test` ishlatadi.
+- [`go.uber.org/goleak`](https://pkg.go.dev/go.uber.org/goleak), [dars README'si](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest).
+
+Natijalar `go1.27.4 linux/amd64`, 2026-11-28: barcha koʻrsatilgan buyruqlar qayta bajarildi, `-race` Docker'da.
+Oddiy ishga tushirishlarda `CGO_ENABLED=0`, `GOFLAGS=-trimpath`; race skriptida `CGO_ENABLED=1`.
+Video va README raqamlari alohida qayd etilgan oʻlchovlar sifatida matnda keltirildi.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-06-leak-synctest)
+
+---
+
+← Oldingi dars: [GB-7.05](/lab/youtube/gb/gb-7-05) · Keyingi dars: [GB-7.07](/lab/youtube/gb/gb-7-07) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>

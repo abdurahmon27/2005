@@ -1,0 +1,857 @@
+---
+title: "Мьютекс или канал: принимаем решение по измерениям"
+date: "2026/11/28"
+description: "Защитите остаток мьютексом и горутиной-владельцем, измерьте затраты и проверьте, почему атомарный счётчик не защищает правило продажи."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-05"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-05) · **Русский** · [English](/lab/youtube/gb/gb-7-05/en)  
+Урок GB-7.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-05) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+В bozor заказы уменьшают остаток, а импортёр его пополняет. Защитить общую map мьютексом или поручить все изменения одной горутине?
+
+**Одна идея:** либо каждый доступ к состоянию проходит под одним мьютексом, либо к состоянию обращается только одна горутина. Оба способа верны; обоснуйте выбор простотой кода и измерением на вашей нагрузке.
+
+После урока вы сможете:
+
+- написать одинаковую операцию `Sell` с мьютексом и каналами запросов и ответов;
+- объяснить результат `-race` и измерить затраты обоих способов;
+- считать через `atomic.Int64` и показать, почему две атомарные операции не образуют один шаг;
+- написать `OwnedStore.Stock` без блокировок и пройти тесты задания.
+
+| Слово | Простое значение | Английский термин |
+|---|---|---|
+| горутина-владелец | только она обращается к состоянию; остальные отправляют запросы | owner goroutine |
+| величина, обратная пропускной способности | общее время / число завершённых операций; именно это мы измеряем | inverse throughput |
+| атомарная операция | чтение или изменение, которое другие горутины наблюдают как одну неделимую операцию | atomic operation |
+
+Вспомогательное понятие: **состояние гонки** — ошибочная зависимость результата от порядка выполнения горутин. Оно не всегда означает гонку данных. `ns` — наносекунда; `µs` — микросекунда, 1000 ns.
+
+## Что нужно знать заранее
+
+Основа: [GB-7.04 · Ограниченные worker и errgroup](/lab/youtube/gb/gb-7-04/ru), [GB-4.07 · sync.Mutex и race detector](/lab/youtube/gb/gb-4-07/ru).
+Каналы и жизненный цикл: [GB-7.01 · Горутина](/lab/youtube/gb/gb-7-01/ru), [GB-7.02 · Канал](/lab/youtube/gb/gb-7-02/ru), [GB-7.03 · select и context](/lab/youtube/gb/gb-7-03/ru).
+Примеры bozor и время: [GB-4.08 · API каталога](/lab/youtube/gb/gb-4-08/ru), [GB-4.03 · Обработчик](/lab/youtube/gb/gb-4-03/ru), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/ru), [GB-5.05 · pgx, time.Now и time.Since](/lab/youtube/gb/gb-5-05/ru).
+
+Запись Go: [GB-2.09 · Анонимная функция и defer](/lab/youtube/gb/gb-2-09/ru), [GB-2.05 · Метод](/lab/youtube/gb/gb-2-05/ru), [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структура](/lab/youtube/gb/gb-2-03/ru), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02/ru), [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru), [GB-1.08 · Тест](/lab/youtube/gb/gb-1-08/ru), [GB-1.07 · Функция](/lab/youtube/gb/gb-1-07/ru), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/ru), [GB-1.05 · if](/lab/youtube/gb/gb-1-05/ru), [GB-1.03 · int64](/lab/youtube/gb/gb-1-03/ru), [GB-1.02 · Переменная](/lab/youtube/gb/gb-1-02/ru), [GB-1.01 · Первая программа](/lab/youtube/gb/gb-1-01/ru).
+
+**Окружение:** откройте папку курса `lessons/gb-7-05-mutex-channel`. Это отдельная лабораторная: свой `go.mod`, один `package main`, внешних зависимостей нет. Нужны Go 1.27.4 и Bash. Для измерений с несколькими файлами используйте локальный терминал.
+
+Все команды выполняются из этой папки. `_video/run.sh` копирует файлы этапа и `go.mod` во временную папку, затем выполняет там переданную команду. `go run .` собирает и запускает пакет. Ваши начальные файлы не меняются.
+
+Для обычных команд задайте окружение через `export`:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+Скрипт также работает с `GOTOOLCHAIN=go1.27.4` и `CGO_ENABLED=0`. Первое выбирает версию, второе отключает cgo. `(chiqish kodi: 0)` означает успех команды; `1` — внутренняя команда завершилась с ошибкой.
+
+В Linux для `-race` нужны cgo и компилятор C. На этой машине нет gcc. `_video/race.sh` использует те же инструменты Go 1.27.4 в Docker-образе `golang:1.26.8`, где есть gcc. Все приведённые результаты `-race` получены заново в Docker; обычные измерения выполнены без cgo.
+
+**Вспомните:** что делает `g.SetLimit(10)`? **A)** останавливается после 10 ошибок · **B)** одновременно не более 10 задач; без свободного места `g.Go` ждёт · **C)** отменяет через 10 секунд.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Ограничение относится к числу активных горутин в errgroup. Число ошибок и ограничение времени — другие понятия. В прошлом уроке результаты записывались по отдельным индексам; сегодня меняется одна общая map.
+
+</details>
+
+## Проверка и уменьшение под одним мьютексом
+
+Упростим хранилище из GB-4.07: `stock` — `map[int64]int`, соответствие ID товара и количества. `Sell(id, n)` продаёт `n` единиц при достаточном остатке. В этой лабораторной предполагается `n > 0`; эти методы не проверяют входные значения.
+
+`LockedStore` — хранилище с мьютексом. Его метод `Sell`, фрагмент полного файла:
+
+```go
+func (s *LockedStore) Sell(id int64, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stock[id] < n {
+		return false
+	}
+	s.stock[id] -= n
+	return true
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1 | `s *LockedStore` — receiver с указателем на исходное хранилище; параметры `id`, `n`; результат `bool` |
+| 2 | `s.mu.Lock()` ждёт освобождения этого мьютекса, затем захватывает его |
+| 3 | `defer` обеспечивает выполнение `Unlock` при любом возврате из метода |
+| 4–6 | если `stock[id] < n`, возвращает `false`; остаток не меняется |
+| 7 | `-=` уменьшает это значение map на `n` |
+| 8–9 | возвращает `true`, метод заканчивается; выполняется отложенный `Unlock` |
+
+Ситуация с одной оставшейся единицей:
+
+| Шаг | A | B | `stock[1]` |
+|---|---|---|---|
+| Начало | захватывает мьютекс | ждёт в `Lock` | 1 |
+| A продаёт | 1 достаточно, записывает 0 | ждёт | 0 |
+| A освобождает мьютекс | возвращает `true` | захватывает мьютекс | 0 |
+| B проверяет | завершена | 0 недостаточно, `false` | 0 |
+
+Защитить только уменьшение недостаточно: проверка тоже должна быть под тем же мьютексом. Другие методы чтения также должны использовать именно его.
+
+## К map обращается только горутина-владелец
+
+Теперь к map обращается одна горутина. Другие передают ей по каналу ID товара, количество и канал ответа. Владелец выполняет запросы по одному.
+
+| Этап | Вызывающий `Sell` | Владелец `loop` |
+|---|---|---|
+| До запроса | создаёт канал `reply` | ждёт в `sells` |
+| Запрос | отправляет `{id, n, reply}` | получает запрос в `r` |
+| Работа | ждёт ответ | проверяет и уменьшает |
+| Ответ | получает `bool` | отправляет результат в `r.reply` |
+
+`OwnedStore` — хранилище с горутиной-владельцем. Поля map у него нет. `NewOwnedStore` передаёт map в `loop`; вызывающий код после этого не должен к ней обращаться. Система типов Go не обеспечивает это правило владения.
+
+Полный `store.go` этого этапа, вместе с вариантом на мьютексе:
+
+```go filename="_video/01-ikki/store.go" showLineNumbers
+// bozor: bitta umumiy holat — mahsulot qoldigʻi (ID → dona) — ikki usulda himoyalangan (GB-7.05).
+// LockedStore: map + sync.Mutex (GB-4.07). OwnedStore: map'ning yagona egasi boʻlgan goroutine, qolganlar
+// unga channel orqali soʻrov yuboradi. Ikkalasida Sell bir xil ishlaydi.
+package main
+
+import "sync"
+
+// LockedStore — qoldiq map'i va uni himoyalaydigan qulf. stock'ga har murojaat mu ostida.
+type LockedStore struct {
+	mu    sync.Mutex
+	stock map[int64]int
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *LockedStore) Sell(id int64, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stock[id] < n {
+		return false
+	}
+	s.stock[id] -= n
+	return true
+}
+
+// sellReq — egasiga yuboriladigan sotish soʻrovi: qaysi mahsulot, necha dona va javob qaytadigan channel.
+type sellReq struct {
+	id    int64
+	n     int
+	reply chan bool
+}
+
+// OwnedStore — qoldiq map'iga faqat loop goroutine'i tegadi; Sell unga soʻrov yuboradi va javobni kutadi.
+type OwnedStore struct {
+	sells chan sellReq
+}
+
+// NewOwnedStore loop'ni yangi goroutine'da boshlaydi va stock map'ini unga topshiradi:
+// bundan keyin chaqiruvchi bu map'ga tegmasligi kerak.
+func NewOwnedStore(stock map[int64]int) *OwnedStore {
+	s := &OwnedStore{sells: make(chan sellReq)}
+	go s.loop(stock)
+	return s
+}
+
+// loop — stock'ning yagona egasi. Soʻrovlarni birma-bir bajaradi; sells yopilganda tugaydi.
+func (s *OwnedStore) loop(stock map[int64]int) {
+	for r := range s.sells {
+		ok := stock[r.id] >= r.n
+		if ok {
+			stock[r.id] -= r.n
+		}
+		r.reply <- ok
+	}
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *OwnedStore) Sell(id int64, n int) bool {
+	reply := make(chan bool)
+	s.sells <- sellReq{id, n, reply}
+	return <-reply
+}
+
+// Close loop goroutine'ini toʻxtatadi. Close'dan keyin Sell chaqirilmaydi; Close ikkinchi marta chaqirilsa,
+// yopiq channel'ni qayta yopish panic beradi (GB-7.02).
+func (s *OwnedStore) Close() { close(s.sells) }
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–6 | `//` — комментарии; `package main` — исполняемый пакет; импорт `sync` для мьютекса |
+| 8–12 | `LockedStore`: `mu` — мьютекс, `stock` — ID → количество; `{}` ограничивают список полей |
+| 14–23 | описанный выше `Sell` с блокировкой |
+| 25–30 | `sellReq` — запрос продажи: `id int64`, `n int`, `reply chan bool` |
+| 32–35 | `sells chan sellReq` переносит только значения `sellReq` |
+| 37–40 | конструктор возвращает `*OwnedStore`; `&` берёт адрес структуры; `make` создаёт канал без буфера |
+| 41–43 | `go s.loop(stock)` запускает новую горутину; `return s` возвращает указатель на хранилище |
+| 45–47 | `loop` получает map параметром; `for r := range` принимает запросы до закрытия |
+| 48 | `ok` — хватает ли остатка для этой продажи; `>=` допускает и равенство |
+| 49–51 | только при истинном `ok` из `stock[r.id]` вычитается `r.n` |
+| 52–54 | `<-` отправляет результат по каналу ответа; закрываются скобки цикла и метода |
+| 56–58 | `Sell` создаёт отдельный `reply` для каждого вызова |
+| 59 | значения `sellReq{id, n, reply}` идут в порядке объявления полей; запрос отправляется в `sells` |
+| 60–61 | `return <-reply` ждёт ответ и возвращает его |
+| 63–65 | `Close` закрывает `sells`; `range` заканчивается, `loop` возвращается |
+
+Отправка без буфера ждёт встречи с получателем. После отправки запроса `Sell` обязательно принимает ответ, поэтому владелец не остаётся на его отправке. Отменяемые вызовы этот API пока не поддерживает.
+
+Вызывайте `Close` один раз после завершения всех `Sell`. Он не ждёт окончания loop: закрытие даёт loop возможность выйти. После этого не вызывайте ни `Sell`, ни `Stock`.
+
+## Подготовим одинаковую нагрузку
+
+В обоих хранилищах для ID 1 есть 800 000 единиц. `measure` выполняет всего 800 000 вызовов из восьми горутин:
+
+```go filename="_video/01-ikki/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+func main() {
+	locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+	measure("mutex", func() { locked.Sell(1, 1) })
+	owned := NewOwnedStore(map[int64]int{1: 800_000})
+	measure("egasi", func() { owned.Sell(1, 1) })
+	owned.Close()
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–7 | пакет `main`; `fmt` для вывода, `sync` для ожидания, `time` для времени |
+| 9–10 | `measure(name string, op func())` принимает имя и функцию без параметров и результата |
+| 11–12 | `start` получает время начала; `wg` отслеживает завершение работ |
+| 13–14 | `for range 8` делает восемь итераций; `wg.Go` каждый раз запускает новую горутину |
+| 15–19 | каждая горутина вызывает `op()` 100 000 раз; `})` завершает анонимную функцию и вызов `Go` |
+| 20 | `wg.Wait()` ждёт окончания восьми работ |
+| 21–22 | делит всё прошедшее время на 800 000 и выводит с `name`; `measure` заканчивается |
+| 24–26 | `locked` создаётся с map и нулевым значением мьютекса; анонимная функция вызывает `Sell(1, 1)` |
+| 27–30 | `owned` получает другую map; измеряется та же продажа; затем канал закрывается и `main` заканчивается |
+
+`egasi` («владелец») — подпись варианта с владельцем в выводе. Это число не является задержкой одного вызова: восемь горутин работают одновременно. Это **величина, обратная пропускной способности**: общее время / число операций.
+
+## Почему в коде без блокировки нет гонки данных?
+
+В `OwnedStore` нет мьютекса. Что выведет `-race`? **A)** `WARNING: DATA RACE` · **B)** только измерения · **C)** `fatal error: concurrent map`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** К map обращается только `loop`. Выбрав A или C, вы приравняли множество вызывающих к множеству обращающихся к map. Вызывающие работают только с каналами.
+
+</details>
+
+Повторно полученный результат Docker:
+
+```console
+$ ./_video/race.sh 01-ikki go run -race .
+mutex 519ns
+egasi 1.252µs
+(chiqish kodi: 0)
+```
+
+В видео записано `mutex 784ns`, `egasi 1.634µs`. Это сохранённые числа; выше — новый результат. `-race` добавляет проверки и меняет время. Скорость возьмём из следующего обычного запуска.
+
+Для **гонки данных** нужны конфликтующие обращения к одному участку памяти без синхронизации; хотя бы одно — запись. Основная защита здесь — доступ к map из одной горутины.
+
+[Модель памяти Go](https://go.dev/ref/mem#chan) гарантирует и порядок запроса и ответа: отправка синхронизирована перед завершением соответствующего получения. Значит, записи до отправки видимы коду после получения.
+
+Map создана до `go s.loop(stock)`. Правило [запуска горутины](https://go.dev/ref/mem#go) обеспечивает видимость и этих записей, сделанных до её старта.
+
+| До | Синхронизация | После |
+|---|---|---|
+| вызывающий записывает поля запроса | отправка `sells` → завершение соответствующего получения | `loop` читает поля |
+| `loop` обновляет остаток | отправка `reply` → завершение соответствующего получения | `Sell` получает результат |
+| изменение под мьютексом | `Unlock` этого мьютекса → возврат из следующего `Lock` | следующий защищённый доступ видит обновление |
+
+Молчание `-race` не доказывает корректность всех выполнений. Основа здесь — правило владения и синхронизация; запуск проверяет их на практике.
+
+## Измерим затраты
+
+Вариант с владельцем создаёт канал при каждом вызове и выполняет две передачи. Что быстрее? **A)** примерно одинаково · **B)** мьютекс быстрее · **C)** владелец быстрее, потому что нет блокировки.
+
+<details>
+<summary>Ответ</summary>
+
+**B**, для этой небольшой операции и этой реализации. A игнорирует затраты на канал и пробуждения. C трактует «без блокировки» как «без затрат». Проверим отношение измерением.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ikki go run .
+mutex 44ns
+egasi 462ns
+(chiqish kodi: 0)
+```
+
+| Операция | Запись из видео | Новый запуск для письменного урока |
+|---|---|---|
+| `Sell` с мьютексом | 59 ns | 44 ns |
+| `Sell` с владельцем | 519 ns | 462 ns |
+| владелец / мьютекс | около 8.8× | около 10.5× |
+
+На машине выполняется и другая работа, поэтому абсолютные времена меняются. Существенно, что при этой нагрузке вариант с владельцем обходится в несколько раз дороже. Это не обещание скорости для любой программы.
+
+Быстрый путь захвата свободного мьютекса начинается с одного атомарного сравнения с заменой. Занятый мьютекс может перейти к короткому активному ожиданию или блокировке; длительность ожидания не гарантирована. У владельца есть новый канал ответа, передача запроса и ответа. Runtime делает ожидающую горутину снова готовой к выполнению.
+
+В этом простом измерении нет прогрева, есть один товар, все продажи успешны. Создание канала тоже входит в результат владельца. Полноценные бенчмарки изучим в [GB-11.01](/lab/youtube/gb#gb-11-01).
+
+Из 500 ns/операцию получается примерно 2 миллиона операций в секунду. Это арифметика, а не отдельный эксперимент. Если в полном запросе преобладают JSON или база, доля этой разницы уменьшается. Измеряйте и весь обработчик.
+
+## Atomic для одного счётчика
+
+Для подсчёта продаж нужно одно число. `atomic.Int64` даёт **атомарные операции** над ним. Нулевое значение готово к работе; после первого использования не копируйте его. `Add(1)` неделимо прибавляет, `Load()` читает, `Store(v)` записывает новое значение.
+
+Полный `main.go` следующего этапа; `store.go` не меняется:
+
+```go filename="_video/02-atomic/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+// sold — sanagich: sakkiz goroutine bir vaqtda oshiradi, qulfsiz.
+var sold atomic.Int64
+
+func main() {
+	locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+	measure("mutex", func() { locked.Sell(1, 1) })
+	owned := NewOwnedStore(map[int64]int{1: 800_000})
+	measure("egasi", func() { owned.Sell(1, 1) })
+	owned.Close()
+	measure("atomic", func() { sold.Add(1) })
+	fmt.Println("sotildi:", sold.Load())
+}
+```
+
+Новые строки: 6 — импорт `sync/atomic`; 25–26 — счётчик `sold`; 34 — измерение `Add(1)`; 35 — вывод результата `Load()`. Остальные `measure` и оба `Sell` не изменились. `sotildi` означает «продано», здесь это подпись счётчика.
+
+Что будет в конце? **A)** всегда 800 000 · **B)** меньше из-за потерянных прибавлений · **C)** предупреждение о гонке данных.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Каждое прибавление атомарно; `Wait` ждёт их все. Для обычного общего `int` с `++` был риск B. Поскольку доступ идёт через атомарные методы, C тоже не ожидается.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-atomic go run .
+mutex 61ns
+egasi 606ns
+atomic 16ns
+sotildi: 800000
+(chiqish kodi: 0)
+```
+
+| Операция | Запись из видео | Новый запуск |
+|---|---|---|
+| мьютекс | 52 ns | 61 ns |
+| владелец | 465 ns | 606 ns |
+| atomic `Add` | 20 ns | 16 ns |
+| `sold.Load()` | 800000 | 800000 |
+
+В новом результате владелец/мьютекс — около 9.9×; мьютекс/atomic — около 3.8×. Atomic здесь лишь увеличивает число, а не выполняет работу с map и правилом из `Sell`.
+
+Проверим и с `-race` в Docker; ожидаются те же прибавления и итоговое число, но времена изменятся:
+
+```console
+$ ./_video/race.sh 02-atomic go run -race .
+mutex 435ns
+egasi 1.271µs
+atomic 258ns
+sotildi: 800000
+(chiqish kodi: 0)
+```
+
+Предупреждений нет. Не смешивайте времена этого блока с обычным измерением.
+
+## Две атомарные операции не образуют продажу
+
+Напишем для остатка «сначала прочитать, потом уменьшить». Эта программа намеренно ошибочна:
+
+```go filename="_video/03-atomic-xato/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+// stock — oʻrik qoldigʻi, 100 000 dona. Xato: tekshirish va kamaytirish — ikki alohida atomik amal.
+var stock atomic.Int64
+
+func main() {
+	stock.Store(100_000)
+	measure("atomic", func() {
+		if stock.Load() > 0 {
+			stock.Add(-1)
+		}
+	})
+	fmt.Println("qoldiq:", stock.Load())
+}
+```
+
+`measure` прежний. В строке 26 `stock` («остаток») теперь атомарное число; в 29 `Store` записывает 100 000 единиц. В 31 проверяем положительный `Load`, в 32 уменьшаем через `Add(-1)`. Строка 35 выводит `qoldiq` («остаток»).
+
+Что будет после 800 000 попыток? **A)** всегда 0 · **B)** возможен и отрицательный остаток · **C)** `-race` обязательно найдёт гонку данных.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Между `Load` и `Add` может продать другая горутина. A считает весь `if` одной атомарной операцией. C путает логическую ошибку с гонкой данных.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-atomic-xato go run .
+atomic 2ns
+qoldiq: -6
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/race.sh 03-atomic-xato go run -race .
+atomic 192ns
+qoldiq: -4
+(chiqish kodi: 0)
+```
+
+Новый обычный запуск продал 6 лишних единиц; Docker — 4. В записи видео было соответственно −4 и −6. Даже отрицательное число не гарантировано: иногда получается 0.
+
+В исследовании для видео из 30 запусков 29 дали отрицательное число, один — 0. Мы цитируем исторический результат; серию из 30 запусков заново не выполняли. Два новых запуска выше — отдельные.
+
+| Шаг | A | B | `stock` |
+|---|---|---|---|
+| 1 | `Load()` → 1 | — | 1 |
+| 2 | — | `Load()` → 1 | 1 |
+| 3 | `Add(-1)` | — | 0 |
+| 4 | — | `Add(-1)` | −1 |
+
+Каждая операция атомарна отдельно, но проверка и уменьшение вместе — нет. В этом **состоянии гонки** нет гонки данных, поэтому `-race` молчит. Даже тест результата не воспроизводит эту таблицу при каждом запуске.
+
+Верное решение: выполнять проверку и изменение под мьютексом или внутри одного владельца. Для одного числа есть ещё способ в необязательном разделе.
+
+## Выбор для bozor
+
+[Go wiki](https://go.dev/wiki/MutexOrChannel) рекомендует выбирать наиболее выразительное или простое решение. Если правила блокировок усложняются, горутина-владелец может их упростить.
+
+| Ситуация | Обычный выбор | Причина |
+|---|---|---|
+| map остатков, короткие чтения и записи | мьютекс | общее состояние легко защитить; как каталог GB-4.08 |
+| передача прайс-листов между этапами | канал | передаётся владение данными; как поток GB-7.02 |
+| распределение работы или будущий результат | канал | передача работы и результата |
+| число запросов | atomic | одна операция над одним независимым числом |
+| состояние и последовательная работа, например запись в файл | горутина-владелец | состояние и работа имеют один порядок выполнения |
+
+Кэш — результаты, сохранённые в памяти, — тоже обычный случай для мьютекса. Увеличение числа каналов без нужного правила и измерения может усложнить код.
+
+Правило «разделяйте память через общение, а не общайтесь через общую память» читайте как правило владения. Отправка map по каналу сама по себе не запрещает старые обращения. Код должен отказаться от них. [Effective Go](https://go.dev/doc/effective_go#sharing) также предупреждает, что подходом можно увлечься чрезмерно; для счётчика может хватить мьютекса.
+
+## Глубже (необязательно): продажа одного числа через CompareAndSwap
+
+**Compare-and-swap**: записать `old-1`, только если значение всё ещё равно `old`. `CompareAndSwap` объединяет это в одну атомарную операцию и возвращает успех как `bool`. Если другая горутина изменила значение, читаем заново.
+
+```go filename="_video/04-cas/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+var stock atomic.Int64
+
+// sellOne: CompareAndSwap — qiymat hali biz oʻqigan old boʻlsa, old-1 yozadi; boshqa goroutine
+// oraliqda oʻzgartirgan boʻlsa, false qaytaradi va biz qaytadan oʻqiymiz.
+func sellOne() bool {
+	for {
+		old := stock.Load()
+		if old <= 0 {
+			return false
+		}
+		if stock.CompareAndSwap(old, old-1) {
+			return true
+		}
+	}
+}
+
+func main() {
+	stock.Store(100_000)
+	measure("cas", func() { sellOne() })
+	fmt.Println("qoldiq:", stock.Load())
+}
+```
+
+Строки 1–23 — прежние импорты и `measure`; 25 — `stock`. 29–31 — `sellOne` читает остаток в бесконечном цикле. 32–34 — при исчерпании возвращает `false`. 35–36 — уменьшает ещё не изменённое значение и возвращает `true`. При неудачном CAS после 38 начинается новая итерация. 41–45 — начальный остаток, 800 000 попыток и итоговый вывод.
+
+Результат? **A)** всегда 0 · **B)** может быть отрицательным · **C)** только `-race` исправит.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Для последней единицы только один CAS будет успешен. Другой прочитает обновлённый 0 и откажет. `-race` не исправляет код.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-cas go run .
+cas 6ns
+qoldiq: 0
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/race.sh 04-cas go run -race .
+cas 327ns
+qoldiq: 0
+(chiqish kodi: 0)
+```
+
+В README записано `cas 6ns`, с `-race` — `cas 245ns`; новые результаты выше. Во время входят и отказы после 100 000 успешных продаж. Не сравнивайте это как одинаковую работу с `Sell`, где продаёт каждый вызов. Для совместного изменения остатка и списка заказов этого одного CAS недостаточно.
+
+Дополнительный эксперимент отделяет влияние одной и восьми горутин:
+
+```go filename="_video/06-bitta/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// measure — 01-ikki'dagidek, lekin goroutine'lar soni g: 800 000 chaqiruv g ta goroutine'ga boʻlinadi.
+// Natija: jami vaqt / 800 000, ya'ni bitta chaqiruvga toʻgʻri keladigan vaqt (g = 1 da bu bitta chaqiruvning oʻzi).
+func measure(name string, g int, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range g {
+		wg.Go(func() {
+			for range 800_000 / g {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, g, time.Since(start)/800_000)
+}
+
+func main() {
+	for _, g := range []int{1, 8} {
+		locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+		measure("mutex", g, func() { locked.Sell(1, 1) })
+		owned := NewOwnedStore(map[int64]int{1: 800_000})
+		measure("egasi", g, func() { owned.Sell(1, 1) })
+		owned.Close()
+	}
+}
+```
+
+Изменённые строки: 11 — параметр `g`; 14–16 — деление 800 000 вызовов на `g` задач. 22 — вывод также `g`. 26 — перебор `[]int{1, 8}`; `_` отбрасывает индекс. 27–31 создают, измеряют и закрывают хранилища для каждого `g`.
+
+Исчезнут ли затраты на передачу у владельца с одним вызывающим? **A)** да · **B)** нет · **C)** канал больше не нужен.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Даже с одним вызывающим владелец — отдельная горутина. Поэтому затраты на передачу запроса и ответа по каналам остаются.
+
+</details>
+
+Результат:
+
+```console
+$ ./_video/run.sh 06-bitta go run .
+mutex 1 20ns
+egasi 1 618ns
+mutex 8 85ns
+egasi 8 533ns
+(chiqish kodi: 0)
+```
+
+Это программа из `_video/06-bitta/main.go`: `measure(name, g, op)` делит всего 800 000 вызовов на `g`. `mutex 1` и `egasi 1` — одна горутина, `8` — восемь.
+
+В README для одной горутины записано 21–31 ns для мьютекса, 636–714 ns для владельца. Новый результат — 20 и 618 ns. С восемью — 85 и 533 ns; сохранённые диапазоны — 34–80 и 448–739 ns. Нагрузка и планирование меняют абсолютные числа. Даже один вызывающий встречается через канал без буфера с отдельным `loop`.
+
+## Частые ошибки
+
+**1. «Каждый метод атомарен, значит, продажа тоже».** Ошибочная программа и настоящий отрицательный результат приведены выше. Молчание `-race` не проверяет правило продажи. Исправление: общий мьютекс, владелец или CAS для одного числа.
+
+**2. Читать map после передачи.** Тип `OwnedStore` скрывает map, но её старое имя у вызывающего может остаться. Этот этап использует ту же копию `store.go`, что приведена выше:
+
+```go filename="_video/05-topshirilgan/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Xato: map loop'ga topshirilgandan keyin main uni oʻzi oʻqiydi. Endi map'ga ikki goroutine tegadi.
+func main() {
+	stock := map[int64]int{1: 1000}
+	owned := NewOwnedStore(stock)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 100 {
+				owned.Sell(1, 1)
+			}
+		})
+	}
+	fmt.Println("qoldiq:", stock[1]) // topshirilgan map'ga tegdik
+	wg.Wait()
+	owned.Close()
+}
+```
+
+В строках 9–11 `stock` передаётся владельцу. В 12–19 `wg` запускает четырёх продавцов, каждый продаёт 100 раз. В 20 `main` читает map без синхронизации; 21–23 ждут продавцов и закрывают хранилище. Значение строки `qoldiq` не гарантировано.
+
+Что скажет `-race`? **A)** после передачи map всё безопасно · **B)** предупредит, если обнаружит конфликтующие чтение и запись · **C)** всегда просто выведет `0`.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Основная горутина читает map, а `loop` пишет в неё. Канал не делает старую map у вызывающего недоступной для чтения.
+
+</details>
+
+`2>&1` передаёт также поток ошибок; `|` направляет его в `sed`. `sed -n` выводит только предупреждения, число найденных гонок и строки статуса. Строки адресов и стека удалены этим фильтром:
+
+```console
+$ ./_video/race.sh 05-topshirilgan go run -race . 2>&1 | sed -n '/^WARNING: DATA RACE$/p; /^Found .*data race/p; /^exit status /p; /^(chiqish kodi:/p'
+WARNING: DATA RACE
+WARNING: DATA RACE
+Found 2 data race(s)
+exit status 66
+(chiqish kodi: 1)
+```
+
+`WARNING: DATA RACE` — предупреждение о гонке данных; `Found 2 data race(s)` — в этом запуске найдены два конфликта. `exit status 66` означает завершение с обнаруженной ошибкой. Скрипт показывает это как код выхода 1. Исправление: не обращайтесь к старой map; запрашивайте остаток у владельца через `Stock`.
+
+**3. Обычное получение из закрытого канала.** В `select` задания закрытый `sells` всегда готов. Нужны `r, ok := <-s.sells` и `if !ok { return }`; иначе loop может крутиться или остаться на отправке в нулевой `reply`.
+
+**4. Несозданный канал.** Если новое поле `stocks` не создано через `make`, оно `nil`. Отправка туда ждёт вечно. Конструктор должен создать канал, а loop — принимать из него.
+
+**5. Завершение и копирование.** Двойной `Close` вызывает panic; продавать после него тоже нельзя. `Stock` из решения также зависнет после завершения владельца. Сначала завершите вызывающих; не копируйте использованные мьютекс или `atomic.Int64`.
+
+## Проверьте себя
+
+**1.** Почему в варианте с владельцем без блокировки нет гонки данных?
+
+<details>
+<summary>Ответ</summary>
+
+К map обращается только `loop`. Каналы запроса и ответа синхронизируют видимость записей. Вызывающий не должен обращаться к переданной map.
+
+</details>
+
+**2.** Две горутины получили 1 из `Load()`. Каждая делает `Add(-1)`. Что останется? **A)** 0 · **B)** −1 · **C)** ошибка гонки данных.
+
+<details>
+<summary>Ответ</summary>
+
+**B: −1.** Две неделимые операции последовательно уменьшают число. Обе проверки уже прошли. Это состояние гонки без гонки данных.
+
+</details>
+
+**3.** GB-7.02: что даёт `n, ok := <-ch` для закрытого `chan int` с пустым буфером?
+
+<details>
+<summary>Ответ</summary>
+
+Сразу `n == 0`, `ok == false`. В задании именно этот `ok` обеспечивает завершение loop.
+
+</details>
+
+**4.** 800 000 операций завершились за 0.4 секунды. Каждый вызов ждал 500 ns?
+
+<details>
+<summary>Ответ</summary>
+
+Нет. 0.4 / 800 000 = 500 ns/операцию — величина, обратная общей пропускной способности. Собственное время ожидания параллельного вызова отличается.
+
+</details>
+
+## Домашнее задание
+
+Код: [lessons/gb-7-05-mutex-channel](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel).
+Условие: [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-05-mutex-channel/TASK.md).
+Ответ: [solution/store.go](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-05-mutex-channel/solution/store.go).
+
+- 🟢 **`Stock(id int64) int`:** напишите `stockReq{id, reply chan int}`, второй канал `stocks` и `select`, ожидающий оба канала. Нет ID — 0. При закрытии `sells` делайте `return`. Map остаётся только в loop; не добавляйте map или мьютекс в `OwnedStore`.
+- 🟡 **Необязательный `Requests() int64`:** используйте готовое поле `calls atomic.Int64`. Каждый `Sell`, включая отказ, делает `Add(1)`; `Requests` возвращает `Load()`. Без реализации эта проверка будет `SKIP`.
+
+Не меняйте `LockedStore`, `main.go`, `tekshiruv_test.go` и порядок запроса и ответа в `Sell`. Начальный `Stock` возвращает −1. `-count=1` запускает тест заново без кеша; для локальных команд задано `CGO_ENABLED=0`.
+
+```console
+$ go test -count=1 .
+--- FAIL: TestVazifaStock (0.00s)
+    tekshiruv_test.go:45: Stock(1) = -1: Stock hali yozilmagan. TASK.md 1-qadam: Stock soʻrovini loop'ga yuborib, javobni qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.013s
+FAIL
+```
+
+`tekshiruv_test.go:45` — строка 45 файла проверки. `Stock hali yozilmagan` означает «Stock ещё не написан»: начальное задание падает. `FAIL` — тест не прошёл; путь модуля и время относятся к работе этого пакета.
+
+Тест проверяет остатки 40, 5, 0; ровно 5 продаж при одновременных `Sell`/`Stock`; отсутствие полей map и блокировок. Также проверяет завершение горутин после закрытия 20 хранилищ. Нет ответа за две секунды — проверьте создание канала и приём из него в loop.
+
+<details>
+<summary>Ответ</summary>
+
+Поля `stockReq` — `id int64`, `reply chan int`. Конструктор создаёт `stocks: make(chan stockReq)`. Основная форма `Stock`:
+
+```go
+func (s *OwnedStore) Stock(id int64) int {
+	reply := make(chan int)
+	s.stocks <- stockReq{id, reply}
+	return <-reply
+}
+```
+
+В loop бесконечный `for`, внутри `select`: принимайте из `sells` значения `r, ok`, при `!ok` возвращайтесь. Тело продажи прежнее. В case `stocks` — `r.reply <- stock[r.id]`. Нулевое значение отсутствующего ключа map — 0.
+
+Для `Requests` добавьте `s.calls.Add(1)` в начало `Sell`, а в `Requests` — `return s.calls.Load()`. Из 100 вызовов теста только 3 продают, но Requests должен быть 100.
+
+Проверим ответ; `./solution/` выбирает только пакет решения:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.012s
+```
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	1.020s
+(chiqish kodi: 0)
+```
+
+`ok` означает, что тесты прошли; время меняется при каждом запуске. Статическая проверка:
+
+```console
+$ go vet ./...
+
+```
+
+`go vet ./...` ничего не вывел. Это не заменяет тест. В вашем решении должен пройти и `go test -count=1 .`.
+
+</details>
+
+## Источники
+
+- [Go wiki: MutexOrChannel](https://go.dev/wiki/MutexOrChannel).
+- [Effective Go: Share by communicating](https://go.dev/doc/effective_go#sharing), [Go Proverbs](https://go-proverbs.github.io/), [Share Memory By Communicating](https://go.dev/blog/codelab-share).
+- [Модель памяти Go](https://go.dev/ref/mem): [каналы](https://go.dev/ref/mem#chan), [блокировки](https://go.dev/ref/mem#locks), [атомарные значения](https://go.dev/ref/mem#atomic).
+- [sync.Mutex](https://pkg.go.dev/sync#Mutex), [sync.WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [sync/atomic](https://pkg.go.dev/sync/atomic), [atomic.Int64](https://pkg.go.dev/sync/atomic#Int64), [Store](https://pkg.go.dev/sync/atomic#Int64.Store), [CompareAndSwap](https://pkg.go.dev/sync/atomic#Int64.CompareAndSwap).
+- [Data Race Detector](https://go.dev/doc/articles/race_detector), [затраты проверки](https://go.dev/doc/articles/race_detector#Runtime_Overheads), [Go 1.20: cgo](https://go.dev/doc/go1.20#cgo).
+- [Спецификация Go: типы каналов](https://go.dev/ref/spec#Channel_types), [range](https://go.dev/ref/spec#For_range), [составные литералы](https://go.dev/ref/spec#Composite_literals), [оператор получения](https://go.dev/ref/spec#Receive_operator), [select](https://go.dev/ref/spec#Select_statements), [close](https://pkg.go.dev/builtin#close).
+- [errgroup.SetLimit](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.SetLimit), [time.Since](https://pkg.go.dev/time#Since), [Duration.String](https://pkg.go.dev/time#Duration.String).
+- [Go 1.27.4: быстрый путь мьютекса](https://github.com/golang/go/blob/go1.27.4/src/internal/sync/mutex.go#L61-L68), [отправка по каналу](https://github.com/golang/go/blob/go1.27.4/src/runtime/chan.go#L318).
+- [README, TASK.md, _video, solution](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel).
+
+Результаты: `go1.27.4 linux/amd64`, 2026-11-28. Обычные команды — `CGO_ENABLED=0`; `-race` в Docker — `CGO_ENABLED=1`. Числа из видео отмечены отдельно.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel)
+
+---
+
+← Предыдущий урок: [GB-7.04](/lab/youtube/gb/gb-7-04/ru) · Следующий урок: [GB-7.06](/lab/youtube/gb/gb-7-06/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

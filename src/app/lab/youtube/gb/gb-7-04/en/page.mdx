@@ -1,0 +1,771 @@
+---
+title: "Bounded workers and errgroup"
+date: "2026/11/28"
+description: "Fetch a thousand products ten at a time: worker pools, SetLimit, cancellation on the first error, and context use after Wait."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-04) · [Русский](/lab/youtube/gb/gb-7-04/ru) · **English**  
+Lesson GB-7.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-04) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+The bozor importer updates catalog stock. It fetches stock counts for 1000 products every night. Sequential processing takes about 20 seconds. Starting a goroutine per product makes the lab supplier reject 990 requests. How can you speed up the import and limit concurrent requests?
+
+**One idea:** input size should not determine the number of concurrent requests. A limit you choose and a cancellation signal control the import.
+
+After this lesson, you can:
+
+- measure unbounded work through request counts, goroutine counts, and memory;
+- write ten workers reading one channel;
+- combine a concurrency limit and the first error with `errgroup`;
+- cancel remaining work through the group context and fix context use after `Wait`.
+
+| Term | Plain meaning | English term |
+|---|---|---|
+| worker pool | persistent goroutines take jobs from one channel | worker pool |
+| `errgroup.Group` | waits for functions and returns the first error | errgroup |
+| `errgroup.WithContext` | cancels the group context on error or when `Wait` returns | WithContext |
+
+**Bounded concurrency** means at most N tasks are in progress, including tasks waiting for responses. `SetLimit` sets that bound. The helper syntax `errs...` expands slice elements into separate arguments. `golang.org/x/sync` is a Go module outside the standard library.
+
+## Before you start
+
+Start with [GB-7.03 · select and context](/lab/youtube/gb/gb-7-03/en), [GB-7.02 · Channels](/lab/youtube/gb/gb-7-02/en), and [GB-7.01 · Goroutine lifetime](/lab/youtube/gb/gb-7-01/en).
+
+Practical background: [GB-6.07 · 429 and rate limits](/lab/youtube/gb/gb-6-07/en), [GB-6.03 · A golang.org/x module](/lab/youtube/gb/gb-6-03/en), [GB-5.05 · The pgx pool](/lab/youtube/gb/gb-5-05/en), [GB-4.07 · Races and mutexes](/lab/youtube/gb/gb-4-07/en).
+
+Go syntax: [GB-2.09 · defer and panic](/lab/youtube/gb/gb-2-09/en), [GB-2.08 · %w and errors.Join](/lab/youtube/gb/gb-2-08/en), [GB-2.06 · Modules](/lab/youtube/gb/gb-2-06/en), [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en), [GB-1.08 · Tests](/lab/youtube/gb/gb-1-08/en), [GB-1.07 · Functions and error](/lab/youtube/gb/gb-1-07/en), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/en), [GB-1.05 · if](/lab/youtube/gb/gb-1-05/en), [GB-1.03 · const and int64](/lab/youtube/gb/gb-1-03/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.01 · go run](/lab/youtube/gb/gb-1-01/en).
+
+Run the code in `lessons/gb-7-04-worker-errgroup`. This is an independent module: `go.mod` specifies `go 1.27` and `golang.org/x/sync v0.25.0`. You need Go, Bash, and Docker for the race check. No server is started.
+
+Select the environment for ordinary commands:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` chooses the Go version; `CGO_ENABLED=0` builds without a C compiler. `_video/run.sh` makes a copy of the stage file, `supplier.go`, `go.mod`, and `go.sum` into a temporary folder. It runs the command there. `(chiqish kodi: 0)` is the script reporting a successful process exit; it does not mean the application reported no error.
+
+**Recall:** `checkStock` respects its context. The timeout is 1 second; the supplier waits 3 seconds. What happens? **A)** stock after 3 seconds · **B)** `context deadline exceeded` after about 1 second · **C)** an immediate error.
+
+<details>
+<summary>Answer</summary>
+
+**B.** When `ctx.Done()` closes, `select` ends the wait. `ctx.Err()` returns `context deadline exceeded`, meaning the deadline passed. A ignores cancellation; C ignores the wait until the deadline.
+
+</details>
+
+## Sequential import: the baseline
+
+The supplier is a fake with no network: `supplier.go`. `checkStock(ctx, id)` returns one stock count. ID 1 is `olma` (apple), 40; ID 2 is `non` (bread), 120; ID 3 is `oʻrik` (apricot), 5. Other existing IDs have stock `id % 50`. Only IDs 1…1000 exist.
+
+Each request waits about 20 ms. When more than 10 requests overlap, excess requests receive `ErrTooMany`: `429 too many requests`. This lab limits concurrent work; a rate limit counts requests over time instead. No actual HTTP response is sent. `catalogIDs(n)` builds a slice of IDs 1…n; `saveStocks` only checks its context. Writing to Postgres comes in GB-7.07.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	for i, id := range ids {
+		n, err := checkStock(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("mahsulot %d: %w", id, err)
+		}
+		stocks[i] = n
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+| Line | Code | What it does |
+|---|---|---|
+| 1 | `package main` | executable package |
+| 3–7 | `import` | context, formatting, and time packages |
+| 9 | `importStocks` | takes `ctx` and `[]int64`; returns `[]int` and `error` |
+| 10 | `stocks := make(...)` | one result cell per ID |
+| 11–12 | `range`, `checkStock` | index `i`, ID `id`; each call follows the previous call |
+| 13–15 | `if`, `fmt.Errorf` | return `nil` on error; `%d` inserts the ID, `%w` wraps the cause |
+| 16–19 | `stocks[i] = n`, `return` | assign the stock count; after the loop, return the slice and `nil` |
+| 21–25 | `main`, `time.Now`, `report` | record start time, import with the initial context, print the output |
+
+`[]` denotes a slice type; `len(ids)` is its length. `:=` creates a new variable; `=` assigns to an existing location. Parentheses delimit calls and parameters; `{}` delimit function or loop bodies.
+
+**Predict:** how long is 1000 × 20 ms sequentially? **A)** 20 ms · **B)** about 20 s · **C)** about 2 s.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Each call waits for the previous one. A is one request; C requires ten overlapping requests.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+soʻrov: 1000 · bir vaqtda: 1 · rad: 0 · vaqt: 20.106s
+qoldiqlar: 1000
+goroutine: 1 · xotira: 7 MB
+(chiqish kodi: 0)
+```
+
+Every console result was rerun on 2026-11-28; none is quoted from a recording. The video baseline was 20.218 s; this run took 20.106 s.
+
+`soʻrov` counts supplier calls; `bir vaqtda` is the highest active request count; `rad` counts rejections. `vaqt` is import duration. `qoldiqlar` is result length; `goroutine` is the highest count observed when requests began. Sampling is not continuous.
+
+`xotira` is `runtime.MemStats.Sys`: total memory obtained from the OS, rather than live object size. The code computes `Sys >> 20` but labels it `MB`: the actual unit is MiB. 1 MiB = 1,048,576 bytes.
+
+## A goroutine per ID: no bound
+
+```go filename="_video/02-cheksiz/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Go(func() {
+			stocks[i], errs[i] = checkStock(ctx, id)
+		})
+	}
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Lines 11–12 create separate slices for stock counts and errors. Line 13 creates a `WaitGroup`; 14–18 start `wg.Go` for each ID. Line 16 writes only to its own index `i`. There is no `append`. Line 19 waits for all tasks; 20 joins non-nil errors through `errors.Join(errs...)`. New imports are `errors` and `sync`; `main` is unchanged.
+
+**Predict:** 1000 goroutines; the supplier accepts at most 10 overlapping requests. What do we expect in this rapidly launched experiment? **A)** 0 rejected, an automatic queue · **B)** 12 rejected, matching the CPU count · **C)** 990 rejected.
+
+<details>
+<summary>Answer</summary>
+
+**C**, in this experiment. `go` does not wait for the called work to finish. CPU count does not bound requests waiting for responses. The language does not guarantee that every goroutine runs immediately together; 990 is this run’s result.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-cheksiz go run .
+soʻrov: 1000 · bir vaqtda: 1000 · rad: 990 · vaqt: 22ms
+xato: 429 too many requests (va yana 989 ta)
+goroutine: 1001 · xotira: 16 MB
+(chiqish kodi: 0)
+```
+
+`too many requests` explains the rejection. `va yana 989 ta` means “and 989 more”: `report` counted the remaining lines of the joined error. Video: 30 ms and 12 MiB; this run: 22 ms and 16 MiB. Finishing quickly is not success: 990 requests failed.
+
+For 100,000 IDs, only the argument in `main` changes. The remaining lines of `_video/03-xotira/main.go` match the second version:
+
+```go
+	stocks, err := importStocks(context.Background(), catalogIDs(100_000))
+```
+
+**Predict:** what can a larger list do to goroutines and memory? **A)** no change · **B)** they can grow · **C)** requests automatically run ten at a time.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The loop starts work according to input size. No bound in this code supports A or C. Starts and completions overlap, so counts vary.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-xotira go run .
+soʻrov: 100000 · bir vaqtda: 31123 · rad: 99990 · vaqt: 188ms
+xato: 429 too many requests (va yana 99989 ta)
+goroutine: 39955 · xotira: 167 MB
+(chiqish kodi: 0)
+```
+
+Video: 23,580 active requests, 25,151 goroutines, 123 MiB, and 249 ms. This run: 31,123, 39,955, 167 MiB, and 188 ms. These are not guaranteed bounds. Supplier capacity, Postgres pool connections, and memory require a limit chosen by the caller.
+
+## One jobs channel, ten workers
+
+Build a **worker pool**. `main` sends job indexes; ten persistent goroutines receive them.
+
+| State | main / jobs | Workers and requests |
+|---|---|---|
+| start | unbuffered `jobs`, no jobs | 10 workers wait to receive |
+| 10 busy | next `jobs <- i` waits | at most 10 requests |
+| one finishes | a free worker receives the index | it starts the next request |
+| sending ends | `close(jobs)`, then `wg.Wait()` | range ends, all workers are awaited |
+
+```go filename="_video/04-worker/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				stocks[i], errs[i] = checkStock(ctx, ids[i])
+			}
+		})
+	}
+	for i := range ids {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Line 10 sets `workers = 10`. Line 15 creates an unbuffered `chan int`: it carries indexes rather than IDs. Lines 17–23 start ten `wg.Go` calls. Lines 19–21 receive indexes until the channel closes and write only to the corresponding result cell.
+
+Lines 24–26 send each index through `jobs <- i`. Without a free worker, the sender waits. Line 27 closes the channel; `for i := range jobs` ends. Line 28 waits for all workers. Line 29 joins errors.
+
+**Predict:** 1000 products, 10 workers, 20 ms per request. Approximate time? **A)** 20 ms · **B)** 2 s · **C)** 20 s.
+
+<details>
+<summary>Answer</summary>
+
+**B.** 1000 / 10 × 20 ms = 2 s. A covers one batch of ten; C is sequential. Scheduling and other overhead add to the ideal calculation.
+
+</details>
+
+```console
+$ ./_video/race.sh 04-worker go run -race .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.023s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+This `-race` command was rerun in Docker. There is no local `gcc`; `race.sh` uses an image with a C compiler and the Go 1.27.4 toolchain. No race report appeared: no race was detected on the executed paths. That does not prove every possible execution safe.
+
+Video: 2.024 s; this run: 2.023 s. The ratio 20.106 / 2.023 is about 9.9. What matters is roughly tenfold speedup, no rejections, and at most 10 active requests. Errors are still collected at the end; the first error does not stop later work.
+
+## errgroup: a limit and the first error
+
+We managed a channel, a worker loop, and an error slice manually. **errgroup** combines waiting for functions with error return. It is a package in `golang.org/x/sync`.
+
+The lesson folder already has this dependency. The following command was rerun in a separate temporary module without that dependency:
+
+```console
+$ go get golang.org/x/sync/errgroup
+go: added golang.org/x/sync v0.25.0
+```
+
+`go: added` means the module was added to `go.mod`; `go.sum` stores checksums. The video also showed `go: downloading`; this run used the module cache, so that line is absent.
+
+```go filename="_video/05-errgroup/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	var g errgroup.Group
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Line 8 imports the package. Line 15 creates a zero-value `Group`: ready to use, but with no limit or error cancellation by itself. Line 16 bounds active work using `SetLimit(workers)`.
+
+Line 18 passes `func() error` to `g.Go`. When the limit is full, the caller of `g.Go` waits. These are not ten persistent workers: a goroutine starts for each task, with a bound on active tasks. Lines 19–25 fetch stock, wrap an error with the ID, or write `stocks[i]` and return `nil`.
+
+Lines 27–29 wait for every started function and return the first non-nil error. “First” means the first recorded error, rather than the first ID in input order. Line 30 returns only a successful result.
+
+| State | Caller of `g.Go` | Result |
+|---|---|---|
+| 0 active | starts the first task | 1 active |
+| 10 active | waits to add task 11 | bound holds |
+| one finishes | a slot opens and the next task starts | at most 10 active |
+| loop ends | `g.Wait()` | all finish, first error or `nil` |
+
+**Predict:** what happens with 1000 valid IDs? **A)** 990 rejections again · **B)** about 2 s, at most 10 active · **C)** only 10 results.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `SetLimit` bounds concurrent work rather than total tasks. A ignores the limit; C mistakes it for the total result count.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-errgroup go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.024s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.034 s, 12 goroutines; this run: 2.024 s, 11. In v0.25.0, a finishing goroutine can release its slot before fully exiting. The total count also includes `main`. `SetLimit(10)` does not bound the entire process’s goroutine count.
+
+Active work is bounded, but the `ids` and `stocks` slices still use memory proportional to list length. This does not promise constant memory for the entire import.
+
+## WithContext: work after an error
+
+First check a plain `Group`. `_video/06-xato/main.go` differs from the previous file only in `main`:
+
+```go
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+`ids[499]` is element 500; the supplier has no ID 9999. **Predict:** how many total requests? **A)** 1000 · **B)** about 510 · **C)** 500.
+
+<details>
+<summary>Answer</summary>
+
+**A.** A plain `Group` records the error but does not cancel remaining work. `Wait` still waits for all functions. B and C assume cancellation exists.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-xato go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.016s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.043 s; this run: 2.016 s. `mahsulot topilmadi` means “product not found”. Now `WithContext` returns a group and its associated context:
+
+```go filename="_video/07-withctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+Line 15 is `g, ctx := errgroup.WithContext(ctx)`. In this function body, `ctx` shares the parameter’s block. `:=` creates only `g` and assigns a new context to the existing `ctx`. Line 19 now passes the group context. The first non-nil error cancels it.
+
+The supplier responds in two places: it checks `ctx.Err()` on entry and watches `ctx.Done()` through `select` while waiting. Cancellation does not forcibly kill a goroutine. If both `select` cases are ready, choosing the cancellation case is not guaranteed.
+
+**Mid-lesson question:** the error for product 9999 triggered cancellation; other functions returned `context canceled`. What does `Wait` return? **A)** the first error about 9999 · **B)** `context canceled` · **C)** every error through `errors.Join`.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The group keeps the first error. Later cancellation errors neither replace it nor join it. Before returning, `Wait` waits for all started functions.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-withctx go run .
+soʻrov: 509 · bir vaqtda: 10 · rad: 0 · vaqt: 1.005s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 13 MB
+(chiqish kodi: 0)
+```
+
+Video: 509 requests, 1.026 s; this run: 509 and 1.005 s. Compared with the plain group, 2.016 / 1.005 is about 2. The error is halfway through the list, so this experiment takes nearly half the time. 509 is not an API guarantee; scheduling affects the count.
+
+The loop still calls every `g.Go`. A `checkStock` started after cancellation usually returns at its entry check without increasing the supplier counter. Calls already running react to the signal. A `g.Go` blocked on the limit does not itself return automatically on context cancellation; it waits for a slot.
+
+| Event | Group context | Work |
+|---|---|---|
+| before error | active | at most 10 requests |
+| first error | canceled | running calls observe the signal |
+| remaining loop | canceled | new functions are called; entry checks return quickly |
+| `Wait` | canceled | after every function finishes, first error |
+
+## Which context after Wait?
+
+Now there is no invalid ID. After importing, save the stock counts through `saveStocks`. `g, ctx :=` replaced the parameter’s context. The added part of `_video/08-wait-ctx/main.go` is:
+
+```go
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+```
+
+Rule: the context from `WithContext` is canceled on the first error **or when `Wait` returns**. Successful completion also cancels it.
+
+**Predict:** what happens with 1000 valid IDs? **A)** 1000 stock counts, no error · **B)** `saqlash: context canceled` · **C)** product not found.
+
+<details>
+<summary>Answer</summary>
+
+**B.** `Wait` succeeded, but the next `saveStocks` received the canceled group context. A assumes a longer context lifetime; C has no invalid ID to explain it.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-wait-ctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.026s
+xato: saqlash: context canceled
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.027 s; this run: 2.026 s. `saqlash` identifies saving; `context canceled` identifies the reason. This is not a compile error: there is no file or line number. It came from the `ctx.Err()` check in `saveStocks`.
+
+Fix it by naming the group context `gctx`. Use `gctx` inside group work and the outer `ctx` after `Wait`. The full stage file below behaves like the lesson folder’s `importStocks`:
+
+```go filename="_video/09-gctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(gctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Line 15 now creates new `g` and `gctx`, preserving the parameter `ctx`. Line 19 uses `checkStock(gctx, id)`; lines 30–32 use `saveStocks(ctx, stocks)`. The outer context’s own deadline or cancellation still applies.
+
+**Predict:** the outer context is active and every ID is valid. **A)** 1000 stock counts · **B)** `context canceled` again · **C)** only 10 stock counts.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Saving receives the active outer context. B would reuse the group context; C confuses the concurrency limit with total results.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-gctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.02s
+qoldiqlar: 1000
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+Video: 2.024 s; this run: 2.02 s. Result order does not depend on completion order: each function writes `stocks[i]`. The slice is read after `Wait`, which also ensures the writes have finished.
+
+## Going deeper (optional): the channel behind the limit
+
+In the v0.25.0 source, `SetLimit(n)` creates a buffered channel with capacity n. `g.Go` sends to reserve a slot; receiving when a function finishes releases it. This is a version-specific detail; the API promises a bound on active work.
+
+`SetLimit(0)` prevents adding new goroutines. Unless the limit changes, the next `g.Go` remains blocked. If no goroutine can make progress, the runtime may terminate with deadlock. In a server with other work or timers, one blocked call does not guarantee that report. A negative limit removes the bound. Do not change the limit while tasks are active.
+
+`errgroup` does not recover panics. An unrecovered panic terminates the whole program; `Wait` does not convert it into an ordinary `error`.
+
+## Common mistakes
+
+1. **Expecting a plain Group to stop everything on error.** Stage 06 still sent 1000 requests. Use `WithContext`, pass its context into work, and have that work check the signal.
+2. **Using the group context after `Wait`.** Stage 08’s `saveStocks(ctx, stocks)` produced the real error `saqlash: context canceled`. Stage 09 separates `gctx` and passes the outer `ctx` to saving.
+3. **Calling `append` on a shared slice from every goroutine.** This breaks the separate-index rule. Allocate the result length first, write only `stocks[i]`, and call `Wait` before reading.
+4. **Skipping limit validation.** Zero prevents new work; negative values remove the bound. In the task, return `errBadLimit` for `limit < 1` before calling `SetLimit`.
+5. **Reading exit code 0 as a successful import.** The lab’s `main` prints errors without calling `os.Exit(1)`. Also read the result line containing `xato` (“error”).
+
+## Check yourself
+
+**1.** Why does one goroutine per product create an unbounded import?
+
+<details>
+<summary>Answer</summary>
+
+Task starts depend on list length. Waiting may not occupy a CPU, but active requests and goroutines still require resources. The code should set the limit.
+
+</details>
+
+**2.** What is needed to cancel remaining work on the first error?
+
+<details>
+<summary>Answer</summary>
+
+`WithContext(ctx)`, `gctx` inside `g.Go`, and signal checks inside `checkStock`. `SetLimit` bounds concurrent work; it does not itself cancel anything.
+
+</details>
+
+**3. Predict:** `g.SetLimit(2)` and five valid IDs. What is the result length? **A)** 2 · **B)** 5 · **C)** depends on completion order.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The bound applies to active tasks. All five IDs are processed, and results are written in `ids` order.
+
+</details>
+
+**4. GB-7.01:** what happens to running goroutines when `main` returns?
+
+<details>
+<summary>Answer</summary>
+
+The program exits without waiting for other goroutines. The work’s owner therefore waits using `wg.Wait()` or `g.Wait()`.
+
+</details>
+
+## Homework
+
+🟢 [Lesson folder and TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup): rewrite `fetchPrices(ctx, ids, limit)` in `main.go`. This is one task with automated checks:
+
+1. At most `limit` concurrent requests: use `WithContext` and `SetLimit`.
+2. `prices[i]` is the price of `ids[i]` in tiyin (`int64`); completion order must not change the result.
+3. On the first error, return `nil` and `narx <ID>: <xato>`. Wrap with `%w` so `errors.Is(err, ErrNotFound)` works; cancel remaining work.
+4. For `limit < 1`, return `errBadLimit` without sending requests.
+
+Do not change `importStocks`, `supplier.go`, `import_test.go`, or `tekshiruv_test.go`. `checkPrice` returns a product price; the starter creates a goroutine for every ID. **Predict:** what happens to the unchanged starter’s test? **A)** passes · **B)** limit, cancellation, and zero-limit checks fail · **C)** only ordering fails.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The starter ignores the limit, has no group cancellation context, and does not validate the limit. Separate indexes preserve order, so C does not explain the failure.
+
+</details>
+
+```console
+$ go test .
+--- FAIL: TestVazifaLimit (0.01s)
+    tekshiruv_test.go:45: limit 5 edi, lekin yetkazib beruvchiga bir vaqtda 200 ta soʻrov ketdi.
+        	Har ID uchun alohida goroutine ochilyapti: errgroup'ning SetLimit(limit)'i kerak.
+--- FAIL: TestVazifaBirinchiXato (0.01s)
+    tekshiruv_test.go:74: xatodan keyin ham soʻrovlar ketaverdi: jami 200 ta (200 tadan), qolganlari bekor qilinmadi.
+        	errgroup.WithContext(ctx) bergan ctx'ni g.Go ichida checkPrice'ga bering.
+--- FAIL: TestVazifaNolLimit (0.01s)
+    tekshiruv_test.go:96: fetchPrices(…, 0): errBadLimit kutilgan, keldi <nil>
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.221s
+FAIL
+```
+
+`tekshiruv_test.go:45` identifies the file and line; `limit 5 edi` means “the limit was 5”, but 200 were observed. Line 74 checks cancellation; line 96 checks `errBadLimit`. `FAIL` means the task is unfinished. Test durations can differ.
+
+Hint: follow `importStocks`, replacing `stocks` with `prices`, `checkStock` with `checkPrice`, and `workers` with `limit`. Validate the limit first. [Answer code](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-04-worker-errgroup/solution/main.go) and explanation:
+
+<details>
+<summary>Answer and verification</summary>
+
+```go
+func fetchPrices(ctx context.Context, ids []int64, limit int) ([]int64, error) {
+	if limit < 1 {
+		return nil, errBadLimit
+	}
+	prices := make([]int64, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for i, id := range ids {
+		g.Go(func() error {
+			p, err := checkPrice(gctx, id)
+			if err != nil {
+				return fmt.Errorf("narx %d: %w", id, err)
+			}
+			prices[i] = p
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return prices, nil
+}
+```
+
+The first three lines reject invalid limits. Then come the result slice, `g` and `gctx`, the limit, and a task per ID. Only `prices[i]` is written. Errors are wrapped with `narx %d: %w`; after `Wait`, return `nil` on error or the complete slice.
+
+**Predict:** what happens to the answer’s checks? **A)** pass · **B)** 429 again · **C)** hang at zero limit.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The checks cover the bound, ordering, first error, and invalid limits. The supplier receives `gctx`; zero is rejected before `SetLimit`.
+
+</details>
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.973s
+```
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	2.024s
+(chiqish kodi: 0)
+```
+
+`ok` means the tests passed. `./solution/` checks the answer package. `-count=1` avoids cached test results; `-race` checks executed paths for races. The Docker check was also rerun.
+
+Formatting and static checks were rerun too:
+
+```console
+$ gofmt -l .
+```
+
+```console
+$ go vet ./...
+```
+
+Both commands printed nothing: no formatting differences or `vet` findings. `./...` covers packages in the current module. Check your own solution in the main folder using `go test .`.
+
+</details>
+
+## Sources
+
+- [errgroup v0.25.0: Group, Go, SetLimit, Wait, WithContext](https://pkg.go.dev/golang.org/x/sync@v0.25.0/errgroup) and [package documentation](https://pkg.go.dev/golang.org/x/sync/errgroup).
+- [errgroup.go v0.25.0 source](https://cs.opensource.google/go/x/sync/+/refs/tags/v0.25.0:errgroup/errgroup.go).
+- [Go specification: go](https://go.dev/ref/spec#Go_statements), [range](https://go.dev/ref/spec#For_range), [short declarations and parameters](https://go.dev/ref/spec#Short_variable_declarations), [select](https://go.dev/ref/spec#Select_statements), [program termination](https://go.dev/ref/spec#Program_execution).
+- [Go memory model](https://go.dev/ref/mem), [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup).
+- [Pipelines: bounded concurrency](https://go.dev/blog/pipelines#bounded-parallelism).
+- [context](https://pkg.go.dev/context), [WithTimeout](https://pkg.go.dev/context#WithTimeout), [errors.Join](https://pkg.go.dev/errors#Join), [fmt.Errorf and %w](https://pkg.go.dev/fmt#Errorf).
+- [Race detector: capabilities and requirements](https://go.dev/doc/articles/race_detector).
+- [RFC 6585 §4: 429](https://www.rfc-editor.org/rfc/rfc6585#section-4), [pgxpool connection bounds](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig), [runtime.MemStats.Sys](https://pkg.go.dev/runtime#MemStats).
+
+Results: `go1.27.4 linux/amd64`, 2026-11-28; ordinary commands use `CGO_ENABLED=0`, race commands run in Docker with `CGO_ENABLED=1`.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+---
+
+← Previous lesson: [GB-7.03](/lab/youtube/gb/gb-7-03/en) · Next lesson: [GB-7.05](/lab/youtube/gb/gb-7-05/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

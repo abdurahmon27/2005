@@ -1,0 +1,771 @@
+---
+title: "Ограниченные воркеры и errgroup"
+date: "2026/11/28"
+description: "Запрашивайте тысячу товаров по десять: пул воркеров, SetLimit, отмена при первой ошибке и выбор контекста после Wait."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-04/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-04"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-04) · **Русский** · [English](/lab/youtube/gb/gb-7-04/en)  
+Урок GB-7.04 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-04) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Импортёр bozor обновляет остатки каталога. Каждую ночь он запрашивает остатки 1000 товаров у поставщика. Последовательная обработка занимает около 20 секунд. Если создать горутину для каждого товара, учебный поставщик отклонит 990 запросов. Как ускорить импорт и ограничить число одновременных запросов?
+
+**Одна идея:** размер входного списка не должен определять число одновременных запросов. Импортом управляют выбранный вами предел и сигнал отмены.
+
+После урока вы:
+
+- проверите последствия неограниченного запуска по числу запросов, горутин и расходу памяти;
+- напишете десять воркеров, читающих один канал;
+- объедините ограничение и возврат первой ошибки через `errgroup`;
+- отмените оставшуюся работу через контекст группы и исправите ошибку выбора контекста после `Wait`.
+
+| Слово | Простой смысл | Английский термин |
+|---|---|---|
+| пул воркеров | постоянные горутины получают задания из одного канала | worker pool |
+| `errgroup.Group` | ждёт завершения функций, возвращает первую ошибку | errgroup |
+| `errgroup.WithContext` | отменяет контекст группы при ошибке или возврате `Wait` | WithContext |
+
+**Ограниченная конкурентность** — одновременно выполняется не больше N задач, включая ожидание ответов. `SetLimit` задаёт этот предел. Вспомогательная запись `errs...` передаёт элементы слайса отдельными аргументами. `golang.org/x/sync` — модуль Go вне стандартной библиотеки.
+
+## Что нужно знать заранее
+
+Основа: [GB-7.03 · select и context](/lab/youtube/gb/gb-7-03/ru), [GB-7.02 · Канал](/lab/youtube/gb/gb-7-02/ru), [GB-7.01 · Жизнь горутины](/lab/youtube/gb/gb-7-01/ru).
+
+Практическая база: [GB-6.07 · 429 и rate limit](/lab/youtube/gb/gb-6-07/ru), [GB-6.03 · Модуль golang.org/x](/lab/youtube/gb/gb-6-03/ru), [GB-5.05 · Пул pgx](/lab/youtube/gb/gb-5-05/ru), [GB-4.07 · Гонка и мьютекс](/lab/youtube/gb/gb-4-07/ru).
+
+Записи Go: [GB-2.09 · defer и panic](/lab/youtube/gb/gb-2-09/ru), [GB-2.08 · %w и errors.Join](/lab/youtube/gb/gb-2-08/ru), [GB-2.06 · Модули](/lab/youtube/gb/gb-2-06/ru), [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru), [GB-1.08 · Тест](/lab/youtube/gb/gb-1-08/ru), [GB-1.07 · Функция и error](/lab/youtube/gb/gb-1-07/ru), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/ru), [GB-1.05 · if](/lab/youtube/gb/gb-1-05/ru), [GB-1.03 · const и int64](/lab/youtube/gb/gb-1-03/ru), [GB-1.02 · Переменная](/lab/youtube/gb/gb-1-02/ru), [GB-1.01 · go run](/lab/youtube/gb/gb-1-01/ru).
+
+Выполняйте код в папке `lessons/gb-7-04-worker-errgroup`. Это самостоятельный модуль: в `go.mod` указаны `go 1.27` и `golang.org/x/sync v0.25.0`. Нужны Go, Bash и Docker для проверки гонок. Серверы не запускаются.
+
+Выберите окружение для обычных команд:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` выбирает версию Go; `CGO_ENABLED=0` позволяет сборку без C-компилятора. `_video/run.sh` копирует файл этапа, `supplier.go`, `go.mod` и `go.sum` во временную папку. Команда выполняется там. `(chiqish kodi: 0)` — строка скрипта об успешном завершении процесса; она не означает отсутствие ошибки приложения.
+
+**Вспомните:** `checkStock` учитывает контекст. Тайм-аут — 1 секунда, поставщик ждёт 3 секунды. Что получится? **A)** остаток через 3 секунды · **B)** `context deadline exceeded` примерно через секунду · **C)** немедленная ошибка.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Когда `ctx.Done()` закрывается, `select` завершает ожидание. `ctx.Err()` возвращает `context deadline exceeded`: срок истёк. A игнорирует отмену; C не учитывает ожидание срока.
+
+</details>
+
+## Последовательный импорт: точка отсчёта
+
+Здесь поставщик искусственный и работает без сети: `supplier.go`. `checkStock(ctx, id)` возвращает один остаток. ID 1 — `olma` («яблоко»), 40; ID 2 — `non` («хлеб»), 120; ID 3 — `oʻrik` («абрикос»), 5. Для остальных существующих ID остаток равен `id % 50`. Существуют только ID 1…1000.
+
+Каждый запрос ждёт около 20 мс. При более чем 10 одновременных запросах лишние получают `ErrTooMany`: `429 too many requests`. Это ограничение одновременной работы в лаборатории; оно отличается от ограничения частоты запросов за единицу времени. Настоящий HTTP-ответ не отправляется. `catalogIDs(n)` создаёт слайс ID 1…n; `saveStocks` только проверяет контекст. Запись в Postgres появится в GB-7.07.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	for i, id := range ids {
+		n, err := checkStock(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("mahsulot %d: %w", id, err)
+		}
+		stocks[i] = n
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+| Строка | Код | Что делает |
+|---|---|---|
+| 1 | `package main` | исполняемый пакет |
+| 3–7 | `import` | пакеты контекста, форматирования и времени |
+| 9 | `importStocks` | принимает `ctx` и `[]int64`; возвращает `[]int` и `error` |
+| 10 | `stocks := make(...)` | по одной ячейке результата на ID |
+| 11–12 | `range`, `checkStock` | индекс `i`, ID `id`; следующий вызов после предыдущего |
+| 13–15 | `if`, `fmt.Errorf` | при ошибке `nil`; `%d` — ID, `%w` оборачивает причину |
+| 16–19 | `stocks[i] = n`, `return` | записывает остаток; после цикла — слайс и `nil` |
+| 21–25 | `main`, `time.Now`, `report` | запоминает время, запускает импорт с исходным контекстом, печатает результат |
+
+`[]` обозначает тип слайса; `len(ids)` — его длина. `:=` создаёт новую переменную, `=` присваивает значение существующему месту. Круглые скобки выделяют вызов и параметры, `{}` — тело функции или цикла.
+
+**Прогноз:** сколько займёт 1000 × 20 мс последовательно? **A)** 20 мс · **B)** около 20 с · **C)** около 2 с.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Каждый вызов ждёт предыдущего. A — время одного запроса; для C нужны десять одновременно выполняющихся запросов.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+soʻrov: 1000 · bir vaqtda: 1 · rad: 0 · vaqt: 20.106s
+qoldiqlar: 1000
+goroutine: 1 · xotira: 7 MB
+(chiqish kodi: 0)
+```
+
+Весь консольный вывод повторно получен 2026-11-28; заимствованных результатов нет. В видео последовательный запуск занял 20.218 с, здесь — 20.106 с.
+
+`soʻrov` — число вызовов, посчитанных поставщиком; `bir vaqtda` — максимум активных запросов; `rad` — число отказов. `vaqt` — длительность импорта. `qoldiqlar` — длина результата; `goroutine` — максимальное число горутин, замеченное при начале запросов. Это не непрерывное наблюдение.
+
+`xotira` — `runtime.MemStats.Sys`: вся память, полученная runtime от ОС, а не размер живых объектов. Код вычисляет `Sys >> 20`, но пишет `MB`: фактически единица — MiB. 1 MiB = 1 048 576 байт.
+
+## Горутина на каждый ID: предела нет
+
+```go filename="_video/02-cheksiz/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Go(func() {
+			stocks[i], errs[i] = checkStock(ctx, id)
+		})
+	}
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Строки 11–12 создают отдельные слайсы для остатков и ошибок. Строка 13 создаёт `WaitGroup`; 14–18 запускают `wg.Go` для каждого ID. Строка 16 пишет только по своему индексу `i`. Здесь нет `append`. Строка 19 ждёт всех; 20 собирает ненулевые ошибки через `errors.Join(errs...)`. Новые импорты — `errors` и `sync`; `main` прежний.
+
+**Прогноз:** 1000 горутин, поставщик принимает не больше 10 одновременно. Что ожидается в этом быстро запущенном опыте? **A)** 0 отказов, автоматическая очередь · **B)** 12 отказов, по числу CPU · **C)** 990 отказов.
+
+<details>
+<summary>Ответ</summary>
+
+**C**, в этом опыте. `go` не заставляет вызывающий код ждать завершения работы. Число CPU не ограничивает запросы, ожидающие ответа. Язык не гарантирует немедленный одновременный запуск всех горутин; 990 — результат этого запуска.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-cheksiz go run .
+soʻrov: 1000 · bir vaqtda: 1000 · rad: 990 · vaqt: 22ms
+xato: 429 too many requests (va yana 989 ta)
+goroutine: 1001 · xotira: 16 MB
+(chiqish kodi: 0)
+```
+
+`too many requests` означает «слишком много запросов». `va yana 989 ta` — `report` посчитал остальные строки составной ошибки. В видео: 30 мс и 12 MiB; здесь: 22 мс и 16 MiB. Быстрое завершение не означает успех: отклонены 990 запросов.
+
+Для 100 000 ID меняется только аргумент в `main`. Остальные строки `_video/03-xotira/main.go` совпадают со вторым вариантом:
+
+```go
+	stocks, err := importStocks(context.Background(), catalogIDs(100_000))
+```
+
+**Прогноз:** как большой список повлияет на горутины и память? **A)** без изменений · **B)** могут вырасти · **C)** запросы автоматически пойдут по десять.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Цикл запускает работу по размеру входа. Для A и C код не задаёт нужного предела. Запуск и завершение перекрываются, поэтому числа меняются.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-xotira go run .
+soʻrov: 100000 · bir vaqtda: 31123 · rad: 99990 · vaqt: 188ms
+xato: 429 too many requests (va yana 99989 ta)
+goroutine: 39955 · xotira: 167 MB
+(chiqish kodi: 0)
+```
+
+В видео: 23 580 активных запросов, 25 151 горутина, 123 MiB и 249 мс. Здесь: 31 123, 39 955, 167 MiB и 188 мс. Это не гарантированные пределы. Ограничения поставщика, соединений пула Postgres и памяти требуют предела на стороне вызывающего кода.
+
+## Один канал jobs, десять воркеров
+
+Создадим **пул воркеров**. `main` отправляет индексы заданий; десять постоянных горутин получают их.
+
+| Состояние | main / jobs | Воркеры и запросы |
+|---|---|---|
+| начало | небуферизованный `jobs`, заданий нет | 10 воркеров ждут получения |
+| 10 заняты | следующий `jobs <- i` ждёт | не более 10 запросов |
+| один завершил | индекс получает свободный воркер | он начинает следующий запрос |
+| отправка завершена | `close(jobs)`, затем `wg.Wait()` | range завершается, ждём всех |
+
+```go filename="_video/04-worker/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	errs := make([]error, len(ids))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				stocks[i], errs[i] = checkStock(ctx, ids[i])
+			}
+		})
+	}
+	for i := range ids {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return stocks, errors.Join(errs...)
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Строка 10 задаёт `workers = 10`. Строка 15 создаёт небуферизованный `chan int`: передаём индекс, а не ID. Строки 17–23 запускают десять `wg.Go`. Строки 19–21 получают индексы до закрытия канала и пишут только в соответствующую ячейку результата.
+
+Строки 24–26 отправляют каждый индекс через `jobs <- i`. Если свободного воркера нет, отправитель ждёт. Строка 27 закрывает канал; `for i := range jobs` завершается. Строка 28 ждёт всех воркеров. Строка 29 собирает ошибки.
+
+**Прогноз:** 1000 товаров, 10 воркеров, 20 мс на запрос. Примерное время? **A)** 20 мс · **B)** 2 с · **C)** 20 с.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** 1000 / 10 × 20 мс = 2 с. A достаточно для одной десятки товаров; C соответствует последовательному варианту. На практике есть расходы планирования и другая работа.
+
+</details>
+
+```console
+$ ./_video/race.sh 04-worker go run -race .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.023s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+Эта команда с `-race` повторно выполнена в Docker. Локально нет `gcc`; `race.sh` использует образ с C-компилятором и toolchain Go 1.27.4. Отчёта о гонке нет: на выполненных путях гонка не обнаружена. Это не доказательство для всех возможных выполнений.
+
+В видео: 2.024 с; здесь: 2.023 с. Отношение 20.106 / 2.023 ≈ 9.9. Важно примерно десятикратное ускорение, 0 отказов и не больше 10 активных запросов. Ошибки пока собираются в конце; первая ошибка не останавливает последующую работу.
+
+## errgroup: предел и первая ошибка
+
+Мы вручную управляли каналом, циклом воркеров и слайсом ошибок. **errgroup** объединяет ожидание функций и возврат ошибки. Это пакет модуля `golang.org/x/sync`.
+
+В папке урока зависимость уже указана. Следующая команда повторно выполнена в отдельном временном модуле, где её ещё не было:
+
+```console
+$ go get golang.org/x/sync/errgroup
+go: added golang.org/x/sync v0.25.0
+```
+
+`go: added` означает добавление модуля в `go.mod`; `go.sum` хранит контрольные суммы. В видео была ещё строка `go: downloading`; сейчас используется кэш модулей, поэтому её нет.
+
+```go filename="_video/05-errgroup/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	var g errgroup.Group
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Строка 8 импортирует пакет. Строка 15 создаёт нулевой `Group`: он готов к работе, но сам не задаёт предел и не отменяет работу при ошибке. Строка 16 ограничивает активную работу через `SetLimit(workers)`.
+
+Строка 18 передаёт `g.Go` функцию `func() error`. Когда предел занят, ждёт именно вызывающий `g.Go` код. Здесь нет десяти постоянных воркеров: для каждой задачи запускается горутина, но число активных задач ограничено. Строки 19–25 получают остаток, оборачивают ошибку с ID либо записывают `stocks[i]` и возвращают `nil`.
+
+Строки 27–29 ждут завершения всех запущенных функций и возвращают первую ненулевую ошибку. «Первая» означает первую зарегистрированную ошибку, а не первый ID в списке. Строка 30 возвращает только успешный результат.
+
+| Состояние | Вызывающий `g.Go` код | Результат |
+|---|---|---|
+| 0 активных | запускает первую задачу | 1 активная |
+| 10 активных | ждёт добавления 11-й задачи | предел соблюдён |
+| одна завершилась | освободилось место, запускается следующая | не более 10 активных |
+| цикл закончился | `g.Wait()` | все завершаются, первая ошибка либо `nil` |
+
+**Прогноз:** что будет с 1000 правильных ID? **A)** снова 990 отказов · **B)** около 2 с, не больше 10 активных · **C)** только 10 результатов.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `SetLimit` ограничивает одновременную работу, а не общее число задач. A игнорирует предел, C принимает его за число результатов.
+
+</details>
+
+```console
+$ ./_video/run.sh 05-errgroup go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.024s
+qoldiqlar: 1000
+goroutine: 11 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+В видео: 2.034 с, 12 горутин; здесь: 2.024 с, 11. В v0.25.0 завершающаяся горутина может освободить место до полного выхода. Общий счёт включает и `main`. `SetLimit(10)` не ограничивает суммарное число горутин всего процесса.
+
+Активная работа ограничена, но слайсы `ids` и `stocks` всё ещё занимают память пропорционально длине списка. Это не обещание постоянной памяти для всего импорта.
+
+## WithContext: работа после ошибки
+
+Сначала проверим обычный `Group`. `_video/06-xato/main.go` отличается от предыдущего файла только функцией `main`:
+
+```go
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+`ids[499]` — 500-й элемент списка; ID 9999 у поставщика нет. **Прогноз:** сколько всего запросов? **A)** 1000 · **B)** около 510 · **C)** 500.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Обычный `Group` запоминает ошибку, но не отменяет остальную работу. `Wait` всё равно ждёт всех. B и C предполагают наличие отмены.
+
+</details>
+
+```console
+$ ./_video/run.sh 06-xato go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.016s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 8 MB
+(chiqish kodi: 0)
+```
+
+В видео: 2.043 с; здесь: 2.016 с. `mahsulot topilmadi` означает «товар не найден». Теперь `WithContext` вернёт группу и связанный с ней контекст:
+
+```go filename="_video/07-withctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(ctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	ids := catalogIDs(1000)
+	ids[499] = 9999
+	stocks, err := importStocks(context.Background(), ids)
+	report(stocks, err, start)
+}
+```
+
+Строка 15: `g, ctx := errgroup.WithContext(ctx)`. В теле функции `ctx` находится в том же блоке, что и параметр. `:=` создаёт только `g`, а существующему `ctx` присваивает новый контекст. Строка 19 теперь передаёт контекст группы. Первая ненулевая ошибка отменяет этот контекст.
+
+Поставщик реагирует в двух местах: проверяет `ctx.Err()` при входе и наблюдает `ctx.Done()` через `select` во время ожидания. Отмена не уничтожает горутину принудительно. Если готовы обе ветви `select`, выбор ветви отмены не гарантирован.
+
+**Промежуточный вопрос:** ошибка товара 9999 вызвала отмену; другие функции вернули `context canceled`. Что вернёт `Wait`? **A)** первую ошибку о 9999 · **B)** `context canceled` · **C)** все ошибки через `errors.Join`.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Группа сохраняет первую ошибку. Поздние ошибки отмены не заменяют её и не добавляются к ней. Перед возвратом `Wait` ждёт все запущенные функции.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-withctx go run .
+soʻrov: 509 · bir vaqtda: 10 · rad: 0 · vaqt: 1.005s
+xato: mahsulot 9999: mahsulot topilmadi
+goroutine: 12 · xotira: 13 MB
+(chiqish kodi: 0)
+```
+
+В видео: 509 запросов, 1.026 с; здесь: 509 и 1.005 с. Отношение к обычной группе: 2.016 / 1.005 ≈ 2. Ошибка находится посередине списка, поэтому в этом опыте время почти вдвое меньше. 509 — не гарантия API; число зависит от планирования.
+
+Цикл по-прежнему вызывает все `g.Go`. Начавшийся после отмены `checkStock` обычно выходит при начальной проверке, не увеличивая счётчик поставщика. Уже работающие вызовы реагируют на сигнал. Заблокированный на пределе `g.Go` сам не возвращается автоматически из-за отмены контекста: он ждёт освобождения места.
+
+| Событие | Контекст группы | Работа |
+|---|---|---|
+| до ошибки | активен | не более 10 запросов |
+| первая ошибка | отменяется | работающие видят сигнал |
+| остаток цикла | отменён | новые функции вызываются, проверка быстро возвращает |
+| `Wait` | отменён | после всех функций — первая ошибка |
+
+## Какой контекст после Wait?
+
+Теперь ошибочного ID нет. После импорта сохраняем остатки через `saveStocks`. `g, ctx :=` заменил контекст параметра. Добавленный фрагмент `_video/08-wait-ctx/main.go`:
+
+```go
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+```
+
+Правило: контекст от `WithContext` отменяется при первой ошибке **или при возврате `Wait`**. Успешное завершение тоже отменяет его.
+
+**Прогноз:** что получится с 1000 правильных ID? **A)** 1000 остатков, без ошибки · **B)** `saqlash: context canceled` · **C)** товар не найден.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `Wait` завершился успешно, но следующий `saveStocks` получил отменённый контекст группы. A неверно предполагает его срок жизни; для C нет ошибочного ID.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-wait-ctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.026s
+xato: saqlash: context canceled
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+В видео: 2.027 с; здесь: 2.026 с. `saqlash` — этап сохранения; `context canceled` — контекст отменён. Это не ошибка компиляции: имени файла и номера строки нет. Ошибка пришла из проверки `ctx.Err()` в `saveStocks`.
+
+Исправление: дайте контексту группы отдельное имя `gctx`. Внутри группы используйте `gctx`; после `Wait` — внешний `ctx`. Полный код этапа ниже работает так же, как `importStocks` в папке урока:
+
+```go filename="_video/09-gctx/main.go" showLineNumbers
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+const workers = 10
+
+func importStocks(ctx context.Context, ids []int64) ([]int, error) {
+	stocks := make([]int, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, id := range ids {
+		g.Go(func() error {
+			n, err := checkStock(gctx, id)
+			if err != nil {
+				return fmt.Errorf("mahsulot %d: %w", id, err)
+			}
+			stocks[i] = n
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := saveStocks(ctx, stocks); err != nil {
+		return nil, err
+	}
+	return stocks, nil
+}
+
+func main() {
+	start := time.Now()
+	stocks, err := importStocks(context.Background(), catalogIDs(1000))
+	report(stocks, err, start)
+}
+```
+
+Строка 15 теперь создаёт новые `g` и `gctx`, сохраняя параметр `ctx`. Строка 19 — `checkStock(gctx, id)`; строки 30–32 — `saveStocks(ctx, stocks)`. Собственный срок или отмена внешнего контекста продолжают действовать.
+
+**Прогноз:** внешний контекст активен, все ID правильные. **A)** 1000 остатков · **B)** снова `context canceled` · **C)** только 10 остатков.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Сохранение получает активный внешний контекст. B возникнет при повторном использовании контекста группы; C путает предел с общим числом результатов.
+
+</details>
+
+```console
+$ ./_video/run.sh 09-gctx go run .
+soʻrov: 1000 · bir vaqtda: 10 · rad: 0 · vaqt: 2.02s
+qoldiqlar: 1000
+goroutine: 12 · xotira: 12 MB
+(chiqish kodi: 0)
+```
+
+В видео: 2.024 с; здесь: 2.02 с. Порядок остатков не зависит от порядка завершения: каждая функция пишет в `stocks[i]`. Слайс читается после `Wait`; ожидание также обеспечивает завершение записей.
+
+## Глубже (необязательно): канал внутри предела
+
+В исходнике v0.25.0 `SetLimit(n)` создаёт буферизованный канал ёмкостью n. `g.Go` отправляет в него значение, занимая место; при завершении функции получение освобождает место. Это деталь версии; обещание API — предел активной работы.
+
+`SetLimit(0)` запрещает добавлять новые горутины. Без изменения предела следующий `g.Go` остаётся ждать. Если ни одна горутина не может продвинуться, runtime может завершить программу с deadlock. В сервере с другой работой или таймерами такое сообщение для одного зависшего вызова не гарантировано. Отрицательный предел убирает ограничение. Не меняйте предел при наличии активных задач.
+
+`errgroup` не перехватывает panic. Неперехваченный panic завершает всю программу; `Wait` не превращает его в обычный `error`.
+
+## Частые ошибки
+
+1. **Ожидать, что обычный Group всё остановит при ошибке.** В этапе 06 отправились 1000 запросов. Исправление — `WithContext`, его контекст внутри работы и функция, проверяющая сигнал.
+2. **Использовать контекст группы после `Wait`.** В этапе 08 `saveStocks(ctx, stocks)` дал настоящую ошибку `saqlash: context canceled`. В этапе 09 `gctx` отделён, сохранение получает внешний `ctx`.
+3. **Вызывать `append` в общий слайс из всех горутин.** Это нарушает правило отдельных индексов. Заранее выделите результат, пишите только в `stocks[i]`; перед чтением вызовите `Wait`.
+4. **Не проверять предел.** Ноль запрещает запуск новой работы; отрицательное число убирает ограничение. В задании при `limit < 1` верните `errBadLimit` до `SetLimit`.
+5. **Считать код выхода 0 успешным импортом.** Учебный `main` печатает ошибку, но не вызывает `os.Exit(1)`. Читайте и строку результата с `xato` («ошибка»).
+
+## Проверьте себя
+
+**1.** Почему горутина на каждый товар приводит к неограниченному импорту?
+
+<details>
+<summary>Ответ</summary>
+
+Число запусков зависит от длины списка. Ожидание ответа может не занимать CPU, но активные запросы и горутины требуют ресурсов. Предел должен задавать код.
+
+</details>
+
+**2.** Что нужно для отмены остальной работы при первой ошибке?
+
+<details>
+<summary>Ответ</summary>
+
+`WithContext(ctx)`, `gctx` внутри `g.Go` и проверка сигнала в `checkStock`. `SetLimit` задаёт предел одновременной работы; сам он ничего не отменяет.
+
+</details>
+
+**3. Прогноз:** `g.SetLimit(2)` и пять правильных ID. Какова длина результата? **A)** 2 · **B)** 5 · **C)** зависит от порядка завершения.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Предел относится к активным задачам. Обрабатываются все пять ID, результат записывается в порядке `ids`.
+
+</details>
+
+**4. GB-7.01:** что происходит с работающими горутинами при завершении `main`?
+
+<details>
+<summary>Ответ</summary>
+
+Программа завершается, не дожидаясь других горутин. Поэтому владелец работы ждёт через `wg.Wait()` или `g.Wait()`.
+
+</details>
+
+## Домашнее задание
+
+🟢 [Папка урока и TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup): перепишите `fetchPrices(ctx, ids, limit)` в `main.go`. Это одно задание с автоматическими проверками:
+
+1. Не больше `limit` одновременных запросов: используйте `WithContext` и `SetLimit`.
+2. `prices[i]` — цена `ids[i]` в тийинах (`int64`); порядок завершения не меняет результат.
+3. При первой ошибке верните `nil` и `narx <ID>: <xato>`. Оборачивайте через `%w`, чтобы работал `errors.Is(err, ErrNotFound)`; отменяйте остальную работу.
+4. При `limit < 1` верните `errBadLimit`, не отправляя запросов.
+
+Не меняйте `importStocks`, `supplier.go`, `import_test.go` и `tekshiruv_test.go`. `checkPrice` возвращает цену товара; стартер создаёт горутину на каждый ID. **Прогноз:** что с тестом неизменённого стартера? **A)** пройдёт · **B)** упадут проверки предела, отмены и нулевого предела · **C)** упадёт только порядок.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Стартер не использует предел, не связывает контекст с группой и не проверяет неверный предел. Отдельные индексы сохраняют порядок, поэтому C не объясняет ошибку.
+
+</details>
+
+```console
+$ go test .
+--- FAIL: TestVazifaLimit (0.01s)
+    tekshiruv_test.go:45: limit 5 edi, lekin yetkazib beruvchiga bir vaqtda 200 ta soʻrov ketdi.
+        	Har ID uchun alohida goroutine ochilyapti: errgroup'ning SetLimit(limit)'i kerak.
+--- FAIL: TestVazifaBirinchiXato (0.01s)
+    tekshiruv_test.go:74: xatodan keyin ham soʻrovlar ketaverdi: jami 200 ta (200 tadan), qolganlari bekor qilinmadi.
+        	errgroup.WithContext(ctx) bergan ctx'ni g.Go ichida checkPrice'ga bering.
+--- FAIL: TestVazifaNolLimit (0.01s)
+    tekshiruv_test.go:96: fetchPrices(…, 0): errBadLimit kutilgan, keldi <nil>
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.221s
+FAIL
+```
+
+`tekshiruv_test.go:45` — файл и строка; `limit 5 edi` означает «предел был 5», а наблюдалось 200. Строка 74 проверяет отмену, 96 — `errBadLimit`. `FAIL` означает, что задание не завершено. Время тестов может отличаться.
+
+Подсказка: возьмите схему `importStocks`, заменив `stocks` на `prices`, `checkStock` на `checkPrice`, `workers` на `limit`. Проверяйте предел в самом начале. [Код ответа](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-04-worker-errgroup/solution/main.go) и пояснение:
+
+<details>
+<summary>Ответ и проверка</summary>
+
+```go
+func fetchPrices(ctx context.Context, ids []int64, limit int) ([]int64, error) {
+	if limit < 1 {
+		return nil, errBadLimit
+	}
+	prices := make([]int64, len(ids))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for i, id := range ids {
+		g.Go(func() error {
+			p, err := checkPrice(gctx, id)
+			if err != nil {
+				return fmt.Errorf("narx %d: %w", id, err)
+			}
+			prices[i] = p
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return prices, nil
+}
+```
+
+Первые три строки отвергают неверный предел. Затем создаются слайс результата, `g` и `gctx`, задаётся предел и запускается работа для ID. Записывается только `prices[i]`. Ошибка оборачивается через `narx %d: %w`; после `Wait` возвращается `nil` при ошибке либо полный слайс.
+
+**Прогноз:** проверки ответа? **A)** пройдут · **B)** снова 429 · **C)** зависнут на нулевом пределе.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** Проверяются предел, порядок, первая ошибка и неверный предел. Поставщик получает `gctx`; нулевой предел отвергается до `SetLimit`.
+
+</details>
+
+```console
+$ go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.973s
+```
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	2.024s
+(chiqish kodi: 0)
+```
+
+`ok` означает, что тесты прошли. `./solution/` проверяет пакет ответа. `-count=1` отключает кэш результатов тестов; `-race` ищет гонки на выполненных путях. Проверка Docker тоже повторно выполнена.
+
+Форматирование и статическая проверка также повторены:
+
+```console
+$ gofmt -l .
+```
+
+```console
+$ go vet ./...
+```
+
+Обе команды ничего не напечатали: расхождений форматирования и замечаний `vet` нет. `./...` охватывает пакеты текущего модуля. Своё решение проверяйте в основной папке через `go test .`.
+
+</details>
+
+## Источники
+
+- [errgroup v0.25.0: Group, Go, SetLimit, Wait, WithContext](https://pkg.go.dev/golang.org/x/sync@v0.25.0/errgroup) и [документация пакета](https://pkg.go.dev/golang.org/x/sync/errgroup).
+- [Исходник errgroup.go v0.25.0](https://cs.opensource.google/go/x/sync/+/refs/tags/v0.25.0:errgroup/errgroup.go).
+- [Спецификация Go: go](https://go.dev/ref/spec#Go_statements), [range](https://go.dev/ref/spec#For_range), [краткое объявление и параметр](https://go.dev/ref/spec#Short_variable_declarations), [select](https://go.dev/ref/spec#Select_statements), [завершение программы](https://go.dev/ref/spec#Program_execution).
+- [Модель памяти Go](https://go.dev/ref/mem), [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup).
+- [Pipelines: ограниченная конкурентность](https://go.dev/blog/pipelines#bounded-parallelism).
+- [context](https://pkg.go.dev/context), [WithTimeout](https://pkg.go.dev/context#WithTimeout), [errors.Join](https://pkg.go.dev/errors#Join), [fmt.Errorf и %w](https://pkg.go.dev/fmt#Errorf).
+- [Детектор гонок: возможности и требования](https://go.dev/doc/articles/race_detector).
+- [RFC 6585 §4: 429](https://www.rfc-editor.org/rfc/rfc6585#section-4), [предел соединений pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig), [runtime.MemStats.Sys](https://pkg.go.dev/runtime#MemStats).
+
+Результаты: `go1.27.4 linux/amd64`, 2026-11-28; обычные команды с `CGO_ENABLED=0`, команды race в Docker с `CGO_ENABLED=1`.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-04-worker-errgroup)
+
+---
+
+← Предыдущий урок: [GB-7.03](/lab/youtube/gb/gb-7-03/ru) · Следующий урок: [GB-7.05](/lab/youtube/gb/gb-7-05/ru) → · [Все уроки](/lab/youtube/gb)
+
+</div>

@@ -1,0 +1,792 @@
+---
+title: "Конфигурация и секреты: понятная ошибка при неверной настройке"
+date: "2026/11/28"
+description: "Читайте конфигурацию Go API из окружения и флагов, проверяйте при запуске и не раскрывайте пароль в логах и git."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 1
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/ru"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-8-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-8-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-8-01"
+---
+
+<div lang="ru">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-8-01) · **Русский** · [English](/lab/youtube/gb/gb-8-01/en)  
+Урок GB-8.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-8-01) · ▶️ видео скоро · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config)
+
+> Это полная письменная версия видеоурока: по ней можно учиться, не смотря (и не слушая) видео. Само видео на узбекском языке.
+
+## Что вы узнаете
+
+Порт `8765` API bozor занят на сервере. Почему ради другого порта приходится заново собирать код?
+Кто увидит пароль Postgres, если он попадёт в лог при запуске?
+
+**Одна идея:** конфигурация приходит в процесс извне и проверяется в одном месте при запуске.
+Если порт неверен или адрес базы отсутствует, API возвращает обе ошибки до подключения к базе и открытия HTTP-порта.
+В лог и git попадают только значения, которые можно раскрывать.
+
+После урока вы:
+
+- реализуете приоритет `флаг > окружение > значение по умолчанию`, различите отсутствие и пустое значение;
+- поставите проверку перед внешними ресурсами через `loadConfig` и `run`;
+- воспроизведёте утечку пароля через `%+v` и зададите явное представление для лога;
+- оставите `.env` вне git и добавите `HOST` до прохождения тестов.
+
+| Термин | Простой смысл | Английский термин |
+|---|---|---|
+| конфигурация | порт, адрес базы и другие входные значения, меняющиеся между развёртываниями | configuration |
+| проверка при запуске | проверка значений до начала работы сервиса | startup validation |
+| секрет | пароль или ключ, который нельзя раскрывать; в коде помечен `secret` | secret |
+
+## Что нужно знать заранее
+
+- [GB-7.07 · Контрольная точка импортера](/lab/youtube/gb/gb-7-07/ru) — предыдущий урок по порядку курса.
+- [GB-6.08 · Защищённый bozor](/lab/youtube/gb/gb-6-08/ru) — сегодняшний API начинается с копии его `solution/`.
+- [GB-5.10 · API заказов](/lab/youtube/gb/gb-5-10/ru) и [GB-5.05 · pgx pool](/lab/youtube/gb/gb-5-05/ru) — `main → run`, `defer`, context, пул соединений и `Ping`.
+- [GB-5.02 · Postgres и Compose](/lab/youtube/gb/gb-5-02/ru) и [GB-5.06 · Миграции](/lab/youtube/gb/gb-5-06/ru) — локальная база, volume и команды миграции из комментария `main.go`.
+- [GB-2.08 · Ошибки](/lab/youtube/gb/gb-2-08/ru) и [GB-2.07 · Интерфейс и Stringer](/lab/youtube/gb/gb-2-07/ru) — `errors.Join`, `errors.Is`, `String()`.
+- [GB-2.06 · Пакеты](/lab/youtube/gb/gb-2-06/ru), [GB-2.04 · Указатель](/lab/youtube/gb/gb-2-04/ru), [GB-2.03 · Структура](/lab/youtube/gb/gb-2-03/ru) — поля с маленькой буквы, `*p`, метод и `%+v`.
+- [GB-2.02 · Comma-ok](/lab/youtube/gb/gb-2-02/ru) и [GB-2.01 · Слайс](/lab/youtube/gb/gb-2-01/ru) — `v, ok`, `append`, `len`, `[1:]`.
+- [GB-1.07 · Аргументы и ошибка](/lab/youtube/gb/gb-1-07/ru), [GB-1.05 · Условия](/lab/youtube/gb/gb-1-05/ru), [GB-1.04 · Форматирование](/lab/youtube/gb/gb-1-04/ru), [GB-1.02 · Значение и тип](/lab/youtube/gb/gb-1-02/ru), [GB-1.01 · Build](/lab/youtube/gb/gb-1-01/ru) — основные конструкции следующего кода.
+- [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/ru) — исключение полей с маленькой буквы из JSON.
+- [GB-7.04 · Ограниченная конкурентность](/lab/youtube/gb/gb-7-04/ru) — вопрос о `SetLimit` в конце.
+
+Код работает в папке `lessons/gb-8-01-config` с собственным `go.mod`. Команды выполняются из корня этой папки.
+Это локальная лаборатория Linux: нужны Go 1.27.4, Docker Compose и свободные порты `5581`, `8781`.
+Config-тестам Postgres не нужен. Полным тестам API он нужен.
+
+Мы повторили результаты в новой сессии Bash. Команды подготовки окружения ничего не вывели:
+
+```console
+$ export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+$ unset PORT DATABASE_URL HOST
+$ go version
+go version go1.27.4 linux/amd64
+```
+
+`CGO_ENABLED=0` позволяет собрать лабораторию без C-компилятора.
+Сначала GB-6.08: какой статус получит Дилноза, запросив заказ Жасура №42?
+
+**A)** `401` · **B)** `403` · **C)** `404`
+
+<details>
+<summary>Ответ</summary>
+
+**C: `404`.** SQL проверяет и владельца заказа. Чужой и отсутствующий заказ дают одинаковый ответ.
+
+</details>
+
+## Конфигурация вне кода
+
+**Deploy в Twelve-Factor** — работающий экземпляр приложения в определённом окружении: локальном, тестовом или production, где работают настоящие пользователи.
+Это определение дано в [разделе Codebase](https://12factor.net/codebase).
+[Twelve-Factor](https://12factor.net/config) определяет конфигурацию как значения, меняющиеся между развёртываниями.
+Изменение порта не меняет код. После замены пароля работает тот же binary.
+
+Пароль базы передаётся через переменную окружения. **Флаг** — именованный параметр командной строки, например `-port 8781`.
+Флаги в этом уроке добавлены для удобства; рекомендация Twelve-Factor — хранить конфигурацию в окружении.
+
+| Вход | Флаг | По умолчанию | Проверка |
+|---|---|---|---|
+| `PORT` | `-port` | `8765` | целое число от 1 до 65535 |
+| `DATABASE_URL` | нет | нет | непустое; формат и подключение позже проверяет pgx |
+
+Этот API намеренно отвергает порт 0. Это выбранное правило, а не общее правило обо всех портах TCP.
+Секрет — пароль в строке подключения к базе. У сессий bozor нет дополнительного ключа подписи; мы его не придумываем.
+Даже открытый код не должен раскрывать настоящие учётные данные.
+
+## Окружение, флаг и приоритет
+
+В `cmd/api/config.go` два поля. Маленькая буква оставляет их внутри пакета `main`, но не скрывает от лога.
+Ниже фрагменты этого файла. Полный файл появится после исправления вывода секрета.
+
+```go
+type config struct {
+	port        int
+	databaseURL string // secret: ichida parol bor
+}
+
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+```
+
+`key` — имя в окружении, `def` — значение по умолчанию. `LookupEnv` возвращает значение и признак наличия `ok`.
+`:=` внутри `if` получает два результата; `; ok` проверяет признак. `Getenv` не позволяет различить эти случаи.
+
+| Состояние `PORT` | `v` | `ok` | `envOr("PORT", "8765")` |
+|---|---|---|---|
+| отсутствует | `""` | `false` | `"8765"` |
+| `PORT=` | `""` | `true` | `""` |
+| `PORT=9090` | `"9090"` | `true` | `"9090"` |
+
+```go
+func loadConfig(args []string) (config, error) {
+	fs := flag.NewFlagSet("api", flag.ContinueOnError)
+	port := fs.String("port", envOr("PORT", "8765"), "HTTP port (muhitda: PORT)")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+```
+
+`args []string` — аргументы без имени программы. `NewFlagSet` при каждом вызове создаёт отдельный набор с именем `api`.
+С `ContinueOnError` метод `Parse` возвращает ошибку, а не завершает процесс. Поэтому функцию можно вызывать из теста.
+`fs.String` принимает имя, значение по умолчанию и справочный текст. Результат — `*string`, указатель на строку.
+Сначала там окружение или значение по умолчанию. `Parse` заменяет его значением переданного `-port`.
+`config{}` — пустая структура, возвращаемая с ошибкой. Не используйте её как успешную конфигурацию.
+
+| Шаг | `PORT=9090`, аргумент `-port 8781` | Только `PORT=9090` | Оба отсутствуют |
+|---|---|---|---|
+| `*port` после `fs.String` | `"9090"` | `"9090"` | `"8765"` |
+| `*port` после `fs.Parse` | `"8781"` | `"9090"` | `"8765"` |
+
+Для `DATABASE_URL` флаг не регистрируется: секрету не место в командной строке.
+
+## Проверка перед ресурсами
+
+```go
+	var errs []error
+	n, err := strconv.Atoi(*port)
+	if err != nil || n < 1 || n > 65535 {
+		errs = append(errs, fmt.Errorf("port %q: 1–65535 oraligʻidagi butun son kerak", *port))
+	}
+	db := os.Getenv("DATABASE_URL")
+	if db == "" {
+		errs = append(errs, errors.New("DATABASE_URL qoʻyilmagan: .env.example'ga qarang"))
+	}
+	if len(errs) > 0 {
+		return config{}, errors.Join(errs...)
+	}
+	return config{port: n, databaseURL: db}, nil
+}
+```
+
+`errs` — слайс ошибок. `Atoi(*port)` превращает строку за указателем в целое число.
+`||` добавляет ошибку при истинности хотя бы одного условия. Результат `append` записывается обратно в `errs`.
+`%q` добавляет кавычки: пустой порт виден как `""`. В ошибке базы есть только имя, без значения.
+Если `len(errs)` положителен, `errs...` передаёт элементы в `Join` как отдельные аргументы.
+`Join` возвращает одно значение ошибки и соединяет сообщения переводами строк. Без проблем возвращаются `config` с именованными полями и `nil`.
+
+Далее полный `main.go` из курса. Его строка `Printf` в текущем файле использует `String()`.
+В следующем разделе мы воспроизведём стадию без этого метода в отдельной копии.
+
+```go filename="cmd/api/main.go" showLineNumbers
+// api — bozor API'si (GB-6.08'dagi himoyalangan bozor), endi sozlamasi tashqaridan (GB-8.01, config.go):
+// port flag yoki muhitdan, DATABASE_URL faqat muhitdan; notoʻgʻri sozlamada server aniq xato bilan toʻxtaydi.
+//
+//	docker compose up -d --wait
+//	goose up                     (GOOSE_DRIVER, GOOSE_DBSTRING, GOOSE_MIGRATION_DIR: GB-5.06)
+//	docker compose exec db psql -f /lab/seed.sql
+//	cp .env.example .env         (bir marta; .env gitga tushmaydi)
+//	set -a; . ./.env; set +a     (.env'dagi qatorlarni muhitga eksport qiladi)
+//	go build ./cmd/api && ./api  → config: port=8765 db=localhost:5581/bozor
+//	./api -h                     → flag'lar roʻyxati
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/abdurahmon27/bozor/internal/store"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// newServer — bozor API serveri (GB-4.04). Handler — newHandler: middleware zanjiri, ichida newMux (GB-6.01).
+func newServer(addr string, st *store.Store) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           newHandler(st),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func main() {
+	err := run(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		return // -h: flag yordam matnini chiqardi, bu xato emas
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "xato:", err)
+		os.Exit(1)
+	}
+}
+
+// run — dasturning hammasi shu yerda (GB-5.10): xato qaytaradi, defer'lar ishlaydi, chiqish kodini main hal qiladi.
+func run(args []string) error {
+	cfg, err := loadConfig(args)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("config: %+v\n", cfg) // String() chaqiriladi: parol chiqmaydi
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, cfg.databaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil { // baza ishlamasa server ishga tushmaydi
+		return err
+	}
+	srv := newServer(cfg.addr(), store.New(pool))
+	fmt.Printf("bozor API: http://localhost:%d\n", cfg.port)
+	return srv.ListenAndServe()
+}
+```
+
+| Строка | Что делает |
+|---|---|
+| 1–10 | комментарии о запуске; не выполняются |
+| 11 | исполняемый пакет `main` |
+| 13–24 | пакеты context, ошибок, флагов, форматирования, HTTP, окружения, времени, store и pgx pool |
+| 26–33 | `newServer`: адрес, handler и предел чтения заголовков 5 секунд; `&` возвращает указатель на сервер |
+| 35–39 | `os.Args[1:]` убирает имя программы; при `ErrHelp` успешно завершает работу |
+| 40–44 | пишет другую ошибку в stderr и вызывает `os.Exit(1)` |
+| 46–51 | `run` получает конфигурацию; при ошибке возвращается до внешних ресурсов |
+| 52 | выводит представление конфигурации для лога |
+| 53–54 | context на 5 секунд для базы; `defer cancel()` выполнится при возврате |
+| 55–62 | создаёт pool, планирует закрытие, проверяет соединение через `Ping` |
+| 63–65 | создаёт HTTP-сервер, выводит адрес и начинает слушать; возвращает ошибку |
+
+`loadConfig` проверяет только порт и непустой `DATABASE_URL`. Формат URI и доступность базы эта функция не проверяет.
+`pgxpool.New` и `Ping` идут следующим этапом; они тоже выполняются до HTTP-прослушивания.
+При неверном флаге `Parse` сразу возвращается: последующие ошибки валидации в этом случае не собираются.
+
+| Состояние | `loadConfig` | Postgres | HTTP-порт |
+|---|---|---|---|
+| неверный порт или нет DB | ошибка, `run` возвращается | не открывается | не открывается |
+| строка DB есть, но подключение неверно | возвращает конфигурацию | ошибка создания или `Ping` | не открывается |
+| всё верно | возвращает конфигурацию | `Ping` проходит | открывается в `ListenAndServe` |
+
+`PORT=80a`, а `DATABASE_URL` отсутствует. Что получится?
+
+**A)** только ошибка порта · **B)** ошибки порта и DB · **C)** ошибка подключения Postgres
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `append` сохраняет обе проблемы. A предполагает возврат на первой ошибке, C — подключение к базе до проверки.
+
+</details>
+
+```console
+$ go build ./cmd/api && ./api ; echo "kod: $?"
+xato: DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+$ PORT=80a ./api ; echo "kod: $?"
+xato: port "80a": 1–65535 oraligʻidagi butun son kerak
+DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+```
+
+`go build ./cmd/api` создаёт binary `api` в корне. `PORT=80a` задаёт окружение только этой команды.
+`$?` — код выхода последней команды. Префикс `xato:` добавляется в `main` один раз.
+Это ошибка приложения, не сообщение компилятора `файл:строка:столбец`. Проблема и имя настройки указаны в самом сообщении.
+
+## Справка и пустое значение
+
+Какое значение по умолчанию покажет `PORT=9090 ./api -h`?
+
+**A)** `8765` · **B)** `9090` · **C)** ошибка DB
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `fs.String` уже прочитал окружение. `-h` выводит справку и возвращает `ErrHelp`; `main` не считает это ошибкой.
+
+</details>
+
+```console
+$ PORT=9090 ./api -h
+Usage of api:
+  -port string
+    	HTTP port (muhitda: PORT) (default "9090")
+$ ./api -h 2> /dev/null ; echo "kod: $?"
+kod: 0
+```
+
+`Usage of api` — имя набора, `string` — тип значения флага, следующая строка — наш справочный текст.
+По умолчанию справка идёт в stderr; `2> /dev/null` скрывает этот поток. Отдельная проверка в `main` даёт код 0.
+
+Теперь `PORT=`. Что произойдёт?
+
+**A)** вернётся к `8765` · **B)** ошибка `port ""` · **C)** заработает на порту 0
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Переменная есть, значение пустое. `ok` в `LookupEnv` истинно, затем `Atoi("")` возвращает ошибку. A смешивает отсутствие и пустоту; C не делает строку допустимым числом.
+
+</details>
+
+```console
+$ PORT= ./api ; echo "kod: $?"
+xato: port "": 1–65535 oraligʻidagi butun son kerak
+DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+kod: 1
+```
+
+## Секрет вне git
+
+В `.env.example` только имена и образец. `PAROL` («пароль») — не настоящие учётные данные.
+Этот образец совпадает с файлом курса:
+
+```text
+# Nusxa oling: cp .env.example .env — haqiqiy qiymatlar faqat .env'da (u gitga tushmaydi).
+PORT=8765
+DATABASE_URL='postgres://bozor:PAROL@localhost:5581/bozor'
+```
+
+В URI `bozor` — пользователь, `PAROL` — пароль, `localhost:5581` — host и порт, `/bozor` — база.
+Одинарные кавычки защищают от интерпретации shell; специальные символы внутри URI при необходимости записываются через percent-encoding.
+Одинарную кавычку в самом пароле нельзя вставить в такую запись без изменения формы.
+
+Bash выполняет файл как код, не читает его как данные. Загружайте только доверенный `.env`.
+Правила git уже записаны. Какой файл игнорируется: `.env` или `.env.example`?
+
+**A)** оба · **B)** только `.env` · **C)** ни один
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Правило `.env` не совпадает с `.env.example`. `/api` скрывает binary только в корне; `api` совпало бы и с `cmd/api`.
+
+</details>
+
+```console
+$ cat .gitignore
+.env
+/api
+$ git check-ignore -v .env
+.gitignore:1:.env	.env
+$ git check-ignore -v .env.example ; echo "kod: $?"
+kod: 1
+$ cp .env.example .env
+```
+
+Результат `-v`: файл правила, строка, правило, затем Tab и проверяемый путь. `kod: 1` здесь означает отсутствие правила игнорирования.
+`cp` ничего не вывела. В копии замените `PAROL` на `bozor-lab` редактором; кавычки сохраните.
+**Это намеренно открытый лабораторный пароль**, тот же используется в `compose.yaml`. Настоящий пароль не помещайте на страницу или в git.
+
+`set -a` экспортирует последующие значения; `.` выполняет файл в текущем shell; `set +a` отключает автоматический экспорт.
+Go не читает `.env` самостоятельно. Ниже вывод есть только у `echo`:
+
+```console
+$ set -a; . ./.env; set +a
+$ echo $PORT
+8765
+```
+
+`.gitignore` помогает только с неотслеживаемыми файлами. Уже закоммиченный секрет остаётся в истории.
+Раскрытый пароль или ключ немедленно отзовите или замените. Игнорирование файла этого не исправит.
+На сервере окружение задают Docker или systemd; они рассматриваются в GB-8.04 и GB-8.06.
+
+## В лог только выбранные значения
+
+Startup log — строка, записываемая при запуске программы. Что выведет следующий код на стадии без `String()`?
+
+```go
+fmt.Printf("config: %+v\n", cfg)
+```
+
+**A)** все поля, включая пароль · **B)** только порт · **C)** `{}`
+
+Только в учебной копии мы убрали `String()` и ставший ненужным импорт `net/url`, затем пересобрали программу.
+Основные файлы курса не менялись. Утечка ниже повторена на этой машине, это не цитата из видео.
+
+<details>
+<summary>Ответ</summary>
+
+**A.** `%+v` выводит поля структуры, включая поля с маленькой буквы. B и C переносят правила JSON на `fmt`.
+
+</details>
+
+База поднимается через Compose. `-d` запускает её в фоне, `--wait` ждёт готовности.
+При проверке порты были свободны. Для команды Docker ниже показан полный вывод этого запуска:
+
+```console
+$ docker compose up -d --wait
+ Volume gb801_pgdata Creating 
+ Volume gb801_pgdata Creating 
+ Network gb801_default Creating 
+ Network gb801_default Creating 
+ Volume gb801_pgdata Created 
+ Volume gb801_pgdata Created 
+ Network gb801_default Created 
+ Network gb801_default Created 
+ Container gb801-db-1 Creating 
+ Container gb801-db-1 Created 
+ Container gb801-db-1 Starting 
+ Container gb801-db-1 Started 
+ Container gb801-db-1 Waiting 
+ Container gb801-db-1 Healthy
+```
+
+```console
+$ ./api -port 8781
+config: {port:8781 databaseURL:postgres://bozor:bozor-lab@localhost:5581/bozor}
+bozor API: http://localhost:8781
+```
+
+Флаг выбрал `8781` вместо `8765` из `.env`. Сервер занимает текущий терминал; после проверки остановите его через `Ctrl+C`.
+Но лог раскрыл пароль. Поле с маленькой буквы не обеспечивает секретность.
+
+[OWASP Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude) рекомендует не записывать пароли и строки подключения непосредственно в лог.
+Копия лога может попасть в файл, сервис логирования или скриншот.
+Исправление — выбирать разрешённые для вывода поля, вместо попыток удалить пользователя и пароль из исходной строки.
+`Parse` из `net/url` разбирает адрес; `Host` содержит host и порт, `Path` — путь базы.
+
+Далее полный исправленный `config.go` из курса:
+
+```go filename="cmd/api/config.go" showLineNumbers
+package main
+
+// Sozlama (GB-8.01). Kod hamma muhitda bir xil; muhitga qarab oʻzgaradigan narsa (port, baza manzili, kalitlar)
+// tashqaridan keladi: muhit oʻzgaruvchilari va flag'lardan (Twelve-Factor App, III. Config).
+// Ustunlik: flag > muhit oʻzgaruvchisi > standart qiymat. Hammasi ishga tushishda BIR MARTA tekshiriladi:
+// biror qiymat notoʻgʻri boʻlsa server hech narsa ochmaydi, hamma xatolarni sanab, 1 kodi bilan chiqadi.
+//
+//	PORT          -port   HTTP port, 1–65535 (standart 8765)
+//	DATABASE_URL  —       Postgres manzili. SECRET: ichida parol bor. Faqat muhitdan, flag emas:
+//	                      buyruq qatori (ps, /proc/PID/cmdline) shu kompyuterdagi hamma foydalanuvchiga koʻrinadi.
+//
+// Qiymatlar: .env.example (gitda) → nusxasi .env (gitda emas, .gitignore).
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+)
+
+// config — serverning ishga tushish sozlamalari.
+type config struct {
+	port        int
+	databaseURL string // secret: ichida parol bor
+}
+
+// envOr — key qoʻyilgan boʻlsa uning qiymati (boʻsh boʻlsa ham), qoʻyilmagan boʻlsa def.
+// «PORT=» (boʻsh) — xato sozlama: u standart qiymatga jim almashmaydi, tekshiruvda ushlanadi.
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+// loadConfig — args (os.Args[1:]) va muhitdan config. Hamma xato bitta error'da (errors.Join), har biri alohida qatorda.
+// flag.ContinueOnError: notoʻgʻri flag'da Parse dasturni toʻxtatmaydi, xato qaytaradi (testlar uchun ham).
+func loadConfig(args []string) (config, error) {
+	fs := flag.NewFlagSet("api", flag.ContinueOnError)
+	port := fs.String("port", envOr("PORT", "8765"), "HTTP port (muhitda: PORT)")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	var errs []error
+	n, err := strconv.Atoi(*port)
+	if err != nil || n < 1 || n > 65535 {
+		errs = append(errs, fmt.Errorf("port %q: 1–65535 oraligʻidagi butun son kerak", *port))
+	}
+	db := os.Getenv("DATABASE_URL")
+	if db == "" {
+		errs = append(errs, errors.New("DATABASE_URL qoʻyilmagan: .env.example'ga qarang"))
+	}
+	if len(errs) > 0 {
+		return config{}, errors.Join(errs...)
+	}
+	return config{port: n, databaseURL: db}, nil
+}
+
+// addr — http.Server'ning Addr maydoni: ":8765" — shu portda, kompyuterning hamma tarmoq manzillarida.
+func (c config) addr() string {
+	return fmt.Sprintf(":%d", c.port)
+}
+
+// String — config'ning log'dagi koʻrinishi. fmt'ning %v, %+v va %s'i shu metodni chaqiradi (GB-2.07).
+// Bazadan faqat host va baza nomi: foydalanuvchi, parol va ?parametrlar chiqmaydi (OWASP Logging Cheat Sheet:
+// «Database connection strings» log'ga toʻgʻridan-toʻgʻri yozilmaydi). %#v String'ni chaqirmaydi: config'ni %#v bilan yozmang.
+func (c config) String() string {
+	db := "[yashirin]"
+	if u, err := url.Parse(c.databaseURL); err == nil && u.Host != "" {
+		db = u.Host + u.Path
+	}
+	return fmt.Sprintf("port=%d db=%s", c.port, db)
+}
+```
+
+Ранее разобранные `envOr` и `loadConfig` не изменились. Новые строки полного файла:
+
+| Строка | Что делает |
+|---|---|
+| 1–13 | пакет и комментарии; слово «всё» в комментарии ограничено описанной выше областью проверки |
+| 14–21 | импортирует необходимые стандартные пакеты |
+| 23–27 | два поля `config` |
+| 29–36 | `envOr` различает отсутствие и пустое значение |
+| 38–60 | чтение флага, валидация и возврат одной ошибки |
+| 62–65 | `addr()` форматирует порт через `%d` в `":8765"` |
+| 67–69 | комментарии о `String()` и ограничении `%#v` |
+| 70–71 | метод с получателем-значением, исходный результат `[yashirin]` («скрыто») |
+| 72 | через `&&` проверяет успех `Parse` и непустой host |
+| 73–74 | берёт только `u.Host + u.Path`; `u.User` и query не используются |
+| 75–76 | возвращает форматированную строку: `%d` для порта, `%s` для выбранного текста DB |
+
+Наличие `Host` не доказывает корректность полного адреса Postgres. Это условие для представления в логе.
+`[yashirin]` означает, что формат адреса не подошёл этому способу; выводить исходное значение не требуется.
+
+Пересоберите программу. Что появится теперь?
+
+**A)** пароль снова · **B)** порт, host и имя базы · **C)** пустая строка
+
+<details>
+<summary>Ответ</summary>
+
+**B.** `fmt` вызывает `String()` непосредственно переданного `config`. Вывод меняется без изменения `Printf`.
+
+</details>
+
+```console
+$ go build ./cmd/api && ./api -port 8781
+config: port=8781 db=localhost:5581/bozor
+bozor API: http://localhost:8781
+```
+
+Этот результат тоже повторён. `%v`, `%+v`, `%s` используют `String()` для непосредственно переданного значения `config`.
+**Ограничение:** `%#v` обходит этот метод. Неверный `%d` или config в поле другой структуры с маленькой буквы тоже могут раскрыть исходные данные.
+Не отправляйте целые структуры в лог с произвольными форматами. Метод контролирует только показанный путь вывода.
+Следующий урок покажет `LogValue` для `slog`.
+
+Вывод выбранных `Host` и `Path` тоже должен быть разрешён в вашей системе.
+Собственная ошибка `loadConfig` не раскрывает секрет; это не гарантия для всех ошибок библиотек.
+Перед записью исходной строки подключения или непроверенной внешней ошибки в production-лог отдельно проверьте этот путь.
+
+## Глубже (необязательно): командная строка тоже видна
+
+Мы не случайно отказались от флага `DATABASE_URL`. В Linux командная строка обычно видна другим пользователям.
+В видео использованы `ps -o args= -C api` и `pid=$(pgrep -x api)`.
+`-o args=` выводит аргументы без заголовка, `-C api` выбирает все процессы с этим именем; `pgrep -x` сравнивает имя целиком.
+При нашей проверке работала ещё одна лаборатория с тем же именем процесса. Поэтому мы выбрали PID только своего процесса.
+PID — номер процесса. Реальный вывод второго терминала, пока сервер выполнял предыдущую команду:
+
+```console
+$ ps -o args= -p 1036694
+./api -port 8781
+$ stat -c '%A %n' /proc/1036694/cmdline /proc/1036694/environ
+-r--r--r-- /proc/1036694/cmdline
+-r-------- /proc/1036694/environ
+```
+
+`-p` выбирает один PID; в шаблоне `stat -c` `%A` означает права, `%n` — имя файла.
+PID в видео — `990337`; наш номер указан выше. При каждом запуске PID меняется.
+В этот раз права `cmdline` — `-r--r--r--`, а `environ` — `-r--------`.
+Это не делает окружение абсолютной защитой секретов: доступ зависит также от настроек procfs, состояния процесса и проверок ptrace.
+[Документация Linux](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html) указывает проверку доступа ptrace для `environ`.
+
+[OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html) напоминает: значения окружения могут попасть в логи и дампы памяти.
+В больших системах используют secret manager — отдельный сервис управления секретами.
+Не выводите окружение процесса целиком. После проверки остановите сервер через `Ctrl+C` и удалите лабораторную базу вместе с volume:
+
+```console
+$ docker compose down -v
+ Container gb801-db-1 Stopping 
+ Container gb801-db-1 Stopped 
+ Container gb801-db-1 Removing 
+ Container gb801-db-1 Removed 
+ Volume gb801_pgdata Removing 
+ Network gb801_default Removing 
+ Volume gb801_pgdata Removed 
+ Network gb801_default Removed
+```
+
+`down -v` удаляет данные этой лаборатории. Не выполняйте его для Compose-проекта другого сервиса.
+В видео нет измерений скорости; здесь важны код завершения, порядок проверок и отсутствие секрета в выводе.
+
+## Частые ошибки
+
+1. **«Маленькая буква скроет пароль».** Неверный код — показанный `fmt.Printf("config: %+v\n", cfg)` на стадии без `String()`.
+   Его реальный вывод раскрыл пароль. Исправление — выбирать разрешённые значения; правила полей JSON не действуют для `fmt`.
+2. **Подменять пустой `PORT` значением по умолчанию.** Выше `PORT=` дал `port ""` и код 1.
+   Исправление — использовать значение по умолчанию только при `ok == false` от `LookupEnv`. Не скрывайте неверный ввод молча.
+3. **Флаг не определён.** В starter ещё нет `-host`. Тест задания ниже действительно выводит `flag provided but not defined: -host`.
+   Это означает «флаг передан, но не определён». Добавьте `fs.String("host", …)` перед `Parse`.
+4. **Исправлять старый commit через `.gitignore`.** Правило не влияет на отслеживаемый файл.
+   Исправление — немедленно отозвать или заменить раскрытые учётные данные; затем правильно очистить репозиторий и историю.
+5. **Считать, что `loadConfig` проверяет всё.** URI базы проверяется позже в pgx; позиционные аргументы этот код не отвергает.
+   `flag.Parse` останавливается на первом обычном аргументе. Если лишние аргументы запрещены, проверяйте `fs.NArg()`.
+
+## Проверьте себя
+
+**1.** Почему проверка стоит в начале `run`?
+
+<details>
+<summary>Ответ</summary>
+
+Ошибка порта или отсутствующей DB появляется до ресурсов. Проблемы видны в одном сообщении, а не после первого HTTP-запроса.
+
+</details>
+
+**2.** Какой порт выберет `PORT=9090 ./api -port 8781`?
+
+<details>
+<summary>Ответ</summary>
+
+`8781`. `fs.String` сначала получает `9090`, а `Parse` заменяет его на `8781`.
+
+</details>
+
+**3.** Почему `%+v` раскрыл пароль и каковы ограничения `String()`?
+
+<details>
+<summary>Ответ</summary>
+
+`fmt` форматирует и поля с маленькой буквы. `String()` задаёт выбранное представление непосредственного значения, но не защищает все форматы и вложенные поля.
+
+</details>
+
+**4.** GB-7.04: `SetLimit(10)` и 1000 ID — сколько работ одновременно?
+
+<details>
+<summary>Ответ</summary>
+
+Не больше 10. При заполненном лимите `g.Go` ждёт свободного места. Общее число ID не ограничивается.
+
+</details>
+
+## Домашнее задание
+
+🟢 **Добавьте настройку `HOST`.** Одно обязательное задание: [папка курса](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config),
+[TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/TASK.md),
+[ответ](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/solution/cmd/api/config.go).
+
+1. Добавьте поле `host string` и флаг `-host`. По умолчанию `envOr("HOST", "")`, флаг выше окружения.
+2. Принимайте пустое значение и `localhost`. Остальные значения должны быть IP; `net.ParseIP` возвращает `nil` для неверной строки.
+3. Добавляйте ошибку в `errs`: имя `host`, значение через `%q` и требование; остальные проблемы должны сохраняться.
+4. Реализуйте `addr()` через `net.JoinHostPort`. `strconv.Itoa(c.port)` превращает порт в строку. Файл теста не меняйте.
+
+| Вход (`DATABASE_URL` задан) | Ожидаемый `addr()` |
+|---|---|
+| `HOST` отсутствует или пуст | `:8765`, все сетевые адреса |
+| `HOST=127.0.0.1` | `127.0.0.1:8765`, только этот компьютер |
+| `HOST=localhost` | `localhost:8765` |
+| `HOST=::1` | `[::1]:8765`, IPv6 loopback |
+| `HOST=0.0.0.0`, флаг `-host 127.0.0.1` | `127.0.0.1:8765`; `0.0.0.0` — все интерфейсы IPv4 |
+| `HOST=127.0.0.300` или `HOST=bozor.uz` | ошибка; если DB тоже нет, обе проблемы |
+
+Если перед API стоит другой сервер, например Caddy, `HOST=127.0.0.1` ограничит API локальными подключениями.
+Тест starter пока не проходит: `HOST` не читается, `-host` не определён. Ниже полный повторённый результат:
+
+```console
+$ go test ./cmd/api -run Config
+flag provided but not defined: -host
+Usage of api:
+  -port string
+    	HTTP port (muhitda: PORT) (default "8765")
+--- FAIL: TestConfigHost (0.00s)
+    tekshiruv_test.go:85: HOST=127.0.0.1 []: addr() ":8765", kutilgan "127.0.0.1:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:85: HOST=localhost []: addr() ":8765", kutilgan "localhost:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:85: HOST=::1 []: addr() ":8765", kutilgan "[::1]:8765" (TASK.md, 3-qadam: addr() host'ni ham qoʻshadi, net.JoinHostPort)
+    tekshiruv_test.go:80: HOST=0.0.0.0 [-host 127.0.0.1]: xato flag provided but not defined: -host
+          kutilgan addr() "127.0.0.1:8765" (TASK.md, 1-qadam: -host flag'i, standarti envOr("HOST", ""))
+    tekshiruv_test.go:94: HOST="127.0.0.300" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host "127.0.0.300" … va DATABASE_URL … (TASK.md, 2-qadam)
+    tekshiruv_test.go:94: HOST="bozor.uz" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host "bozor.uz" … va DATABASE_URL … (TASK.md, 2-qadam)
+    tekshiruv_test.go:94: HOST=" 127.0.0.1" va DATABASE_URL yoʻq: xato DATABASE_URL qoʻyilmagan: .env.example'ga qarang
+          kutilgan ikkala muammo bitta xatoda: host " 127.0.0.1" … va DATABASE_URL … (TASK.md, 2-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/cmd/api	0.048s
+FAIL
+```
+
+`tekshiruv_test.go:85` — строка проверки в тесте. Рядом показаны прежний результат `addr()` и ожидаемое значение.
+`flag provided but not defined` означает, что `-host` ещё не зарегистрирован. Для starter это ожидаемая неудача.
+
+Предскажите результат решения: **A)** те же ошибки · **B)** `ok` · **C)** потребует базу.
+
+<details>
+<summary>Ответ</summary>
+
+**B.** Эти тесты вызывают только config, не `run` и Postgres. Ниже `cd` переходит в папку решения.
+
+</details>
+
+```console
+$ cd solution && go test ./cmd/api -run Config
+ok  	github.com/abdurahmon27/bozor/cmd/api	0.050s
+```
+
+<details>
+<summary>Ответ</summary>
+
+Решение добавляет флаг перед `Parse` и собирает неверный host вместе с ошибками порта и DB.
+`net.JoinHostPort` заключает IPv6 host в квадратные скобки; простое `host + ":" + port` ломает этот случай.
+В возвращаемый `config` нужно добавить и `host: *host`. В решении `String()` выводит выбранный адрес с `addr=`.
+Полный ответ находится по ссылке выше. Других обязательных уровней нет.
+
+После выполнения задания полная проверка выглядит так. `./...` — пакеты текущего модуля; `solution` — отдельный модуль.
+При повторном запуске решения все пакеты прошли. Время тестов меняется с нагрузкой машины:
+
+```bash
+docker compose up -d --wait
+go test ./...
+docker compose down -v
+```
+
+```console
+$ go test ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+ok  	github.com/abdurahmon27/bozor/cmd/api	2.778s
+ok  	github.com/abdurahmon27/bozor/internal/password	0.252s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/store	0.657s
+```
+
+</details>
+
+## Источники
+
+Следующие источники использованы для проверки кода и наблюдаемого поведения:
+
+- [The Twelve-Factor App: III. Config](https://12factor.net/config)
+- [OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html), [remediation](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html#92-remediation), [environment injection](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html#51-injection-of-secrets-file-in-memory)
+- [OWASP Logging: Data to exclude](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude)
+- [Go: os.LookupEnv](https://pkg.go.dev/os#LookupEnv), [os.Getenv](https://pkg.go.dev/os#Getenv), [os.Args](https://pkg.go.dev/os#pkg-variables)
+- [Go: flag](https://pkg.go.dev/flag), [NewFlagSet](https://pkg.go.dev/flag#NewFlagSet), [errors.Join](https://pkg.go.dev/errors#Join)
+- [Go: fmt printing](https://pkg.go.dev/fmt#hdr-Printing), [net/url.URL](https://pkg.go.dev/net/url#URL), [exported identifiers](https://go.dev/ref/spec#Exported_identifiers)
+- [Go: net.ParseIP](https://pkg.go.dev/net#ParseIP), [net.JoinHostPort](https://pkg.go.dev/net#JoinHostPort), [errgroup.SetLimit](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.SetLimit)
+- [PostgreSQL 18: connection URIs](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNSTRING-URIS)
+- [Bash: set](https://www.gnu.org/software/bash/manual/bash.html#The-Set-Builtin), [simple command expansion](https://www.gnu.org/software/bash/manual/bash.html#Simple-Command-Expansion)
+- [Git: gitignore](https://git-scm.com/docs/gitignore), [git check-ignore](https://git-scm.com/docs/git-check-ignore)
+- [Linux: proc_pid_cmdline(5)](https://man7.org/linux/man-pages/man5/proc_pid_cmdline.5.html), [proc_pid_environ(5)](https://man7.org/linux/man-pages/man5/proc_pid_environ.5.html)
+- [RFC 9293 §3.1](https://www.rfc-editor.org/rfc/rfc9293#section-3.1), [OWASP API1:2023](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/)
+- [README](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/README.md), [video run script](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-8-01-config/_video/chiqishlar.sh)
+
+Результаты: `go1.27.4 linux/amd64`, `CGO_ENABLED=0`, PostgreSQL 18 (`postgres:18-alpine`), Bash, 2026-11-28.
+
+## Видео и код
+
+▶️ Видео скоро выйдет. Эта страница объясняет урок полностью, ждать видео не обязательно.
+
+💻 [Код и ответы к домашнему заданию на GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-8-01-config)
+
+---
+
+← Предыдущий урок: [GB-7.07](/lab/youtube/gb/gb-7-07/ru) · Следующий урок: [GB-8.02](/lab/youtube/gb#gb-8-02) → · [Все уроки](/lab/youtube/gb)
+
+</div>

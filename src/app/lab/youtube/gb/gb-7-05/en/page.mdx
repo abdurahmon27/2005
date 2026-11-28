@@ -1,0 +1,857 @@
+---
+title: "Mutex or channel: decide by measuring"
+date: "2026/11/28"
+description: "Protect stock with a mutex and an owner goroutine, measure the cost, and see why an atomic counter does not protect a sale rule."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-05"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-05/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-05"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-05) · [Русский](/lab/youtube/gb/gb-7-05/ru) · **English**  
+Lesson GB-7.05 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-05) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+In bozor, orders reduce stock and the importer replenishes it. Should we protect the shared map with a mutex or give all changes to one goroutine?
+
+**The one idea:** either put every access to state under the same lock, or let only one goroutine access that state. Both work; justify the choice with code simplicity and a measurement of your actual workload.
+
+After this lesson you will:
+
+- write the same `Sell` operation with a mutex and request–reply channels;
+- explain the `-race` result and measure both approaches;
+- count with `atomic.Int64` and show why two atomic operations do not form one step;
+- write `OwnedStore.Stock` without a lock and pass the task tests.
+
+| Word | Plain meaning | English term |
+|---|---|---|
+| owner goroutine | only it accesses the state; everyone else sends requests | owner goroutine |
+| inverse throughput | total time / completed operations; the number we measure here | inverse throughput |
+| atomic operation | a read or change that other goroutines observe as one indivisible operation | atomic operation |
+
+A helper term: **race condition** means an incorrect dependence of the result on goroutine execution order. It does not always mean a data race. `ns` means nanosecond; `µs` means microsecond, 1000 ns.
+
+## Before you start
+
+The foundation: [GB-7.04 · Bounded workers and errgroup](/lab/youtube/gb/gb-7-04/en), [GB-4.07 · sync.Mutex and the race detector](/lab/youtube/gb/gb-4-07/en).
+Channels and lifetime: [GB-7.01 · Goroutine](/lab/youtube/gb/gb-7-01/en), [GB-7.02 · Channel](/lab/youtube/gb/gb-7-02/en), [GB-7.03 · select and context](/lab/youtube/gb/gb-7-03/en).
+Bozor examples and time: [GB-4.08 · Catalog API](/lab/youtube/gb/gb-4-08/en), [GB-4.03 · Handler](/lab/youtube/gb/gb-4-03/en), [GB-3.02 · JSON](/lab/youtube/gb/gb-3-02/en), [GB-5.05 · pgx, time.Now and time.Since](/lab/youtube/gb/gb-5-05/en).
+
+Go notation: [GB-2.09 · Anonymous functions and defer](/lab/youtube/gb/gb-2-09/en), [GB-2.05 · Methods](/lab/youtube/gb/gb-2-05/en), [GB-2.04 · Pointers](/lab/youtube/gb/gb-2-04/en), [GB-2.03 · Structs](/lab/youtube/gb/gb-2-03/en), [GB-2.02 · Maps](/lab/youtube/gb/gb-2-02/en), [GB-2.01 · Slices](/lab/youtube/gb/gb-2-01/en), [GB-1.08 · Tests](/lab/youtube/gb/gb-1-08/en), [GB-1.07 · Functions](/lab/youtube/gb/gb-1-07/en), [GB-1.06 · for](/lab/youtube/gb/gb-1-06/en), [GB-1.05 · if](/lab/youtube/gb/gb-1-05/en), [GB-1.03 · int64](/lab/youtube/gb/gb-1-03/en), [GB-1.02 · Variables](/lab/youtube/gb/gb-1-02/en), [GB-1.01 · First program](/lab/youtube/gb/gb-1-01/en).
+
+**Environment:** open the course folder `lessons/gb-7-05-mutex-channel`. This is a standalone lab: its own `go.mod`, one `package main`, and no external dependencies. You need Go 1.27.4 and Bash. Use a local terminal for these measurements across several files.
+
+Run every command from that folder. `_video/run.sh` copies the stage files and `go.mod` to a temporary folder, then runs the supplied command there. `go run .` builds and runs the package. Your starter files stay unchanged.
+
+For ordinary commands, set the environment with `export`:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+The script also uses `GOTOOLCHAIN=go1.27.4` and `CGO_ENABLED=0`. The first selects the version; the second disables cgo. `(chiqish kodi: 0)` means the command succeeded; `1` means the inner command failed.
+
+On Linux, `-race` needs cgo and a C compiler. This machine has no gcc. `_video/race.sh` uses the same Go 1.27.4 tools inside the `golang:1.26.8` Docker image, which has gcc. Every `-race` result below was rerun in Docker; ordinary measurements were taken without cgo.
+
+**Recall:** what does `g.SetLimit(10)` do? **A)** stops after 10 errors · **B)** at most 10 active tasks; `g.Go` waits without a free slot · **C)** cancels after 10 seconds.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The limit applies to active goroutines in the errgroup. Error counts and time limits are different concepts. In the previous lesson, results went into separate indexes; today one shared map changes.
+
+</details>
+
+## Check and decrement under one lock
+
+Simplify the store from GB-4.07: `stock` is a `map[int64]int`, mapping product ID to quantity. `Sell(id, n)` sells `n` units if enough stock remains. This lab assumes `n > 0`; these methods do not validate input.
+
+`LockedStore` is the store with a mutex. Its `Sell` method, an excerpt from the full file:
+
+```go
+func (s *LockedStore) Sell(id int64, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stock[id] < n {
+		return false
+	}
+	s.stock[id] -= n
+	return true
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1 | `s *LockedStore` is a pointer receiver operating on the original store; `id`, `n` are parameters; the result is `bool` |
+| 2 | `s.mu.Lock()` waits for this mutex to become available, then acquires it |
+| 3 | `defer` ensures `Unlock` runs on every return from the method |
+| 4–6 | if `stock[id] < n`, returns `false`; stock does not change |
+| 7 | `-=` reduces this map value by `n` |
+| 8–9 | returns `true` and ends the method; the deferred `Unlock` runs |
+
+With one unit left:
+
+| Step | A | B | `stock[1]` |
+|---|---|---|---|
+| Start | acquires the lock | waits in `Lock` | 1 |
+| A sells | 1 is enough, writes 0 | waits | 0 |
+| A releases the lock | returns `true` | acquires the lock | 0 |
+| B checks | finished | 0 is not enough, `false` | 0 |
+
+Locking only the decrement is insufficient: the check must use the same lock. Other methods that read the state must use that mutex too.
+
+## Only the owner goroutine accesses the map
+
+Now one goroutine accesses the map. Others send it the product ID, quantity, and a reply channel through a channel. The owner handles requests one at a time.
+
+| Stage | Caller of `Sell` | Owner `loop` |
+|---|---|---|
+| Before request | creates `reply` channel | waits on `sells` |
+| Request | sends `{id, n, reply}` | receives request into `r` |
+| Work | waits for reply | checks and decrements |
+| Reply | receives `bool` | sends result on `r.reply` |
+
+`OwnedStore` is the store using an owner goroutine. It has no map field. `NewOwnedStore` hands the map to `loop`; the caller must stop accessing it afterwards. Go's type system does not enforce this ownership rule.
+
+The complete `store.go` for this stage, including the mutex version above:
+
+```go filename="_video/01-ikki/store.go" showLineNumbers
+// bozor: bitta umumiy holat — mahsulot qoldigʻi (ID → dona) — ikki usulda himoyalangan (GB-7.05).
+// LockedStore: map + sync.Mutex (GB-4.07). OwnedStore: map'ning yagona egasi boʻlgan goroutine, qolganlar
+// unga channel orqali soʻrov yuboradi. Ikkalasida Sell bir xil ishlaydi.
+package main
+
+import "sync"
+
+// LockedStore — qoldiq map'i va uni himoyalaydigan qulf. stock'ga har murojaat mu ostida.
+type LockedStore struct {
+	mu    sync.Mutex
+	stock map[int64]int
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *LockedStore) Sell(id int64, n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stock[id] < n {
+		return false
+	}
+	s.stock[id] -= n
+	return true
+}
+
+// sellReq — egasiga yuboriladigan sotish soʻrovi: qaysi mahsulot, necha dona va javob qaytadigan channel.
+type sellReq struct {
+	id    int64
+	n     int
+	reply chan bool
+}
+
+// OwnedStore — qoldiq map'iga faqat loop goroutine'i tegadi; Sell unga soʻrov yuboradi va javobni kutadi.
+type OwnedStore struct {
+	sells chan sellReq
+}
+
+// NewOwnedStore loop'ni yangi goroutine'da boshlaydi va stock map'ini unga topshiradi:
+// bundan keyin chaqiruvchi bu map'ga tegmasligi kerak.
+func NewOwnedStore(stock map[int64]int) *OwnedStore {
+	s := &OwnedStore{sells: make(chan sellReq)}
+	go s.loop(stock)
+	return s
+}
+
+// loop — stock'ning yagona egasi. Soʻrovlarni birma-bir bajaradi; sells yopilganda tugaydi.
+func (s *OwnedStore) loop(stock map[int64]int) {
+	for r := range s.sells {
+		ok := stock[r.id] >= r.n
+		if ok {
+			stock[r.id] -= r.n
+		}
+		r.reply <- ok
+	}
+}
+
+// Sell id'li mahsulotdan n dona sotadi; qoldiq yetmasa false.
+func (s *OwnedStore) Sell(id int64, n int) bool {
+	reply := make(chan bool)
+	s.sells <- sellReq{id, n, reply}
+	return <-reply
+}
+
+// Close loop goroutine'ini toʻxtatadi. Close'dan keyin Sell chaqirilmaydi; Close ikkinchi marta chaqirilsa,
+// yopiq channel'ni qayta yopish panic beradi (GB-7.02).
+func (s *OwnedStore) Close() { close(s.sells) }
+```
+
+| Line | What it does |
+|---|---|
+| 1–6 | `//` comments; `package main` is an executable package; `sync` is imported for the lock |
+| 8–12 | `LockedStore`: `mu` is the mutex, `stock` maps ID → quantity; `{}` delimit the fields |
+| 14–23 | the locked `Sell` explained above |
+| 25–30 | `sellReq` is a sale request: `id int64`, `n int`, `reply chan bool` |
+| 32–35 | `sells chan sellReq` carries only `sellReq` values |
+| 37–40 | constructor returns `*OwnedStore`; `&` takes the struct's address; `make` creates a channel without a buffer |
+| 41–43 | `go s.loop(stock)` starts a new goroutine; `return s` returns the store pointer |
+| 45–47 | `loop` takes the map as a parameter; `for r := range` receives requests until closure |
+| 48 | `ok` says whether this sale has enough stock; `>=` includes equality |
+| 49–51 | subtracts `r.n` from `stock[r.id]` only when `ok` is true |
+| 52–54 | `<-` sends the result on the reply channel; closes the loop and method braces |
+| 56–58 | `Sell` creates a separate `reply` for every call |
+| 59 | `sellReq{id, n, reply}` values follow field declaration order; sends the request on `sells` |
+| 60–61 | `return <-reply` waits for the reply and returns it |
+| 63–65 | `Close` closes `sells`; `range` ends and `loop` returns |
+
+A send without a buffer waits to meet a receiver. After sending its request, `Sell` always receives the reply, so the owner does not remain blocked sending it. This API does not yet support cancellable calls.
+
+Call `Close` once, after every `Sell` has finished. It does not wait for loop completion: closure lets the loop exit. Do not call `Sell` or `Stock` afterwards.
+
+## Prepare the same workload
+
+Both stores have 800,000 units of ID 1. `measure` makes 800,000 calls in total from eight goroutines:
+
+```go filename="_video/01-ikki/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+func main() {
+	locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+	measure("mutex", func() { locked.Sell(1, 1) })
+	owned := NewOwnedStore(map[int64]int{1: 800_000})
+	measure("egasi", func() { owned.Sell(1, 1) })
+	owned.Close()
+}
+```
+
+| Line | What it does |
+|---|---|
+| 1–7 | `main` package; `fmt` for output, `sync` for waiting, `time` for timing |
+| 9–10 | `measure(name string, op func())` takes a name and a function without parameters or results |
+| 11–12 | `start` records the start time; `wg` tracks work completion |
+| 13–14 | `for range 8` iterates eight times; `wg.Go` starts a new goroutine each time |
+| 15–19 | each goroutine calls `op()` 100,000 times; `})` ends the anonymous function and the `Go` call |
+| 20 | `wg.Wait()` waits for all eight tasks |
+| 21–22 | divides total elapsed time by 800,000 and prints it with `name`; ends `measure` |
+| 24–26 | creates `locked` with a map and a zero-value mutex; the anonymous function calls `Sell(1, 1)` |
+| 27–30 | `owned` gets a different map; measures the same sale; closes the channel and ends `main` |
+
+`egasi` means "owner", the output label for that version. This number is not one call's latency: eight goroutines run together. It is **inverse throughput**: total time / operation count.
+
+## Why is there no data race without a lock?
+
+`OwnedStore` has no mutex. What does `-race` print? **A)** `WARNING: DATA RACE` · **B)** only measurements · **C)** `fatal error: concurrent map`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Only `loop` accesses the map. If you chose A or C, you treated many callers as many map users. Callers only operate on channels.
+
+</details>
+
+The rerun inside Docker:
+
+```console
+$ ./_video/race.sh 01-ikki go run -race .
+mutex 519ns
+egasi 1.252µs
+(chiqish kodi: 0)
+```
+
+The video records `mutex 784ns`, `egasi 1.634µs`. Those are saved numbers; the new result is above. `-race` adds checks and changes timing. Use the next ordinary run to compare speed.
+
+A **data race** requires conflicting accesses to the same memory location without synchronization; at least one is a write. Single-goroutine access to this map is the main protection.
+
+The [Go memory model](https://go.dev/ref/mem#chan) also guarantees request–reply ordering: a send synchronizes before completion of its corresponding receive. Writes before sending are therefore visible to code after receiving.
+
+The map was initialized before `go s.loop(stock)`. The [goroutine creation](https://go.dev/ref/mem#go) rule also makes those earlier writes visible when the goroutine starts.
+
+| Before | Synchronization | After |
+|---|---|---|
+| caller writes request fields | `sells` send → corresponding receive completes | `loop` reads fields |
+| `loop` updates stock | `reply` send → corresponding receive completes | `Sell` receives result |
+| update under the mutex | that mutex's `Unlock` → a later `Lock` returns | next locked access sees updated state |
+
+Silence from `-race` does not prove correctness for every execution. The basis here is ownership and synchronization; the run checks them in practice.
+
+## Measure the cost
+
+The owner version creates a channel on every call and performs two transfers. Which is faster? **A)** roughly equal · **B)** mutex faster · **C)** owner faster because it has no lock.
+
+<details>
+<summary>Answer</summary>
+
+**B**, for this small operation and this implementation. A ignores channel creation and wake-up costs. C treats "without a lock" as "without cost". Check the ratio by measuring.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ikki go run .
+mutex 44ns
+egasi 462ns
+(chiqish kodi: 0)
+```
+
+| Operation | Video recording | New run for the written lesson |
+|---|---|---|
+| mutex `Sell` | 59 ns | 44 ns |
+| owner `Sell` | 519 ns | 462 ns |
+| owner / mutex | about 8.8× | about 10.5× |
+
+The machine is also doing other work, so absolute timings change. What matters is that the owner version costs several times more for this workload. This is not a speed guarantee for every program.
+
+The fast path for acquiring an unlocked mutex starts with one atomic comparison and replacement. A contended mutex may spin briefly or block; waiting time is not guaranteed. The owner version has a new reply channel, request transfer, and reply transfer. The runtime makes a waiting goroutine ready to run again.
+
+This simple measurement has no warm-up, uses one product, and every sale succeeds. The owner's result includes channel creation. We study proper benchmarks in [GB-11.01](/lab/youtube/gb#gb-11-01).
+
+500 ns/operation gives roughly 2 million operations/second. This is arithmetic, not another experiment. If JSON or the database dominates the whole request, this difference becomes a smaller share. Measure the complete handler too.
+
+## Atomic for one counter
+
+Counting sales needs one number. `atomic.Int64` provides **atomic operations** on it. Its zero value is ready; do not copy it after first use. `Add(1)` adds indivisibly, `Load()` reads, and `Store(v)` writes a new value.
+
+The complete `main.go` for the next stage; `store.go` does not change:
+
+```go filename="_video/02-atomic/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+// sold — sanagich: sakkiz goroutine bir vaqtda oshiradi, qulfsiz.
+var sold atomic.Int64
+
+func main() {
+	locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+	measure("mutex", func() { locked.Sell(1, 1) })
+	owned := NewOwnedStore(map[int64]int{1: 800_000})
+	measure("egasi", func() { owned.Sell(1, 1) })
+	owned.Close()
+	measure("atomic", func() { sold.Add(1) })
+	fmt.Println("sotildi:", sold.Load())
+}
+```
+
+New lines: 6 imports `sync/atomic`; 25–26 declare the `sold` counter; 34 measures `Add(1)`; 35 prints `Load()`. The rest of `measure` and both `Sell` calls are unchanged. `sotildi` means "sold", the counter label here.
+
+What is the final result? **A)** always 800,000 · **B)** less because increments are lost · **C)** a data race warning.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Every increment is atomic; `Wait` waits for them all. An ordinary shared `int` with `++` had the risk in B. Because access uses atomic methods, C is not expected either.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-atomic go run .
+mutex 61ns
+egasi 606ns
+atomic 16ns
+sotildi: 800000
+(chiqish kodi: 0)
+```
+
+| Operation | Video recording | New run |
+|---|---|---|
+| mutex | 52 ns | 61 ns |
+| owner | 465 ns | 606 ns |
+| atomic `Add` | 20 ns | 16 ns |
+| `sold.Load()` | 800000 | 800000 |
+
+The new owner/mutex ratio is about 9.9×; mutex/atomic is about 3.8×. Atomic only increments a number here; it does not perform the map and rule work of `Sell`.
+
+Also check with `-race` in Docker; expect the same increments and final count, but different timings:
+
+```console
+$ ./_video/race.sh 02-atomic go run -race .
+mutex 435ns
+egasi 1.271µs
+atomic 258ns
+sotildi: 800000
+(chiqish kodi: 0)
+```
+
+No warnings. Keep these timings separate from the ordinary measurement.
+
+## Two atomic operations do not make a sale
+
+Write "read first, then decrement" for stock. This program is intentionally wrong:
+
+```go filename="_video/03-atomic-xato/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+// stock — oʻrik qoldigʻi, 100 000 dona. Xato: tekshirish va kamaytirish — ikki alohida atomik amal.
+var stock atomic.Int64
+
+func main() {
+	stock.Store(100_000)
+	measure("atomic", func() {
+		if stock.Load() > 0 {
+			stock.Add(-1)
+		}
+	})
+	fmt.Println("qoldiq:", stock.Load())
+}
+```
+
+`measure` is unchanged. On line 26, `stock` is now an atomic number; line 29 uses `Store` to write 100,000 units. Line 31 checks a positive `Load`, and line 32 decrements with `Add(-1)`. Line 35 prints `qoldiq`, meaning "remaining stock".
+
+What happens after 800,000 attempts? **A)** always 0 · **B)** it can be negative · **C)** `-race` must find a data race.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Another goroutine can sell between `Load` and `Add`. A treats the whole `if` as one atomic operation. C confuses a logic error with a data race.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-atomic-xato go run .
+atomic 2ns
+qoldiq: -6
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/race.sh 03-atomic-xato go run -race .
+atomic 192ns
+qoldiq: -4
+(chiqish kodi: 0)
+```
+
+The new ordinary run oversold by 6 units; the Docker run by 4. The video's recordings were −4 and −6 respectively. Even a negative number is not guaranteed: sometimes the result is 0.
+
+The video's research recorded 29 negative results and one 0 across 30 runs. We are quoting that historical result; we did not repeat that series of 30. The two new runs above are separate.
+
+| Step | A | B | `stock` |
+|---|---|---|---|
+| 1 | `Load()` → 1 | — | 1 |
+| 2 | — | `Load()` → 1 | 1 |
+| 3 | `Add(-1)` | — | 0 |
+| 4 | — | `Add(-1)` | −1 |
+
+Each operation is atomic separately, but the check and decrement together are not. This **race condition** has no data race, so `-race` stays silent. Even a result-checking test does not reproduce this schedule on every run.
+
+The correct approach: check and change under a mutex or inside one owner. Another approach for a single number is in the optional section.
+
+## Choose for bozor
+
+The [Go wiki](https://go.dev/wiki/MutexOrChannel) recommends whichever solution is most expressive or simple. When locking rules become complicated, an owner goroutine may simplify them.
+
+| Situation | Usual choice | Reason |
+|---|---|---|
+| stock map, short reads and writes | mutex | shared state is easy to protect; like the GB-4.08 catalog |
+| price lists moving between stages | channel | data ownership transfers; like the GB-7.02 flow |
+| distributing work or a future result | channel | communicates work and results |
+| request count | atomic | one operation on one independent number |
+| state and sequential work, such as file writes | owner goroutine | state and work share one execution order |
+
+A cache, meaning results kept in memory, is another common mutex case. Adding channels without a needed rule or measurement may complicate code.
+
+Read "share memory by communicating, rather than communicate by sharing memory" as an ownership rule. Sending a map through a channel does not itself prohibit old accesses. The code must give them up. [Effective Go](https://go.dev/doc/effective_go#sharing) also warns that this approach can be taken too far; a mutex may be enough for a counter.
+
+## Going deeper (optional): sell one number with CompareAndSwap
+
+**Compare-and-swap** means writing `old-1` only if the value is still `old`. `CompareAndSwap` makes these one atomic operation and returns success as `bool`. If another goroutine changed the value, read again.
+
+```go filename="_video/04-cas/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// measure op'ni sakkiz goroutine'dan jami 800 000 marta chaqiradi va bitta chaqiruvga ketgan oʻrtacha vaqtni chiqaradi.
+func measure(name string, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100_000 {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, time.Since(start)/800_000)
+}
+
+var stock atomic.Int64
+
+// sellOne: CompareAndSwap — qiymat hali biz oʻqigan old boʻlsa, old-1 yozadi; boshqa goroutine
+// oraliqda oʻzgartirgan boʻlsa, false qaytaradi va biz qaytadan oʻqiymiz.
+func sellOne() bool {
+	for {
+		old := stock.Load()
+		if old <= 0 {
+			return false
+		}
+		if stock.CompareAndSwap(old, old-1) {
+			return true
+		}
+	}
+}
+
+func main() {
+	stock.Store(100_000)
+	measure("cas", func() { sellOne() })
+	fmt.Println("qoldiq:", stock.Load())
+}
+```
+
+Lines 1–23 are the earlier imports and `measure`; 25 declares `stock`. Lines 29–31 read stock in the infinite loop of `sellOne`. Lines 32–34 return `false` when empty. Lines 35–36 decrement the unchanged value and return `true`. If CAS fails, line 38 leads to the next iteration. Lines 41–45 set initial stock, make 800,000 attempts, and print the result.
+
+The result? **A)** always 0 · **B)** can be negative · **C)** only `-race` fixes it.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Only one CAS succeeds for the last unit. The other caller reads the updated 0 and refuses. `-race` does not fix code.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-cas go run .
+cas 6ns
+qoldiq: 0
+(chiqish kodi: 0)
+```
+
+```console
+$ ./_video/race.sh 04-cas go run -race .
+cas 327ns
+qoldiq: 0
+(chiqish kodi: 0)
+```
+
+The README records `cas 6ns` and `cas 245ns` with `-race`; the new results are above. Timing also includes refused attempts after 100,000 successful sales. Do not compare it as equal work with `Sell`, where every call sells. This single CAS is insufficient to update stock and an orders list together.
+
+An extra experiment separates the effect of one and eight goroutines:
+
+```go filename="_video/06-bitta/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// measure — 01-ikki'dagidek, lekin goroutine'lar soni g: 800 000 chaqiruv g ta goroutine'ga boʻlinadi.
+// Natija: jami vaqt / 800 000, ya'ni bitta chaqiruvga toʻgʻri keladigan vaqt (g = 1 da bu bitta chaqiruvning oʻzi).
+func measure(name string, g int, op func()) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range g {
+		wg.Go(func() {
+			for range 800_000 / g {
+				op()
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(name, g, time.Since(start)/800_000)
+}
+
+func main() {
+	for _, g := range []int{1, 8} {
+		locked := &LockedStore{stock: map[int64]int{1: 800_000}}
+		measure("mutex", g, func() { locked.Sell(1, 1) })
+		owned := NewOwnedStore(map[int64]int{1: 800_000})
+		measure("egasi", g, func() { owned.Sell(1, 1) })
+		owned.Close()
+	}
+}
+```
+
+Changed lines: 11 adds parameter `g`; 14–16 divide 800,000 calls among `g` tasks. Line 22 also prints `g`. Line 26 iterates over `[]int{1, 8}`; `_` discards the index. Lines 27–31 create, measure, and close stores for each `g`.
+
+Do the owner's transfer costs disappear with one caller? **A)** yes · **B)** no · **C)** the channel is no longer needed.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Even with one caller, the owner is a separate goroutine. Request and reply channel transfer costs therefore remain.
+
+</details>
+
+The result:
+
+```console
+$ ./_video/run.sh 06-bitta go run .
+mutex 1 20ns
+egasi 1 618ns
+mutex 8 85ns
+egasi 8 533ns
+(chiqish kodi: 0)
+```
+
+This is `_video/06-bitta/main.go`: `measure(name, g, op)` divides 800,000 total calls by `g`. `mutex 1` and `egasi 1` mean one goroutine; `8` means eight.
+
+For one goroutine, the README records mutex 21–31 ns and owner 636–714 ns. The new result is 20 and 618 ns. With eight, it is 85 and 533 ns; the recorded ranges were 34–80 and 448–739 ns. Load and scheduling change absolute numbers. Even one caller must meet the separate `loop` through a channel without a buffer.
+
+## Common mistakes
+
+**1. "Every method is atomic, so the sale is atomic."** The broken program and actual negative result appear above. Silence from `-race` does not check the sale rule. Fix: a shared lock, an owner, or CAS for one number.
+
+**2. Reading the map after handing it over.** `OwnedStore` hides the map, but the caller may still have its old map variable. This stage uses the same copy of `store.go` shown above:
+
+```go filename="_video/05-topshirilgan/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+// Xato: map loop'ga topshirilgandan keyin main uni oʻzi oʻqiydi. Endi map'ga ikki goroutine tegadi.
+func main() {
+	stock := map[int64]int{1: 1000}
+	owned := NewOwnedStore(stock)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 100 {
+				owned.Sell(1, 1)
+			}
+		})
+	}
+	fmt.Println("qoldiq:", stock[1]) // topshirilgan map'ga tegdik
+	wg.Wait()
+	owned.Close()
+}
+```
+
+Lines 9–11 hand `stock` to the owner. Lines 12–19 start four sellers with `wg`, each selling 100 times. On line 20, `main` reads the map without synchronization; lines 21–23 wait for sellers and close the store. The value printed after `qoldiq` is not guaranteed.
+
+What does `-race` say? **A)** handing over the map makes everything safe · **B)** warns if it finds the conflicting read and write · **C)** always just prints `0`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** The main goroutine reads the map while `loop` writes to it. A channel does not make the caller's old map unreadable.
+
+</details>
+
+`2>&1` also passes the error stream; `|` sends it to `sed`. `sed -n` prints only warnings, the race count, and status lines. Address and stack lines are removed by this filter:
+
+```console
+$ ./_video/race.sh 05-topshirilgan go run -race . 2>&1 | sed -n '/^WARNING: DATA RACE$/p; /^Found .*data race/p; /^exit status /p; /^(chiqish kodi:/p'
+WARNING: DATA RACE
+WARNING: DATA RACE
+Found 2 data race(s)
+exit status 66
+(chiqish kodi: 1)
+```
+
+`WARNING: DATA RACE` is a data race warning; `Found 2 data race(s)` means this run found two conflicts. `exit status 66` means the detector ended after finding an error. The script shows that as exit code 1. Fix: stop accessing the old map; ask the owner for stock through `Stock`.
+
+**3. Plain receiving from a closed channel.** In the task's `select`, closed `sells` is always ready. Use `r, ok := <-s.sells` and `if !ok { return }`; otherwise the loop may spin or block sending to a zero `reply`.
+
+**4. An uninitialized channel.** Without `make`, the new `stocks` field is `nil`. Sending to it waits forever. The constructor must create the channel, and the loop must receive from it.
+
+**5. Shutdown and copying.** Calling `Close` twice panics; selling afterwards is invalid too. The solution's `Stock` also blocks after the owner exits. Finish the callers first; do not copy a mutex or `atomic.Int64` after use.
+
+## Check yourself
+
+**1.** Why is there no data race in the owner version without a lock?
+
+<details>
+<summary>Answer</summary>
+
+Only `loop` accesses the map. Request and reply channels synchronize write visibility. The caller must stop accessing the map it handed over.
+
+</details>
+
+**2.** Two goroutines received 1 from `Load()`. Each calls `Add(-1)`. What remains? **A)** 0 · **B)** −1 · **C)** a data race error.
+
+<details>
+<summary>Answer</summary>
+
+**B: −1.** Two indivisible operations decrement in sequence. Both checks already passed. This is a race condition without a data race.
+
+</details>
+
+**3.** GB-7.02: what does `n, ok := <-ch` return for a closed `chan int` with an empty buffer?
+
+<details>
+<summary>Answer</summary>
+
+Immediately `n == 0`, `ok == false`. That `ok` makes the task's loop terminate.
+
+</details>
+
+**4.** 800,000 operations finish in 0.4 seconds. Did every call wait 500 ns?
+
+<details>
+<summary>Answer</summary>
+
+No. 0.4 / 800,000 = 500 ns/operation is inverse aggregate throughput. An individual concurrent call has a different waiting time.
+
+</details>
+
+## Homework
+
+Code: [lessons/gb-7-05-mutex-channel](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel).
+Task: [TASK.md](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-05-mutex-channel/TASK.md).
+Answer: [solution/store.go](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-05-mutex-channel/solution/store.go).
+
+- 🟢 **`Stock(id int64) int`:** write `stockReq{id, reply chan int}`, a second `stocks` channel, and a `select` waiting on both channels. Missing ID means 0. Return when `sells` closes. Keep the map only in the loop; do not add a map or lock to `OwnedStore`.
+- 🟡 **Optional `Requests() int64`:** use the existing `calls atomic.Int64` field. Every `Sell`, including a refused sale, calls `Add(1)`; `Requests` returns `Load()`. Without an implementation, that check is `SKIP`.
+
+Do not change `LockedStore`, `main.go`, `tekshiruv_test.go`, or the request–reply order of `Sell`. The starter `Stock` returns −1. `-count=1` reruns the test without using cached results; local commands use `CGO_ENABLED=0`.
+
+```console
+$ go test -count=1 .
+--- FAIL: TestVazifaStock (0.00s)
+    tekshiruv_test.go:45: Stock(1) = -1: Stock hali yozilmagan. TASK.md 1-qadam: Stock soʻrovini loop'ga yuborib, javobni qaytaring
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.013s
+FAIL
+```
+
+`tekshiruv_test.go:45` is line 45 in the checker file. `Stock hali yozilmagan` means "Stock has not been written": the starter task fails. `FAIL` means the test failed; the module path and timing describe that package's run.
+
+The test checks stock 40, 5, 0; exactly 5 sales during concurrent `Sell`/`Stock`; and the absence of map and lock fields. It also checks goroutine termination after closing 20 stores. If no reply arrives in two seconds, check channel creation and receiving in the loop.
+
+<details>
+<summary>Answer</summary>
+
+The `stockReq` fields are `id int64`, `reply chan int`. The constructor creates `stocks: make(chan stockReq)`. The basic shape of `Stock`:
+
+```go
+func (s *OwnedStore) Stock(id int64) int {
+	reply := make(chan int)
+	s.stocks <- stockReq{id, reply}
+	return <-reply
+}
+```
+
+Use an infinite `for` with `select` in the loop: receive `r, ok` from `sells`, return on `!ok`. The sale body stays the same. In the `stocks` case, use `r.reply <- stock[r.id]`. A missing map key has zero value 0.
+
+For `Requests`, add `s.calls.Add(1)` at the start of `Sell` and `return s.calls.Load()` in `Requests`. Only 3 of the test's 100 calls sell, but Requests must be 100.
+
+Check the answer; `./solution/` selects only the solution package:
+
+```console
+$ go test -count=1 ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	0.012s
+```
+
+```console
+$ ./_video/race.sh solution go test -race -count=1 .
+ok  	github.com/abdurahmon27/bozor	1.020s
+(chiqish kodi: 0)
+```
+
+`ok` means the tests passed; timing changes on each run. Static analysis:
+
+```console
+$ go vet ./...
+
+```
+
+`go vet ./...` printed nothing. This does not replace testing. Your solution must also pass `go test -count=1 .`.
+
+</details>
+
+## Sources
+
+- [Go wiki: MutexOrChannel](https://go.dev/wiki/MutexOrChannel).
+- [Effective Go: Share by communicating](https://go.dev/doc/effective_go#sharing), [Go Proverbs](https://go-proverbs.github.io/), [Share Memory By Communicating](https://go.dev/blog/codelab-share).
+- [Go memory model](https://go.dev/ref/mem): [channels](https://go.dev/ref/mem#chan), [locks](https://go.dev/ref/mem#locks), [atomic values](https://go.dev/ref/mem#atomic).
+- [sync.Mutex](https://pkg.go.dev/sync#Mutex), [sync.WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [sync/atomic](https://pkg.go.dev/sync/atomic), [atomic.Int64](https://pkg.go.dev/sync/atomic#Int64), [Store](https://pkg.go.dev/sync/atomic#Int64.Store), [CompareAndSwap](https://pkg.go.dev/sync/atomic#Int64.CompareAndSwap).
+- [Data Race Detector](https://go.dev/doc/articles/race_detector), [runtime overheads](https://go.dev/doc/articles/race_detector#Runtime_Overheads), [Go 1.20: cgo](https://go.dev/doc/go1.20#cgo).
+- [Go specification: channel types](https://go.dev/ref/spec#Channel_types), [range](https://go.dev/ref/spec#For_range), [composite literals](https://go.dev/ref/spec#Composite_literals), [receive operator](https://go.dev/ref/spec#Receive_operator), [select](https://go.dev/ref/spec#Select_statements), [close](https://pkg.go.dev/builtin#close).
+- [errgroup.SetLimit](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.SetLimit), [time.Since](https://pkg.go.dev/time#Since), [Duration.String](https://pkg.go.dev/time#Duration.String).
+- [Go 1.27.4: mutex fast path](https://github.com/golang/go/blob/go1.27.4/src/internal/sync/mutex.go#L61-L68), [channel send](https://github.com/golang/go/blob/go1.27.4/src/runtime/chan.go#L318).
+- [README, TASK.md, _video, solution](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel).
+
+Results: `go1.27.4 linux/amd64`, 2026-11-28. Ordinary commands use `CGO_ENABLED=0`; `-race` uses `CGO_ENABLED=1` in Docker. Numbers quoted from the video are marked separately.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-05-mutex-channel)
+
+---
+
+← Previous lesson: [GB-7.04](/lab/youtube/gb/gb-7-04/en) · Next lesson: [GB-7.06](/lab/youtube/gb/gb-7-06/en) → · [All lessons](/lab/youtube/gb)
+
+</div>

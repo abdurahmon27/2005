@@ -1,0 +1,911 @@
+---
+title: "Checkpoint: a cancellable importer"
+date: "2026/11/28"
+description: "Import a catalog into Postgres with N workers, stop with Ctrl+C, and verify the batch report against the database."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 2
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-07/en"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-07"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-07/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-07/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-07"
+---
+
+<div lang="en">
+
+🌐 [Oʻzbekcha](/lab/youtube/gb/gb-7-07) · [Русский](/lab/youtube/gb/gb-7-07/ru) · **English**  
+Lesson GB-7.07 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-07) · ▶️ video coming soon · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer)
+
+> This is the full written version of the video lesson: you can learn from it without watching (or hearing) the video. The video itself is in Uzbek.
+
+## What you will learn
+
+Every night, bozor imports a catalog of 200,000 lines into Postgres. How many rows remain if you press Ctrl+C halfway through, and how can you check?
+
+**One idea:** Ctrl+C cancels one context; the reader, workers, and SQL respond to that signal. Each batch is one transaction: the counter increases after a successful Commit.
+
+After this lesson, you can:
+
+- write a large file with N workers through `cmd/import`;
+- trace Ctrl+C and the first error through the pipeline;
+- check the report against the database and repeat the import;
+- test shutdown and add a batch deadline.
+
+| Term | Plain meaning | English term |
+|---|---|---|
+| `signal.NotifyContext` | turns a process signal into context cancellation | signal.NotifyContext |
+| cancellable pipeline | every stage checks cancellation; the owner waits for all stages | cancellable pipeline |
+| batch boundary | 500 rows in one transaction; counters change after the result | batch boundary |
+
+## Before you start
+
+Main prerequisites:
+
+- [GB-7.06 · synctest and leaks](/lab/youtube/gb/gb-7-06/en)
+
+- [GB-5.10 · Postgres checkpoint](/lab/youtube/gb/gb-5-10/en)
+
+- [GB-3.01 · Scanner and files](/lab/youtube/gb/gb-3-01/en)
+
+- [GB-7.01 · goroutine owner](/lab/youtube/gb/gb-7-01/en)
+
+- [GB-7.02 · channels and pipelines](/lab/youtube/gb/gb-7-02/en)
+
+- [GB-7.03 · select and context](/lab/youtube/gb/gb-7-03/en)
+
+- [GB-7.04 · workers and errgroup](/lab/youtube/gb/gb-7-04/en)
+
+- [GB-7.05 · atomic counters](/lab/youtube/gb/gb-7-05/en)
+
+- [GB-5.02 · Docker and psql](/lab/youtube/gb/gb-5-02/en)
+
+- [GB-5.03 · UNIQUE and identity](/lab/youtube/gb/gb-5-03/en)
+
+- [GB-5.05 · pgxpool](/lab/youtube/gb/gb-5-05/en)
+
+- [GB-5.06 · goose](/lab/youtube/gb/gb-5-06/en)
+
+- [GB-5.07 · transactions](/lab/youtube/gb/gb-5-07/en)
+
+- [GB-4.07 · race detector](/lab/youtube/gb/gb-4-07/en)
+
+- [GB-4.02 · Ctrl+C](/lab/youtube/gb/gb-4-02/en)
+
+- [GB-2.07 · interfaces and io.Reader](/lab/youtube/gb/gb-2-07/en)
+
+- [GB-2.08 · %w and errors.Is](/lab/youtube/gb/gb-2-08/en)
+
+- [GB-2.09 · defer and os.Exit](/lab/youtube/gb/gb-2-09/en)
+
+- [GB-2.05 · methods](/lab/youtube/gb/gb-2-05/en)
+
+- [GB-2.04 · pointers](/lab/youtube/gb/gb-2-04/en)
+
+- [GB-2.03 · structs](/lab/youtube/gb/gb-2-03/en)
+
+- [GB-2.01 · slices](/lab/youtube/gb/gb-2-01/en)
+
+- [GB-1.08 · tests](/lab/youtube/gb/gb-1-08/en)
+
+- [GB-1.07 · functions and errors](/lab/youtube/gb/gb-1-07/en)
+
+- [GB-1.06 · for](/lab/youtube/gb/gb-1-06/en)
+
+- [GB-1.05 · if](/lab/youtube/gb/gb-1-05/en)
+
+- [GB-1.04 · fmt.Printf](/lab/youtube/gb/gb-1-04/en)
+
+- [GB-1.03 · int64 and tiyin](/lab/youtube/gb/gb-1-03/en)
+
+- [GB-1.02 · :=](/lab/youtube/gb/gb-1-02/en)
+
+Open the [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer): `lessons/gb-7-07-importer`. Run commands there. Its own `go.mod` uses Go 1.27, pgx v5.13.0, goose v3.30.2, and x/sync v0.25.0. You need Docker, Bash, and the goose CLI. This multi-package lab uses a local file and database.
+
+Environment for ordinary commands:
+
+```bash
+export GOTOOLCHAIN=go1.27.4 CGO_ENABLED=0
+```
+
+`GOTOOLCHAIN` selects the version; `CGO_ENABLED=0` builds without a C compiler. Outputs were rerun on 2026-11-28 in a separate copy. Its compose project was `gb707docs`, port 5517, volume `gb707docs_pgdata`; all were removed afterward. The course project is `gb707`.
+
+**Recall:** which wait inside a synctest bubble is not durably blocking? **A)** a channel created inside the bubble · **B)** a Postgres network request · **C)** `time.Sleep`.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Network I/O wakes on an external event. The pipeline therefore uses a fake saver in synctest, while Postgres is tested separately. A and C are waits inside the bubble.
+
+</details>
+
+## Specification and batches
+
+Command: `go run ./cmd/import [-workers 4] katta.txt`. Square brackets mark an optional argument; do not type them.
+
+| Part | Rule |
+|---|---|
+| Input | `nom;narx;qoldiq`; price in som, `Price int64` in tiyin |
+| Key | `products.name` is UNIQUE; the database assigns IDs |
+| Batch | `BatchSize = 500`; the final batch may be smaller |
+| Concurrency | one reader and N persistent workers |
+| Ctrl+C | a worker that observes cancellation does not start another batch |
+| Bad line | the first error cancels remaining work; earlier commits remain |
+| Counter | `Rows`: inserted **and updated** rows in successful batches |
+
+In `Product`, `Name` is the name, `Price` is the price, and `Stock` is the stock. `olma;12000;40` → `Name: "olma", Price: 1200000, Stock: 40`. Empty lines and lines starting with `#` are skipped. `product.go` checks three fields, a nonempty UTF-8 name, a price of 1…10,000,000 som, and nonnegative stock.
+
+The entire file is not one transaction. For `Rows = count(*)`, the table must start empty and names in the file must be unique. There must be no other writers, and Commit outcomes must be known.
+
+## How Ctrl+C becomes a context
+
+On Ctrl+C, the terminal sends SIGINT to its foreground process group. On Unix, `os.Interrupt` is that signal. `signal.NotifyContext` turns it into **context cancellation** instead of the usual exit ([documentation](https://pkg.go.dev/os/signal#NotifyContext)). Complete `main` function from `cmd/import/main.go`:
+
+```go
+func main() {
+	workers := flag.Int("workers", 4, "bir vaqtda nechta partiya yoziladi")
+	flag.Parse()
+	if err := run(flag.Arg(0), *workers); err != nil {
+		fmt.Fprintln(os.Stderr, "import:", err)
+		os.Exit(1)
+	}
+}
+```
+
+`workers` is the `*int` returned by `flag.Int`: supply the name, default 4, and help text. `Parse` reads `os.Args`; `Arg(0)` is the filename after flags, and `*workers` dereferences the pointer. If `run` returns an error, `Fprintln` writes it with `import:` to `os.Stderr`; `os.Exit(1)` exits with an error code. The full `flag` topic is in [GB-8.01](/lab/youtube/gb/gb-8-01/en).
+
+Three lines at the start of `run`:
+
+```go
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	context.AfterFunc(ctx, stop) // birinchi Ctrl+C'dan keyin ushlash oʻchadi: ikkinchisi dasturni darhol toʻxtatadi
+```
+
+The first line returns `ctx` and `stop`, which unregisters signal handling. `defer stop()` releases resources on return. `context.AfterFunc(ctx, stop)` calls `stop` in a separate goroutine after cancellation. Once it runs, a subsequent Ctrl+C restores normal exit behavior.
+
+| Event | State |
+|---|---|
+| Import starts | `ctx.Done()` is open |
+| SIGINT arrives | `ctx.Done()` closes; `ctx.Err()` is `context.Canceled` |
+| Stages respond | the reader and workers return |
+| `g.Wait()` finishes | the final report is printed |
+
+`run` opens the file with `os.Open`, creates a pool with `pgxpool.New`, and closes both through `defer`. `importer.NewPG(pool)` provides the real saver. Reporting excerpt:
+
+```go
+	start := time.Now()
+	st, err := importer.Run(ctx, f, importer.NewPG(pool), importer.Config{Workers: workers})
+	fmt.Printf("%v · vaqt: %v\n", st, time.Since(start).Round(time.Millisecond))
+	if errors.Is(err, context.Canceled) { // birinchi xato bekor qilish boʻlsa, uni Ctrl+C qilgan
+		return errors.New("toʻxtatildi (Ctrl+C)")
+	}
+	return err
+```
+
+`start` stores the start time; `Since` gives elapsed time, and `Round` rounds to milliseconds. `%v` calls `Stats.String()`. The report appears even on error. If `errors.Is` finds cancellation, it returns `toʻxtatildi (Ctrl+C)`, meaning “stopped.” For exit code 1, `go run` prints `exit status 1`.
+
+## One reader, N workers, and one owner
+
+The **cancellable pipeline**: `read` reads and validates, `work` saves, and `Run` owns them.
+
+```text
+katta.txt -> read -> batches (500) -> work x N -> Saver
+              |                         |
+              +------- gctx ------------+
+                         |
+                      g.Wait()
+```
+
+`Saver` is an interface with one method, `SaveBatch(ctx, rows)`. Tests use a fake; the actual run uses `PG`. `Batch.N` is the batch number; `Batch.Rows` is a product slice. Complete `internal/importer/importer.go`:
+
+```go filename="internal/importer/importer.go" showLineNumbers
+// Package importer — katta katalog faylini bazaga yozadigan bosqichlar (GB-7.07, 7-modul nazorat nuqtasi).
+//
+//	fayl → read (1 goroutine) → batches channel → work (Workers ta goroutine) → Saver (Postgres)
+//
+// read qatorlarni oʻqiydi, tekshiradi va BatchSize'lik partiyalarga yigʻadi. Har work goroutine partiyani oladi
+// va Saver'ga beradi: Postgres'da bitta partiya = bitta transaction (pg.go), yoki toʻliq yoziladi, yoki umuman.
+// Hammasi bitta errgroup'da (GB-7.04): birinchi xato (buzuq qator, baza xatosi) yoki tashqi ctx'ning bekor
+// boʻlishi (Ctrl+C) qolgan hamma goroutine'ni toʻxtatadi, Run esa ular tugagandan keyingina qaytadi.
+package importer
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+)
+
+// BatchSize — bitta partiyadagi qatorlar soni (bitta transaction).
+const BatchSize = 500
+
+// Batch — fayldagi ketma-ket BatchSize ta qator. N — partiya raqami, 1 dan.
+type Batch struct {
+	N    int
+	Rows []Product
+}
+
+// Saver partiyani bazaga yozadi: yoki hammasini, yoki hech birini (xato qaytaradi).
+// Haqiqiysi — PG (pg.go); testlarda soxtasi (vaqt va xatoni test boshqaradi).
+type Saver interface {
+	SaveBatch(ctx context.Context, rows []Product) error
+}
+
+// Config — import sozlamalari.
+type Config struct {
+	Workers int // bir vaqtda nechta partiya yoziladi (kamida 1)
+
+	// BatchTimeout — bitta partiyaga beriladigan eng koʻp vaqt; 0 — cheklovsiz.
+	// VAZIFA (TASK.md): hozir ishlatilmaydi.
+	BatchTimeout time.Duration
+}
+
+// Stats — import hisobi. Uni Workers ta goroutine bir vaqtda oshiradi, shuning uchun atomic (GB-7.05).
+// Rows — commit boʻlgan partiyalardagi qatorlar (qoʻshilgan yoki upsert bilan yangilangan); faylda nomlar
+// takrorlanmasa va jadval boʻsh boʻlsa, import tugagach Rows = SELECT count(*). Rolled* — SaveBatch xato qaytargan
+// partiyalar (Begin'ning xatosi ham shu yerda: unda hech narsa yozilmagan). Commit javobi tarmoqda yoʻqolsa,
+// partiya bazada boʻlsa ham Rolled'ga tushadi: bu holatni upsert qayta ishga tushirish bilan tuzatadi.
+type Stats struct {
+	Rows, Batches             atomic.Int64 // commit boʻlgan qatorlar va partiyalar
+	RolledRows, RolledBatches atomic.Int64 // xato bilan tugagan (rollback) qatorlar va partiyalar
+}
+
+func (s *Stats) String() string {
+	return fmt.Sprintf("yozildi: %d qator (%d partiya) · rollback: %d qator (%d partiya)",
+		s.Rows.Load(), s.Batches.Load(), s.RolledRows.Load(), s.RolledBatches.Load())
+}
+
+// ErrBadWorkers — Workers 1 dan kichik: hech kim partiya olmasdi, read esa abadiy kutardi.
+var ErrBadWorkers = errors.New("workers kamida 1 boʻlishi kerak")
+
+// Run r'dagi katalogni s'ga cfg.Workers ta goroutine bilan yozadi. Birinchi xatoni qaytaradi; ctx bekor
+// qilinsa (Ctrl+C), ctx xatosini. Qaytganda hech bir goroutine ishlamayotgan boʻladi, Stats esa yakuniy.
+func Run(ctx context.Context, r io.Reader, s Saver, cfg Config) (*Stats, error) {
+	st := &Stats{}
+	if cfg.Workers < 1 {
+		return st, ErrBadWorkers
+	}
+	batches := make(chan Batch)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		defer close(batches)
+		return read(gctx, r, batches)
+	})
+	for range cfg.Workers {
+		g.Go(func() error {
+			return work(gctx, s, batches, st, cfg.BatchTimeout)
+		})
+	}
+	return st, g.Wait()
+}
+
+// read qatorlarni oʻqiydi va partiyalarni out'ga yuboradi. Buzuq qatorda raqami bilan xato qaytaradi.
+// Boʻsh qatorlar va # bilan boshlangan izohlar tashlab oʻtiladi (GB-3.01).
+func read(ctx context.Context, r io.Reader, out chan<- Batch) error {
+	sc := bufio.NewScanner(r)
+	b := Batch{N: 1}
+	line := 0
+	for sc.Scan() {
+		line++
+		text := strings.TrimSpace(sc.Text())
+		if text == "" || strings.HasPrefix(text, "#") {
+			continue
+		}
+		p, err := parseLine(text)
+		if err != nil {
+			return fmt.Errorf("%d-qator: %w", line, err)
+		}
+		b.Rows = append(b.Rows, p)
+		if len(b.Rows) == BatchSize {
+			if err := send(ctx, out, b); err != nil {
+				return err
+			}
+			b = Batch{N: b.N + 1}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("%d-qator: %w", line+1, err)
+	}
+	if len(b.Rows) > 0 {
+		return send(ctx, out, b)
+	}
+	return nil
+}
+
+// send partiyani yuboradi yoki ctx bekor boʻlsa, kutmasdan qaytadi (GB-7.03).
+func send(ctx context.Context, out chan<- Batch, b Batch) error {
+	select {
+	case out <- b:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// work partiyalarni in channel'i yopilguncha oladi va s'ga yozadi.
+// VAZIFA (TASK.md): timeout > 0 boʻlsa, har partiya shu vaqtdan koʻp davom etmasin.
+func work(ctx context.Context, s Saver, in <-chan Batch, st *Stats, timeout time.Duration) error {
+	for b := range in {
+		if ctx.Err() != nil {
+			return ctx.Err() // bekor qilingan: yangi partiya boshlanmaydi
+		}
+		if err := s.SaveBatch(ctx, b.Rows); err != nil {
+			st.RolledRows.Add(int64(len(b.Rows)))
+			st.RolledBatches.Add(1)
+			return fmt.Errorf("partiya %d: %w", b.N, err)
+		}
+		st.Rows.Add(int64(len(b.Rows)))
+		st.Batches.Add(1)
+	}
+	return nil
+}
+```
+
+| Lines | What happens |
+|---|---|
+| 1–22 | Comments, package, and imports: Scanner, context, errors, formatting, Reader, strings, atomic, time, and errgroup. |
+| 24–39 | The limit 500, `Batch` with a number and slice, and the `Saver` interface. |
+| 41–48 | `Workers` sets the worker count; `BatchTimeout` is still the exercise. |
+| 50–65 | Four `atomic.Int64` values; `Add` updates, `Load` reads, and `String` formats the report. |
+| 67–75 | `ErrBadWorkers`; `st := &Stats{}` creates zero counters; N &lt; 1 returns an error immediately. |
+| 76–87 | An unbuffered channel, `WithContext`, one reader, N workers, then `g.Wait()`. |
+| 89–110 | Scanner validates lines; `line` counts physical lines; after 500 rows it sends and starts a new slice. |
+| 111–118 | Wrap the Scanner error, send a partial final batch, return `nil` on success. |
+| 120–128 | `select`: a worker receives the batch, or cancellation ends the wait. |
+| 130–146 | Work until the channel closes, check ctx, update counters after the save result. |
+
+`chan<- Batch` only sends; `<-chan Batch` only receives. `for range cfg.Workers` starts N goroutines. Only the sending reader calls `defer close(batches)`: closure ends the workers’ `range` loops.
+
+`b = Batch{N: b.N + 1}` starts a new slice. The next batch does not overwrite the slice already sent. `%w` preserves the original error; `%d` prints the number.
+
+If both `select` cases are ready, one is chosen: cancellation has no priority. That is why the worker checks `ctx.Err()` again. All goroutines do not freeze simultaneously.
+
+`WithContext` cancels `gctx` on the first error. `g.Wait()` waits for **all** functions and returns the first recorded error ([errgroup](https://pkg.go.dev/golang.org/x/sync/errgroup#WithContext)). `SetLimit` is unnecessary: active workers are already bounded by N. Workers safely update shared counters using `atomic`.
+
+## Batch = transaction, counters follow the result
+
+If we write 500 rows independently, Ctrl+C leaves a partial batch. The **batch boundary** puts them into one transaction. Complete `internal/importer/pg.go`:
+
+```go filename="internal/importer/pg.go" showLineNumbers
+package importer
+
+import (
+	"context"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PG — Saver: partiyani Postgres'ga bitta transaction'da yozadi (GB-5.07).
+type PG struct {
+	pool *pgxpool.Pool
+}
+
+// NewPG pool ustidagi Saver qaytaradi. Pool bir vaqtda koʻp goroutine uchun xavfsiz (GB-5.05).
+func NewPG(pool *pgxpool.Pool) *PG {
+	return &PG{pool: pool}
+}
+
+// upsert: shu nomli mahsulot yoʻq boʻlsa qoʻshadi, bor boʻlsa narxi va qoldigʻini yangilaydi.
+// excluded — qoʻshilmoqchi boʻlgan (UNIQUE'ga urilgan) qator. Shuning uchun importni qayta ishga tushirish xavfsiz.
+// Eslatma: qator yangilansa ham identity ketma-ketligi bitta qiymatni sarflaydi (ID'larda boʻshliq boʻladi).
+const upsert = `
+INSERT INTO products (name, price, stock) VALUES ($1, $2, $3)
+ON CONFLICT (name) DO UPDATE SET price = excluded.price, stock = excluded.stock`
+
+// endTimeout — Commit yoki Rollback javobini kutishning yuqori chegarasi (baza yoki tarmoq javob bermay qolsa).
+const endTimeout = 5 * time.Second
+
+// SaveBatch rows'ni bitta transaction'da yozadi. ctx bekor boʻlsa (Ctrl+C yoki BatchTimeout), Exec toʻxtaydi va
+// transaction rollback boʻladi. Commit va Rollback esa alohida end ctx bilan: context.WithoutCancel ctx'ning bekor
+// qilinishini (va muddatini) olib tashlaydi, WithTimeout oʻz chegarasini qoʻyadi. Natija: Exec'lari tugagan
+// partiyaning Commit'i Ctrl+C'dan yarmida uzilmaydi, lekin abadiy ham kutmaydi; partiya yo toʻliq, yo yoʻq.
+func (s *PG) SaveBatch(ctx context.Context, rows []Product) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	end, cancel := context.WithTimeout(context.WithoutCancel(ctx), endTimeout)
+	defer cancel()
+	defer tx.Rollback(end) // Commit'dan keyin hech narsa qilmaydi
+	for _, p := range rows {
+		if _, err := tx.Exec(ctx, upsert, p.Name, p.Price, p.Stock); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(end)
+}
+```
+
+| Lines | What happens |
+|---|---|
+| 1–8 | Package `importer`; imports for context, time, and pgxpool. |
+| 10–18 | `PG` stores a pool pointer; `NewPG` returns `&PG{pool: pool}`. |
+| 20–25 | The `upsert` SQL string; `$1`, `$2`, `$3` are name, price, and stock arguments. |
+| 27–28 | `endTimeout` is 5 seconds. |
+| 30–38 | `SaveBatch` begins a transaction; a Begin error returns immediately. |
+| 39–41 | `end` and `cancel`; on return, Rollback runs before cancel. |
+| 42–46 | `_` discards the index; each `p` gets `Exec(ctx, …)`; an error returns and triggers Rollback. |
+| 47–48 | Return the result of `Commit(end)`. |
+
+Rollback after a successful Commit does not undo the write: it returns `ErrTxClosed`, ignored here ([pgx Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)).
+
+`ctx` stops work; `end` finishes the transaction. **`context.WithoutCancel`** removes the parent’s cancellation and deadline; `WithTimeout` adds a new bound ([documentation](https://pkg.go.dev/context#WithoutCancel)).
+
+The timer starts **after Begin, before the Exec loop**. Commit and Rollback share its remaining time. Commit does not get a fresh five seconds.
+
+| When Ctrl+C arrives | Result |
+|---|---|
+| During `Exec(ctx, …)` | usually an error and rollback; the success counter does not grow |
+| After all Exec calls, before Commit | Ctrl+C does not cancel `end`; the Commit attempt continues |
+| After a successful Commit | `Rows` and `Batches` increase |
+
+**Predict:** the last Exec finished; Ctrl+C arrives before Commit. The database is healthy and `end` has enough time left. **A)** a complete commit · **B)** mandatory rollback · **C)** half a batch.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Ctrl+C does not cancel the Commit context. B confuses `ctx` with `end`; C ignores transaction atomicity. This does not guarantee success during a network or database failure.
+
+</details>
+
+The helper concept is **upsert**: INSERT if the name is absent, UPDATE on `ON CONFLICT (name)`. `excluded` is the proposed row ([PostgreSQL](https://www.postgresql.org/docs/18/sql-insert.html#SQL-ON-CONFLICT)). A repeated import updates an existing product’s price and stock.
+
+## Run: Ctrl+C, the database, and another import
+
+First use `docker compose up -d --wait`: it starts the database in the background and waits for its healthcheck. This was rerun in the separate copy described above. `compose.yaml` exposes port 5517 only on localhost and uses a named volume.
+
+Set `LAB_DATABASE_URL` in your local environment to this lab’s connection address. The course’s `compose.yaml` contains its user, password, and database settings; use host `localhost` and port 5517. Do not copy authentication values onto the page. For goose and the importer:
+
+```bash
+export GOOSE_DRIVER=postgres GOOSE_MIGRATION_DIR=migrations
+export GOOSE_DBSTRING="$LAB_DATABASE_URL"
+export DATABASE_URL="$GOOSE_DBSTRING"
+```
+
+Three migrations create the GB-5.10 schema. `goose up` applies them:
+
+```console
+$ goose up
+2026/11/28 16:01:13 OK   00001_products.sql (7.45ms)
+2026/11/28 16:01:13 OK   00002_orders.sql (8.79ms)
+2026/11/28 16:01:13 OK   00003_orders_status.sql (2.4ms)
+2026/11/28 16:01:13 goose: successfully migrated database to version: 3
+```
+
+`OK` means success; `version: 3` means it reached the third migration. The date prefix comes from goose logging. The generator creates 200,000 lines; `>` redirects stdout to a file. `head -4` prints the first four lines:
+
+```console
+$ go run ./cmd/katalog 200000 > katta.txt
+```
+
+```console
+$ head -4 katta.txt
+olma;12000;40
+non;4000;120
+oʻrik;35000;5
+choy;25000;8
+```
+
+The first command printed nothing on screen. Names start with olma (“apple”), non (“bread”), oʻrik (“apricot”), and choy (“tea”); later names add numbers and do not repeat.
+
+**Predict:** Ctrl+C arrives while four workers are inside Exec. **A)** the written portion of each batch remains · **B)** the four batches ending in error roll back · **C)** the whole file finishes.
+
+<details>
+<summary>Answer</summary>
+
+**B**, in this situation. A forgets the batch transaction; C ignores cancellation. A batch that reached Commit may still finish, as in the previous question.
+
+</details>
+
+First, `go build -o imp ./cmd/import` warmed the build cache. `_video/ctrlc.py` sends SIGINT to the whole group after 2.5 seconds and prints `^C`, like a terminal. The SIGINT delay starts when the script launches, while the report measures from Run; that is why 2.5 s and 2.2 s differ.
+
+Normally, start `go run ./cmd/import katta.txt` and press Ctrl+C yourself.
+
+```console
+$ python3 _video/ctrlc.py 2.5 go run ./cmd/import katta.txt
+^Cyozildi: 56000 qator (112 partiya) · rollback: 2000 qator (4 partiya) · vaqt: 2.2s
+import: toʻxtatildi (Ctrl+C)
+exit status 1
+```
+
+```console
+$ docker compose exec -T db psql -c "SELECT count(*) FROM products"
+ count 
+-------
+ 56000
+(1 row)
+```
+
+`exec -T` disables the pseudo-terminal when capturing output to a file; interactive `exec` gives the same result. `-c` executes SQL, and `count(*)` counts rows. 56,000 = 56,000: this new table contains no partial batches.
+
+The video had 48,000 rows, 4 rolled-back batches, and 2.182 s. This run had 56,000, 4, and 2.2 s. Completed batches depend on load and scheduling; check equality and the 500-row boundary.
+
+**Predict:** import the same file again to completion. **A)** 256,000 · **B)** 200,000 · **C)** a UNIQUE error.
+
+<details>
+<summary>Answer</summary>
+
+**B.** Upsert updates the existing 56,000 names and inserts the rest. A counts updates as new rows; C forgets ON CONFLICT. The file is read from the beginning.
+
+</details>
+
+```console
+$ go run ./cmd/import katta.txt
+yozildi: 200000 qator (400 partiya) · rollback: 0 qator (0 partiya) · vaqt: 9.727s
+```
+
+```console
+$ docker compose exec -T db psql -c "SELECT count(*) FROM products"
+ count  
+--------
+ 200000
+(1 row)
+```
+
+The video’s full repeated import took 8.896 s; this run took 9.727 s, about 1.09 times as long. This is not an N-worker speedup measurement; it compares repeated imports under different loads. The main result is 400 successful batches and 200,000 database rows.
+
+Create the bad file from the large file. The first `sed` command changes only line 120,000’s price to −5. `-n 120000p` prints only that line:
+
+```console
+$ sed '120000s/;[0-9]*;/;-5;/' katta.txt > buzuq.txt
+```
+
+```console
+$ sed -n 120000p buzuq.txt
+sut-120000;-5;199
+```
+
+**Predict:** what happens when importing the bad file? **A)** skip the bad line · **B)** undo every earlier commit · **C)** stop with an error and retain earlier commits.
+
+<details>
+<summary>Answer</summary>
+
+**C.** `read` returns an error, and errgroup cancels remaining work. A contradicts the specification; B treats the entire file as one transaction.
+
+</details>
+
+```console
+$ go run ./cmd/import buzuq.txt
+yozildi: 117500 qator (235 partiya) · rollback: 2000 qator (4 partiya) · vaqt: 5.401s
+import: 120000-qator: narx: narx musbat boʻlishi kerak, keldi -5
+exit status 1
+```
+
+`120000-qator` is the source line number; `narx` is the price field; the final phrase explains the cause. `read` never sent this batch. Other workers’ earlier commits remain. The table was already full from the previous import: 117,500 is processed rows, not the final table size. The video took 5.364 s; this run took 5.401 s. Both had 117,500 and 4 rolled-back batches.
+
+## Prove shutdown in a test
+
+The `synctest.Test` bubble controls time. `slowSaver` is a fake saver that waits for `delay`; `catalog(t, 10_000)` creates 10,000 lines in memory. Two excerpts from `importer_test.go`:
+
+```go
+type slowSaver struct {
+	delay time.Duration
+}
+
+func (s slowSaver) SaveBatch(ctx context.Context, rows []Product) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+```go
+func TestCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			cancel() // Ctrl+C
+		}()
+		st, err := Run(ctx, catalog(t, 10_000), slowSaver{10 * time.Millisecond}, Config{Workers: 4})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, kutilgan context.Canceled", err)
+		}
+		if st.Batches.Load() != 8 || st.RolledBatches.Load() != 4 {
+			t.Errorf("%v; kutilgan: 8 partiya yozilgan, 4 tasi rollback", st)
+		}
+	})
+}
+```
+
+`delay` is the batch duration. A ready `time.After` means success; a ready `ctx.Done()` means a context error. The test creates ctx with `WithCancel`. Another goroutine waits 25 ms on the fake clock, then cancels. `Run` waits for everyone; `errors.Is` checks the cause, and `.Load()` checks both counters.
+
+| Fake time | Total commits | Total rollbacks |
+|---|---|---|
+| 10 ms | 4 | 0 |
+| 20 ms | 8 | 0 |
+| 25 ms, cancel | 8 | 4 |
+
+These counts of 8 and 4 describe the fake saver’s conditions, not actual Postgres speed. If a blocked, unfinished goroutine remains in the bubble, synctest fails the test.
+
+`TestBadLine` checks the bad line and prevents later batches from starting. `TestPostgresImport` writes 2,000 rows twice into the database: the count remains 2,000. `TestPostgresCancel` compares the report with an actual `count(*)`. `pgtest.New(t)` creates a separate schema for each test and removes it afterward.
+
+**Predict:** for the four selected tests, **A)** all PASS · **B)** the upsert test fails with UNIQUE · **C)** the cancellation test sees partial batches.
+
+<details>
+<summary>Answer</summary>
+
+**A.** Upsert updates a repeated name; the transaction preserves the batch boundary. B and C ignore those rules. Counts in the real test depend on scheduling.
+
+</details>
+
+```console
+$ go test -count=1 -v -run 'TestCancel|TestBadLine|TestPostgres' ./internal/importer
+=== RUN   TestCancel
+--- PASS: TestCancel (0.01s)
+=== RUN   TestBadLine
+--- PASS: TestBadLine (0.00s)
+=== RUN   TestPostgresImport
+--- PASS: TestPostgresImport (0.31s)
+=== RUN   TestPostgresCancel
+    pg_test.go:68: yozildi: 2000 qator (4 partiya) · rollback: 1000 qator (2 partiya) · bazada: 2000 qator
+--- PASS: TestPostgresCancel (0.19s)
+PASS
+ok  	github.com/abdurahmon27/bozor/internal/importer	0.513s
+```
+
+`-count=1` prevents cached test results; `-v` prints test names. `|` in `-run` means “or.” `pg_test.go:68` identifies the log’s file and line. The video had 1,500 = 1,500; this run had 2,000 = 2,000.
+
+On Linux, `-race` needs cgo and a C compiler ([race detector](https://go.dev/doc/articles/race_detector)). This machine has no gcc. `_video/race.sh` uses the same Go 1.27.4 tools in the `golang:1.26.8` Docker image, which has gcc. The result below was **rerun in Docker**:
+
+```console
+$ bash _video/race.sh final go test -race -count=1 -v -run 'TestCancel|TestBadLine|TestPostgres' ./internal/importer
+=== RUN   TestCancel
+--- PASS: TestCancel (0.05s)
+=== RUN   TestBadLine
+--- PASS: TestBadLine (0.04s)
+=== RUN   TestPostgresImport
+--- PASS: TestPostgresImport (0.29s)
+=== RUN   TestPostgresCancel
+    pg_test.go:68: yozildi: 1500 qator (3 partiya) · rollback: 1500 qator (3 partiya) · bazada: 1500 qator
+--- PASS: TestPostgresCancel (0.22s)
+PASS
+ok  	github.com/abdurahmon27/bozor/internal/importer	1.609s
+(chiqish kodi: 0)
+```
+
+`final` selects the starter folder; the script prints the final `(chiqish kodi: 0)` line. `PASS` and `ok` mean the executed tests passed. No `WARNING: DATA RACE` appeared. The detector observes executed paths; it does not prove every possible execution safe.
+
+## Going deeper (optional): limits of counters and cancellation
+
+- `Rolled*` actually counts batches for which `SaveBatch` returned an error. With a Begin error, a transaction may never have started.
+- If the server commits but its response is lost in transit, the client cannot know the outcome with certainty. This code adds the batch to `Rolled*`; equality with the database is not guaranteed. Repeating the import with upsert restores the final product state.
+- `Scanner.Scan()` on the ordinary file does not accept a context. Cancellation is observed at the next `send` or worker check. This code alone cannot handle an arbitrary `io.Reader` that blocks forever.
+- The Commit/Rollback `end` deadline is separate from the work ctx. `BatchTimeout` is not a strict total deadline for the real Postgres call: finalization may continue separately.
+
+Transaction atomicity and the client’s knowledge of the result are separate concerns. The former prevents partial batches; a network failure affects the latter.
+
+## Common mistakes
+
+**1. “When the workers return, the reader stops by itself.”** A plain send replaces `send` inside `read`. Excerpt from `_video/stages/importer-xato.go`:
+
+```go
+		b.Rows = append(b.Rows, p)
+		if len(b.Rows) == BatchSize {
+			out <- b // XATO VERSIYA: ctx bekor boʻlsa ham kutadi (select yoʻq)
+			b = Batch{N: b.N + 1}
+		}
+```
+
+After the workers return, nobody receives `out <- b`. The reader waits to send, and `g.Wait()` waits for the reader.
+
+**Predict:** what happens to `TestCancel`? **A)** 8/4 and PASS · **B)** synctest waits forever · **C)** FAIL with deadlock.
+
+<details>
+<summary>Answer</summary>
+
+**C.** Nothing inside the bubble can wake the remaining work. A assumes a cancellation-aware send; B confuses an ordinary CLI hang with synctest’s check.
+
+</details>
+
+We tested the broken copy in a temporary folder with `go test -run 'TestCancel$' ./internal/importer`. `$` anchors the end of the test name. These are **exact excerpts from our own rerun**, not the full stack:
+
+```text
+--- FAIL: TestCancel (0.00s)
+panic: deadlock: all goroutines in bubble are blocked [recovered, repanicked]
+goroutine 8 [sync.WaitGroup.Wait (durable), synctest bubble 1]:
+goroutine 10 [chan send (durable), synctest bubble 1]:
+```
+
+`all goroutines in bubble are blocked` describes the deadlock. `sync.WaitGroup.Wait` is errgroup waiting; `chan send` is the reader sending. The full stack pointed to `importer.go:107` in the broken file. Goroutine numbers differ from the video. In the actual CLI, this bug prevents the program from reporting and exiting after Ctrl+C.
+
+Fix: restore `send(ctx, out, b)`. In the complete file, it also waits on `ctx.Done()` through `select`. In the fixed copy:
+
+```console
+$ go test -run 'TestCancel$' ./internal/importer
+ok  	github.com/abdurahmon27/bozor/internal/importer	0.007s
+```
+
+**2. “Every reported rollback is confirmed.”** `Rolled*` counts batches that returned errors. The lost Commit response is covered in “Going deeper.” Read the report with that limitation; check the database and rerun with upsert if needed.
+
+**3. Delaying cancel until the worker finishes.** `defer cancel()` inside `for` runs when the entire `work` function returns. Cancel after each batch or use a separate `save` function. `WithTimeout(ctx, 0)` is an already expired context, not an unlimited one.
+
+## Check yourself
+
+**1.** How does Ctrl+C reach every goroutine?
+
+<details>
+<summary>Answer</summary>
+
+NotifyContext cancels ctx and therefore `gctx`; send, workers, and Exec observe it. Cancel does not wait for them; `g.Wait()` does.
+
+</details>
+
+**2.** Why does “written” match the database count in the new-table test?
+
+<details>
+<summary>Answer</summary>
+
+Each batch is a transaction; counters increase after successful Commit. The table is empty, names are unique, and there are no other writers or ambiguous commits. On rerun, Rows also counts updates.
+
+</details>
+
+**3.** From GB-7.04: what lets the first error stop the others?
+
+<details>
+<summary>Answer</summary>
+
+Use `errgroup.WithContext`, pass `gctx` into work, and make work honor it. A plain `errgroup.Group` or an unused context is insufficient.
+
+</details>
+
+**4.** Import 2,000 unique names twice into an initially empty table. What are the second `Rows` and `count(*)`? **A)** 2000/2000 · **B)** 4000/4000 · **C)** 0/2000.
+
+<details>
+<summary>Answer</summary>
+
+**A.** The second import updated 2,000 rows. B forgets upsert; C forgets updated rows are counted.
+
+</details>
+
+## Homework
+
+🟢 **Batch deadline.** Implement `Config.BatchTimeout` from [TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer/TASK.md). The [course folder](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer) contains the starter and checks.
+
+- `timeout > 0`: give each batch its own `WithTimeout(ctx, timeout)`; pass that context to SaveBatch; cancel when the batch ends.
+- `timeout == 0`: use the parent ctx directly without another limit.
+- The error starts with `partiya N: ` and preserves `%w`; rollback accounting still works.
+- In the test with 1 worker and a hanging third batch: exactly 5 s of fake time, 2 commits, 1 rollback, and `errors.Is(err, context.DeadlineExceeded)` is true.
+- A 10 s task succeeds without a deadline; a 4 s task is not interrupted by a 5 s deadline.
+
+🟡 **Optional:** add `-timeout` to `cmd/import` using `flag.Duration`. For example, `-timeout 10s`; pass the value into `Config.BatchTimeout`. Existing tests do not check this extra flag.
+
+Start the database with `docker compose up -d --wait`. The starter’s full test run is expected to fail:
+
+```console
+$ go test -count=1 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/import	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/katalog	[no test files]
+--- FAIL: TestTaskBatchTimeout (0.00s)
+    tekshiruv_test.go:48: 3-partiya osilib qoldi va Run 1 daqiqada ham qaytmadi: BatchTimeout (5s) ishlatilmayapti (TASK.md, 1-qadam)
+FAIL
+FAIL	github.com/abdurahmon27/bozor/internal/importer	0.659s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+FAIL
+```
+
+`tekshiruv_test.go:48` identifies the missing exercise: the third batch did not return within a fake minute. The test does not wait a real minute. `[no test files]` means that package has no tests; the failure is in `TestTaskBatchTimeout`. After implementation, `go test ./...` must pass. The [answer is in solution/](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer/solution).
+
+<details>
+<summary>Answer</summary>
+
+Replace `s.SaveBatch(ctx, b.Rows)` in `work` with `save(ctx, s, b.Rows, timeout)`. Helper from `solution/internal/importer/importer.go`:
+
+```go
+func save(ctx context.Context, s Saver, rows []Product, timeout time.Duration) error {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return s.SaveBatch(ctx, rows)
+}
+```
+
+A child context is created only when `timeout > 0`. `ctx, cancel =` replaces the existing ctx. `defer cancel()` runs when the helper returns, without waiting for the worker to finish. Zero creates no new context. Error wrapping and counters stay in `work`.
+
+pgx errors may be wrapped as `partiya 3: timeout: context deadline exceeded`. Do not compare the entire string; check `errors.Is`. This helper cannot forcibly stop a Saver that ignores its context.
+
+Verification rerun inside `solution`:
+
+```console
+$ go test -count=1 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/import	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/katalog	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/importer	0.416s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+```
+
+All solution packages were also checked with `-race` in Docker:
+
+```console
+$ bash _video/race.sh solution go test -race -count=1 ./...
+?   	github.com/abdurahmon27/bozor	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/import	[no test files]
+?   	github.com/abdurahmon27/bozor/cmd/katalog	[no test files]
+ok  	github.com/abdurahmon27/bozor/internal/importer	1.824s
+?   	github.com/abdurahmon27/bozor/internal/pgtest	[no test files]
+(chiqish kodi: 0)
+```
+
+</details>
+
+Afterward, `docker compose down -v` removes this lab’s container and volume. We also ran cleanup after verification.
+
+## Sources
+
+- [Interface types](https://go.dev/ref/spec#Interface_types)
+- [bufio.Scanner](https://pkg.go.dev/bufio#Scanner)
+- [context](https://pkg.go.dev/context)
+- [errgroup.Group.Wait](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.Wait)
+- [synctest.Test](https://pkg.go.dev/testing/synctest#Test)
+- [synctest: Blocking](https://pkg.go.dev/testing/synctest#hdr-Blocking)
+- [time.Since](https://pkg.go.dev/time#Since)
+
+- [os/signal.NotifyContext](https://pkg.go.dev/os/signal#NotifyContext)
+
+- [context.WithoutCancel](https://pkg.go.dev/context#WithoutCancel)
+
+- [context.WithTimeout](https://pkg.go.dev/context#WithTimeout)
+
+- [context.AfterFunc](https://pkg.go.dev/context#AfterFunc)
+
+- [flag](https://pkg.go.dev/flag)
+
+- [sync/atomic.Int64](https://pkg.go.dev/sync/atomic#Int64)
+
+- [testing/synctest](https://pkg.go.dev/testing/synctest)
+
+- [Select statements](https://go.dev/ref/spec#Select_statements)
+
+- [The Go Memory Model](https://go.dev/ref/mem)
+
+- [Race detector](https://go.dev/doc/articles/race_detector)
+
+- [Pipelines and cancellation](https://go.dev/blog/pipelines)
+
+- [errgroup.WithContext](https://pkg.go.dev/golang.org/x/sync/errgroup#WithContext)
+
+- [pgx Tx](https://pkg.go.dev/github.com/jackc/pgx/v5#Tx)
+
+- [pgxpool](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool)
+
+- [PostgreSQL 18 INSERT / ON CONFLICT](https://www.postgresql.org/docs/18/sql-insert.html#SQL-ON-CONFLICT)
+
+- [PostgreSQL 18 transactions](https://www.postgresql.org/docs/18/tutorial-transactions.html)
+
+- [PostgreSQL 18 identity columns](https://www.postgresql.org/docs/18/ddl-identity-columns.html)
+
+- [POSIX SIGINT](https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html)
+
+- [Lesson code, README, and output logs](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer).
+
+Results: `go1.27.4 linux/amd64`, PostgreSQL 18 (`postgres:18-alpine`), 2026-11-28. Ordinary checks used `CGO_ENABLED=0`; `-race` checks were rerun with cgo in Docker. Video numbers were quoted from the recording for comparison.
+
+## Video and code
+
+▶️ The video is coming soon. This page teaches the whole lesson, so you don't have to wait for it.
+
+💻 [Code and homework answers on GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-07-importer)
+
+---
+
+← Previous lesson: [GB-7.06](/lab/youtube/gb/gb-7-06/en) · Next lesson: [GB-8.01](/lab/youtube/gb/gb-8-01/en) → · [All lessons](/lab/youtube/gb)
+
+</div>
