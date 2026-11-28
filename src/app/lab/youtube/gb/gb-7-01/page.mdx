@@ -1,0 +1,913 @@
+---
+title: "Goroutine va uning hayoti: kim boshlaydi, kim kutadi"
+date: "2026/11/28"
+description: "go bilan ish boshlash, main qaytganda dastur tugashi, WaitGroup bilan kutish va natijani data raceʼsiz yigʻish."
+tag: "youtube, gb, dars"
+author: "Bekzotovich"
+lab: true
+order: 51
+alternates:
+  canonical: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+  languages:
+    uz: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+    ru: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/ru"
+    en: "https://www.haywan.uz/lab/youtube/gb/gb-7-01/en"
+    x-default: "https://www.haywan.uz/lab/youtube/gb/gb-7-01"
+---
+
+<div lang="uz">
+
+🌐 **Oʻzbekcha** · [Русский](/lab/youtube/gb/gb-7-01/ru) · [English](/lab/youtube/gb/gb-7-01/en)  
+Dars GB-7.01 · [Go backend: noldan guru'gacha](/lab/youtube/gb#gb-7-01) · ▶️ video tez orada · 💻 [GitHub](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+> Bu sahifa videodagi darsning toʻliq yozma shakli: videoni koʻrmasdan (yoki eshitmasdan) ham shu yerdan oʻrganish mumkin.
+
+## Nimani oʻrganasiz
+
+bozor uchta yetkazuvchidan narx roʻyxatini oladi. Har javob bir soniya ketsa, nega uch soniya kutish kerak?
+Uchalasini bir vaqtda boshlasak, hammasi tugaganini qanday bilamiz?
+
+**Bitta gʻoya:** ishni yangi goroutine'da boshlash uni kutishni anglatmaydi. Ishni boshlagan kod uning tugashini ham boshqarsin.
+Bu laboratoriyada `sync.WaitGroup` tugashni kutadi; `time.Sleep` esa faqat vaqtni taxmin qiladi.
+
+Dars oxirida siz:
+
+- `go` bilan funksiyani yangi goroutine'da boshlaysiz va `main` qaytganda nima boʻlishini tushuntirasiz;
+- `wg.Go` va `wg.Wait` bilan uchta ishni boshlab, hammasini kutasiz;
+- umumiy `append`dagi xatoni topib, natijani alohida indekslarga yozasiz;
+- handler ichidagi ishning egasini tekshirasiz va `fetchAll` vazifasini bajarasiz.
+
+| Soʻz | Oddiy maʼnosi | Inglizcha |
+|---|---|---|
+| goroutine | Go runtime boshqaradigan, boshqa kod bilan bir vaqtda bajariladigan funksiya bajarilishi | goroutine |
+| WaitGroup | boshlangan ishlar hisobini yuritib, ularning tugashini kutadigan `sync` turi | WaitGroup |
+| goroutine egasi | ishni boshlash va tugashini kutish uchun masʼul kod | goroutine owner |
+
+## Oldin bilish kerak
+
+Asos: [GB-6.08 · Himoyalangan bozor](/lab/youtube/gb/gb-6-08) va [GB-4.07 · Mutex va data race](/lab/youtube/gb/gb-4-07).
+Yana: [GB-2.01 · Slice](/lab/youtube/gb/gb-2-01), [GB-2.02 · Map](/lab/youtube/gb/gb-2-02), [GB-2.09 · defer, panic, recover](/lab/youtube/gb/gb-2-09),
+[GB-5.05 · pgx va vaqt oʻlchash](/lab/youtube/gb/gb-5-05), [GB-6.01 · Middleware](/lab/youtube/gb/gb-6-01),
+[GB-6.06 · Buyurtmaga ruxsat](/lab/youtube/gb/gb-6-06), [GB-5.10 · Buyurtmalar API](/lab/youtube/gb/gb-5-10) va [GB-4.02 · HTTP mijoz](/lab/youtube/gb/gb-4-02).
+Asosiy yozuvlar uchun: [GB-1.01](/lab/youtube/gb/gb-1-01), [GB-1.02](/lab/youtube/gb/gb-1-02), [GB-1.06](/lab/youtube/gb/gb-1-06),
+[GB-1.07](/lab/youtube/gb/gb-1-07), [GB-1.08](/lab/youtube/gb/gb-1-08).
+
+[Dars papkasi](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti) — mustaqil modul, `go.mod`da `go 1.27`.
+Terminalni `lessons/gb-7-01-goroutine-hayoti` ichida oching. Go 1.27.4 va Docker ishlatildi; Postgres kerak emas.
+Barcha buyruqlar shu papkadan bajariladi. `./_video/run.sh QADAM go run .` qadamni vaqtinchalik papkaga koʻchirib ishga tushiradi.
+Skript `CGO_ENABLED=0` bilan ishlaydi va oxirida `(chiqish kodi: N)` chiqaradi.
+`-race` uchun bu Linux mashinada C kompilyator yoʻq: `race.sh` Docker ichida `CGO_ENABLED=1` va gcc bilan ishlaydi.
+U ham Go 1.27.4 toolchain'ini ishlatadi. Quyidagi natijalar qayta bajarilgan; video raqamlari alohida belgilangan.
+
+**Eslash, GB-6.08.** Himoya testida nega ikkita xaridor kerak?
+**A)** begona buyurtmani soʻrash · **B)** urinishlar sonini cheklash · **C)** parolni tekshirish
+
+<details>
+<summary>Javob</summary>
+
+**A.** Ikkinchi xaridor birinchisining buyurtmasini soʻraydi. Bitta xaridor bilan begona buyurtmaga kirish sinalmaydi. B va C boshqa tekshiruvlar.
+
+</details>
+
+## Avval ketma-ket bajarilish
+
+Bu tajribada tarmoq oʻrnida `time.Sleep(time.Second)` bor: yetkazuvchi bir soniya kutib javob bergandek boʻladi.
+`fetch` roʻyxatni oʻqishni bildiradi, `name` — yetkazuvchi nomi. Hozir `fetch` natija qaytarmaydi.
+
+```go filename="_video/01-ketma/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+| Qator | Kod | Nima qiladi |
+|---|---|---|
+| 1 | `package main` | bajariladigan dastur paketi |
+| 3–6 | `import` | `fmt` ekranga yozadi, `time` vaqt bilan ishlaydi |
+| 8 | `func fetch(name string)` | matn parametrli funksiya; `{}` tana chegarasi |
+| 9 | `fmt.Println` | `boshlandi:` va nomni chiqaradi |
+| 10 | `time.Sleep(time.Second)` | shu goroutine'ni kamida bir soniya toʻxtatadi |
+| 11–12 | `fmt.Println`, `}` | `tayyor:` chiqarib funksiyani tugatadi |
+| 14 | `func main()` | dastur kirish funksiyasi |
+| 15 | `start := time.Now()` | `start` oʻzgaruvchisiga boshlanish vaqtini yozadi |
+| 16 | `for _, name := range []string{…}` | uch nomli slice boʻylab yuradi; `_` indeksni tashlaydi |
+| 17–18 | `fetch(name)` | bitta chaqiruvni tugatib, keyingisiga oʻtadi |
+| 19–20 | `time.Since(start)` | oʻtgan vaqtni `jami:` bilan chiqaradi, `main` qaytadi |
+
+Nuqta paket aʼzosini tanlaydi; `()` chaqiradi, qoʻshtirnoq matnni belgilaydi. Boʻsh qatorlar bajarilmaydi.
+
+**Bashorat:** jami qancha? **A)** ~1 s · **B)** ~3 s · **C)** deyarli 0 s
+
+<details>
+<summary>Javob</summary>
+
+**B.** Uch marta bir soniyalik kutish ketma-ket keladi. A kutishlar ustma-ust tushishini, C esa kutmaslikni taxmin qiladi.
+
+</details>
+
+```console
+$ ./_video/run.sh 01-ketma go run .
+boshlandi: chorsu
+tayyor: chorsu
+boshlandi: oloy
+tayyor: oloy
+boshlandi: siyob
+tayyor: siyob
+jami: 3.001382105s
+(chiqish kodi: 0)
+```
+
+| Bosqich | `main` nima qiladi | Holat |
+|---|---|---|
+| boshida | `fetch("chorsu")` ichida kutadi | boshqalar boshlanmagan |
+| keyin | `fetch("oloy")` ichida kutadi | chorsu tugagan |
+| oxirida | `fetch("siyob")` tugashini kutadi | keyin `jami` |
+
+Bu vaqtlar uchta sunʼiy kutish yigʻindisi. Yuzta bir soniyalik kutish ketma-ket boʻlsa, model boʻyicha yuz soniya ketadi.
+
+## `go`: boshlaydi, kutmaydi
+
+Bitta soʻz qoʻshamiz: `go fetch(name)`. **Goroutine** — Go runtime boshqaradigan alohida funksiya bajarilishi.
+Runtime — dastur bilan birga ishlaydigan Go yordamchi kodi. `main` ham goroutine'da ishlaydi.
+`go` funksiya va argument qiymatlarini chaqiruvchi goroutine'da hisoblaydi, keyin yangi goroutine'ni boshlaydi.
+Chaqiruv tugashini kutmaydi; qaytgan natijalar tashlanadi. [Rasmiy qoida](https://go.dev/ref/spec#Go_statements).
+
+```go filename="_video/02-go/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+17-qator oʻzgardi: `fetch(name)` oldida `go`. `main` uchta ishni boshlaydi va `jami`ga oʻtadi.
+
+**Bashorat:** nima chiqadi? **A)** doim uchta `tayyor` · **B)** `jami`, balki `boshlandi` ham · **C)** tugamagan ish haqida xato
+
+<details>
+<summary>Javob</summary>
+
+**B.** `main` qaytsa, dastur boshqa goroutine'larni kutmay tugaydi. A yashirin kutishni, C majburiy xatoni taxmin qiladi; ikkalasi ham yoʻq.
+
+</details>
+
+```console
+$ ./_video/run.sh 02-go go run .
+boshlandi: chorsu
+jami: 4.094µs
+(chiqish kodi: 0)
+```
+
+`µs` — mikrosekund. Kichik `jami` ish bajarilganini bildirmaydi: natija chiqishidan oldin dastur tugagan.
+[Rasmiy qoida](https://go.dev/ref/spec#Program_execution) `main` qaytganda boshqa goroutine'lar kutilmasligini aytadi.
+Bu ularga tartibli tugash imkonini berish emas; ularning `defer`lari bajarilishiga ham tayanmang.
+
+| Hodisa | `main` | Uchta ish |
+|---|---|---|
+| `go fetch` | keyingi qatorga oʻtadi | bajarilishga tayyor yoki ishlayapti |
+| `main` qaytadi | dastur tugaydi | tugamagan ish davom etmaydi |
+
+`olchov.sh go` dasturni bir marta qurib, 200 marta ishga tushiradi. Natijani `boshlandi` va `tayyor` qatorlari soniga guruhlaydi.
+
+```console
+$ ./_video/olchov.sh go
+    110 boshlandi=0 tayyor=0
+     35 boshlandi=1 tayyor=0
+     28 boshlandi=2 tayyor=0
+     27 boshlandi=3 tayyor=0
+```
+
+Videoda qayd etilgan taqsimot: `110 / 32 / 37 / 21`; bu qayta bajarilgan natija emas.
+Bugungi taqsimot yuqorida: `110 / 35 / 28 / 27`. Ikkalasida ham `tayyor` nol.
+Foiz qoida emas: asosiy sabab — tugashni kutadigan kod yoʻqligi.
+
+## `Sleep`: vaqt oʻtishi tugash dalili emas
+
+Endi `main`ga `time.Sleep(500 * time.Millisecond)` qoʻshiladi. `*` davomiylikni 500 ga koʻpaytiradi: yarim soniya.
+
+```go filename="_video/03-sleep/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		go fetch(name)
+	}
+	time.Sleep(500 * time.Millisecond)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+**Bashorat:** `main` 0,5 s, `fetch` 1 s kutadi. **A)** uchta `tayyor` · **B)** odatda uchta `boshlandi`, `tayyor` yoʻq · **C)** doim faqat `jami`
+
+<details>
+<summary>Javob</summary>
+
+**B — odatiy natija.** Yarim soniya ishni boshlashga yetdi, tugashiga yetmadi. A ishning bir soniyasini unutadi; C goroutine'lar boshlanishini inkor qiladi. Jadval tartibi kafolatlanmagan.
+
+</details>
+
+```console
+$ ./_video/run.sh 03-sleep go run .
+boshlandi: siyob
+boshlandi: chorsu
+boshlandi: oloy
+jami: 500.059456ms
+(chiqish kodi: 0)
+```
+
+`Sleep` kamida berilgan vaqtni kutadi, aynan shuncha vaqtni emas. Uni ikki soniyaga oshirish bu misolda ortiqcha kutish beradi.
+Yetkazuvchi uch soniyada javob bersa, ikki soniya ham yetmaydi. Bu sonlar taxminni koʻrsatadi, alohida oʻlchov emas.
+
+| `main` kutishi | Ishning holati | Xulosa |
+|---|---|---|
+| 0,5 s | 1 s kutadigan ish tugamagan | natija yoʻqoladi |
+| 2 s | 1 s ish odatda tugagan | ortiqcha kutish |
+| 2 s | 3 s ish hali tugamagan | yana natija yoʻqoladi |
+
+## `WaitGroup`: vaqtni emas, ishni kutish
+
+Bizga boshlangan ishlar tugaganini bilish kerak. **WaitGroup** shu ishlar hisobini yuritadi.
+`var wg sync.WaitGroup` nol qiymat bilan tayyor. `wg` — oʻzgaruvchi nomi; import'ga `"sync"` qoʻshildi.
+`wg.Go(func() { fetch(name) })` nomsiz funksiyani yangi goroutine'da boshlaydi va uni hisobga oladi.
+Funksiya qaytsa, ish hisobdan chiqadi. `wg.Wait()` hisob nol boʻlguncha chaqiruvchi goroutine'ni kutdiradi.
+`wg.Go` Go 1.25'da qoʻshilgan.
+
+```go filename="_video/04-wg/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Yangi qatorlar: 5 — `sync`, 17 — `wg`, 19 — ishni boshlash, 21 — hammasini kutish.
+`func() { … }` parametrsiz va natijasiz funksiya; uning ichida `fetch(name)` bajariladi.
+
+**Bashorat:** **A)** ~1 s va uchta `tayyor` · **B)** ~3 s va uchta `tayyor` · **C)** ~0 s, `tayyor` yoʻq
+
+<details>
+<summary>Javob</summary>
+
+**A.** Uch kutish ustma-ust tushadi. B ishlar hali ham ketma-ket deb oʻylaydi; C `Wait`ni hisobga olmaydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 04-wg go run .
+boshlandi: chorsu
+boshlandi: siyob
+boshlandi: oloy
+tayyor: oloy
+tayyor: siyob
+tayyor: chorsu
+jami: 1.000144574s
+(chiqish kodi: 0)
+```
+
+| Hodisa | Hisob | `main` |
+|---|---|---|
+| ishlar roʻyxatga olinadi | har ishga +1 | siklda |
+| ish qaytadi | har ishga −1 | `Wait`da kutishi mumkin |
+| barcha ishlar qaytgan | 0 | `Wait`dan keyingi qatorga oʻtadi |
+
+Ishlar roʻyxatga olinayotganda ham tugashi mumkin; hisob doim avval uchga chiqishi shart emas.
+Hisob nol paytda boshlanadigan `wg.Go` chaqiruvlari `Wait`dan oldin boʻlsin. Bu kodda ular siklda, `Wait` esa sikldan keyin.
+
+| Variant | Videoda qayd etilgan, qayta bajarilmagan | Bugungi bajarilish |
+|---|---|---|
+| ketma-ket | 3.002459679 s | 3.001382105 s |
+| `wg.Go` + `Wait` | 1.003058399 s | 1.000144574 s |
+
+Muhimi — taxminan uch baravar nisbat: kutishlar ustma-ust tushdi. Bu CPU hisoblash tezligi haqidagi benchmark emas.
+Boshlanish va tugash tartibi kafolatlanmaydi.
+
+[Sync hujjati](https://pkg.go.dev/sync#WaitGroup.Go) kutishdan oldingi ish yozuvlarini kutishdan keyingi oʻqish bilan tartiblaydi.
+Bu kafolat aynan shu WaitGroup hisoblagan ishlar uchun. U goroutine'larning oʻzaro umumiy manzilga yozishini xavfsiz qilmaydi.
+
+## Eski shakl: `Add`, `go`, `Done`
+
+Ishdagi kodda shu koʻrinish ham uchraydi. Yangi kod uchun hujjat `wg.Go`ni tavsiya qiladi.
+
+```go filename="_video/08-adddone/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func fetch(name string) {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fetch(name)
+		}()
+	}
+	wg.Wait()
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+19-qator: `wg.Add(1)` ishni **go'dan oldin** hisobga oladi. 20–23: `go func() { … }()` nomsiz funksiyani boshlaydi.
+Oxirgi `()` — chaqiruv; `defer wg.Done()` shu funksiya qaytganda yoki panic bilan ochilganda hisobni kamaytiradi.
+25-qator hammasini kutadi. `Add`ni goroutine ichiga qoʻysangiz, `Wait` nol hisobni koʻrib erta qaytishi mumkin.
+Bu xato baʼzan jimgina kechadi; kompilyator uni tuzatmaydi.
+
+**Bashorat:** **A)** ~1 s · **B)** ~3 s · **C)** hisob hech qachon kamaymaydi
+
+<details>
+<summary>Javob</summary>
+
+**A.** Ishlar alohida goroutine'da, har biri `Done` bilan tugaydi. B ketma-ketlikni, C `defer` ishlamasligini taxmin qiladi.
+
+</details>
+
+```console
+$ ./_video/run.sh 08-adddone go run .
+boshlandi: oloy
+boshlandi: siyob
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: siyob
+tayyor: oloy
+jami: 1.000167093s
+(chiqish kodi: 0)
+```
+
+Panic paytida bu shakl `wg.Go`ga aynan teng emas; farqi ixtiyoriy boʻlimda.
+
+## Natija: umumiy `append`dagi data race
+
+Endi `offers` map'i yetkazuvchi nomini mahsulotlar soniga bogʻlaydi: `40`, `120`, `5`.
+`fetch(name string) int` shu sonni `return offers[name]` bilan qaytaradi. Map faqat oʻqiladi, oʻzgarmaydi.
+`counts` — mahsulot sonlari. `var counts []int` boʻsh slice; har ish `append` natijasini shu oʻzgaruvchiga yozadi.
+
+```go filename="_video/05-append/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	var counts []int
+	for _, name := range []string{"chorsu", "oloy", "siyob"} {
+		wg.Go(func() { counts = append(counts, fetch(name)) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+Yangi qatorlar: 9 — `offers`; 11 va 15 — `int` natija va `return`; 21 — `counts`; 23 — umumiy oʻqish va yozish;
+26 — natijani chiqarish. `mahsulotlar` mahsulot sonlari roʻyxatini bildiradi.
+
+**Bashorat:** **A)** doim `[40 120 5]` · **B)** son yoʻqolishi mumkin · **C)** kompilyatsiya xatosi
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bir nechta goroutine bitta `counts`ni sinxronlashsiz oʻqib, yozadi: bu **data race**.
+`Wait` oxirida kutadi, lekin yozuvchilarni bir-biridan ajratmaydi. A tartib va xavfsizlikni ortiqcha taxmin qiladi; C bu bajarilishdagi xato ekanini oʻtkazib yuboradi.
+
+</details>
+
+Quyidagi buyruq **Docker'da qayta bajarildi**. `-race` bajarilgan yoʻllardagi nizoli xotira murojaatlarini tekshiradi.
+`-trimpath` fayl yoʻllarini modul yoʻli bilan chiqaradi. `2>&1` xatolar oqimini ham oladi; `| sed -n` faqat tanlangan qatorlarni chiqaradi.
+Birinchi 18 qator va yakuniy natija tanlangan; oʻrtadagi stek qatorlari chiqarilmagan.
+
+```console
+$ ./_video/race.sh 05-append go run -trimpath -race . 2>&1 | sed -n '1,18p;/^mahsulotlar:/p;/^jami:/p;/^Found /p;/^exit status/p;/^(chiqish/p'
+boshlandi: oloy
+boshlandi: chorsu
+boshlandi: siyob
+tayyor: siyob
+tayyor: chorsu
+tayyor: oloy
+==================
+WARNING: DATA RACE
+Read at 0x00c000124030 by goroutine 8:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0x54
+
+Previous write at 0x00c000124030 by goroutine 10:
+  main.main.func1()
+      github.com/abdurahmon27/bozor/main.go:23 +0xc9
+
+Goroutine 8 (running) created at:
+  sync.(*WaitGroup).Go()
+mahsulotlar: [5 40]
+jami: 1.001180388s
+Found 2 data race(s)
+exit status 66
+(chiqish kodi: 1)
+```
+
+`WARNING: DATA RACE` — nizoli murojaatlar topildi. `Read at` — manzildan oʻqish, `Previous write` — oldingi yozish.
+Goroutine `8` va `10` — bajarilish identifikatorlari. `main.main.func1` — `main` ichidagi birinchi nomsiz funksiya.
+`main.go:23` — xato qator; `+0x54` va `+0xc9` — funksiyadagi mashina kodi siljishlari.
+`Found 2 data race(s)` — ikkita hisobot. Bu bajarilishda `120` yoʻqoldi: `[5 40]` qoldi.
+Videodagi `[40 5]` ham `120`ni yoʻqotgan; u qayd etilgan eski natija.
+
+`exit status 66` — tekshirilgan dasturning sukutdagi race kodi. Skriptdagi `chiqish kodi: 1` — `go run` buyrugʻining kodi.
+Ularni bitta kod deb oʻqimang.
+
+`append` slice sarlavhasini oʻqiydi, kerak boʻlsa massiv ajratadi va yangilangan sarlavhani qaytaradi.
+`counts = …` uni umumiy oʻzgaruvchiga yozadi. Quyidagi jadval yoʻqotishning mumkin boʻlgan tartibini koʻrsatadi:
+
+| Qadam | A | B | Oxirgi `counts` |
+|---|---|---|---|
+| oʻqish | `[40]`ni oldi | `[40]`ni oldi | `[40]` |
+| A yozadi | `[40 120]` | eski qiymat hali unda | `[40 120]` |
+| B yozadi | tugadi | `[40 5]` | `[40 5]`: `120` yoʻq |
+
+Bu ruxsat etilgan dastur natijalari roʻyxati emas: race bor kodga tayanmang.
+Yoʻqotish har bajarilishda koʻrinmaydi. Quyidagi oʻlchov `-race`siz, har ishga bir soniyalik kutish bilan bajarildi.
+
+```console
+$ ./_video/olchov.sh append
+      3 sonlar=1
+      8 sonlar=2
+    189 sonlar=3
+```
+
+`sonlar=1/2/3` — natijada qolgan sonlar miqdori; chapdagi son — nechta bajarilish.
+Videodagi eski oʻlchovlarda 200 martadan 7 va 20 tasida son yoʻqolgan. Bugungi taqsimot yuqorida.
+Sonlar oʻzgarsa ham xato oʻzgarmaydi: umumiy slice sarlavhasiga bir nechta yozuvchi bor.
+Tartib ham yetkazuvchilar tartibiga bogʻlanmagan. Hatto qulf qoʻshishning oʻzi kerakli indeks tartibini bermaydi.
+
+## Tuzatish: har ish oʻz elementiga yozadi
+
+Natija uzunligi oldindan maʼlum. `make([]int, len(suppliers))` shuncha element ajratadi.
+Slice sarlavhasi oʻzgarmaydi, har goroutine faqat bitta `counts[i]`ga yozadi.
+
+```go filename="_video/06-index/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+func main() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	suppliers := []string{"chorsu", "oloy", "siyob"}
+	counts := make([]int, len(suppliers))
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+21-qator: `suppliers` nomlar slice'i. 22-qator: `counts` uzunligi ham uch.
+23-qator indeksni `i`ga, nomni `name`ga beradi. 24-qator faqat oʻz elementini yozadi; 26-qator oʻqishdan oldin kutadi.
+`for i, name := range`dagi `:=` har aylanish uchun alohida oʻzgaruvchi yaratadi: modulning `go` versiyasi kamida 1.22 boʻlganda.
+Bu modulda `go 1.27`. Oldindan eʼlon qilingan oʻzgaruvchilarga `=` bilan yozish bu qoida emas.
+
+[Rasmiy qoidada](https://go.dev/ref/spec#Variables) har bir slice elementi alohida oʻzgaruvchi sifatida qaraladi.
+[Sync kafolati](https://pkg.go.dev/sync#WaitGroup.Go) shu ishlarning yozuvlarini `Wait`dan keyin oʻqishga imkon beradi.
+Boshqa goroutine shu elementlarni ish paytida oʻqisa yoki yozsa, alohida sinxronlash kerak.
+
+| Element | Yozuvchi | `Wait`dan keyin |
+|---|---|---|
+| `counts[0]` | chorsu ishi | 40 |
+| `counts[1]` | oloy ishi | 120 |
+| `counts[2]` | siyob ishi | 5 |
+
+**Bashorat:** **A)** `[40 120 5]`, ogohlantirishsiz · **B)** tugash tartibidagi sonlar · **C)** umumiy `append`dagi race
+
+<details>
+<summary>Javob</summary>
+
+**A.** Joy indeks bilan tanlanadi, tugash tartibi bilan emas. Bu yerda umumiy sarlavhaga yozish yoʻq; B va C eski kodga mos.
+
+</details>
+
+```console
+$ ./_video/race.sh 06-index go run -race .
+boshlandi: siyob
+boshlandi: oloy
+boshlandi: chorsu
+tayyor: chorsu
+tayyor: oloy
+tayyor: siyob
+mahsulotlar: [40 120 5]
+jami: 1.000461175s
+(chiqish kodi: 0)
+```
+
+Bu bajarilishda race ogohlantirishi yoʻq. Bitta toza bajarilish barcha yoʻllarda race yoʻqligini isbotlamaydi;
+bu kodning asosiy dalili — alohida elementlar va oʻqishdan oldingi `Wait`.
+
+## Har goroutine'ning egasi
+
+Backend'da quyidagi qisqa parcha uchrashi mumkin. Bu bajariladigan toʻliq dastur emas, handler qarorini koʻrsatadi.
+`sendReceipt(o)` yangi `o` buyurtmasi uchun chek yuboradi. `writeJSON` javob yozadi.
+
+```go
+go sendReceipt(o)
+writeJSON(w, http.StatusCreated, o)
+```
+
+`w` — javob yozuvchi, `http.StatusCreated` — `201`. Chaqiruvlar GB-5.10 va GB-6.08'dagi `createOrder` handler'ining ichida.
+Chek yuborish uzoq davom etsa ham handler javob yozib qaytadi.
+
+**Savol:** bu goroutine'ni kim kutadi? **A)** server avtomatik · **B)** hech kim · **C)** `main` avtomatik
+
+<details>
+<summary>Javob</summary>
+
+**B.** Bu parchada kutish yozilmagan. Handler qaytishi alohida goroutine'ni oʻzidan-oʻzi toʻxtatmaydi.
+Ammo dastur tugasa, yarim yoʻldagi chek yoʻqolishi mumkin. Nechta ish borligini hisoblaydigan kod ham yoʻq.
+A va C server yoki `main`da yashirin kutish bor deb oʻylaydi.
+
+</details>
+
+**Egasi** — ishni boshlash va tugashini kutish uchun masʼul kod. Bu Go majburlaydigan til qoidasi emas, loyihalash qoidasi.
+Egasi ishni boshqa aniq boshqaruvchiga topshirishi ham mumkin; masʼuliyat ochiq boʻlsin.
+Vazifadagi `fetchAll` boshlagan barcha ishlarini kutib, keyin qaytadi.
+
+| Kod | Boshlaydi | Tugashni kutadi | Qaytganda |
+|---|---|---|---|
+| `go sendReceipt(o)`li handler | ha | yoʻq | chek hali yuborilayotgan boʻlishi mumkin |
+| tuzatilgan `fetchAll` | ha | `wg.Wait` | oʻzi boshlagan `fetch`lar tugagan |
+
+Toʻxtatish signali GB-7.03'dagi `context`da, serverni tartibli toʻxtatish GB-8.03'da,
+jarayon qayta ishga tushsa ham yoʻqolmaydigan ishlar GB-9.01'da oʻtiladi.
+
+## Chuqurroq (ixtiyoriy): `recover` boshqa goroutine'ni himoya qilmaydi
+
+`main`da `defer` va `recover` bor, ammo `panic` `wg.Go` boshlagan goroutine'da yuz beradi.
+
+```go filename="_video/07-panic/main.go" showLineNumbers
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("ushlandi:", r)
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Go(func() { panic("chorsu: javob buzuq") })
+	wg.Wait()
+	fmt.Println("tugadi")
+}
+```
+
+9–13-qatorlar: `main`ning kechiktirilgan funksiyasi `recover()` natijasini `r`ga oladi va `nil` boʻlmasa chiqaradi.
+15-qator boshqa goroutine'da panic qiladi. 17-qator `tugadi` chiqarishi kerak edi, lekin unga yetilmaydi.
+
+**Bashorat:** **A)** `ushlandi` chiqadi · **B)** dastur panic bilan tugaydi · **C)** panic eʼtiborsiz qoladi
+
+<details>
+<summary>Javob</summary>
+
+**B.** `recover` faqat shu goroutine'da, kechiktirilgan funksiyadan toʻgʻri chaqirilganda panic'ni ushlaydi.
+A himoyani boshqa goroutine'ga yoyadi; C panic avtomatik yoʻqoladi deb oʻylaydi.
+
+</details>
+
+```console
+$ ./_video/run.sh 07-panic go run -trimpath .
+panic: chorsu: javob buzuq [recovered, repanicked]
+
+goroutine 19 [running]:
+sync.(*WaitGroup).Go.func1.1()
+	sync/waitgroup.go:251 +0x45
+panic({0x5593a0?, 0x4a4a60?})
+	runtime/panic.go:859 +0x125
+main.main.func2()
+	github.com/abdurahmon27/bozor/main.go:15 +0x25
+sync.(*WaitGroup).Go.func1()
+	sync/waitgroup.go:258 +0x4a
+created by sync.(*WaitGroup).Go in goroutine 1
+	sync/waitgroup.go:238 +0x7d
+exit status 2
+(chiqish kodi: 1)
+```
+
+`ushlandi` — ushlash xabari — chiqmadi. `goroutine 19 [running]` panic yuz bergan goroutine'ni bildiradi.
+`main.main.func2` — `main` ichidagi ikkinchi nomsiz funksiya; `main.go:15` uning panic qatori.
+`sync` va `runtime` qatorlari chaqiruvlar steki: panic shu yoʻldan qayta koʻtarilgan.
+`exit status 2` panic bilan tugagan dastur kodi; skriptdagi `1` yana `go run` kodi.
+
+`[recovered, repanicked]` — Go 1.27.4'dagi `wg.Go` panic'ni ushlab, qayta tashlagan.
+Bu amalga oshirish `Done`ni chaqirmaydi: `Wait` ochilib, dastur panic xabari tugashidan oldin chiqmasligi uchun.
+Oddiy `defer wg.Done()` panic ochilishida ham hisobni kamaytiradi. Shuning uchun ikkala shakl panic'da aynan teng emas.
+**Shartnoma:** `wg.Go`ga berilgan `f` panic qilmasligi kerak. Xatolarni qaytarish va yigʻish GB-7.04'dagi `errgroup` mavzusi.
+
+GB-6.01'dagi `recoverPanic` ham faqat handler ishlayotgan goroutine'da himoya qiladi.
+`sendReceipt` alohida goroutine'da ushlanmagan panic qilsa, server jarayoni tugaydi.
+
+## Koʻp uchraydigan xatolar
+
+1. **`go` yozilsa, ish albatta tugaydi deb oʻylash.** `02-go`da bu jimgina buzildi. Tuzatish: ishlarni roʻyxatga olib, qaytishdan oldin `Wait`.
+2. **`Sleep`ni kutish kafolati deb olish.** `03-sleep`dagi yarim soniya natijani kutmadi. Tuzatish: vaqtni emas, ish tugashini kutish.
+3. **`WaitGroup` umumiy `append`ni himoyalaydi deb oʻylash.** `05-append`da haqiqiy race hisoboti bor. Tuzatish: oldindan `make`, har ishga alohida `counts[i]`.
+4. **`Add(1)`ni goroutine ichiga qoʻyish.** `Wait` roʻyxatga olishdan oldin qaytishi mumkin. `Add`ni `go`dan oldinga chiqaring yoki `wg.Go` ishlating.
+5. **`recover`ni boshqa goroutine uchun yetarli sanash.** `07-panic`da dastur `exit status 2` bilan tugadi. `f` shartnomasini saqlang; tashqi `recover`ga tayanmang.
+
+Birinchi ikki xatoda kompilyatsiya xabari yoʻq. Race va panic xabarlarining fayli, qatori va tuzatishi yuqorida koʻrsatildi.
+
+## Oʻzingizni tekshiring
+
+1. `main` qaytsa, hali tugamagan goroutine'lar nima boʻladi?
+
+<details>
+<summary>Javob</summary>
+
+Dastur ularni kutmay tugaydi. Boshlangan ishning natijasi yoʻqolishi mumkin.
+
+</details>
+
+2. Nega `time.Sleep` oʻrniga `wg.Wait`?
+
+<details>
+<summary>Javob</summary>
+
+`Sleep` davomiylikka qaraydi; `Wait` shu guruhdagi ishlar tugashiga qaraydi. Yetkazuvchi tezlashsa, kutish ham qisqaradi.
+
+</details>
+
+3. `06-index`da siyob birinchi tugasa, `counts` qanday chiqadi?
+**A)** `[5 40 120]` · **B)** `[40 120 5]` · **C)** faqat `[5]`
+
+<details>
+<summary>Javob</summary>
+
+**B.** Siyob oʻzining 2-indeksiga yozadi. `Wait` uchalasini ham kutadi; tugash tartibi indekslarni almashtirmaydi.
+
+</details>
+
+4. GB-6.06: begona buyurtma uchun nega `403` oʻrniga `404`?
+
+<details>
+<summary>Javob</summary>
+
+bozor bu javobni yoʻq buyurtma javobiga tenglashtiradi. Shunda mijoz buyurtma mavjudligini ajrata olmaydi; farqli `403` buni oshkor qilardi.
+
+</details>
+
+## Uy vazifasi
+
+[Dars papkasi va TASK.md](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti),
+[javob kodi](https://github.com/abdurahmon27/go-backend-uz/blob/main/lessons/gb-7-01-goroutine-hayoti/solution/main.go).
+
+🟢 **`fetchAll`ni bir vaqtda ishlaydigan qiling.** `main.go`dagi funksiya yetkazuvchilar slice'i va `fetch func(string) int` oladi.
+Ikkinchi parametr — matn olib `int` qaytaradigan funksiya. Hozirgi tana ketma-ket; faqat shu vazifa joylarini oʻzgartiring.
+`"sync"` import qiling, har ishni `wg.Go` bilan boshlang, `counts[i]`ga yozing, qaytishdan oldin `wg.Wait()`.
+`offers`, `fetch`, `main` va testlarni oʻzgartirmang.
+
+🟡 **Ixtiyoriy: `fetchAllAddDone`.** Xuddi shu xatti-harakatni `wg.Add(1)`, `go func() { … }()` va `defer wg.Done()` bilan yozing.
+Bu funksiyada `wg.Go` ishlatmang. Yozilmaguncha uning testi `SKIP`, yaʼni oʻtkazib yuboriladi.
+
+Test beshta yetkazuvchini `150, 120, 90, 60, 30 ms` kutishlar bilan beradi. Ketma-ket yigʻindi 450 ms, bir vaqtda taxminan 150 ms.
+U ishlarning tugashini, `[40 120 5 17 64]` tartibini va tezlikni tekshiradi. Oʻn baravar tez javoblar `Sleep` bilan taxmin qilishni ushlaydi.
+`sync/atomic` tugagan chaqiruvlarni sanaydi; `go/parser` sariq vazifada manba matnini tekshiradi. Bular testning ichki qismi.
+
+**Bashorat:** starter testi **A)** oʻtadi · **B)** ketma-ketlik sabab yiqiladi · **C)** kompilyatsiya qilinmaydi
+
+<details>
+<summary>Javob</summary>
+
+**B.** Kod toʻgʻri yozilgan, lekin ishlar ketma-ket. Test xabari `wg.Go` bilan alohida boshlashni soʻraydi.
+
+</details>
+
+```console
+$ ./_video/run.sh final go test .
+--- FAIL: TestVazifaFetchAll (0.45s)
+    tekshiruv_test.go:97: fetchAll 5 ta yetkazuvchini 452ms'da oʻqidi: ular ketma-ket ishlayapti (450ms atrofida). Bir vaqtda boʻlsa, eng sekini, ya'ni ~150ms atrofida tugaydi: har fetch'ni wg.Go bilan alohida goroutine'da boshlang
+FAIL
+FAIL	github.com/abdurahmon27/bozor	0.455s
+FAIL
+(chiqish kodi: 1)
+```
+
+`tekshiruv_test.go:97` — xato sharti chaqirilgan test qatori; `FAIL` — tekshiruv oʻtmadi.
+450 ms atrofidagi vaqt aynan ketma-ketlikni koʻrsatadi. Xabardagi maslahatni qoʻllab, `go test .`ni `ok` boʻlguncha bajaring.
+`./...` bilan tekshirish uchun `go test ./...` ham mavjud: shu modul paketlari va `solution`ni oladi, `_video` papkalarini chetlab oʻtadi.
+
+<details>
+<summary>Yechim va izoh</summary>
+
+Javobning toʻliq fayli quyida. `counts` oldindan ajratiladi; `fetchAll` oʻzi boshlagan ishlarni kutadi.
+Sariq variant ham `Add`ni ish boshlanishidan oldin chaqiradi. Boʻsh kirishda sikl ishlamaydi, `Wait` darhol qaytadi.
+
+```go filename="solution/main.go" showLineNumbers
+// bozor import'ining birinchi qadami (GB-7.01): bir nechta yetkazib beruvchidan narx roʻyxatini
+// bir vaqtda oʻqish. Tarmoq oʻrniga time.Sleep: har yetkazuvchi bir soniyada javob beradi.
+// Toʻliq importer (cmd/import, bekor qilish, chegaralangan worker'lar) GB-7.07'da.
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// offers — har yetkazib beruvchining narx roʻyxatida nechta mahsulot bor (laboratoriya maʼlumoti).
+var offers = map[string]int{"chorsu": 40, "oloy": 120, "siyob": 5}
+
+// fetch — bitta yetkazuvchining roʻyxatini "oʻqiydi" va undagi mahsulotlar sonini qaytaradi.
+func fetch(name string) int {
+	fmt.Println("boshlandi:", name)
+	time.Sleep(time.Second)
+	fmt.Println("tayyor:", name)
+	return offers[name]
+}
+
+// fetchAll har yetkazuvchi uchun fetch'ni chaqiradi va natijalarni xuddi suppliers tartibida qaytaradi:
+// counts[i] = fetch(suppliers[i]).
+//
+// Javob (TASK.md, 1-qadam): har fetch alohida goroutine'da (wg.Go), har goroutine oʻz counts[i]'iga yozadi
+// (har element alohida xotira joyi: data race yoʻq), fetchAll qaytishdan oldin hammasini kutadi (wg.Wait).
+// fetchAll — bu goroutine'larning egasi: u qaytganda ulardan birortasi ham ishlamayapti.
+func fetchAll(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Go(func() { counts[i] = fetch(name) })
+	}
+	wg.Wait()
+	return counts
+}
+
+// fetchAllAddDone — 🟡 javob (TASK.md, 2-qadam): xuddi fetchAll, eski shaklda. wg.Add(1) go'dan OLDIN
+// (goroutine ichida emas: aks holda Wait hisob hali nol paytda qaytib ketishi mumkin), Done esa defer bilan.
+// wg.Go shu ikki qatorni oʻzi bajaradi, bitta farq bilan: f panic qilsa, wg.Go Done'ni chaqirmaydi va panic'ni
+// qayta tashlaydi, Wait ochilib, dastur panic tugashidan oldin chiqib ketmasin deb (src/sync/waitgroup.go).
+// Hujjat yangi kodda wg.Go'ni tavsiya qiladi (go doc sync.WaitGroup.Add).
+func fetchAllAddDone(suppliers []string, fetch func(string) int) []int {
+	counts := make([]int, len(suppliers))
+	var wg sync.WaitGroup
+	for i, name := range suppliers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			counts[i] = fetch(name)
+		}()
+	}
+	wg.Wait()
+	return counts
+}
+
+func main() {
+	start := time.Now()
+	counts := fetchAll([]string{"chorsu", "oloy", "siyob"}, fetch)
+	fmt.Println("mahsulotlar:", counts)
+	fmt.Println("jami:", time.Since(start))
+}
+```
+
+`fetchAll`dagi yangi `wg` mahalliy; har chaqiruv oʻz guruhiga ega. `return counts` faqat kutishdan keyin bajariladi.
+Bu laboratoriyadagi `fetch` xato qaytarmaydi. Haqiqiy tarmoq xatosini yigʻish va bekor qilish GB-7.03–7.04'da qoʻshiladi.
+
+Javob testini shu papkadan tekshiramiz; `./solution/` javob paketini tanlaydi.
+
+```console
+$ CGO_ENABLED=0 GOTOOLCHAIN=go1.27.4 go test ./solution/
+ok  	github.com/abdurahmon27/bozor/solution	(cached)
+```
+
+Docker ichidagi `-race` bilan ham javob tekshirildi:
+
+```console
+$ ./_video/race.sh solution go test -race .
+ok  	github.com/abdurahmon27/bozor	1.347s
+(chiqish kodi: 0)
+```
+
+</details>
+
+## Manbalar
+
+- [Go statements](https://go.dev/ref/spec#Go_statements), [Program execution](https://go.dev/ref/spec#Program_execution), [Variables](https://go.dev/ref/spec#Variables), [Appending to slices](https://go.dev/ref/spec#Appending_and_copying_slices), [Handling panics](https://go.dev/ref/spec#Handling_panics).
+- [sync.WaitGroup](https://pkg.go.dev/sync#WaitGroup), [WaitGroup.Go](https://pkg.go.dev/sync#WaitGroup.Go), [WaitGroup.Add](https://pkg.go.dev/sync#WaitGroup.Add), [WaitGroup.Wait](https://pkg.go.dev/sync#WaitGroup.Wait), [Go 1.27.4 amalga oshirish kodi](https://cs.opensource.google/go/go/+/refs/tags/go1.27.4:src/sync/waitgroup.go).
+- [Go xotira modeli](https://go.dev/ref/mem): nizoli murojaatlar va sinxronlash.
+- [Go 1.25](https://go.dev/doc/go1.25), [Go 1.22 sikl oʻzgaruvchilari](https://go.dev/doc/go1.22#language), [go.mod versiyasi sharti](https://go.dev/blog/loopvar-preview).
+- [Data Race Detector](https://go.dev/doc/articles/race_detector), [exitcode sozlamasi](https://go.dev/doc/articles/race_detector#Options).
+- [time.Sleep](https://pkg.go.dev/time#Sleep), [time.Since](https://pkg.go.dev/time#Since), [net/http.Handler va panic](https://pkg.go.dev/net/http#Handler).
+- [Dave Cheney: goroutine tugash yoʻlini oldindan biling](https://dave.cheney.net/2016/12/22/never-start-a-goroutine-without-knowing-how-it-will-stop).
+- [OWASP: obyektga ruxsat tekshiruvi](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/).
+
+Natijalar: `go1.27.4 linux/amd64`, 2026-11-28. Oddiy bajarilishlar `CGO_ENABLED=0`; `-race` Docker'da `CGO_ENABLED=1` bilan.
+Vaqtlar, xotira manzillari va goroutine identifikatorlari sizda boshqacha boʻladi.
+
+## Video va kod
+
+▶️ Video tez orada chiqadi. Bu sahifa darsni toʻliq oʻrgatadi, videoni kutish shart emas.
+
+💻 [Kod va uy vazifasi javoblari GitHub'da](https://github.com/abdurahmon27/go-backend-uz/tree/main/lessons/gb-7-01-goroutine-hayoti)
+
+---
+
+← Oldingi dars: [GB-6.08](/lab/youtube/gb/gb-6-08) · Keyingi dars: [GB-7.02](/lab/youtube/gb/gb-7-02) → · [Barcha darslar](/lab/youtube/gb)
+
+</div>
